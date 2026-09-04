@@ -32,7 +32,7 @@ from src.distill.artifacts import (
     write_kd_targets,
 )
 from src.distill.config import DistillConfig
-from src.distill.losses import kd_dist_loss, kd_gram_loss, kd_logit_loss, kd_rank_loss
+from src.distill.losses import kd_dist_loss, kd_gram_loss, kd_logit_loss, kd_rank_loss, kd_rep_loss
 from src.distill.struct_targets import STRUCT_NAMES, structural_row_targets
 from src.eval.early_stopping import compose_val_total
 from src.model.egostitch.classifier.b0_v31 import V3_1
@@ -1777,3 +1777,73 @@ def test_evaluate_distributed_kd_white_names_r2_by_artifact_axes() -> None:
         "val_kd_struct_r2_pc4",
     }
     assert "val_kd_logit_corr" not in outcome.kd
+
+
+def test_kd_rank_rep_row_bank_emits_weighted_cosine_and_logit_telemetry(tmp_path: Path) -> None:
+    node_ids = [f"n{i}" for i in range(4)]
+    train_pairs = _ring_pairs(node_ids)
+    train_labels = [1, 0, 1, 0]
+    teacher_rep = np.eye(4, dtype=np.float32)
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=node_ids,
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        teacher_logit=np.array([1.0, -1.0, 0.5, -0.5], dtype=np.float32),
+        teacher_rep=teacher_rep,
+    )
+    model = nn.Module()
+    model.d_model = 4  # type: ignore[assignment]
+    bank = KDRowBank(
+        DistillConfig(
+            targets_path="t", context_targets_path="c", w_rank=0.1, w_dist=10.0, w_rep=2.0
+        ),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=train_pairs,
+        train_labels=train_labels,
+        val_pairs=train_pairs[:1],
+        val_labels=train_labels[:1],
+        model=model,
+        device=torch.device("cpu"),
+    )
+    assert bank.arm == "kd_rank_rep"
+    assert bank.train_rep is not None
+    student_rep = torch.tensor([[1.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], requires_grad=True)
+    output = {"logits": torch.tensor([0.3, -0.7]), "pair_repr": student_rep}
+    loss, stats = bank.loss({"_row_id": torch.tensor([0, 1])}, output)
+    expected = 2.0 * kd_rep_loss(student_rep, torch.tensor(teacher_rep[[0, 1]]))
+    assert torch.allclose(loss, expected, atol=1e-6)
+    assert loss.requires_grad
+    assert stats["rows"] == 2.0
+    assert "sum_rep_cos" in stats and "sum_st" in stats
+    assert "sum_logit_bce" not in stats
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), stats)
+    assert {"kd_rep_cos", "kd_rep_loss", "kd_logit_corr", "kd_prob_mae"} <= telemetry.keys()
+    assert bank.global_relational is False
+    assert bank.val_diagnostics().teacher_rep is not None
+
+
+def test_context_stream_accepts_kd_rank_rep_and_rejects_arms_without_w_rank() -> None:
+    targets, table = _context_fixture()
+
+    def build(distill: DistillConfig) -> KDContextStream:
+        return KDContextStream(
+            distill,
+            targets,
+            table,
+            allowed_nodes=frozenset(targets.node_ids),
+            forbidden_internal_nodes=frozenset({"n0"}),
+            epochs=2,
+            rank=0,
+            world_size=1,
+            token_budget=1 << 20,
+        )
+
+    stream = build(
+        DistillConfig(
+            targets_path="rows", context_targets_path="contexts", w_rank=0.1, w_dist=10.0, w_rep=1.0
+        )
+    )
+    assert stream is not None
+    with pytest.raises(ValueError, match="w_rank"):
+        build(DistillConfig(targets_path="rows", w_rep=1.0))

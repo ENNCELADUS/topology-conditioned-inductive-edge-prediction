@@ -113,6 +113,8 @@ from src.model.egostitch.classifier.topo_gen import TopoGenBase
 
 # Arms that regress the auxiliary head (`kd_struct_head`) onto ``teacher_rep`` by MSE.
 _AUX_HEAD_ARMS = frozenset({"kd_struct", "kd_white"})
+# Arms that align pair representations to teacher vectors by per-row cosine.
+_REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep"})
 
 logger = logging.getLogger(__name__)
 
@@ -2728,7 +2730,7 @@ class KDValDiagnostics:
             `validate_gathered_validation` sorts scored logits into.
         teacher_rep: ``(n_val, rep_dim)`` fp16 teacher pooled embeddings (or
             z-scored descriptors for ``kd_struct``), on the training device;
-            populated for ``kd_rep``, ``kd_gram``, and ``kd_struct``.
+            populated for the cosine arms, ``kd_gram``, and the aux-head arms.
         teacher_latent: ``(n_val, latent_dim)`` fp16 teacher latents, on the
             training device; populated only for ``kd_gen`` and normalized at use.
         latent_scale: Artifact-wide teacher latent RMS used for normalization.
@@ -2848,8 +2850,10 @@ class KDContextStream:
         world_size: int,
         token_budget: int,
     ) -> None:
-        if distill.arm != "kd_rank":
-            raise ValueError("KDContextStream requires the active kd_rank arm")
+        if distill.w_rank <= 0.0:
+            raise ValueError(
+                "KDContextStream requires an active w_rank term (kd_rank or kd_rank_rep)"
+            )
         if token_budget < 1:
             raise ValueError(f"KD context token budget must be positive, got {token_budget}")
         if epochs > len(targets.banks):
@@ -3159,9 +3163,9 @@ class KDRowBank:
     teacher target exists for every official training row
     (`src/distill/teacher_targets.py`, format ``kd_row_targets_v1``), joined
     to the trainer's own rows by ``batch["_row_id"]``. Non-rank KD terms use
-    the task forward; ``kd_rank`` keeps this bank only for official-row
-    logit-correlation and probability-error telemetry while its relational
-    losses come from :class:`KDContextStream`.
+    the task forward; ``kd_rank`` keeps only logit/probability telemetry here,
+    while ``kd_rank_rep`` also adds per-row cosine KD. Both arms get their
+    rank/distribution losses from :class:`KDContextStream`.
 
     The matched-control invariant: with ``cfg.distill`` absent or every
     weight zero, the caller never constructs a `KDRowBank`, and the training
@@ -3298,12 +3302,12 @@ class KDRowBank:
             self.train_a_idx = torch.as_tensor(targets.pair_a_idx, dtype=torch.int64, device=device)
             self.train_b_idx = torch.as_tensor(targets.pair_b_idx, dtype=torch.int64, device=device)
         self.train_rep: torch.Tensor | None = None
-        if self.arm in {"kd_rep", "kd_gram", "kd_gen"} or self.arm in _AUX_HEAD_ARMS:
+        if self.arm in {"kd_gram", "kd_gen"} | _REP_COS_ARMS | _AUX_HEAD_ARMS:
             self.train_rep = torch.as_tensor(
                 targets.teacher_rep, dtype=torch.float16, device=device
             )
         val_teacher_rep: torch.Tensor | None = None
-        if self.arm in {"kd_rep", "kd_gram"} or self.arm in _AUX_HEAD_ARMS:
+        if self.arm in {"kd_gram"} | _REP_COS_ARMS | _AUX_HEAD_ARMS:
             val_teacher_rep = torch.as_tensor(
                 targets.val_teacher_rep, dtype=torch.float16, device=device
             )
@@ -3409,7 +3413,7 @@ class KDRowBank:
             if logit_term is not None:
                 stats["sum_logit_bce"] = float(logit_term.detach().item()) * stats["rows"]
 
-        if self.arm == "kd_rep":
+        if self.arm in _REP_COS_ARMS:
             student_rep = output.get("kd_rep")
             if student_rep is None:
                 student_rep = output.get("pair_repr")
@@ -3530,7 +3534,7 @@ class KDRowBank:
             telemetry["kd_prob_mae"] = reduced_sums["sum_prob_err"] / n
         if self.arm == "kd_logit":
             telemetry["kd_logit_loss"] = reduced_sums["sum_logit_bce"] / n
-        if self.arm == "kd_rep":
+        if self.arm in _REP_COS_ARMS:
             telemetry["kd_rep_cos"] = reduced_sums["sum_rep_cos"] / n
             telemetry["kd_rep_loss"] = 1.0 - telemetry["kd_rep_cos"]
         if self.arm == "kd_gram":
@@ -4904,7 +4908,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             device=accelerator.device,
         )
         kd_val = kd_bank.val_diagnostics()
-        if cfg.distill.arm == "kd_rank":
+        if cfg.distill.w_rank > 0.0:
             context_targets = load_kd_context_targets(Path(cfg.distill.context_targets_path))
             kd_context_stream = KDContextStream(
                 cfg.distill,
