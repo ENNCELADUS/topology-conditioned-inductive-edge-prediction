@@ -15,7 +15,7 @@ import argparse
 import math
 import os
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,28 +54,41 @@ ENQUEUED_PRIORS: tuple[dict[str, object], ...] = (
 )
 
 
-def materialize_trial_config(
-    base_config: Path, params: Mapping[str, object], trial_number: int, sweep_dir: Path
+def _write_trial_config(
+    base_config: Path, distill_overrides: Mapping[str, object], trial_number: int, sweep_dir: Path
 ) -> Path:
-    """Write trial ``trial_number``'s config; only the five whitelisted keys differ.
+    """Write trial ``trial_number``'s config: base + ``distill_overrides`` + ``output_dir``.
 
     Raises:
-        KeyError: On an unknown bank name.
         ValueError: If the resulting ``distill`` section is illegal.
     """
     cfg = yaml.safe_load(base_config.read_text(encoding="utf-8"))
     cfg["output_dir"] = str(sweep_dir / f"trial_{trial_number:03d}")
-    distill = dict(cfg["distill"])
-    distill["w_rank"] = float(params["w_rank"])  # type: ignore[arg-type]
-    distill["w_dist"] = float(params["w_dist"])  # type: ignore[arg-type]
-    distill["margin"] = float(params["margin"])  # type: ignore[arg-type]
-    distill["context_targets_path"] = BANKS[str(params["bank"])].path
+    distill = {**cfg["distill"], **distill_overrides}
     cfg["distill"] = distill
     DistillConfig.from_mapping(distill)
     config_path = sweep_dir / "configs" / f"trial_{trial_number:03d}.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
     return config_path
+
+
+def materialize_trial_config(
+    base_config: Path, params: Mapping[str, object], trial_number: int, sweep_dir: Path
+) -> Path:
+    """Write trial ``trial_number``'s kd_rank config; only the five whitelisted keys differ.
+
+    Raises:
+        KeyError: On an unknown bank name.
+        ValueError: If the resulting ``distill`` section is illegal.
+    """
+    overrides = {
+        "w_rank": float(params["w_rank"]),  # type: ignore[arg-type]
+        "w_dist": float(params["w_dist"]),  # type: ignore[arg-type]
+        "margin": float(params["margin"]),  # type: ignore[arg-type]
+        "context_targets_path": BANKS[str(params["bank"])].path,
+    }
+    return _write_trial_config(base_config, overrides, trial_number, sweep_dir)
 
 
 @dataclass(frozen=True)
@@ -86,6 +99,19 @@ class TrialOutcome:
     geo_mmd: float
     constraint: float
     surface: dict[str, float]
+
+
+@dataclass(frozen=True)
+class SweepSpec:
+    """One arm's sweep: study identity, priors, search space, config writer, and prep step."""
+
+    study_name: str
+    n_startup_trials: int
+    priors: tuple[dict[str, object], ...]
+    param_names: tuple[str, ...]
+    suggest: Callable[[optuna.Trial], dict[str, object]]
+    materialize: Callable[[Path, Mapping[str, object], int, Path], Path]
+    prepare: Callable[[argparse.Namespace], None]
 
 
 def trial_outcome(run_dir: Path, rd_band: float) -> TrialOutcome:
@@ -125,26 +151,29 @@ def _constraints(trial: optuna.trial.FrozenTrial) -> Sequence[float]:
     return (float(constraint[0]),)
 
 
-def build_study(db_path: Path) -> optuna.Study:
-    """Create-or-load the sweep study."""
+def build_study(
+    db_path: Path, *, study_name: str = STUDY_NAME, n_startup_trials: int = N_STARTUP_TRIALS
+) -> optuna.Study:
+    """Create-or-load a sweep study (kd_rank's by default)."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sampler = optuna.samplers.TPESampler(
         seed=0,
         multivariate=True,
-        n_startup_trials=N_STARTUP_TRIALS,
+        n_startup_trials=n_startup_trials,
         constraints_func=_constraints,
     )
-    study = optuna.create_study(
-        study_name=STUDY_NAME,
+    return optuna.create_study(
+        study_name=study_name,
         storage=f"sqlite:///{db_path}",
         directions=["maximize", "minimize"],
         sampler=sampler,
         load_if_exists=True,
     )
-    return study
 
 
-def enqueue_priors(study: optuna.Study) -> None:
+def enqueue_priors(
+    study: optuna.Study, priors: Sequence[Mapping[str, object]] = ENQUEUED_PRIORS
+) -> None:
     """Enqueue every prior that has no waiting, running, or completed trial.
 
     A prior whose trial failed is re-enqueued, so a fixed environment gets
@@ -156,7 +185,7 @@ def enqueue_priors(study: optuna.Study) -> None:
         t.system_attrs.get("fixed_params", t.params)
         for t in study.get_trials(deepcopy=False, states=live)
     ]
-    for params in ENQUEUED_PRIORS:
+    for params in priors:
         if dict(params) not in seen:
             study.enqueue_trial(dict(params))
 
@@ -275,19 +304,32 @@ def _n_complete(study: optuna.Study) -> int:
     return len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
 
 
-def run_sweep(args: argparse.Namespace) -> None:
-    """Drive the whole sweep: reconcile, dump banks, ask/tell until budget."""
-    study = build_study(args.sweep_dir / "optuna.db")
+KD_RANK_SPEC = SweepSpec(
+    study_name=STUDY_NAME,
+    n_startup_trials=N_STARTUP_TRIALS,
+    priors=ENQUEUED_PRIORS,
+    param_names=("w_rank", "w_dist", "bank", "margin"),
+    suggest=suggest_params,
+    materialize=materialize_trial_config,
+    prepare=dump_missing_banks,
+)
+
+
+def run_sweep(args: argparse.Namespace, spec: SweepSpec = KD_RANK_SPEC) -> None:
+    """Drive the whole sweep: reconcile, prepare banks, ask/tell until budget."""
+    study = build_study(
+        args.sweep_dir / "optuna.db",
+        study_name=spec.study_name,
+        n_startup_trials=spec.n_startup_trials,
+    )
     reconcile_running(study, args.sweep_dir, args.rd_band)
-    enqueue_priors(study)
-    dump_missing_banks(args)
+    enqueue_priors(study, spec.priors)
+    spec.prepare(args)
     failures = 0
     while _n_complete(study) < args.n_trials:
         trial = study.ask()
-        params = suggest_params(trial)
-        config_path = materialize_trial_config(
-            args.base_config, params, trial.number, args.sweep_dir
-        )
+        params = spec.suggest(trial)
+        config_path = spec.materialize(args.base_config, params, trial.number, args.sweep_dir)
         run_command(["bash", "hpc/run.sh", "train", str(config_path), "--skip-test"])
         run_dir = args.sweep_dir / f"trial_{trial.number:03d}"
         try:
@@ -305,10 +347,12 @@ def run_sweep(args: argparse.Namespace) -> None:
         trial.set_user_attr("constraint", [outcome.constraint])
         trial.set_user_attr("surface", outcome.surface)
         study.tell(trial, values=[outcome.gs, outcome.geo_mmd])
-    print_report(study)
+    print_report(study, spec.param_names)
 
 
-def print_report(study: optuna.Study) -> None:
+def print_report(
+    study: optuna.Study, param_names: Sequence[str] = ("w_rank", "w_dist", "bank", "margin")
+) -> None:
     """Print the full trial table, then the feasible Pareto front."""
     columns = [
         "auprc",
@@ -319,15 +363,12 @@ def print_report(study: optuna.Study) -> None:
         "spectral_mmd",
         "selected_epoch",
     ]
-    print("number state w_rank w_dist bank margin " + " ".join(columns))  # noqa: T201 -- CLI report goes to stdout
+    print("number state " + " ".join(param_names) + " " + " ".join(columns))  # noqa: T201 -- CLI report goes to stdout
     for t in study.get_trials(deepcopy=False):
         surface = t.user_attrs.get("surface", {})
+        params = " ".join(str(t.params.get(name, "-")) for name in param_names)
         values = " ".join(f"{surface[c]:.4f}" if c in surface else "-" for c in columns)
-        print(  # noqa: T201 -- CLI report goes to stdout
-            f"{t.number} {t.state.name} {t.params.get('w_rank', '-')} "
-            f"{t.params.get('w_dist', '-')} {t.params.get('bank', '-')} "
-            f"{t.params.get('margin', '-')} {values}"
-        )
+        print(f"{t.number} {t.state.name} {params} {values}")  # noqa: T201 -- CLI report goes to stdout
     front = ", ".join(str(t.number) for t in study.best_trials)
     print(f"feasible Pareto front (advisory): trials [{front}]")  # noqa: T201 -- CLI report goes to stdout
 
