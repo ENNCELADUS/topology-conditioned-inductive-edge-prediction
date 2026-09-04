@@ -219,7 +219,9 @@ def _production_rank_bank_worker(
         dist.destroy_process_group()
 
 
-def _context_stream_ddp_worker(rank: int, world_size: int, init_file: str, result_dir: str) -> None:
+def _context_stream_ddp_worker(
+    rank: int, world_size: int, init_file: str, result_dir: str, joint: bool
+) -> None:
     """Accumulate unequal context forwards, then execute one real DDP backward."""
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
@@ -235,13 +237,28 @@ def _context_stream_ddp_worker(rank: int, world_size: int, init_file: str, resul
 
         base.weight.register_hook(count_backward)  # type: ignore[no-untyped-call]
         model = DistributedDataParallel(base, broadcast_buffers=False)
-        stream = _context_stream(targets, table, rank=rank, world_size=world_size)
+        stream = _context_stream(
+            targets, table, rank=rank, world_size=world_size, w_rep=0.7 if joint else 0.0
+        )
         # Production's task forward runs through the DDP wrapper and arms its
         # reducer; the context forwards bypass the wrapper.
-        model({"emb_a": table.tokens[:1, None], "emb_b": table.tokens[1:2, None]})
+        if joint:
+            task_loss, rep_loss = _joint_official_losses(
+                model, Path(result_dir), [0] if rank == 0 else [1, 2], world_size
+            )
+        else:
+            model({"emb_a": table.tokens[:1, None], "emb_b": table.tokens[1:2, None]})
         base.forward_calls = 0
         losses = [stream.loss(model, epoch=1, step=step, steps=3)[0] for step in range(3)]
-        torch.stack(losses).sum().backward()  # type: ignore[no-untyped-call]
+        loss = torch.stack(losses).sum()
+        if joint:
+            norms = train_b0._term_grad_norms(task_loss, rep_loss + loss, model)
+            assert all(math.isfinite(norm) and norm > 0 for norm in norms)
+            assert base.weight.grad is None
+            loss = loss + task_loss + rep_loss
+            backward_calls.clear()
+            base.forward_calls = 0
+        loss.backward()  # type: ignore[no-untyped-call]
         assert base.weight.grad is not None
         torch.save(
             {
@@ -456,6 +473,8 @@ def _reorder_context_targets(targets: KDContextTargets, order: list[int]) -> KDC
 
 
 class _ContextToy(nn.Module):
+    d_model = 2
+
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.tensor(0.25))
@@ -471,7 +490,45 @@ class _ContextToy(nn.Module):
         # tensors: a checkpoint recompute at the wrong bucket boundary raises.
         scaled_a = (self.weight * batch["emb_a"]).sum(dim=(1, 2))
         scaled_b = (self.weight * batch["emb_b"]).sum(dim=(1, 2))
-        return {"logits": scaled_a - scaled_b}
+        return {
+            "logits": scaled_a - scaled_b,
+            "pair_repr": torch.stack((scaled_a, torch.ones_like(scaled_a)), dim=1),
+        }
+
+
+def _joint_official_losses(
+    model: nn.Module, directory: Path, rows: list[int], world_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bank = KDRowBank(
+        DistillConfig(
+            targets_path="rows", context_targets_path="contexts", w_rank=1.0, w_dist=1.0, w_rep=0.7
+        ),
+        load_kd_targets(directory / "rows"),
+        train_pairs=[("n0", "n3"), ("n1", "n3"), ("n2", "n3")],
+        train_labels=[1, 0, 1],
+        val_pairs=[("n0", "n3")],
+        val_labels=[1],
+        model=model,
+        device=torch.device("cpu"),
+    )
+    batch = {
+        "_row_id": torch.tensor(rows),
+        "emb_a": torch.tensor([1.0, 2.0, 4.0])[rows, None, None],
+        "emb_b": torch.full((len(rows), 1, 1), 3.0),
+    }
+    output = model(batch)
+    rep_loss, _ = bank.loss(batch, output, world_size=world_size)
+    # Changing only a vector's magnitude would give a vacuous cosine gradient.
+    gradients = torch.autograd.grad(rep_loss, tuple(model.parameters()), retain_graph=True)
+    assert sum(float(gradient.square().sum()) for gradient in gradients) > 1e-8
+    assert bank.global_relational is False
+    rep_loss = _scale_kd_loss(
+        bank, rep_loss, local_count=len(rows), global_count=3, world_size=world_size
+    )
+    task_loss = nn.functional.binary_cross_entropy_with_logits(
+        output["logits"], torch.tensor([0.9, 0.1, 0.9])[rows]
+    ) * (len(rows) * world_size / 3)
+    return task_loss, rep_loss
 
 
 def _context_stream(
@@ -482,9 +539,16 @@ def _context_stream(
     world_size: int = 1,
     epochs: int = 2,
     token_budget: int = 1 << 20,
+    w_rep: float = 0.0,
 ) -> KDContextStream:
     return KDContextStream(
-        DistillConfig(targets_path="rows", context_targets_path="contexts", w_rank=1.0, w_dist=1.0),
+        DistillConfig(
+            targets_path="rows",
+            context_targets_path="contexts",
+            w_rank=1.0,
+            w_dist=1.0,
+            w_rep=w_rep,
+        ),
         targets,
         table,
         allowed_nodes=frozenset(targets.node_ids),
@@ -610,13 +674,24 @@ def test_context_stream_regroups_multiple_length_buckets_without_changing_loss()
     torch.testing.assert_close(reversed_loss, loss)
 
 
+@pytest.mark.parametrize("joint", [False, True], ids=["rank", "rank_rep"])
 def test_context_stream_spawned_ddp_accumulates_unequal_forwards_then_one_backward(
     tmp_path: Path,
+    joint: bool,
 ) -> None:
     world_size = 2
+    if joint:
+        _write_targets(
+            tmp_path / "rows",
+            node_ids=["n0", "n1", "n2", "n3"],
+            train_pairs=[("n0", "n3"), ("n1", "n3"), ("n2", "n3")],
+            train_labels=[1, 0, 1],
+            teacher_logit=np.zeros(3, dtype=np.float32),
+            teacher_rep=np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=np.float32),
+        )
     spawn(  # type: ignore[no-untyped-call]
         _context_stream_ddp_worker,
-        args=(world_size, str(tmp_path / "context-stream-init"), str(tmp_path)),
+        args=(world_size, str(tmp_path / "context-stream-init"), str(tmp_path), joint),
         nprocs=world_size,
         join=True,
     )
@@ -633,11 +708,15 @@ def test_context_stream_spawned_ddp_accumulates_unequal_forwards_then_one_backwa
         _context_stream(reference_targets, table).loss(reference, epoch=1, step=step, steps=3)[0]
         for step in range(3)
     ]
-    torch.stack(reference_losses).sum().backward()  # type: ignore[no-untyped-call]
+    reference_loss = torch.stack(reference_losses).sum()
+    if joint:
+        task_loss, rep_loss = _joint_official_losses(reference, tmp_path, [0, 1, 2], 1)
+        reference_loss = reference_loss + task_loss + rep_loss
+    reference_loss.backward()  # type: ignore[no-untyped-call]
     assert reference.weight.grad is not None
 
     # Checkpointed context forwards recompute once inside the single backward.
-    assert [result["forward_calls"] for result in observed] == [20, 10]
+    assert [result["forward_calls"] for result in observed] == ([10, 5] if joint else [20, 10])
     assert [result["backward_calls"] for result in observed] == [1, 1]
     for result in observed:
         torch.testing.assert_close(result["grad"], reference.weight.grad, atol=1e-6, rtol=1e-6)
