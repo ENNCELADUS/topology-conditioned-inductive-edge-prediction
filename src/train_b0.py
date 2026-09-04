@@ -2323,7 +2323,7 @@ def _evaluate_distributed(
     relational_block = torch.zeros(3, dtype=torch.float64, device=accelerator.device)
     inject_latent = kd_val is not None and kd_val.teacher_latent is not None
     collect_diag = kd_val is not None and (
-        kd_val.arm == "kd_rep" or kd_val.arm in _AUX_HEAD_ARMS or inject_latent
+        kd_val.arm in _REP_COS_ARMS or kd_val.arm in _AUX_HEAD_ARMS or inject_latent
     )
     rng_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
     with torch.random.fork_rng(devices=rng_devices, enabled=inject_latent), torch.no_grad():
@@ -2357,7 +2357,7 @@ def _evaluate_distributed(
             if collect_diag:
                 assert kd_val is not None
                 rows = batch["_row_id"]
-                if kd_val.arm == "kd_rep":
+                if kd_val.arm in _REP_COS_ARMS:
                     student_rep = output.get("kd_rep")
                     if student_rep is None:
                         student_rep = output.get("pair_repr")
@@ -2483,9 +2483,9 @@ def _evaluate_distributed(
                 ):
                     kd_metrics[f"val_kd_struct_r2_{name}"] = float(r2)
             elif diag_np is not None and diag_np.size > 0:
-                key = "val_kd_rep_cos" if kd_val.arm == "kd_rep" else "val_kd_latent_cos"
+                key = "val_kd_rep_cos" if kd_val.arm in _REP_COS_ARMS else "val_kd_latent_cos"
                 kd_metrics[key] = float(diag_np.mean())
-                if kd_val.arm == "kd_rep":
+                if kd_val.arm in _REP_COS_ARMS:
                     kd_metrics["val_kd_rep_loss"] = 1.0 - kd_metrics[key]
             logits64 = logits_sorted.astype(np.float64)
             teacher64 = kd_val.teacher_logit_np

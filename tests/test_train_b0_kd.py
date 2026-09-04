@@ -1847,3 +1847,71 @@ def test_context_stream_accepts_kd_rank_rep_and_rejects_arms_without_w_rank() ->
     assert stream is not None
     with pytest.raises(ValueError, match="w_rank"):
         build(DistillConfig(targets_path="rows", w_rep=1.0))
+
+
+class _RankRepDiagModel(nn.Module):
+    """Answers cls-row batches like `_RepDiagModel` and context batches like `_ContextToy`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if "emb_a" in batch:
+            scaled_a = (self.scale * batch["emb_a"]).sum(dim=(1, 2))
+            scaled_b = (self.scale * batch["emb_b"]).sum(dim=(1, 2))
+            return {"logits": scaled_a - scaled_b}
+        return {
+            "logits": self.scale * batch["logit_seed"],
+            "pair_repr": self.scale * batch["rep_seed"],
+        }
+
+
+def test_evaluate_distributed_kd_rank_rep_reports_rep_and_context_diagnostics() -> None:
+    targets, table = _context_fixture()
+    stream = _context_stream(targets, table)
+    n, rep_dim = 3, 4
+    rep_seed = torch.randn(n, rep_dim)
+    batch = {
+        "label": torch.tensor([1.0, 0.0, 1.0]),
+        "_row_id": torch.tensor([0, 1, 2]),
+        "logit_seed": torch.tensor([0.5, -0.5, 1.0]),
+        "rep_seed": rep_seed,
+    }
+    teacher_logit = torch.tensor([0.4, -0.6, 0.9])
+    kd_val = KDValDiagnostics(
+        arm="kd_rank_rep",
+        teacher_logit=teacher_logit,
+        teacher_logit_np=teacher_logit.double().numpy(),
+        teacher_rep=rep_seed.clone().to(torch.float16),
+        teacher_latent=None,
+        context_stream=stream,
+    )
+    outcome = _evaluate_distributed(
+        _RankRepDiagModel(),
+        [batch],
+        Accelerator(cpu=True),
+        expected_row_ids=np.arange(n),
+        kd_val=kd_val,
+    )
+    assert outcome.kd is not None
+    assert {
+        "val_kd_rep_cos",
+        "val_kd_rep_loss",
+        "val_kd_logit_corr",
+        "val_kd_logit_loss",
+        "val_kd_prob_mae",
+        "val_kd_rank_loss",
+        "val_kd_dist_loss",
+    } <= outcome.kd.keys()
+    assert outcome.kd["val_kd_rep_cos"] == pytest.approx(1.0, abs=1e-3)
+    distill = DistillConfig(
+        targets_path="t", context_targets_path="c", w_rank=0.1, w_dist=10.0, w_rep=1.0
+    )
+    assert outcome.task_loss is not None
+    assert compose_val_total(outcome.task_loss, outcome.kd, distill) == pytest.approx(
+        outcome.task_loss
+        + 0.1 * outcome.kd["val_kd_rank_loss"]
+        + 10.0 * outcome.kd["val_kd_dist_loss"]
+        + outcome.kd["val_kd_rep_loss"]
+    )
