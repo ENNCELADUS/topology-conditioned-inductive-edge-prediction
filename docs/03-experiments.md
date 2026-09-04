@@ -1,6 +1,6 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-02):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, completed KD1, and kd_struct; KD2--KD4 await held-out tests.
+**Status (2026-09-02):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, and completed KD1; KD2--KD4 await held-out tests.
 
 ## 1. Experimental setup
 
@@ -70,8 +70,6 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 | kd_representation | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | `w_rep ∈ {0.01, 0.1, 1, 10, 100}` | representation-matching arm |
 | kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | `w_gram ∈ {0.01, 0.1, 1, 10, 100}` | relational-geometry arm |
 | kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | none; `w_gen=1` fixed (det/EDM variants compared) | generative test |
-| kd_struct | auxiliary head, MSE to z-scored truth-graph descriptors (CN, degrees, Jaccard, Adamic-Adar; queried partner masked) | none: training graph (val rows: substrate) | none; `w_struct=1` fixed | descriptor arm; nonlinear content→structure lower bound |
-| kd_white | same auxiliary head, MSE to the whitened PCA axes 2--8 of the teacher topology vector (axis 1 = teacher logit, dropped) | PMA(1) Full-Ego Oracle row bank, whitened offline | none; `w_white=1` fixed | whitened representation arm; tests the teacher's own coordinates beyond the descriptors ([audit](results/kd_whiten_audit/README.md)) |
 | Oracles | observed topology | Full-Ego graph → GRIT → PMA | none (diagnostic only) | diagnostic ceilings |
 
 ![Teacher and student architecture](results/kd_rep_audit/teacher_architecture.svg)
@@ -88,7 +86,7 @@ w_dist × context bank (hops × negative-sampling rate) × margin. The best conf
 
 ## 2. Main results — edge and assembled topology
 
-Table 2 (pairwise, current selected result per arm) and Table 3 (the five topology numbers at each arm's single frozen V_val-selected threshold) are reported together; KD2 Trial 8 is provisional while its HPO remains unfinished. The two control rows below the arms are the zero-KD run's epoch-10 and epoch-11 checkpoints put through the same protocol (matched-epoch controls); its published selection is epoch 18.
+Table 2 (pairwise, current selected result per arm) and Table 3 (the five topology numbers at each arm's single frozen V_val-selected threshold) are reported together; KD2 Trial 8 is provisional while its HPO remains unfinished.
 
 | Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
 |---|---:|---:|---:|---:|---:|
@@ -98,10 +96,6 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 | kd_ranking (strict Trial 8; provisional) | 0.7183 | 0.7457 | 0.6477 | 0.6656 | 0.2970 |
 | kd_representation (`kd_rep_w0p1`) | 0.7108 | 0.7402 | 0.6234 | 0.6760 | 0.2610 |
 | kd_gram (`kd_gram_w1`) | 0.7169 | 0.7428 | 0.6426 | 0.6713 | 0.2897 |
-| kd_struct (`w_struct=1`) | 0.7241 | 0.7489 | 0.6513 | 0.6820 | 0.3084 |
-| kd_white (`w_white=1`, pma1 axes 2--8) | 0.7186 | 0.7429 | 0.6453 | 0.6754 | 0.2958 |
-| control, epoch 10 (matched to kd_white) | 0.7249 | 0.7515 | 0.6380 | 0.6852 | 0.2893 |
-| control, epoch 11 (matched to kd_struct) | 0.7157 | 0.7463 | 0.6342 | 0.6738 | 0.2767 |
 
 | Arm | BFS GS | BFS RD | Degree | Clustering | Spectral |
 |---|---:|---:|---:|---:|---:|
@@ -111,10 +105,6 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 | kd_ranking (strict Trial 8; provisional) | 0.4143 | 0.4399 | 14.56 | 12.41 | 21.03 |
 | kd_representation (`kd_rep_w0p1`) | 0.4121 | 0.5626 | 8.725 | 7.552 | 13.15 |
 | kd_gram (`kd_gram_w1`) | 0.3959 | 0.4989 | 10.16 | 8.851 | 15.43 |
-| kd_struct (`w_struct=1`) | 0.4072 | 0.5025 | 9.655 | 8.335 | 14.79 |
-| kd_white (`w_white=1`, pma1 axes 2--8) | 0.3939 | 0.5696 | 8.660 | 7.418 | 13.06 |
-| control, epoch 10 (matched to kd_white) | 0.4261 | 0.5765 | 9.160 | 8.010 | 14.41 |
-| control, epoch 11 (matched to kd_struct) | 0.4114 | 0.4462 | 13.97 | 12.25 | 20.82 |
 
 ## 3. Ablations and sensitivity
 
@@ -156,21 +146,4 @@ $t_{uv}$ is the teacher's topology-branch pooled vector before fusion (§1.4 fig
 | $R^2$ of $(x_u,x_v)\to$ the same descriptors | 0.2--0.7 | lower bound on the structure any student can recover from content |
 
 - *The structure is there, on axes the losses ignore.* $t_{uv}$ passes the hidden ego graph's descriptors through almost losslessly (input pass-through, not learned abstraction), but cosine and Gram losses weight directions by variance, so they match the logit axis and miss the tail. KD3/KD4 failed on loss geometry, not on missing information.
-- *Only the content-predictable part can transfer.* The student never sees $t_{uv}$ at test time, so representation KD moves at most the part of $t_{uv}$ that is a function of $(x_u,x_v)$: linearly 0.40--0.47 of the vector, 0.2--0.7 per descriptor. Being linear, these are lower bounds; kd_struct measures the nonlinear reach next.
-
-### 4.6 kd_struct: descriptor targets without a teacher (selected epoch 11)
-![kd_struct loss curves](results/kd_struct/learning_curves.png) ![kd_struct V_val topology curves](results/kd_struct/validation_topology_curves.png)
-- *Design.* An auxiliary head on the student's pair representation regresses the row's truth-graph descriptors (queried partner masked). Its V_val $R^2$ is the nonlinear readout of the second point above ([run record](results/kd_struct/README.md)).
-- *Recovery.* Selected-epoch V_val $R^2$: CN 0.62, degree sum 0.44, degree difference 0.39, Jaccard 0.72, Adamic-Adar 0.59 (best epochs 0.65 / 0.61 / 0.50 / 0.77 / 0.62). Against the linear probe (0.52 / 0.70 / 0.22 / 0.58 / 0.52), overlap descriptors gain 0.1--0.2, degree difference 0.2--0.3, degree sum nothing.
-- *Degree sum is unstable* (0.04--0.61 across epochs): degree is a node-level quantity, so V_val rows are correlated through their nodes and any drift in the head's offset swings the whole column.
-- *The rest is memorization.* Train $R^2$ reaches about 0.85 while the four stable val columns plateau from epoch 9. The plateau is a higher lower bound, not the ceiling: one joint schedule, a task-coupled encoder, and self-pairs that inflate CN and Jaccard.
-- *Held-out.* Edge metrics lead this one-seed comparison (AUPRC +0.013 over control, ECE 0.128 vs 0.219); topology does not (GS +0.02, RD farther from 1, all three MMD ratios above control).
-- *Attribution.* At matched epochs 10--12, control and kd_struct sit within 0.005 V_val AUPRC and 0.01 GS. The control's selection landed on epoch 18 after its val task loss had risen; kd_struct's on 11. The test gaps exceed every matched-epoch V_val gap, so they read as selected-epoch difference plus seed noise, not descriptor transfer.
-- *Bound run.* At `w_struct=100` ([record](results/kd_struct/README.md)) the near-task-free head plateaus at 0.61--0.65 / 0.42--0.52 / 0.58--0.64 / 0.68--0.71 / 0.57--0.60: degree difference rises from 0.50 to 0.64, the overlap descriptors do not move, and held-out AUPRC 0.7405 / GS 0.4012 / RD 0.4426 sit between control and the w=1 run.
-- *Matched-epoch control (epoch 11).* AUROC/AUPRC 0.7157/0.7463, GS/RD 0.4114/0.4462, MMD 13.97/12.25/20.82: kd_struct's edge margin shrinks to +0.003 AUPRC and its topology differences follow RD. The structure the student can encode is already in its decision; what it cannot encode is absent from $(x_u,x_v)$, and a task-free head raises that bound only on degree difference. No descriptor-level gain is claimed.
-
-### 4.7 kd_white: whitened teacher axes without the logit (selected epoch 10)
-- *Design.* The same auxiliary head regresses whitened PCA axes 2--8 of the PMA(1) topology vector, chosen by the [whitened-axis audit](results/kd_whiten_audit/README.md): axis 1 is the teacher logit, axis 2 the degree axis, the tail is structure the linear content probe reads at ≤0.19 ([run record](results/kd_white/README.md)).
-- *Reach.* Head V_val R² over epochs 10--15: pc2 0.63--0.66 (linear 0.62), pc7 0.18--0.31 (0.10), pc8 0.28--0.33 (0.19), pc5/pc6 ≤0.09, pc4 diverging with the V_val block shift. Nonlinear reach beyond the linear probe is real but small, and confined to two axes.
-- *Held-out against the matched-epoch control (epoch 10: AUROC/AUPRC 0.7249/0.7515, GS 0.4261, RD 0.5765).* kd_white is below it on AUROC (−0.006), AUPRC (−0.009), F1, ECE, and GS (−0.03); only the MMD ratios are marginally better. The +0.007 over the published control was the epoch, not the arm.
-- *Selection variance.* The control's epoch 10 checkpoint has the highest test AUPRC of any checkpoint tested (0.7515 against its selected epoch 18's 0.7360), and epochs 10 and 11 differ by RD 0.58 vs 0.45 and MMD 9.2 vs 14.0. One epoch step moves the test readout as much as any KD mechanism does.
+- *Only the content-predictable part can transfer.* The student never sees $t_{uv}$ at test time, so representation KD moves at most the part of $t_{uv}$ that is a function of $(x_u,x_v)$: linearly 0.40--0.47 of the vector, 0.2--0.7 per descriptor. Being linear, these are lower bounds.
