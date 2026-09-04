@@ -143,7 +143,8 @@ $t_{uv}$ is the teacher's topology-branch pooled vector before fusion (§1.4 fig
 | variance share of the top axis of $t_{uv}$, and its correlation with the teacher logit | 0.93, $-0.96$ | one direction dominates, and it is the edge decision |
 | $R^2$ of $t_{uv}\to$ common neighbours, degree, Jaccard, Adamic-Adar | 0.96--0.99 | structure is still readable, from the low-variance tail |
 | $R^2$ of $(x_u,x_v)\to t_{uv}$ | 0.40--0.47 | under half of the vector is a function of the student's input |
-| $R^2$ of $(x_u,x_v)\to$ the same descriptors | 0.2--0.7 | lower bound on the structure any student can recover from content |
+| $R^2$ of $(x_u,x_v)\to$ the same descriptors | 0.2--0.7 | linear lower bound on the structure any student can recover from content |
+| $R^2$ of the student's $c_{uv}\to$ the same descriptors, MLP head trained jointly with the task ([kd_struct](results/kd_struct/README.md)) | CN 0.65, degree sum 0.61, degree difference 0.50, Jaccard 0.77, Adamic-Adar 0.62 | nonlinear lower bound; at 100× the task weight only degree difference rises (0.64) |
 
 - *The structure is there, on axes the losses ignore.* $t_{uv}$ passes the hidden ego graph's descriptors through almost losslessly (input pass-through, not learned abstraction), but cosine and Gram losses weight directions by variance, so they match the logit axis and miss the tail. KD3/KD4 failed on loss geometry, not on missing information.
-- *Only the content-predictable part can transfer.* The student never sees $t_{uv}$ at test time, so representation KD moves at most the part of $t_{uv}$ that is a function of $(x_u,x_v)$: linearly 0.40--0.47 of the vector, 0.2--0.7 per descriptor. Being linear, these are lower bounds.
+- *Only the content-predictable part can transfer.* The student never sees $t_{uv}$ at test time, so representation KD moves at most the part of $t_{uv}$ that is a function of $(x_u,x_v)$: linearly 0.40--0.47 of the vector, 0.2--0.7 per descriptor, and 0.50--0.77 per descriptor through the head on $c_{uv}$. Both are lower bounds: the head shares one schedule with the task loss, its encoder is task-coupled, and self-pairs inflate CN and Jaccard.
