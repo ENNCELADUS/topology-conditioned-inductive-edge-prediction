@@ -38,6 +38,11 @@ _VAL_TERMS: dict[str, tuple[tuple[str, str], ...]] = {
     "none": (),
     "kd_logit": (("w_logit", "val_kd_logit_loss"),),
     "kd_rank": (("w_rank", "val_kd_rank_loss"), ("w_dist", "val_kd_dist_loss")),
+    "kd_rank_rep": (
+        ("w_rank", "val_kd_rank_loss"),
+        ("w_dist", "val_kd_dist_loss"),
+        ("w_rep", "val_kd_rep_loss"),
+    ),
     "kd_gram": (("w_gram", "val_kd_gram_block_loss"),),
     "kd_rep": (("w_rep", "val_kd_rep_loss"),),
     "kd_gen": (),

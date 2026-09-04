@@ -56,6 +56,22 @@ class TestComposeValTotal:
         with pytest.raises(RuntimeError, match="kd_rep"):
             compose_val_total(0.25, None, distill)
 
+    def test_kd_rank_rep_adds_rank_dist_and_rep_terms(self) -> None:
+        distill = DistillConfig(
+            targets_path="t", context_targets_path="c", w_rank=3.0, w_dist=0.5, w_rep=2.0
+        )
+        kd = {"val_kd_rank_loss": 0.2, "val_kd_dist_loss": 0.4, "val_kd_rep_loss": 0.1}
+        assert compose_val_total(0.25, kd, distill) == pytest.approx(
+            0.25 + 3.0 * 0.2 + 0.5 * 0.4 + 2.0 * 0.1
+        )
+
+    def test_kd_rank_rep_missing_rep_counterpart_raises(self) -> None:
+        distill = DistillConfig(
+            targets_path="t", context_targets_path="c", w_rank=1.0, w_dist=1.0, w_rep=1.0
+        )
+        with pytest.raises(RuntimeError, match="val_kd_rep_loss"):
+            compose_val_total(0.25, {"val_kd_rank_loss": 0.2, "val_kd_dist_loss": 0.4}, distill)
+
 
 class TestValTotalTerms:
     def test_undistilled_names_only_the_task_term(self) -> None:
@@ -67,4 +83,15 @@ class TestValTotalTerms:
             "val_task_loss",
             "w_rank * val_kd_rank_loss",
             "w_dist * val_kd_dist_loss",
+        ]
+
+    def test_kd_rank_rep_names_three_weighted_terms(self) -> None:
+        distill = DistillConfig(
+            targets_path="t", context_targets_path="c", w_rank=0.1, w_dist=10.0, w_rep=1.0
+        )
+        assert val_total_terms(distill) == [
+            "val_task_loss",
+            "w_rank * val_kd_rank_loss",
+            "w_dist * val_kd_dist_loss",
+            "w_rep * val_kd_rep_loss",
         ]
