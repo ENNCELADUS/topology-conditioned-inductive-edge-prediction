@@ -47,6 +47,29 @@ def test_kd_gen_arm_pattern() -> None:
     assert cfg.active
 
 
+def test_kd_rank_rep_arm_pattern() -> None:
+    cfg = DistillConfig(
+        targets_path="t", context_targets_path="c", w_rank=0.1, w_dist=10.0, w_rep=1.0
+    )
+    assert cfg.active
+    assert cfg.arm == "kd_rank_rep"
+
+
+def test_kd_rank_rep_requires_all_three_weights_and_the_context_bank() -> None:
+    with pytest.raises(ValueError, match="exactly one arm group"):
+        DistillConfig(targets_path="t", context_targets_path="c", w_rank=1.0, w_rep=1.0)
+    with pytest.raises(ValueError, match="exactly one arm group"):
+        DistillConfig(targets_path="t", context_targets_path="c", w_dist=1.0, w_rep=1.0)
+    with pytest.raises(ValueError, match="exactly one arm group"):
+        DistillConfig(
+            targets_path="t", context_targets_path="c", w_rank=1.0, w_dist=1.0, w_logit=1.0
+        )
+    with pytest.raises(ValueError, match="context_targets_path is required"):
+        DistillConfig(targets_path="t", w_rank=1.0, w_dist=1.0, w_rep=1.0)
+    with pytest.raises(ValueError, match="targets_path is required"):
+        DistillConfig(context_targets_path="c", w_rank=1.0, w_dist=1.0, w_rep=1.0)
+
+
 # --------------------------------------------------------------------------- illegal patterns
 
 
