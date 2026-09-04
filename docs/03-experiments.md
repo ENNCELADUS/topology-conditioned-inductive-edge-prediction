@@ -68,6 +68,7 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 | kd_logit | GLNN-style pointwise soft-target BCE | PMA(4) Full-Ego Oracle row bank | `w_logit ∈ {0.01, 0.1, 1, 10, 100}` | attribution control |
 | kd_ranking | LLP-style rank + distribution matching over context banks | PMA(4) Full-Ego Oracle context bank | `w_rank` log-uniform [0.01, 1]; `w_dist` log-uniform [0.1, 100]; bank ∈ {h2ns1, h2ns3, h2ns5, h3ns3}; margin ∈ {0.05, 0.1, 0.2} | primary transfer test (RQ2) |
 | kd_representation | pair-representation cosine | PMA(4) Full-Ego Oracle row bank | `w_rep ∈ {0.01, 0.1, 1, 10, 100}` | representation-matching arm |
+| kd_rank_rep | strict-LLP rank + distribution KD plus per-row pair-representation cosine | PMA(4) Full-Ego Oracle context bank + row bank | `w_rank` log-uniform [0.01, 1]; `w_dist` log-uniform [0.1, 100]; `w_rep` log-uniform [0.01, 100]; bank and margin inherited from kd_ranking | joint logit + representation transfer |
 | kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | `w_gram ∈ {0.01, 0.1, 1, 10, 100}` | relational-geometry arm |
 | kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | none; `w_gen=1` fixed (det/EDM variants compared) | generative test |
 | Oracles | observed topology | Full-Ego graph → GRIT → PMA | none (diagnostic only) | diagnostic ceilings |
@@ -76,13 +77,12 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 
 ### 1.5 Training, HPO, and reproducibility
 
-The student is V3.1: d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling
-(mean/attn/max/gated), pair_context_gated readout with abba_max order aggregation, label smoothing
-0.05. Optimization: AdamW, lr 1e-4, weight decay 0.05, onecycle, 25 epochs, 1,024 pairs per batch, clip 1.0, bf16 DDP.
+The V3.1 student uses d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling (mean/attn/max/gated), pair_context_gated readout with abba_max aggregation, and 0.05 label smoothing.
+Optimization: AdamW, lr 1e-4, weight decay 0.05, onecycle, 25 epochs, 1,024 pairs per batch, clip 1.0, bf16 DDP.
 
-HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1, kd_gram_w1, kd_rep_w0p1); kd_rank
-continues with a 16-trial constrained MO-TPE study (GS ↑, geometric-mean MMD ↓, soft constraint `|log RD| <= 0.05`) over w_rank ×
-w_dist × context bank (hops × negative-sampling rate) × margin. The best configuration per arm runs the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
+HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1, kd_gram_w1, kd_rep_w0p1). Strict constrained MO-TPE continues with kd_rank (16 trials: w_rank × w_dist × context bank × margin)
+and kd_rank_rep (12 trials: w_rank × w_dist × w_rep, bank/margin inherited). Both maximize GS and minimize geometric-mean MMD with soft constraint `|log RD| <= 0.05`; the study front is advisory to the five-metric undominated verdict plus human pick.
+The best configuration per arm runs the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
 
 ## 2. Main results — edge and assembled topology
 

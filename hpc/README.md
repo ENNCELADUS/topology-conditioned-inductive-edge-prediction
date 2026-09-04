@@ -241,8 +241,8 @@ and add only shell-level logging/backgrounding (or tmux):
 
 ```bash
 mkdir -p outputs/logs && nohup hpc/run.sh train configs/b0_v31_breadth_first.yaml > outputs/logs/b0_v31_train.log 2>&1 &
-# unattended strict-LLP kd_rank HPO sweep: dumps missing context banks, then 16 trials
-.venv/bin/python -m src.experiments.kd_rank_strict_hpo --teacher-checkpoint <full_ego_oracle best.pt>
+.venv/bin/python -m src.experiments.kd_rank_strict_hpo --teacher-checkpoint <full_ego_oracle best.pt>  # dumps missing banks, 16 trials
+.venv/bin/python -m src.experiments.kd_rank_rep_hpo --bank h2ns3 --margin 0.1  # existing bank, 4 priors + 8 guided trials
 ```
 
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
