@@ -1,14 +1,34 @@
 # Topology Project Instructions
 
-## Research contract and sources
+## What this is
 
-- This ICLR 2027 project studies topology-conditioned binary edge prediction. Strict task input is exactly `(x_u, x_v)`; output is a symmetric decision for `edge(u, v)`. Inferred topology is intermediate context, not graph generation. Grounding, retrieval and prototypes are optional arm-specific support, never extra test-time task input or a preselected method.
-- `docs/01-project-definition.md` defines the task, `docs/02-methodology.md` records method constraints, and `docs/03-experiments.md` defines evaluation and evidence. `README.md` orients; `hpc/README.md` and `hpc/run.sh` govern execution.
-- Use `.codex/skills/hpc-execution/SKILL.md` for training, testing, scoring and merges. HPO experiments uses `.claude/skills/autoresearch/SKILL.md` and its human-owned `autoresearch/program.md`, rather than the generic global autoresearch workflow.
+Research code for an ICLR 2027 paper, *Topology-Conditioned Inductive Edge Prediction*. `README.md`
+orients; `docs/01-project-definition.md` and `docs/03-experiments.md` govern task and evaluation,
+`docs/02-methodology.md` the open method-selection constraints. `docs/results/` holds per-arm result
+notes (`b1_kd_arms.md` indexes the KD arms), `docs/superpowers/{specs,plans}` design records,
+`docs/tmp/` working plans, `docs/iclr2027/` the LaTeX paper (`main.tex` + `sections/`, latexmk).
+When a change alters behavior a doc describes, update that doc in the same change; otherwise leave docs alone.
+
+**Core thesis — do not let it drift:** the strict task input is exactly `(x_u,x_v)` and the output
+is the binary decision for `edge(u,v)`. Inferred topology is intermediate context, not graph
+generation; grounding/retrieval/prototypes are optional arm-specific support, never task input or a
+selected method. Every piece of writing must explain how its context helps decide the queried edge.
+
+**Active method set (2026-09):** one teacher, four KD students, one control.
+- Teacher: the Full-Ego Oracle (`model.family: egostitch_e2e`, generator `full_ego_oracle`, encoder
+  `grit_gmt`). It reads true training structure, so it is a ceiling and a bank source, never a
+  deployable arm.
+- Students (`model.family: v3_1`, endpoint-only): `kd_logit` (GLNN soft logits), `kd_rank`
+  (strict-LLP rank + distribution matching over context banks), `kd_gram` (SPKD cosine-Gram),
+  `kd_rep` (per-row representation cosine); `kd_rank_rep` is the joint variant. Control: `b1_kd_control`.
+- Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
+  (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
+  Do not revive them or compare new results against them.
 
 ## Execution and experiment boundaries
 
 - Sync working code between machines through Git only: commit, push, then pull on the H20 checkout. Do not rsync/scp/tar working trees.
+- Use `.codex/skills/hpc-execution/SKILL.md` for training, testing, scoring and merges. HPO experiments uses `.claude/skills/autoresearch/SKILL.md` and its human-owned `autoresearch/program.md`, rather than the generic global autoresearch workflow.
 - GPU work uses the H20 container and `hpc/run.sh`, without a scheduler or general qualification ladder. Ordinary jobs auto-size to visible GPUs; sweep-specific masks and runner details are in the runbook. Direct worker invocation and `--max-steps` are debug-only.
 - Normal pipeline stages are pack, train, publish and test; `--skip-test` omits held-out evaluation. EgoStitch is oracle diagnostics; use its diagnostic run kind and artifact names from the runbook.
 - General experiments have no added plan, registration or qualification gate. KD campaigns retain the specific setup, frozen keys, judge, ledger and stall checkpoints in `autoresearch/program.md`; generic execution autonomy does not authorize changing that program or inventing a baseline.
