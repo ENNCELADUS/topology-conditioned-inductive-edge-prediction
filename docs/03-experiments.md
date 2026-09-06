@@ -1,6 +1,6 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-02):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, and completed KD1; KD2--KD4 await held-out tests.
+**Status (2026-09-06):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, and KD1--KD4 results. The joint `kd_rank_rep` sweep completed 12 trials; Trial 5 (checkpoint epoch 20) completed held-out evaluation; its results are included below.
 
 ## 1. Experimental setup
 
@@ -84,6 +84,8 @@ HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_w
 and kd_rank_rep (12 trials: w_rank × w_dist × w_rep, bank/margin inherited). Both maximize GS and minimize geometric-mean MMD with soft constraint `|log RD| <= 0.05`; the study front is advisory to the five-metric undominated verdict plus human pick.
 The best configuration per arm runs the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
 
+The `kd_rank_rep` study completed all 12 trials (four priors plus eight guided trials), with context bank `h2ns3` and margin 0.1 fixed. Trial 5 was selected for held-out evaluation; its published checkpoint is epoch 20. Its weights and V_val selection metrics are recorded in §4.6.
+
 ## 2. Main results — edge and assembled topology
 
 Table 2 (pairwise, current selected result per arm) and Table 3 (the five topology numbers at each arm's single frozen V_val-selected threshold) are reported together; KD2 Trial 8 is provisional while its HPO remains unfinished.
@@ -96,6 +98,7 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 | kd_ranking (strict Trial 8; provisional) | 0.7183 | 0.7457 | 0.6477 | 0.6656 | 0.2970 |
 | kd_representation (`kd_rep_w0p1`) | 0.7108 | 0.7402 | 0.6234 | 0.6760 | 0.2610 |
 | kd_gram (`kd_gram_w1`) | 0.7169 | 0.7428 | 0.6426 | 0.6713 | 0.2897 |
+| kd_rank_rep (Trial 5) | 0.7084 | 0.7364 | 0.6320 | 0.6708 | 0.2716 |
 
 | Arm | BFS GS | BFS RD | Degree | Clustering | Spectral |
 |---|---:|---:|---:|---:|---:|
@@ -105,6 +108,9 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 | kd_ranking (strict Trial 8; provisional) | 0.4143 | 0.4399 | 14.56 | 12.41 | 21.03 |
 | kd_representation (`kd_rep_w0p1`) | 0.4121 | 0.5626 | 8.725 | 7.552 | 13.15 |
 | kd_gram (`kd_gram_w1`) | 0.3959 | 0.4989 | 10.16 | 8.851 | 15.43 |
+| kd_rank_rep (Trial 5) | 0.4179 | 0.4717 | 13.93 | 11.67 | 19.45 |
+
+`kd_rank_rep` Trial 5: [held-out report](results/kd_rank_rep_hpo/test_report.json), seed 0, checkpoint epoch 20. Classification and topology logit thresholds are frozen on validation at −1.7578125 and 2.671875, respectively; §4.6 separately reports training-time V_val telemetry.
 
 ## 3. Ablations and sensitivity
 
@@ -148,3 +154,21 @@ $t_{uv}$ is the teacher's topology-branch pooled vector before fusion (§1.4 fig
 
 - *The structure is there, on axes the losses ignore.* $t_{uv}$ passes the hidden ego graph's descriptors through almost losslessly (input pass-through, not learned abstraction), but cosine and Gram losses weight directions by variance, so they match the logit axis and miss the tail. KD3/KD4 failed on loss geometry, not on missing information.
 - *Only the content-predictable part can transfer.* The student never sees $t_{uv}$ at test time, so representation KD moves at most the part of $t_{uv}$ that is a function of $(x_u,x_v)$: linearly 0.40--0.47 of the vector, 0.2--0.7 per descriptor, and 0.50--0.77 per descriptor through the head on $c_{uv}$. Both are lower bounds: the head shares one schedule with the task loss, its encoder is task-coupled, and self-pairs inflate CN and Jaccard.
+
+### 4.6 Joint ranking and representation (`kd_rank_rep`, Trial 5, selected epoch 20)
+
+![KD rank-rep loss curves](results/kd_rank_rep_hpo/learning_curves.png)
+![KD rank-rep V_val topology curves](results/kd_rank_rep_hpo/validation_topology_curves.png)
+
+- Combines strict-LLP rank/distribution matching with per-row representation cosine; `w_rank=0.0141`, `w_dist=5.781`, `w_rep=0.0961`, bank `h2ns3`, margin 0.1, seed 0.
+- All three KD losses fall then plateau. At epoch 20, train/V_val representation cosine is 0.786/0.783, while task BCE is 0.334/0.469: close representation fit does not establish better held-out edge decisions.
+- From epoch 20 to 25, V_val total loss improves slightly (0.640 → 0.636), but GS falls (0.5395 → 0.5339) and all three MMD ratios worsen. The selected checkpoint reflects the joint edge/topology criterion rather than minimum loss.
+
+| Epoch | V_val AUPRC | BFS GS ↑ | BFS RD → 1 | Degree ↓ | Clustering ↓ | Spectral ↓ |
+|---|---:|---:|---:|---:|---:|---:|
+| **20 (selected)** | **0.9209** | **0.5395** | **1.0397** | **14.398** | **2.764** | **10.588** |
+| 25 (last) | 0.9213 | 0.5339 | 1.0167 | 14.922 | 2.844 | 10.929 |
+
+These are training-time V_val selection metrics, distinct from the final report's rescored validation threshold surface. [Curve data and provenance](results/kd_rank_rep_hpo/README.md).
+
+- **Held-out:** AUPRC 0.7364, AUROC 0.7084; GS 0.4179, RD 0.4717, MMD degree/clustering/spectral 13.93/11.67/19.45. Against rank-only Trial 8, the joint arm improves all five topology metrics but lowers AUPRC (0.7457 → 0.7364). Against representation-only, it slightly raises GS but worsens RD and all three MMD ratios. This single-seed result shows a tradeoff, with no joint advantage across edge and topology metrics.

@@ -1,0 +1,241 @@
+{
+  "schema_version": "test_protocol_v7",
+  "arm": {
+    "arm": "kd_rank_rep",
+    "seed": 0,
+    "model_family": "v3_1",
+    "topo_gen_control": null,
+    "run_kind": null,
+    "checkpoint_id": "138e492bc4d2fe44",
+    "checkpoint_sha256": "de2beb528f870c1279fdc224de4ec79cf810ffde834dd9342318ec6d2fec5ff8",
+    "selected_epoch": 20
+  },
+  "edge": {
+    "scores_path": "outputs/b1_kd_rank_rep_hpo/trial_005/scores/test.npz",
+    "checkpoint_id": "138e492bc4d2fe44",
+    "model_family": "v3_1",
+    "pairs_source": "test",
+    "strategy": "breadth_first",
+    "num_rows": 64038,
+    "self_rows": 1891,
+    "logit_threshold": -1.7578125,
+    "threshold": 0.14706452045904778,
+    "ece_bins": 15,
+    "self_loops_included": true,
+    "metrics": {
+      "auroc": 0.7083957885646737,
+      "auprc": 0.7364382649948233,
+      "accuracy": 0.631984134420188,
+      "sensitivity": 0.7498360348543053,
+      "specificity": 0.5141322339860708,
+      "precision": 0.6068088763079411,
+      "recall": 0.7498360348543053,
+      "f1": 0.6707829852622756,
+      "mcc": 0.2716212121973429,
+      "ece": 0.19422607500846903,
+      "brier": 0.2580053166531553,
+      "threshold": 0.14706452045904778,
+      "n_pos": 32019,
+      "n_neg": 32019
+    },
+    "metrics_self": null,
+    "metrics_non_self": {
+      "auroc": 0.6900936891029102,
+      "auprc": 0.6951709988847283,
+      "accuracy": 0.6207862004601992,
+      "sensitivity": 0.7341343600637281,
+      "specificity": 0.5141322339860708,
+      "precision": 0.5870736562707366,
+      "recall": 0.7341343600637281,
+      "f1": 0.6524195094612333,
+      "mcc": 0.25394867848034663,
+      "ece": 0.20045165618909386,
+      "brier": 0.2658525610306841,
+      "threshold": 0.14706452045904778,
+      "n_pos": 30128,
+      "n_neg": 32019
+    },
+    "self_loop_rate": {
+      "self_rows": 1891,
+      "reference_positive": 1891,
+      "predicted_positive": 1891
+    }
+  },
+  "classification_threshold": {
+    "method": "max_f1_selected_on_val_cls",
+    "logit_threshold": -1.7578125,
+    "probability_threshold": 0.14706452045904775,
+    "val_rows": 22804,
+    "val_f1": 0.8392879686908219,
+    "val_precision": 0.8067308470188496,
+    "val_recall": 0.8745834064199264,
+    "probabilities": "raw_sigmoid"
+  },
+  "graph": {
+    "fixed_threshold": {
+      "validation_selection": {
+        "rule": "sampled_subgraph_density_shape_1se_v3",
+        "threshold_candidates": "every_unique_validation_sample_union_logit_plus_empty",
+        "candidate_threshold_sha256": "8ec5bfcf5716874091c76d2194c7ddcd20740907dd613fde48cafbe0ad6e0f46",
+        "candidate_count": 2767,
+        "sample_count": 500,
+        "sample_count_by_size": {
+          "20": 50,
+          "40": 50,
+          "60": 50,
+          "80": 50,
+          "100": 50,
+          "120": 50,
+          "140": 50,
+          "160": 50,
+          "180": 50,
+          "200": 50
+        },
+        "sampled_bucket_sha256": "d80c84bfe078e21c1f1f9e4808bc00f08b03e69738b2eb81f6b29510190aac5a",
+        "standard_error": "exact_paired_nonparametric_bootstrap_se_within_size_strata",
+        "resampling_unit": "sampled_ball_paired_within_size; overlapping_balls_not_independent",
+        "density_stage": {
+          "objective": "minimize_macro_mean_abs_log_relative_density",
+          "best_logit_threshold": 2.6875,
+          "min_d_rd": 0.19186674487417382,
+          "finite_candidate_count": 2758,
+          "feasible_count": 4,
+          "d_rd_se_at_selected": 0.00033837778596617485,
+          "criterion": "candidate_d_rd_minus_min_lte_paired_1se"
+        },
+        "shape_stage": {
+          "objective": "minimize_mean_log_mmd_ratio",
+          "log_ratio_epsilon": 1e-12,
+          "candidate_count": 4,
+          "selected_d_shape": 2.023840156619594,
+          "selected_log_mmd_ratio_by_statistic": {
+            "degree": 2.6830237573723372,
+            "clustering": 1.0092308563047392,
+            "spectral": 2.3792658561817053
+          },
+          "selected_mmd_ratio_by_statistic": {
+            "degree": 14.629261823062151,
+            "clustering": 2.743490065222444,
+            "spectral": 10.79697342231784
+          },
+          "config": {
+            "sigma": 1.0,
+            "reference_epsilon": 1e-12
+          }
+        },
+        "tie_break": "higher_logit_threshold",
+        "selected": {
+          "logit_threshold": 2.671875,
+          "probability_threshold": 0.9353465116437761,
+          "union_pair_count": 1132726,
+          "union_admitted_pair_count": 23201,
+          "sample_occurrence_admitted_pair_count": 283377,
+          "selected_boundary_tie_group_pair_count": 240,
+          "validation_graph_similarity": 0.5397003195961956,
+          "validation_relative_density": 1.0263321810803874,
+          "validation_mmd_ratio": {
+            "degree": 14.629261823061734,
+            "clustering": 2.7434900652218883,
+            "spectral": 10.796973422317334
+          }
+        }
+      },
+      "test": {
+        "matching": "fixed_threshold_selected_on_validation",
+        "selection": "logit_greater_than_or_equal",
+        "logit_threshold": 2.671875,
+        "probability_threshold": 0.9353465116437761,
+        "graph_similarity": {
+          "bfs_macro": 0.4179183485990585
+        },
+        "relative_density": {
+          "bfs_macro": 0.47174634695524176
+        },
+        "mmd_ratio": {
+          "degree": 13.925326543034936,
+          "clustering": 11.665944688772596,
+          "spectral": 19.449890125536385
+        },
+        "per_size": {
+          "20": {
+            "graph_similarity": 0.5267283394962399,
+            "relative_density": 0.4759990778651366,
+            "sample_count": 50
+          },
+          "40": {
+            "graph_similarity": 0.47857535088359826,
+            "relative_density": 0.4262347322670042,
+            "sample_count": 50
+          },
+          "60": {
+            "graph_similarity": 0.46553404917289826,
+            "relative_density": 0.4575871445188032,
+            "sample_count": 50
+          },
+          "80": {
+            "graph_similarity": 0.4325731995513598,
+            "relative_density": 0.4524231466456196,
+            "sample_count": 50
+          },
+          "100": {
+            "graph_similarity": 0.41319870370811335,
+            "relative_density": 0.4835572297702662,
+            "sample_count": 50
+          },
+          "120": {
+            "graph_similarity": 0.3822260735927919,
+            "relative_density": 0.48327977511664094,
+            "sample_count": 50
+          },
+          "140": {
+            "graph_similarity": 0.3936765245539531,
+            "relative_density": 0.49436967522252945,
+            "sample_count": 50
+          },
+          "160": {
+            "graph_similarity": 0.3779739568777014,
+            "relative_density": 0.4842620859393619,
+            "sample_count": 50
+          },
+          "180": {
+            "graph_similarity": 0.37284881592003716,
+            "relative_density": 0.4809370796347228,
+            "sample_count": 50
+          },
+          "200": {
+            "graph_similarity": 0.33584847223389225,
+            "relative_density": 0.4788135225723329,
+            "sample_count": 50
+          }
+        },
+        "self_loop_occurrences": {
+          "aggregation": "sum_over_sample_occurrences",
+          "predicted": 55000,
+          "reference": 52754
+        }
+      }
+    }
+  },
+  "provenance": {
+    "val_topology": {
+      "path": "outputs/b1_kd_rank_rep_hpo/trial_005/scores/val_topology.npz",
+      "sha256": "d41e62bbff3851cdb979c9185c5df91374c83fc6bc2de81b5d54d62af56dc8a9",
+      "test_access_ledger_record_sha256": null
+    },
+    "val_cls": {
+      "path": "outputs/b1_kd_rank_rep_hpo/trial_005/scores/val_cls.npz",
+      "sha256": "615246d19fccefc6f6da006646963b0d201a9ad157e68b25ce170f24f5f29e6c",
+      "test_access_ledger_record_sha256": null
+    },
+    "test": {
+      "path": "outputs/b1_kd_rank_rep_hpo/trial_005/scores/test.npz",
+      "sha256": "375b29b6ccaf00b82814a604e101962486c4506a7dd78177546c17771b909275",
+      "test_access_ledger_record_sha256": null
+    },
+    "test_topology": {
+      "path": "outputs/b1_kd_rank_rep_hpo/trial_005/scores/test_topology.npz",
+      "sha256": "4a61fdb8fc4f2aade9d53b6336e3cdb099c065a8a33eb26076e0c129cbec3116",
+      "test_access_ledger_record_sha256": null
+    }
+  }
+}
