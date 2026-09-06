@@ -247,3 +247,32 @@ mkdir -p outputs/logs && nohup hpc/run.sh train configs/b0_v31_breadth_first.yam
 
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
 reported experiment; attempt `train.log` is authoritative and the redirect records launcher output.
+
+### New-split KD queue (2026-09-06)
+
+`src/experiments/queue_kd_val20pos_20260906.py` waits for PMA1 teacher attempt
+`181013a087964e9e93081d24a7fc6198` to release its pipeline lock and finish its diagnostic
+test, then dumps fresh shared row and `h2ns3` context banks from that teacher's `best.pt`.
+It runs `kd_logit`, `kd_rank`, `kd_gram`, `kd_rep`, then `kd_rank_rep`, using all visible
+GPUs for each complete train/publish/test pipeline. A failed dependency stops the queue.
+Status and per-stage logs are under `outputs/kd_val20pos_20260906/`.
+
+The five configs in `configs/kd_val20pos_20260906/` reuse the previous selected HPO
+settings: logit weight 100, strict rank Trial 8 (rank 0.1, distribution 10), Gram 1,
+representation 0.1, and joint Trial 5 (rank 0.014055034704056047, distribution
+5.781033282385391, representation 0.09611862506526807). Both rank arms retain
+`h2ns3`, margin 0.1. These are previous selections among multi-objective candidates,
+not demonstrated optima on the new split. All five use dynamic 1:5 negatives, positive
+weight 5, hard labels, seed 0 and up to 25 epochs; validation cadence follows each source
+config. They start fresh and do not load old model weights or old target banks.
+
+Launch this one-shot queue once from the H20 checkout:
+
+```bash
+nohup .venv/bin/python -u -m src.experiments.queue_kd_val20pos_20260906 \
+  > outputs/logs/kd_val20pos_20260906_queue.log 2>&1 < /dev/null &
+```
+
+It refuses an existing target bank or student output directory; investigate failures
+before arranging a restart. Its `--rescore-reason` records intentional testing of the
+fresh models under the new split.
