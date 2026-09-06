@@ -649,7 +649,7 @@ def build_vval_eval(
 
     g_val_raw = cast(nx.Graph, train_graph.subgraph(resolved_vval).copy())
     giant = _giant_component(strip_self_loops(g_val_raw))
-    buckets = sample_bfs_ball_buckets(giant, sizes=sizes, per_size=per_size, salt=salt)
+    buckets = sample_bfs_ball_buckets(giant, sizes=sizes, per_size=per_size, seed=salt)
 
     needed_pairs = {
         canonical_pair(u, v)

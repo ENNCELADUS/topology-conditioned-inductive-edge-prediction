@@ -9,10 +9,10 @@ CLI (full-row KD rework -- replaces the sampled anchor-context stream):
         [--rep-source topo|fused]
 
 Row universe: this module re-derives the trainer's own row lists
-(`src.train_b0.assemble_data` + `_training_rows`/`_val_cls_rows`) from the
+(`src.train_b0.assemble_data` + `_dynamic_training_corpus`/`_val_cls_rows`) from the
 same training YAML rather than sampling anchor/context pairs -- the training
-block covers every official training row exactly once, in the trainer's
-exact row order (row_id == array position), so the artifact is directly
+block covers the unique union of sampled pairs across configured training epochs,
+in the trainer's exact corpus order (row_id == array position), so the artifact is directly
 joinable against it by position; the validation block covers the official
 V_val classification rows. See `src.distill.artifacts` for the resulting
 `kd_row_targets_v1` format.
@@ -93,7 +93,7 @@ from src.score_universe import (
     _oracle_truth_graph_sha256,
     _shard_range,
 )
-from src.train_b0 import _training_rows, _val_cls_rows, assemble_data, load_config
+from src.train_b0 import _dynamic_training_corpus, _val_cls_rows, assemble_data, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -855,9 +855,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     cfg = load_config(args.config)
     assembled = assemble_data(cfg, verify=True)
     split = assembled.val_split
-    positives, negatives = _training_rows(split, assembled.exclude_nodes)
-    train_rows = positives + negatives
-    train_labels = [1] * len(positives) + [0] * len(negatives)
     val_rows, val_labels = _val_cls_rows(split, assembled.exclude_nodes)
 
     truth_graph = truth_graph_for_kd(split)
@@ -986,6 +983,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         return
 
+    corpus = _dynamic_training_corpus(cfg, assembled)
+    train_rows, train_labels = corpus.pairs, corpus.labels
     assert_no_val_internal_training_rows(train_rows, split.v_val)
 
     position = {node_id: i for i, node_id in enumerate(node_ids)}

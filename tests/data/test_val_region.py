@@ -15,13 +15,14 @@ import networkx as nx
 import numpy as np
 import pytest
 import src.data.artifacts as artifacts
-from src.data.artifacts import canonical_pair, load_benchmark
+from src.data.artifacts import canonical_pair
 from src.data.val_region import (
     ValBallUnionUniverse,
     ValRegionParams,
     ValRegionSplit,
-    _derive_region_membership,
-    _fill_val_negatives,
+    _bfs_ball,
+    _bfs_positive_budget,
+    _sample_val_negatives,
     derive_val_region_split,
     main,
     sample_bfs_ball_buckets,
@@ -57,236 +58,98 @@ def _path_graph(n: int) -> nx.Graph:
     return graph
 
 
-class TestDeriveValRegionSplitDeterminism:
-    def test_identical_under_permuted_node_and_edge_order(self) -> None:
+class TestPairDisjointSampling:
+    def test_order_independent_partition_retains_boundary_pairs(self) -> None:
         nodes = _grid_nodes(6, 6)
         edges = _grid_edges(6, 6)
-        negatives = [("n00_00", "n05_05"), ("n00_05", "n05_00")]
-        global_positives = frozenset(canonical_pair(u, v) for u, v in edges)
+        negatives = list(itertools.combinations(nodes, 2))
         params = ValRegionParams(
-            edge_fraction=0.25, n_regions=3, salt="det|", bucket_sizes=(3, 5), buckets_per_size=3
+            positive_edge_fraction=0.4, root_neighbors=2, bucket_sizes=(3, 5), buckets_per_size=3
+        )
+        truth = frozenset(edges)
+        negatives = [pair for pair in negatives if pair not in truth]
+        split = derive_val_region_split(nodes, edges, negatives, truth, params=params)
+        replay = derive_val_region_split(
+            reversed(nodes), reversed(edges), negatives, truth, params=params
+        )
+        assert split == replay
+        assert len(split.val_positives) <= int(0.4 * len(truth))
+        assert split.substrate_nodes == frozenset(nodes)
+        assert split.v_val <= split.train_nodes == frozenset(nodes)
+        assert set(split.build_training_graph()) == split.train_nodes
+        assert nx.is_connected(split.build_g_val_simple())
+        assert all(
+            u in split.train_nodes and v in split.train_nodes
+            for u, v in (*split.training_positives, *split.training_negatives)
+        )
+        for original, retained in (
+            (edges, split.training_positives),
+            (negatives, split.training_negatives),
+        ):
+            boundary = {(u, v) for u, v in original if (u in split.v_val) != (v in split.v_val)}
+            assert boundary and boundary <= set(retained)
+            assert set(retained) == {
+                (u, v) for u, v in original if not (u in split.v_val and v in split.v_val)
+            }
+        assert not set(split.training_positives) & set(split.val_positives)
+        assert not set(split.training_negatives) & set(split.val_negatives)
+        assert split.val_positives == tuple(
+            sorted((u, v) for u, v in edges if u in split.v_val and v in split.v_val)
+        )
+        assert len(split.val_negatives) == len(split.val_positives)
+        assert len(set(split.val_negatives)) == len(split.val_negatives)
+        assert all(
+            u != v and u in split.v_val and v in split.v_val and (u, v) not in truth
+            for u, v in split.val_negatives
         )
 
-        split1 = derive_val_region_split(nodes, edges, negatives, global_positives, params=params)
-        split2 = derive_val_region_split(
-            list(reversed(nodes)), list(reversed(edges)), negatives, global_positives, params=params
-        )
+    def test_edge_budget_counts_loops_and_stops_before_overshoot(self) -> None:
+        graph = nx.Graph([("a", "a"), ("a", "b"), ("a", "c"), ("b", "c")])
+        assert _bfs_positive_budget(graph, "a", 3) == frozenset({"a", "b"})
+        assert _bfs_positive_budget(graph, "a", 4) == frozenset({"a", "b", "c"})
 
-        assert split1 == split2
+    def test_fifo_preserves_parent_queue_order(self) -> None:
+        graph = nx.Graph([("r", "a"), ("r", "b"), ("a", "z"), ("b", "c")])
+        # Whole-layer lexical sorting would choose c before z.
+        assert _bfs_ball(graph, "r", 4) == {"r", "a", "b", "z"}
 
-    def test_repeated_calls_are_identical(self) -> None:
-        nodes = _grid_nodes(6, 6)
-        edges = _grid_edges(6, 6)
-        negatives = [("n00_00", "n05_05")]
-        global_positives = frozenset(canonical_pair(u, v) for u, v in edges)
+    def test_root_neighbor_count_includes_loop_once(self) -> None:
+        graph = _path_graph(20)
+        graph.add_edge("n00", "n00")
         params = ValRegionParams(
-            edge_fraction=0.25, n_regions=3, salt="det2|", bucket_sizes=(3, 5), buckets_per_size=3
+            positive_edge_fraction=0.4, root_neighbors=2, bucket_sizes=(3,), buckets_per_size=2
         )
+        assert len(graph["n00"]) == 2 and graph.degree("n00") == 3
+        # All eligible roots, including n00, participate in the same seeded choice.
+        import random
 
-        split1 = derive_val_region_split(nodes, edges, negatives, global_positives, params=params)
-        split2 = derive_val_region_split(nodes, edges, negatives, global_positives, params=params)
+        expected = random.Random(42).choice(sorted(n for n in graph if len(graph[n]) == 2))
+        split = derive_val_region_split(graph.nodes, graph.edges, [], frozenset(), params=params)
+        assert split.region_seeds == (expected,)
 
-        assert split1 == split2
+    def test_no_root_and_unreachable_bucket_fail_explicitly(self) -> None:
+        graph = _path_graph(20)
+        with pytest.raises(ValueError, match="eligible root"):
+            derive_val_region_split(graph.nodes, graph.edges, [], frozenset())
+        with pytest.raises(ValueError, match="every root"):
+            sample_bfs_ball_buckets(graph, sizes=(21,), per_size=1, seed=43)
 
+    def test_buckets_allow_repeat_roots_and_are_deterministic(self) -> None:
+        graph = _path_graph(6)
+        first = sample_bfs_ball_buckets(graph, sizes=(3, 6), per_size=20, seed=43)
+        assert first == sample_bfs_ball_buckets(graph, sizes=(3, 6), per_size=20, seed=43)
+        assert len(first[6]) == 20
+        assert all(ball == set(graph) for ball in first[6])
 
-class TestRegionMembershipGrowth:
-    def test_k_seeds_are_distinct_and_every_region_grows(self) -> None:
-        component = nx.Graph()
-        component.add_edges_from(_grid_edges(8, 8))
-        params = ValRegionParams(edge_fraction=0.5, n_regions=4, salt="growth|")
-
-        seeds, v_val, region_membership = _derive_region_membership(component, params)
-
-        assert len(seeds) == 4
-        assert len(set(seeds)) == 4
-        assert len(region_membership) == 4
-        assert v_val == frozenset(node for nodes in region_membership for node in nodes)
-        for nodes in region_membership:
-            assert len(nodes) > 1, "every region must grow beyond its seed"
-            assert nodes[0] in seeds
-
-    def test_raises_when_n_regions_exceeds_component_size(self) -> None:
-        component = nx.Graph()
-        component.add_edges_from([("a", "b"), ("b", "c")])
-        params = ValRegionParams(edge_fraction=0.5, n_regions=10, salt="x|")
-
-        with pytest.raises(ValueError, match="n_regions"):
-            _derive_region_membership(component, params)
-
-
-class TestStopRulePicksNearestPrefix:
-    """Growth on a path graph gives predictable edge counts per step.
-
-    A 10-node path has exactly one new edge per growth step, so the induced
-    edge count after `m` growth additions is exactly `m` regardless of hashed
-    growth direction -- letting the target land deliberately closer to one
-    side or the other of a specific crossing.
-    """
-
-    def test_undershoot_prefix_wins_when_closer(self) -> None:
-        component = _path_graph(10)  # 9 edges
-        params = ValRegionParams(edge_fraction=2.3 / 9, n_regions=1, salt="stop-under|")
-
-        _, v_val, region_membership = _derive_region_membership(component, params)
-
-        assert len(v_val) == 3  # seed + 2 growth nodes (edge_count=2, diff 0.3 < 0.7)
-        assert len(region_membership[0]) == 3
-
-    def test_overshoot_prefix_wins_when_closer(self) -> None:
-        component = _path_graph(10)  # 9 edges
-        params = ValRegionParams(edge_fraction=2.8 / 9, n_regions=1, salt="stop-over|")
-
-        _, v_val, region_membership = _derive_region_membership(component, params)
-
-        assert len(v_val) == 4  # seed + 3 growth nodes (edge_count=3, diff 0.2 < 0.8)
-        assert len(region_membership[0]) == 4
-
-
-class TestPartitionSemantics:
-    def _split(
-        self, *, edge_fraction: float = 0.2, n_regions: int = 3
-    ) -> tuple[ValRegionSplit, list[Pair], list[str]]:
-        nodes = _grid_nodes(8, 8)
-        grid_edges = _grid_edges(8, 8)
-        self_loops = [(node, node) for node in nodes]
-        edges = grid_edges + self_loops
-        negatives = [
-            ("n00_00", "n07_07"),
-            ("n00_07", "n07_00"),
-            ("n03_03", "n04_04"),
-        ]
-        global_positives = frozenset(canonical_pair(u, v) for u, v in edges)
-        params = ValRegionParams(
-            edge_fraction=edge_fraction,
-            n_regions=n_regions,
-            salt="partition|",
-            bucket_sizes=(2, 3),
-            buckets_per_size=2,
-        )
-        split = derive_val_region_split(nodes, edges, negatives, global_positives, params=params)
-        return split, edges, nodes
-
-    def test_no_training_row_has_both_endpoints_internal(self) -> None:
-        split, _, _ = self._split()
-
-        assert not any(u in split.v_val and v in split.v_val for u, v in split.training_positives)
-        assert not any(u in split.v_val and v in split.v_val for u, v in split.training_negatives)
-
-    def test_positives_partition_exactly(self) -> None:
-        split, edges, _ = self._split()
-        truth = frozenset(canonical_pair(u, v) for u, v in edges)
-
-        assert frozenset(split.val_positives) | split.training_positives == truth
-        assert frozenset(split.val_positives).isdisjoint(split.training_positives)
-
-    def test_cross_boundary_edges_land_in_training_positives(self) -> None:
-        split, edges, _ = self._split()
-        grid_only = [(u, v) for u, v in edges if u != v]
-        cross_edges = [
-            canonical_pair(u, v) for u, v in grid_only if (u in split.v_val) != (v in split.v_val)
-        ]
-
-        assert cross_edges, "test graph/params must actually produce a boundary"
-        assert all(edge in split.training_positives for edge in cross_edges)
-
-    def test_self_pair_with_endpoint_in_v_val_is_a_val_positive(self) -> None:
-        split, _, _ = self._split()
-
-        assert split.v_val, "region must be non-empty for this assertion to be meaningful"
-        for node in split.v_val:
-            assert (node, node) in split.val_positives
-
-    def test_training_negatives_preserve_input_order(self) -> None:
-        split, _, nodes = self._split()
-        negatives = [
-            ("n00_00", "n07_07"),
-            ("n00_07", "n07_00"),
-            ("n03_03", "n04_04"),
-        ]
-        expected = tuple(
-            canonical_pair(u, v)
-            for u, v in negatives
-            if not (
-                canonical_pair(u, v)[0] in split.v_val and canonical_pair(u, v)[1] in split.v_val
-            )
-        )
-
-        assert split.training_negatives == expected
-
-
-class TestFillValNegatives:
-    def test_deterministic_topup_rejects_invalid_pairs_and_hits_target(self) -> None:
-        v_val = frozenset(f"n{i:02d}" for i in range(10))
-        val_positives: list[Pair] = [("n00", "n01"), ("n02", "n03")]
-        existing: list[Pair] = [("n04", "n05")]
-        global_positive_edges = frozenset({("n06", "n07")})
-
-        result1 = _fill_val_negatives(
-            v_val=v_val,
-            val_positives=val_positives,
-            existing=existing,
-            global_positive_edges=global_positive_edges,
-            seed=0,
-        )
-        result2 = _fill_val_negatives(
-            v_val=v_val,
-            val_positives=val_positives,
-            existing=existing,
-            global_positive_edges=global_positive_edges,
-            seed=0,
-        )
-
-        assert result1 == result2
-        assert len(result1) == len(val_positives)
-        assert result1[: len(existing)] == tuple(existing)
-        assert ("n06", "n07") not in result1
-        assert all(u != v for u, v in result1)
-        assert len(set(result1)) == len(result1)
-
-    def test_truncates_when_existing_already_meets_target(self) -> None:
-        v_val = frozenset({"a", "b", "c", "d"})
-        val_positives: list[Pair] = [("a", "b")]
-        existing: list[Pair] = [("a", "c"), ("a", "d"), ("b", "c")]
-
-        result = _fill_val_negatives(
-            v_val=v_val,
-            val_positives=val_positives,
-            existing=existing,
-            global_positive_edges=frozenset(),
-            seed=0,
-        )
-
-        assert result == (("a", "c"),)
-
-
-class TestSampleBfsBallBuckets:
-    def test_deterministic_exact_size_and_connected(self) -> None:
-        g = nx.Graph()
-        g.add_edges_from(_grid_edges(6, 6))
-
-        buckets1 = sample_bfs_ball_buckets(g, sizes=(5, 10), per_size=4, salt="bucket-test|")
-        buckets2 = sample_bfs_ball_buckets(g, sizes=(5, 10), per_size=4, salt="bucket-test|")
-
-        assert buckets1 == buckets2
-        for size, balls in buckets1.items():
-            assert len(balls) == 4
-            for ball in balls:
-                assert len(ball) == size
-                assert nx.is_connected(g.subgraph(ball))
-
-    def test_raises_when_no_component_reaches_size(self) -> None:
-        g = nx.Graph()
-        g.add_edge("a", "b")
-        g.add_node("c")
-
-        with pytest.raises(ValueError, match="no component"):
-            sample_bfs_ball_buckets(g, sizes=(5,), per_size=1, salt="x|")
+    def test_negative_sampler_rejects_impossible_balance(self) -> None:
+        with pytest.raises(ValueError, match="distinct negatives"):
+            _sample_val_negatives([("a", "b"), ("a", "a")], seed=0)
 
 
 def _make_split(v_val: set[str], buckets: dict[int, list[set[str]]]) -> ValRegionSplit:
     """Build a minimal ValRegionSplit for val_ball_union_universe tests only."""
     return ValRegionSplit(
-        train_nodes=frozenset(v_val),
+        train_nodes=frozenset(),
         v_val=frozenset(v_val),
         region_seeds=(),
         training_positives=frozenset(),
@@ -375,30 +238,6 @@ class TestValBallUnionUniverse:
 
         with pytest.raises(ValueError, match="buckets"):
             val_ball_union_universe(split)
-
-
-class TestSmallParamsSeam:
-    def test_tiny_edge_fraction_n_regions_and_bucket_sizes_on_toy_graph(self) -> None:
-        nodes = _grid_nodes(5, 5)
-        edges = _grid_edges(5, 5)
-        global_positives = frozenset(canonical_pair(u, v) for u, v in edges)
-        params = ValRegionParams(
-            edge_fraction=0.15,
-            n_regions=1,
-            salt="tiny|",
-            bucket_sizes=(2, 3),
-            buckets_per_size=2,
-            negative_seed=0,
-        )
-
-        split = derive_val_region_split(nodes, edges, [], global_positives, params=params)
-
-        assert split.v_val
-        assert split.buckets
-        for size, balls in split.buckets.items():
-            assert len(balls) == 2
-            for ball in balls:
-                assert len(ball) == size
 
 
 _SYNTHETIC_TRAIN_NODES = [f"t{i:02d}" for i in range(1, 13)]
@@ -522,9 +361,9 @@ class TestBuilderCli:
                 "synthetic_val_region",
                 "--output",
                 str(output_path),
-                "--edge-fraction",
-                "0.3",
-                "--n-regions",
+                "--positive-edge-fraction",
+                "0.5",
+                "--root-neighbors",
                 "1",
                 "--bucket-sizes",
                 "2",
@@ -536,6 +375,9 @@ class TestBuilderCli:
 
         manifest = json.loads(output_path.read_text())
         assert set(manifest) == {
+            "schema_version",
+            "substrate_nodes",
+            "train_nodes",
             "strategy",
             "params",
             "region_seeds",
@@ -568,46 +410,3 @@ class TestBuilderCliImportIsCheap:
 
         assert proc.returncode == 0
         assert elapsed < 10.0
-
-
-@pytest.mark.integration
-class TestDeriveValRegionSplitRealData:
-    # Measured once against data/benchmark_2025_neurips/breadth_first with the
-    # production ValRegionParams() defaults (verified stable across
-    # PYTHONHASHSEED=0/1/2): |v_val|=2553, loopless g_val edges=9528, single
-    # connected component, edge fraction 47643 * 0.2 = 9528.6 -> 9528/47643 =
-    # 0.199987... (within the [0.18, 0.22] acceptance band).
-    def test_production_params_on_real_package(self, benchmark_root: Path) -> None:
-        benchmark = load_benchmark(benchmark_root, "breadth_first")
-        train_nodes = benchmark.split.train_nodes
-        truth_edges = list(benchmark.split.train_graph.edges())
-        benchmark_negatives = [
-            pair
-            for pair, label in zip(
-                benchmark.split.train_pairs.pairs, benchmark.split.train_pairs.labels, strict=True
-            )
-            if label == 0
-        ] + [
-            pair
-            for pair, label in zip(
-                benchmark.split.val_pairs.pairs, benchmark.split.val_pairs.labels, strict=True
-            )
-            if label == 0
-        ]
-
-        split = derive_val_region_split(
-            train_nodes,
-            truth_edges,
-            benchmark_negatives,
-            benchmark.positive_edges,
-            params=ValRegionParams(),
-        )
-        g_val_simple = split.build_g_val_simple()
-
-        assert nx.number_connected_components(g_val_simple) == 1
-        assert len(split.v_val) == 2553
-        assert g_val_simple.number_of_edges() == 9528
-        edge_fraction_achieved = (
-            g_val_simple.number_of_edges() / 47_643
-        )  # giant component edge count
-        assert 0.18 <= edge_fraction_achieved <= 0.22

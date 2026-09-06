@@ -113,9 +113,8 @@ def _toy_split() -> ValRegionSplit:
     edges = _grid_edges(5, 5)
     global_positives = frozenset(canonical_pair(u, v) for u, v in edges)
     params = ValRegionParams(
-        edge_fraction=0.15,
-        n_regions=1,
-        salt="teacher-targets-toy|",
+        positive_edge_fraction=0.4,
+        root_neighbors=2,
         bucket_sizes=(2, 3),
         buckets_per_size=1,
     )

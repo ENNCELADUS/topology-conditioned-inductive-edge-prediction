@@ -28,11 +28,12 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    label_smoothing: 0.05
+    label_smoothing: 0.0 # hard labels, matching the Full-Ego task loss
+    positive_weight: 5.0 # balances the 1:5 dynamic training stream
 data:
   root: data
   strategy: breadth_first
-  negative_ratio: 1
+  negative_ratio: 5 # shared teacher/student dynamic sampler, refreshed each epoch
   token_budget: 131072
   batch_pairs: 1024
   num_workers: 0

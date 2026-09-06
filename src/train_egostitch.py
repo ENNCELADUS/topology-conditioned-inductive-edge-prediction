@@ -56,6 +56,7 @@ from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable
 from src.data.pairs import NegativeSampler
 from src.data.prefetch import _prefetch_batches
+from src.data.training_sampler import enumerate_edge_stream as enumerate_edge_stream
 from src.data.val_region import (
     ValBallUnionUniverse,
     ValRegionParams,
@@ -2000,45 +2001,6 @@ def prepare_pack(
         "pack_identity_sha256": f0_identity,
         "packs": packs,
     }
-
-
-def enumerate_edge_stream(
-    training_positives: Sequence[tuple[str, str]],
-    sampler: NegativeSampler,
-    *,
-    negative_ratio: int,
-    seed: int,
-    epoch: int,
-    rank: int,
-    world_size: int,
-) -> list[tuple[str, str, int]]:
-    """Enumerate one (epoch, rank) edge-stream pair list, deterministically.
-
-    The single source of truth for the training loader
-    (`_BatchFactory.epoch_batches`): positives are epoch-shuffled and
-    rank-strided; negatives come from the pinned Sec 10.2 sampler seeded by
-    ``(seed, epoch, rank)``; the combined list is shuffled with the same stream.
-
-    Args:
-        training_positives: Canonical shared training positives (self-pairs included).
-        sampler: The pinned negative sampler.
-        negative_ratio: Negatives per positive.
-        seed: Base seed.
-        epoch: 1-based epoch.
-        rank: Rank index.
-        world_size: Rank count.
-
-    Returns:
-        Row list ``(u, v, label)`` for this epoch/rank.
-    """
-    positives = sorted(training_positives)
-    rng = np.random.default_rng((seed, epoch, rank, 0xE5))
-    order = np.random.default_rng((seed, epoch, 0xE5)).permutation(len(positives))
-    shard = [positives[i] for i in order.tolist()][rank::world_size]
-    negatives = sampler.sample(shard, ratio=negative_ratio, seed=seed, epoch=epoch, rank=rank)
-    rows = [(u, v, 1) for u, v in shard] + [(u, v, 0) for u, v in negatives]
-    perm = rng.permutation(len(rows))
-    return [rows[i] for i in perm.tolist()]
 
 
 # --------------------------------------------------------------------------- data assembly

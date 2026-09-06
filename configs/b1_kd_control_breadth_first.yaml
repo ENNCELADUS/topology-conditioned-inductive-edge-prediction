@@ -29,11 +29,12 @@ model:
       spectral_norm: false
     mixing:
       mode: none
-    label_smoothing: 0.05 # symmetric BCE smoothing, fixed V3.1 recipe
+    label_smoothing: 0.0 # hard labels, matching the Full-Ego task loss
+    positive_weight: 5.0 # balances the 1:5 dynamic training stream
 data:
   root: data
   strategy: breadth_first
-  negative_ratio: 1 # F0-only; V3.1 trains on fixed balanced train_edges.txt rows
+  negative_ratio: 5 # shared teacher/student dynamic sampler, refreshed each epoch
   token_budget: 131072
   batch_pairs: 1024
   num_workers: 0

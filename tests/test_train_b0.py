@@ -50,6 +50,7 @@ from src.train_b0 import (
     _build_packed_v3_1_loaders,
     _build_v3_1_loaders,
     _cycle_assembled_batches,
+    _dynamic_training_corpus,
     _EpochGpuBatchIterable,
     _evaluate_distributed,
     _evaluate_two_pass,
@@ -61,7 +62,6 @@ from src.train_b0 import (
     _run_timed_epoch_probe,
     _topology_due,
     _topology_from_metrics_row,
-    _training_rows,
     _val_cls_rows,
     _validate_distributed_plan,
     apply_overrides,
@@ -92,12 +92,16 @@ SHIPPED_B0_KD_CONFIGS = (
     "b1_kd_rep_breadth_first.yaml",
 )
 
-# Tiny V_val seam: n_regions=1 keeps growth on the fixture's single path
+# Tiny V_val seam: root_neighbors=1 keeps growth on the fixture's single path
 # component; buckets_per_size=2 is `precompute_bucket_reference`'s minimum for
 # an odd/even floor split. See `_build_synthetic_benchmark` for the fixture
 # this is derived against.
 _TINY_VAL_REGION_PARAMS = ValRegionParams(
-    n_regions=1, edge_fraction=0.3, bucket_sizes=(2, 3), buckets_per_size=2, negative_seed=0
+    root_neighbors=1,
+    positive_edge_fraction=0.5,
+    bucket_sizes=(2, 3),
+    buckets_per_size=2,
+    negative_seed=0,
 )
 
 
@@ -881,11 +885,10 @@ def _build_synthetic_benchmark(root: Path, strategy: str) -> None:
     """Write a tiny, internally-consistent benchmark package (no verify_benchmark).
 
     Train side is a 10-node path (`node_000001`-`node_000010`, 9 edges) so
-    `_TINY_VAL_REGION_PARAMS` (n_regions=1, edge_fraction=0.3) grows a
-    deterministic 4-node/3-edge V_val region {node_000001..node_000004} off
-    one path end: each claimed node contributes exactly one new edge to a
-    contiguous sub-path, so growth crosses `0.3 * 9 = 2.7` at exactly 4 nodes
-    regardless of hashed seed/frontier order. Test side is two disconnected
+    `_TINY_VAL_REGION_PARAMS` (root_neighbors=1, positive_edge_fraction=0.5) grows a
+    deterministic 5-node/4-edge V_val region {node_000001..node_000005} off
+    one path end with the fixed FIFO sampler; its boundary edge remains
+    training supervision. Test side is two disconnected
     nodes, matching the original fixture's shape.
     """
     graph = nx.Graph()
@@ -1014,25 +1017,16 @@ class TestAssembleDataFeatureCoverageGate:
         # node_000012 is test-side only and touches zero train/val pairs here.
         assert assembled.dropped_pair_counts["train_edges.txt"] == 0
         assert assembled.dropped_pair_counts["val_edges.txt"] == 0
-        # V_val grows to {node_000001..node_000004} (see _build_synthetic_benchmark);
-        # the remaining 6-edge subpath node_000004-node_000010 is left for training,
-        # so node_000001-3 (V_val-internal only) are isolated in g_struct and
-        # node_000004 (the cross-boundary node) keeps degree 1.
-        assert assembled.val_split.v_val == {
-            "node_000001",
-            "node_000002",
-            "node_000003",
-            "node_000004",
-        }
-        assert len(assembled.training_positives) == 6
-        assert assembled.degrees["node_000001"] == 0
-        assert assembled.degrees["node_000002"] == 0
-        assert assembled.degrees["node_000003"] == 0
-        assert assembled.degrees["node_000004"] == 1
+        assert len(assembled.val_split.v_val) == 5
+        assert assembled.val_split.v_val <= assembled.val_split.train_nodes
+        assert set(assembled.degrees) <= assembled.val_split.train_nodes
+        assert len(assembled.training_positives) == 5
+        assert assembled.degrees["node_000005"] == 1
+        assert all(assembled.degrees[f"node_{i:06d}"] == 0 for i in range(1, 5))
 
 
 class TestV31TrainingLoader:
-    def test_each_epoch_only_reorders_fixed_train_file_pairs(self, tmp_path: Path) -> None:
+    def test_each_epoch_resamples_negatives_with_the_teacher_sampler(self, tmp_path: Path) -> None:
         data_root = tmp_path / "data"
         benchmark_root = data_root / "benchmark_2025_neurips"
         benchmark_root.mkdir(parents=True)
@@ -1041,22 +1035,29 @@ class TestV31TrainingLoader:
         all_nodes = [f"node_{i:06d}" for i in range(1, 12)]
         _write_feature_store(features_root, all_nodes)
         cfg = _synthetic_data_config(data_root, expected_missing_features=["node_000012"])
-        cfg = replace(cfg, model=replace(cfg.model, family="v3_1"))
+        cfg = replace(
+            cfg, model=replace(cfg.model, family="v3_1"), optim=replace(cfg.optim, epochs=2)
+        )
         assembled = assemble_data(cfg, verify=False, val_region_params=_TINY_VAL_REGION_PARAMS)
 
         factory, _ = _build_v3_1_loaders(cfg, assembled)
-        positives, negatives = _training_rows(assembled.val_split, assembled.exclude_nodes)
-        expected = Counter([(pair, 1) for pair in positives] + [(pair, 0) for pair in negatives])
-
-        for epoch in (0, 1):
+        corpus = _dynamic_training_corpus(cfg, assembled)
+        observed_epochs = []
+        for epoch in (1, 2):
             loader = factory(epoch)
             assert isinstance(loader, DataLoader)
             dataset = loader.dataset
             assert isinstance(dataset, TokenPairDataset)
             assert dataset._labels is not None
             observed = Counter(zip(dataset._pairs, dataset._labels, strict=True))
+            expected = Counter(
+                (corpus.pairs[i], corpus.labels[i]) for i in corpus.epoch_rows[epoch]
+            )
             assert observed == expected
-            assert Counter(dataset._labels) == {0: len(negatives), 1: len(positives)}
+            n_pos = len(assembled.training_positives)
+            assert Counter(dataset._labels) == {0: cfg.data.negative_ratio * n_pos, 1: n_pos}
+            observed_epochs.append(observed)
+        assert observed_epochs[0] != observed_epochs[1]
 
 
 def _synthetic_v31_pack_fixture(
@@ -1144,10 +1145,9 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(
     assert cfg.runtime is not None
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
     # All synthetic features are length 3 -> every pair lands in bucket 128, and the
-    # train (6 positives + 2 negatives) and val (6 rows) buckets both satisfy the
-    # >= world_size planner gate.
-    positives, negatives = _training_rows(assembled.val_split, assembled.exclude_nodes)
-    expected_row_ids = list(range(len(positives) + len(negatives)))
+    # dynamic train and fixed validation buckets satisfy the world-size constraint.
+    corpus = _dynamic_training_corpus(cfg, assembled)
+    expected_row_ids = sorted(corpus.epoch_rows[2].tolist())
     seen_row_ids: list[int] = []
     for process_index in (0, 1):
         multi_worker_factory, _, _, _ = _build_packed_v3_1_loaders(
@@ -1158,7 +1158,7 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(
             process_index=process_index,
             world_size=2,
         )
-        multi_worker_iterable = multi_worker_factory(1)
+        multi_worker_iterable = multi_worker_factory(2)
         assert isinstance(multi_worker_iterable, _EpochGpuBatchIterable)
         loader = multi_worker_iterable._source
         assert isinstance(loader, DataLoader)
@@ -1172,7 +1172,7 @@ def test_packed_loader_multi_worker_ranks_cover_all_rows(
 
         dataset = loader.dataset
         assert isinstance(dataset, CompactPairBatchDataset)
-        multi_worker_iterable._sampler.set_epoch(1)
+        multi_worker_iterable._sampler.set_epoch(2)
         for batch_index in loader.sampler:
             compact_batch = dataset[int(batch_index)]
             seen_row_ids.extend(int(row_id) for row_id in compact_batch.row_ids)
@@ -2971,3 +2971,25 @@ def test_rank_symmetric_resume_operation_raises_remote_rank_failure(
     monkeypatch.setattr("src.train_b0.gather_object", gathered)
     with pytest.raises(RuntimeError, match="corrupt CUDA RNG state"):
         _run_rank_symmetric(cast(Accelerator, accelerator), "resume state restore", lambda: None)
+
+
+def test_student_weighted_bce_matches_teacher_objective() -> None:
+    from src.train_egostitch import e2e_weighted_bce_with_logits
+
+    model = _tiny_v3_1_model()
+    model.positive_weight = 5.0
+    model.label_smoothing = 0.0
+    model.eval()
+    labels = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    batch = {"emb_a": torch.randn(6, 3, 8), "emb_b": torch.randn(6, 3, 8),
+             "len_a": torch.full((6,), 3), "len_b": torch.full((6,), 3), "label": labels}
+    output = model(batch)
+    expected = e2e_weighted_bce_with_logits(
+        output["logits"].reshape_as(labels), labels, torch.ones_like(labels),
+        positive_weight=5.0,
+    )
+    torch.testing.assert_close(output["loss"], expected)
+    assert output["loss_weight_sum"].item() == 10.0
+    actual_gradient = torch.autograd.grad(output["loss"], output["logits"], retain_graph=True)[0]
+    expected_gradient = torch.autograd.grad(expected, output["logits"])[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient)

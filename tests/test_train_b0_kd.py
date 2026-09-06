@@ -1994,3 +1994,40 @@ def test_evaluate_distributed_kd_rank_rep_reports_rep_and_context_diagnostics() 
         + 10.0 * outcome.kd["val_kd_dist_loss"]
         + outcome.kd["val_kd_rep_loss"]
     )
+
+
+def test_dynamic_epoch_rows_join_offline_union_targets(tmp_path: Path) -> None:
+    from src.data.pairs import NegativeSampler
+    from src.data.training_sampler import build_training_corpus
+
+    nodes = [f"n{i:02d}" for i in range(20)]
+    positives = list(zip(nodes[:-1], nodes[1:], strict=True))
+    sampler = NegativeSampler(nodes, dict.fromkeys(nodes, 2), frozenset(positives))
+    corpus = build_training_corpus(positives, sampler, negative_ratio=5, seed=0, epochs=2)
+    logits = np.linspace(-2, 2, len(corpus.pairs), dtype=np.float32)
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=nodes,
+        train_pairs=corpus.pairs,
+        train_labels=corpus.labels,
+        teacher_logit=logits,
+    )
+    bank = KDRowBank(
+        DistillConfig(targets_path="t", w_logit=1.0),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=corpus.pairs,
+        train_labels=corpus.labels,
+        val_pairs=corpus.pairs[:1],
+        val_labels=corpus.labels[:1],
+        model=nn.Linear(1, 1),
+        device=torch.device("cpu"),
+    )
+    assert set(corpus.epoch_rows[2]) - set(corpus.epoch_rows[1])
+    for epoch in (1, 2):
+        ids = corpus.epoch_rows[epoch]
+        student = torch.linspace(-1, 1, len(ids), requires_grad=True)
+        loss, _ = bank.loss({"_row_id": torch.as_tensor(ids)}, {"logits": student})
+        expected = kd_logit_loss(student, torch.from_numpy(logits[ids]))
+        torch.testing.assert_close(loss, expected)
+        loss.backward()
+        assert student.grad is not None and torch.isfinite(student.grad).all()

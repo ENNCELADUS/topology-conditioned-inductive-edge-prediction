@@ -10,14 +10,39 @@
 |---|---:|---:|---|
 | Full reference graph | 10,090 | 122,092 | positive graph truth only |
 | Train-side substrate (`train_graph.pkl`) | 8,072 | 47,762 | original train⁺∪val⁺ graph and pair pool, before the internal split |
-| ↳ Effective train | within the same 8,072 | 38,234 | excludes `V_val`-internal rows; outside–outside and cross-boundary pairs train |
-| ↳ `V_val` region | 2,553-node subset | 9,528 | all internal pairs withheld |
+| ↳ Effective training (new protocol) | 8,072 | 37,989 | V_val-internal pairs excluded; boundary pairs retained |
+| ↳ `V_val` region (new protocol) | 1,250 | 9,773 | pair-disjoint validation |
+| ↳ Included training boundary | — | 12,327 | already counted in effective training |
 | Test graph | disjoint 2,018 | 30,128 | held out until final evaluation |
 | Loopless test candidate universe | same 2,018 | — | all 2,035,153 unordered distinct-node pairs |
 
-Train and test nodes are disjoint; the primary split strategy is `breadth_first`. `V_val` is grown by K=5 dispersed-seed hashed-frontier BFS on the substrate's loopless giant component, stopped at 20% induced loopless edges; all graph-edge counts are loopless positives. Raw train-side, `V_val`, and test labeled sets are balanced 1:1; effective train need not be. `V_val` is only pair-disjoint; test is node-disjoint.
+The primary strategy is `breadth_first`. New V_val uses a single sorted-neighbor FIFO BFS, root neighbor count 5, split seed 42, and a strict upper bound of 20% of substrate positive pairs (including self-loops); the FIFO prefix contains 10,719 positives against a 10,728 cap. V_val is pair-disjoint: only internal pairs are held out, and all boundary pairs remain training samples. Its nodes are exposed through training; test nodes remain disjoint. Inner BFS buckets use seed 43 and 50 uniform-root draws with replacement per size 20–200. Classification validation is balanced with fresh positive-endpoint-frequency negative sampling (seed 0); effective fit need not be balanced. Edge counts above exclude loops. [Sampling design](superpowers/specs/2026-09-06-pring-node-disjoint-validation-design.md) and [current split](../data/val_region/breadth_first.json).
 
-Each node carries a frozen intrinsic token sequence (≤1024 tokens × 1536 dims); F0 is its fp32 mean-pooled vector. Negatives are the fixed benchmark's balanced samples. Graph truth is observation-biased, so uncertain negatives are disclosed.
+**Result provenance:** all model results below predate this change and used the old pair-disjoint V_val (2,553 nodes; 9,528 non-self edges; effective training 38,234 non-self edges with boundary pairs retained). No model has yet been retrained/evaluated under the new single-BFS protocol. These historical results must not be interpreted as new-protocol evidence.
+
+**Dynamic training negatives:** `src/data/training_sampler.py:enumerate_edge_stream`
+is shared by Full-Ego and V3.1. It proposes negatives through a 50:50 mixture of
+uniform node pairs (with self-pair boost) and degree-weighted positive-endpoint
+replacement, rejecting known positives, within-call duplicates and V_val-internal
+pairs. Cross-boundary pairs remain legal. Students use one global sampling rank
+(seed, epoch, rank=0), then distribute batches; Full-Ego retains its original
+per-rank sampling. Thus student membership is GPU-count independent, while the
+teacher and student share the sampler rather than necessarily identical multi-GPU
+pair sets. Every student epoch retains all positive samples and draws five times
+as many negatives. Task BCE weights positive rows by 5 and negative rows by 1,
+normalizing by the global effective weight across DDP ranks. Label smoothing is
+zero, matching the teacher; optimizer and KD weights are otherwise unchanged.
+
+Offline KD row targets cover the unique union of sampled pairs across all configured
+training epochs, with exact pair/label joins and per-epoch row IDs. The union is
+only a scoring bank: each epoch consumes its own 1:5 subset. Build it with the
+same split, seed, negative ratio and epoch count as the student YAML. Old fixed-row
+banks cannot be reused. Training representations stay on CPU and only batch targets
+move to the device. Validation labels and thresholds are unchanged. `kd_rank`
+context-bank sampling remains its separate declared KD objective. The 15 shipped KD weight-sweep configs share the updated 1:5 setting. Human-owned
+autoresearch campaign configs and historical results are not migrated.
+
+Each node carries a frozen intrinsic token sequence (≤1024 tokens × 1536 dims); F0 is its fp32 mean-pooled vector. Active V3.1 students and matched control use the shared Full-Ego dynamic negative sampler at 1:5 each epoch; fixed benchmark negatives are split-accounting data, not their training stream. Graph truth is observation-biased, so uncertain negatives are disclosed.
 
 ### 1.2 Evaluation protocol
 

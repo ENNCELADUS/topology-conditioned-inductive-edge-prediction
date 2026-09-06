@@ -102,7 +102,7 @@ def build_region_corpus(
     """Sample BFS-ball regions from `train_graph` and attach frozen features.
 
     Strips self-loops, draws `sample_bfs_ball_buckets(sizes=sizes,
-    per_size=per_size, salt=salt)`, then flattens the result in ascending size
+    per_size=per_size, seed=salt)`, then flattens the result in ascending size
     order, preserving draw order within a size. Regions containing a
     `FEATURELESS_NODES` member are dropped and counted rather than kept. Each
     kept region's induced loopless edges are precomputed as local `(E_r, 2)`
@@ -125,7 +125,7 @@ def build_region_corpus(
         The `RegionCorpus`.
     """
     simple_graph = strip_self_loops(train_graph)
-    buckets = sample_bfs_ball_buckets(simple_graph, sizes=sizes, per_size=per_size, salt=salt)
+    buckets = sample_bfs_ball_buckets(simple_graph, sizes=sizes, per_size=per_size, seed=salt)
 
     node_ids = sorted(simple_graph.nodes())
     node_index = {node_id: i for i, node_id in enumerate(node_ids)}

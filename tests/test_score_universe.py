@@ -2344,9 +2344,8 @@ def test_egostitch_e2e_scorer_warns_on_n_ground_clamp(
 # through a hand-rolled substitute.
 _VAL_REGION_NODES = [f"h{i}" for i in range(12)]
 _VAL_REGION_TEST_PARAMS = ValRegionParams(
-    edge_fraction=0.4,
-    n_regions=2,
-    salt="test-val-region|",
+    positive_edge_fraction=0.5,
+    root_neighbors=2,
     bucket_sizes=(2, 3),
     buckets_per_size=2,
     negative_seed=0,

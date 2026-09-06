@@ -134,10 +134,9 @@ class TestDeriveVvalNodes:
         graph.add_nodes_from(nodes)
         graph.add_edges_from(edges)
         params = ValRegionParams(
-            edge_fraction=0.25,
-            n_regions=3,
-            salt="s3-vval-nodes|",
-            bucket_sizes=(3, 5),
+            positive_edge_fraction=0.4,
+            root_neighbors=2,
+                bucket_sizes=(3, 5),
             buckets_per_size=3,
         )
 

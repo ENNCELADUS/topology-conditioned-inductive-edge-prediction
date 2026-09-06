@@ -989,6 +989,12 @@ class V3_1(nn.Module):
                 f"model_config.label_smoothing must be in [0.0, 1.0), got {self.label_smoothing}"
             )
 
+        self.positive_weight = _to_float(
+            model_config.get("positive_weight", 1.0), "model_config.positive_weight"
+        )
+        if not 0.0 < self.positive_weight < float("inf"):
+            raise ValueError("model_config.positive_weight must be finite and positive")
+
         mlp_cfg_raw = model_config.get("mlp_head")
         if not isinstance(mlp_cfg_raw, dict) or not mlp_cfg_raw:
             raise ValueError("mlp_head configuration is required for V3_1")
@@ -1266,9 +1272,13 @@ class V3_1(nn.Module):
                 labels_for_loss = (
                     labels_for_loss * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
                 )
-            output["loss"] = nn.functional.binary_cross_entropy_with_logits(
-                logits_for_loss, labels_for_loss
+            per_row = nn.functional.binary_cross_entropy_with_logits(
+                logits_for_loss.float(), labels_for_loss.float(), reduction="none"
             )
+            weights = 1.0 + (self.positive_weight - 1.0) * labels.reshape_as(per_row)
+            denominator = weights.sum().detach()
+            output["loss"] = (weights * per_row).sum() / denominator
+            output["loss_weight_sum"] = denominator
 
         return output
 

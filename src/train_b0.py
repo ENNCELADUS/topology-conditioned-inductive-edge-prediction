@@ -70,6 +70,7 @@ from src.data.pairs import (
     collate_token_pairs,
 )
 from src.data.partition import build_g_struct
+from src.data.training_sampler import TrainingCorpus, build_training_corpus
 from src.data.val_region import (
     Pair,
     ValRegionParams,
@@ -168,7 +169,7 @@ class DataConfig:
         root: Data root containing ``benchmark_2025_neurips/`` and
             ``features/frozen_node_features_1024/``.
         strategy: Split strategy name (e.g. ``breadth_first``).
-        negative_ratio: Negatives sampled per positive, per epoch on the F0-MLP path.
+        negative_ratio: Dynamic negatives sampled per positive per epoch.
         token_budget: Per-batch token budget on the ``v3_1`` path.
         batch_pairs: Per-batch pair count on the ``f0_mlp`` path.
         num_workers: DataLoader workers on the ``v3_1`` path.
@@ -1060,6 +1061,9 @@ class AssembledData:
     operative_node_ids: list[str]
     operative_node_count: int
     exclude_nodes: frozenset[str]
+    _training_corpora: dict[tuple[int, int, int], TrainingCorpus] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
 
 def _count_rows(path: Path) -> int:
@@ -1715,13 +1719,27 @@ def _build_negative_sampler(assembled: AssembledData) -> NegativeSampler:
     )
 
 
+def _dynamic_training_corpus(cfg: Config, assembled: AssembledData) -> TrainingCorpus:
+    """Same epoch rows for student loaders and the offline teacher-target dumper."""
+    key = (cfg.seed, cfg.optim.epochs, cfg.data.negative_ratio)
+    if key not in assembled._training_corpora:
+        assembled._training_corpora[key] = build_training_corpus(
+            assembled.training_positives,
+            _build_negative_sampler(assembled),
+            negative_ratio=cfg.data.negative_ratio,
+            seed=cfg.seed,
+            epochs=cfg.optim.epochs,
+        )
+    return assembled._training_corpora[key]
+
+
 def _build_v3_1_loaders(
     cfg: Config, assembled: AssembledData
 ) -> tuple[LoaderFactory, Iterable[Batch]]:
     """Build loaders over the V_val training/validation partition."""
     store = assembled.store
     val_split = assembled.val_split
-    positives, negatives = _training_rows(val_split, assembled.exclude_nodes)
+    corpus = _dynamic_training_corpus(cfg, assembled)
     length_cache: dict[str, int] = {}
 
     def length_of(node_id: str) -> int:
@@ -1749,7 +1767,9 @@ def _build_v3_1_loaders(
     )
 
     def factory(epoch: int) -> DataLoader[Batch]:
-        pairs, labels = _shuffled_pairs_and_labels(positives, negatives, cfg.seed, epoch)
+        indices = corpus.epoch_rows[epoch]
+        pairs = [corpus.pairs[i] for i in indices]
+        labels = [corpus.labels[i] for i in indices]
         lengths = lengths_for(pairs)
         dataset = TokenPairDataset(pairs, labels, store, lengths=lengths)
         batch_sampler = LengthBucketedBatchSampler(
@@ -1956,10 +1976,12 @@ class _EpochGpuBatchIterable(GpuBatchIterable):
         table: PackedFeatureTable,
         sampler: _EpochIndexSampler,
         epoch: int,
+        expected_row_ids: np.ndarray,
     ) -> None:
         super().__init__(source, table)
         self._sampler = sampler
         self._epoch = epoch
+        self.expected_row_ids = expected_row_ids
 
     def __iter__(self) -> Iterator[Batch]:
         self._sampler.set_epoch(self._epoch)
@@ -2051,9 +2073,8 @@ def _build_packed_v3_1_loaders(
     node_index = table.manifest.node_index()
     lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
 
-    positives, negatives = _training_rows(assembled.val_split, assembled.exclude_nodes)
-    train_pairs = positives + negatives
-    train_labels = [1] * len(positives) + [0] * len(negatives)
+    corpus = _dynamic_training_corpus(cfg, assembled)
+    train_pairs, train_labels = corpus.pairs, corpus.labels
     train_lengths = _pair_lengths_from_manifest(train_pairs, lengths_by_node)
     train_row_ids, train_node_a, train_node_b, train_label_tensor = _compact_pair_columns(
         train_pairs, train_labels, node_index
@@ -2084,8 +2105,9 @@ def _build_packed_v3_1_loaders(
     epoch_offsets: dict[int, tuple[int, int]] = {}
     plans_by_epoch: dict[int, list[list[PairBatchSpec]]] = {}
     for epoch in range(cfg.optim.epochs + 1):
+        epoch_rows = corpus.epoch_rows[epoch]
         plan = build_distributed_epoch_plan(
-            train_lengths,
+            [train_lengths[i] for i in epoch_rows],
             token_budget_per_rank=token_budget_per_rank,
             max_pairs_per_rank=runtime.max_pairs_per_rank,
             world_size=world_size,
@@ -2094,7 +2116,14 @@ def _build_packed_v3_1_loaders(
             shuffle=True,
         )
         plan = [_interleave_bucket_specs(rank_plan) for rank_plan in plan]
-        _validate_distributed_plan(plan, expected_row_count=len(train_pairs))
+        _validate_distributed_plan(plan, expected_row_count=len(epoch_rows))
+        plan = [
+            [
+                replace(spec, indices=tuple(int(epoch_rows[i]) for i in spec.indices))
+                for spec in rank_plan
+            ]
+            for rank_plan in plan
+        ]
         plans_by_epoch[epoch] = plan
         start = len(flat_rank_specs)
         flat_rank_specs.extend(plan[process_index])
@@ -2111,12 +2140,14 @@ def _build_packed_v3_1_loaders(
     train_loader = _wrap_compact_loader(train_dataset, cfg, world_size, sampler=epoch_sampler)
 
     def factory(epoch: int) -> GpuBatchIterable:
-        return _EpochGpuBatchIterable(train_loader, table, epoch_sampler, epoch)
+        return _EpochGpuBatchIterable(
+            train_loader, table, epoch_sampler, epoch, corpus.epoch_rows[epoch]
+        )
 
     baseline_batch_sizes = [
         len(batch)
         for batch in LengthBucketedBatchSampler(
-            train_lengths,
+            [train_lengths[i] for i in corpus.epoch_rows[0]],
             token_budget=cfg.data.token_budget,
             shuffle=True,
             seed=cfg.seed,
@@ -2262,7 +2293,7 @@ def validate_gathered_validation(
 
 
 def validate_training_coverage(*, row_ids: np.ndarray, expected_row_ids: np.ndarray) -> None:
-    """Require every fixed training row exactly once in a completed epoch."""
+    """Require every planned training row exactly once in a completed epoch."""
     unique_ids, counts = np.unique(row_ids, return_counts=True)
     if np.any(counts > 1):
         duplicates = unique_ids[counts > 1].tolist()
@@ -3191,8 +3222,8 @@ class KDRowBank:
             distill: The active `DistillConfig` (`.arm` selects the KD arm).
             targets: The loaded `KDRowTargets` artifact.
             train_pairs: The trainer's official training rows, in exact
-                row-id order (row_id == position) -- ``positives + negatives``
-                from `_training_rows`.
+                row-id order (row_id == position), the unique multi-epoch pair union
+                from `_dynamic_training_corpus`.
             train_labels: Labels aligned with `train_pairs`.
             val_pairs: The trainer's V_val classification rows, in exact
                 row-id order -- `_val_cls_rows`'s pairs.
@@ -3206,7 +3237,7 @@ class KDRowBank:
                 rows, in order, exactly once. This subsumes the old
                 allowed-nodes/V_val-boundary checks entirely: the joined rows
                 ARE the trainer's own quarantined rows, so a row-exact join
-                can never smuggle in a foreign or cross-boundary row.
+                can never smuggle in a foreign or V_val-internal row.
             RuntimeError: On a `kd_rep_head`/`d_model` width mismatch between
                 the artifact and the model.
         """
@@ -3303,9 +3334,7 @@ class KDRowBank:
             self.train_b_idx = torch.as_tensor(targets.pair_b_idx, dtype=torch.int64, device=device)
         self.train_rep: torch.Tensor | None = None
         if self.arm in {"kd_gram", "kd_gen"} | _REP_COS_ARMS | _AUX_HEAD_ARMS:
-            self.train_rep = torch.as_tensor(
-                targets.teacher_rep, dtype=torch.float16, device=device
-            )
+            self.train_rep = torch.as_tensor(targets.teacher_rep, dtype=torch.float16, device="cpu")
         val_teacher_rep: torch.Tensor | None = None
         if self.arm in {"kd_gram"} | _REP_COS_ARMS | _AUX_HEAD_ARMS:
             val_teacher_rep = torch.as_tensor(
@@ -3371,7 +3400,7 @@ class KDRowBank:
         assert self.train_rep is not None
         rows = batch["_row_id"]
         batch["kd_teacher_latent"] = (
-            self.train_rep.index_select(0, rows).float() / self._latent_scale
+            self.train_rep.index_select(0, rows.cpu()).to(rows.device).float() / self._latent_scale
         )
 
     def loss(
@@ -3420,7 +3449,7 @@ class KDRowBank:
             if student_rep is None:
                 raise RuntimeError("kd_rep requires the model forward to emit kd_rep or pair_repr")
             assert self.train_rep is not None
-            teacher_rep = self.train_rep.index_select(0, rows).float()
+            teacher_rep = self.train_rep.index_select(0, rows.cpu()).to(rows.device).float()
             total = total + self._w_rep * kd_rep_loss(student_rep.float(), teacher_rep)
             with torch.no_grad():
                 cos = nn.functional.cosine_similarity(
@@ -3434,7 +3463,8 @@ class KDRowBank:
                 raise RuntimeError(f"{self.arm} requires the model forward to emit kd_struct")
             assert self.train_rep is not None
             struct_loss = kd_struct_loss(
-                struct_pred.float(), self.train_rep.index_select(0, rows).float()
+                struct_pred.float(),
+                self.train_rep.index_select(0, rows.cpu()).to(rows.device).float(),
             )
             total = total + self._w_struct * struct_loss
             stats["sum_struct_mse"] = float(struct_loss.detach().item()) * stats["rows"]
@@ -3448,7 +3478,7 @@ class KDRowBank:
                 and self.train_a_idx is not None
                 and self.train_b_idx is not None
             )
-            teacher_rep = self.train_rep.index_select(0, rows).float()
+            teacher_rep = self.train_rep.index_select(0, rows.cpu()).to(rows.device).float()
             global_rows = _gather_global_relational_rows(
                 student_rep.float(),
                 teacher_rep,
@@ -3926,6 +3956,7 @@ def train_ddp_loop(
         )
         model.train()
         local_loss_sum = 0.0
+        local_loss_weight = 0.0
         epoch_kd_loss_sum = 0.0
         epoch_kd_sums: dict[str, float] = {}
         grad_norm_task = 0.0
@@ -3963,12 +3994,19 @@ def train_ddp_loop(
             start_event, end_event = _maybe_cuda_events(use_cuda)
             output = model(batch)
             local_mean_loss = output["loss"]
-            loss = scale_ddp_mean_loss(
-                local_mean_loss,
-                local_count=local_count,
-                global_count=global_count,
-                world_size=world_size,
-            )
+            effective_weight = output.get("loss_weight_sum")
+            if effective_weight is None:
+                batch_loss_weight = float(local_count)
+                loss = scale_ddp_mean_loss(
+                    local_mean_loss,
+                    local_count=local_count,
+                    global_count=global_count,
+                    world_size=world_size,
+                )
+            else:
+                global_weight = accelerator.reduce(effective_weight.detach(), reduction="sum")
+                batch_loss_weight = float(effective_weight.item())
+                loss = local_mean_loss * (world_size * effective_weight / global_weight)
             kd_loss: torch.Tensor | None = None
             if kd_bank is not None:
                 kd_local, kd_stats = kd_bank.loss(
@@ -4031,7 +4069,8 @@ def train_ddp_loop(
             epoch_steps += 1
             epoch_local_pairs += local_count
             epoch_global_pairs += global_count
-            local_loss_sum += float(local_mean_loss.detach().float().item()) * local_count
+            local_loss_sum += float(local_mean_loss.detach().float().item()) * batch_loss_weight
+            local_loss_weight += batch_loss_weight
             if "_row_id" not in batch:
                 raise ValueError("training batch is missing required _row_id coverage metadata")
             epoch_row_ids.append(batch["_row_id"].detach().to(torch.int64))
@@ -4100,7 +4139,11 @@ def train_ddp_loop(
         row_ids_np = gathered_rows[gathered_rows >= 0].cpu().numpy()
         validate_training_coverage(
             row_ids=row_ids_np,
-            expected_row_ids=np.arange(expected_global_pairs, dtype=np.int64),
+            expected_row_ids=(
+                epoch_loader.expected_row_ids
+                if isinstance(epoch_loader, _EpochGpuBatchIterable)
+                else np.arange(expected_global_pairs, dtype=np.int64)
+            ),
         )
         total_rank_local_pairs += epoch_local_pairs
         total_global_pairs += expected_global_pairs
@@ -4113,7 +4156,7 @@ def train_ddp_loop(
 
         global_loss_stats = accelerator.reduce(
             torch.tensor(
-                [local_loss_sum, float(epoch_local_pairs)],
+                [local_loss_sum, local_loss_weight],
                 device=accelerator.device,
                 dtype=torch.float64,
             ),
@@ -4885,13 +4928,13 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     kd_context_stream: KDContextStream | None = None
     kd_val: KDValDiagnostics | None = None
     if cfg.distill is not None and cfg.distill.active:
-        positives, negatives = _training_rows(val_split, assembled.exclude_nodes)
+        corpus = _dynamic_training_corpus(cfg, assembled)
         if cfg.distill.arm == "kd_struct":
             targets = structural_row_targets(
                 train_graph=val_split.build_training_graph(),
                 val_graph=substrate_graph(val_split, assembled.benchmark.split.train_graph),
-                train_pairs=positives + negatives,
-                train_labels=[1] * len(positives) + [0] * len(negatives),
+                train_pairs=corpus.pairs,
+                train_labels=corpus.labels,
                 val_pairs=val_cls_pairs,
                 val_labels=val_cls_labels,
             )
@@ -4900,8 +4943,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         kd_bank = KDRowBank(
             cfg.distill,
             targets,
-            train_pairs=positives + negatives,
-            train_labels=[1] * len(positives) + [0] * len(negatives),
+            train_pairs=corpus.pairs,
+            train_labels=corpus.labels,
             val_pairs=val_cls_pairs,
             val_labels=val_cls_labels,
             model=model,

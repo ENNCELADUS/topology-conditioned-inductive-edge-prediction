@@ -77,7 +77,7 @@ def _expected_kept_and_dropped(
 ) -> tuple[list[set[str]], int]:
     """Independently replay bucket sampling + the featureless-drop rule as an oracle."""
     buckets = sample_bfs_ball_buckets(
-        strip_self_loops(graph), sizes=sizes, per_size=per_size, salt=salt
+        strip_self_loops(graph), sizes=sizes, per_size=per_size, seed=salt
     )
     kept: list[set[str]] = []
     dropped = 0

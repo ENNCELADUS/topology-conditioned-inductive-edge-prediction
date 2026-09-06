@@ -2321,9 +2321,8 @@ def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int 
 # Toy-scale V_val derivation for the 25-node ring fixture: small enough that
 # region growth and bucket sampling both succeed over so few nodes/edges.
 _TOY_VAL_REGION_PARAMS = ValRegionParams(
-    edge_fraction=0.4,
-    n_regions=2,
-    salt="toy-e2e-val-region|",
+    positive_edge_fraction=0.4,
+    root_neighbors=2,
     bucket_sizes=(2, 3),
     buckets_per_size=2,
     negative_seed=0,
@@ -2438,11 +2437,12 @@ class TestPrepareAndAssembleE2E:
     def test_assembly_statistics_span_the_full_training_universe(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """V_val is a training-universe subset now, so its rows are included, not excluded."""
+        """Validation nodes remain in the training universe through boundary pairs."""
         data = self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
         assert data.feature_stats is not None
         assert data.validation_nodes  # precondition: V_val rows really are in the matrix
         assert set(data.validation_nodes) <= set(data.train_nodes)
+        assert set(data.target_builder.graph) == set(data.train_nodes)
 
         expected = compute_feature_stats(
             np.asarray(

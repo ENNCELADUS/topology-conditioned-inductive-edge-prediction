@@ -1,26 +1,17 @@
-"""V_val: a full-density validation node region carved out of `train_graph.pkl`.
+"""PRING-style pair-disjoint V_val inside the original train-side substrate.
 
-Replaces the old `V_hold` protocol. `V_val` is a hashed-frontier, round-robin
-grown union of `n_regions` dispersed BFS regions inside the loopless giant
-component of the training truth graph (train⁺ ∪ val⁺), stopped at the node-count
-prefix whose induced edge count is nearest `edge_fraction` of the component's
-total loopless edges. Unlike `V_hold`, cross-boundary edges are **not**
-quarantined: only pairs with *both* endpoints inside `V_val` are pulled out of
-training, so nothing is wasted, and `V_val` gets a fully induced (not
-uniform-thinned) gold topology.
-
-Every derivation is a pure function of its inputs plus `ValRegionParams`, so
-callers (workers, the builder CLI) re-derive it deterministically rather than
-reading a cached split; `outputs/val_region/*.json` (this module's `__main__`)
-is provenance only and is never read back by a worker.
+A single seeded FIFO BFS admits at most 20% of substrate positive pairs, including
+self-loops. Training retains boundary
+pairs and excludes only validation-internal pairs. Fixed BFS buckets and
+endpoint-frequency classification negatives come from the validation induced graph.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import heapq
 import json
+import random
+from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -43,23 +34,12 @@ Pair = tuple[str, str]
 
 @dataclass(frozen=True)
 class ValRegionParams:
-    """Tunable knobs of the V_val derivation; the seam small toy tests use.
+    """Fixed production defaults; explicit overrides support small test graphs."""
 
-    Attributes:
-        edge_fraction: Target share of the giant component's loopless edges
-            that `V_val`'s induced subgraph should hold.
-        n_regions: Number of dispersed seed regions grown into `V_val`.
-        salt: Hash-ordering salt shared by seed selection, region growth, and
-            bucket-ball sampling.
-        bucket_sizes: Node-count sizes of the BFS-ball evaluation buckets.
-        buckets_per_size: Number of balls drawn per size.
-        negative_seed: RNG seed for the deterministic validation-negative
-            top-up sampler.
-    """
-
-    edge_fraction: float = 0.20
-    n_regions: int = 5
-    salt: str = "val-region-v1|"
+    positive_edge_fraction: float = 0.20
+    root_neighbors: int = 5
+    split_seed: int = 42
+    bucket_seed: int = 43
     bucket_sizes: tuple[int, ...] = (20, 40, 60, 80, 100, 120, 140, 160, 180, 200)
     buckets_per_size: int = 50
     negative_seed: int = 0
@@ -67,22 +47,10 @@ class ValRegionParams:
 
 @dataclass(frozen=True)
 class ValRegionSplit:
-    """The derived V_val region plus the training/validation pair partition.
+    """Validation membership and disjoint training/validation pair partitions.
 
-    Attributes:
-        train_nodes: All train-side node ids (unchanged by the split).
-        v_val: The derived validation node region, a subset of `train_nodes`.
-        region_seeds: The `n_regions` seed nodes, in selection order.
-        training_positives: Truth edges (self-pairs included) with at least
-            one endpoint outside `v_val`.
-        training_negatives: Benchmark negative rows with at least one endpoint
-            outside `v_val`, in input order.
-        val_positives: Truth edges with both endpoints inside `v_val`
-            (self-pairs included), sorted.
-        val_negatives: `v_val`-internal benchmark negatives topped up to
-            `len(val_positives)` by deterministic sampling.
-        buckets: Bucket size -> BFS-ball node sets, sampled inside `v_val`.
-        params: The parameters this split was derived under.
+    ``train_nodes`` contains the complete train-side substrate, including V_val.
+    Boundary pairs remain training samples; only V_val-internal pairs are held out.
     """
 
     train_nodes: frozenset[str]
@@ -95,8 +63,13 @@ class ValRegionSplit:
     buckets: dict[int, list[set[str]]]
     params: ValRegionParams
 
+    @property
+    def substrate_nodes(self) -> frozenset[str]:
+        """Original train-side membership before the internal pair holdout."""
+        return self.train_nodes | self.v_val
+
     def build_training_graph(self) -> nx.Graph:
-        """Return the loopless training-side graph over ALL train nodes."""
+        """Return the loopless training-side graph over all substrate nodes."""
         graph = nx.Graph()
         graph.add_nodes_from(self.train_nodes)
         graph.add_edges_from((u, v) for u, v in self.training_positives if u != v)
@@ -148,202 +121,69 @@ def _giant_component_nodes(graph: nx.Graph) -> frozenset[str]:
     return frozenset(largest)
 
 
-def _select_seeds(
-    component: nx.Graph, n_regions: int, order_key: Callable[[str], tuple[bytes, str]]
-) -> tuple[str, ...]:
-    """Select `n_regions` dispersed seeds: hashed-min, then iterative farthest-point."""
-    component_nodes = frozenset(component.nodes())
-    seed1 = min(component_nodes, key=order_key)
-    seeds = [seed1]
-    dist_maps = {seed1: dict(nx.single_source_shortest_path_length(component, seed1))}
-    for _ in range(n_regions - 1):
-        remaining = component_nodes - set(seeds)
-        dist_values = {
-            node: min(dist_maps[s].get(node, len(component_nodes)) for s in seeds)
-            for node in remaining
-        }
-        max_dist = max(dist_values.values())
-        candidates = [node for node in remaining if dist_values[node] == max_dist]
-        best = min(candidates, key=order_key)
-        seeds.append(best)
-        dist_maps[best] = dict(nx.single_source_shortest_path_length(component, best))
-    return tuple(seeds)
-
-
-def _grow_regions(
-    component: nx.Graph,
-    seeds: Sequence[str],
-    edge_fraction: float,
-    order_key: Callable[[str], tuple[bytes, str]],
-) -> tuple[frozenset[str], tuple[tuple[str, ...], ...]]:
-    """Round-robin grow `seeds` to the prefix nearest `edge_fraction` of the component's edges.
-
-    Each region keeps its own hashed-order frontier (a min-heap over
-    `order_key`); one turn adds one unclaimed node to one region, cycling
-    through regions. The induced edge count over the union of all claimed
-    nodes is tracked incrementally and checked after every addition; growth
-    stops at whichever of the first crossing prefix or its immediate
-    predecessor is numerically closer to the target (ties keep the crossing
-    prefix).
-
-    Returns:
-        `(v_val, region_membership)`: the union of claimed nodes, and each
-        region's claimed nodes in claim order (seed first).
-
-    Raises:
-        ValueError: If every region's frontier is exhausted before the target
-            is ever reached.
-    """
-    k = len(seeds)
-    claimed: dict[str, int] = {seed: i for i, seed in enumerate(seeds)}
-    region_nodes: list[list[str]] = [[seed] for seed in seeds]
-    frontiers: list[list[tuple[bytes, str]]] = []
-    for seed in seeds:
-        heap = [order_key(n) for n in component.neighbors(seed) if n not in claimed]
-        heapq.heapify(heap)
-        frontiers.append(heap)
-
-    target = edge_fraction * component.number_of_edges()
-    edge_count = 0
-    for i, seed in enumerate(seeds):
-        prior = set(seeds[:i])
-        edge_count += sum(1 for nb in component.neighbors(seed) if nb in prior)
-
-    if edge_count >= target:
-        return frozenset(claimed), tuple(tuple(nodes) for nodes in region_nodes)
-
-    previous_edge_count = edge_count
-    stalled: set[int] = set()
-    turn = 0
-    while True:
-        i = turn % k
-        turn += 1
-        if i in stalled:
-            if len(stalled) == k:
-                raise ValueError(
-                    "all region frontiers exhausted before reaching the edge_fraction target"
-                )
+def _bfs_ball(graph: nx.Graph, seed: str, size: int) -> set[str]:
+    """Take exactly ``size`` nodes using PRING's sorted-neighbor FIFO BFS."""
+    if size < 1 or seed not in graph:
+        raise ValueError("BFS requires a positive size and a root in the graph")
+    visited: set[str] = set()
+    queue = deque([seed])
+    while queue and len(visited) < size:
+        node = queue.popleft()
+        if node in visited:
             continue
+        visited.add(node)
+        queue.extend(sorted(set(graph.neighbors(node)) - visited))
+    if len(visited) != size:
+        raise ValueError(f"component containing seed {seed!r} has fewer than {size} nodes")
+    return visited
 
-        heap = frontiers[i]
-        while heap and heap[0][1] in claimed:
-            heapq.heappop(heap)
-        if not heap:
-            stalled.add(i)
-            if len(stalled) == k:
-                raise ValueError(
-                    "all region frontiers exhausted before reaching the edge_fraction target"
-                )
+
+def _bfs_positive_budget(graph: nx.Graph, root: str, budget: int) -> frozenset[str]:
+    """Longest FIFO prefix within the induced positive-pair cap, loops counted once.
+
+    Stop before the first node that would exceed the cap; never skip a frontier
+    node to search for a cheaper or better-matching region.
+    """
+    visited: set[str] = set()
+    queue = deque([root])
+    edges = 0
+    while queue:
+        node = queue.popleft()
+        if node in visited:
             continue
-
-        _, node = heapq.heappop(heap)
-        claimed[node] = i
-        region_nodes[i].append(node)
-        # `node` was just added to `claimed`, but the component is loopless so
-        # `node` is never its own neighbor: this only counts edges to others.
-        edge_count += sum(1 for nb in component.neighbors(node) if nb in claimed)
-        for neighbor in component.neighbors(node):
-            if neighbor not in claimed:
-                heapq.heappush(heap, order_key(neighbor))
-
-        if edge_count >= target:
-            current_diff = abs(edge_count - target)
-            previous_diff = abs(previous_edge_count - target)
-            if previous_diff < current_diff:
-                del claimed[node]
-                region_nodes[i].pop()
-            return frozenset(claimed), tuple(tuple(nodes) for nodes in region_nodes)
-        previous_edge_count = edge_count
+        added = sum(neighbor in visited or neighbor == node for neighbor in graph[node])
+        if edges + added > budget:
+            break
+        edges += added
+        visited.add(node)
+        queue.extend(sorted(set(graph.neighbors(node)) - visited))
+    return frozenset(visited)
 
 
-def _derive_region_membership(
-    component: nx.Graph, params: ValRegionParams
-) -> tuple[tuple[str, ...], frozenset[str], tuple[tuple[str, ...], ...]]:
-    """Select seeds and grow V_val over one connected `component`.
-
-    Args:
-        component: A connected graph (callers pass the truth graph's giant
-            component); farthest-point seed selection assumes connectivity.
-        params: Region-derivation parameters.
-
-    Returns:
-        `(seeds, v_val, region_membership)`.
-
-    Raises:
-        ValueError: If `component` is empty, or `params.n_regions` exceeds its
-            node count.
-    """
-    nodes = tuple(component.nodes())
-    if not nodes:
-        raise ValueError("component has no nodes to derive a V_val region from")
-    if params.n_regions > len(nodes):
-        raise ValueError(f"n_regions={params.n_regions} exceeds the component's {len(nodes)} nodes")
-
-    def order_key(node: str) -> tuple[bytes, str]:
-        return hashlib.sha256(f"{params.salt}{node}".encode()).digest(), node
-
-    seeds = _select_seeds(component, params.n_regions, order_key)
-    v_val, region_membership = _grow_regions(component, seeds, params.edge_fraction, order_key)
-    return seeds, v_val, region_membership
-
-
-def _fill_val_negatives(
-    *,
-    v_val: frozenset[str],
-    val_positives: Sequence[Pair],
-    existing: Sequence[Pair],
-    global_positive_edges: frozenset[Pair],
-    seed: int,
-) -> tuple[Pair, ...]:
-    """Top up `existing` V_val-internal negatives to `len(val_positives)` rows.
-
-    Truncates `existing` (in its given order) if it already meets the target;
-    otherwise draws additional pairs with endpoints proportional to loopless
-    truth degree within `v_val`, rejecting self-pairs, global positives, and
-    duplicates against `existing` plus rows already drawn this call.
-
-    Raises:
-        RuntimeError: If the target cannot be reached within a generous
-            attempt budget.
-    """
-    target = len(val_positives)
-    if len(existing) >= target:
-        return tuple(existing[:target])
-
-    nodes = sorted(v_val)
-    n = len(nodes)
-    degree: dict[str, int] = dict.fromkeys(nodes, 0)
-    for u, v in val_positives:
-        if u != v:
-            degree[u] += 1
-            degree[v] += 1
-    weights = np.array([float(degree[node]) for node in nodes], dtype=np.float64)
-    total = weights.sum()
-    probs = weights / total if total > 0 else np.full(n, 1.0 / n, dtype=np.float64)
-
-    rng = np.random.default_rng((seed,))
+def _sample_val_negatives(val_positives: Sequence[Pair], *, seed: int) -> tuple[Pair, ...]:
+    """Fresh PRING endpoint-frequency negatives, canonical and without replacement."""
+    positives = frozenset(val_positives)
+    endpoints = [node for pair in sorted(positives) for node in pair]
+    nodes = set(endpoints)
+    target = len(positives)
+    capacity = len(nodes) * (len(nodes) - 1) // 2 - sum(u != v for u, v in positives)
+    if capacity < target:
+        raise ValueError(
+            f"validation has only {capacity} distinct negatives for {target} positives"
+        )
+    rng = random.Random(seed)
     chosen: list[Pair] = []
-    seen: set[Pair] = set(existing)
-    needed = target - len(existing)
-    max_attempts = max(needed * 50, 10_000)
-    attempts = 0
-    while len(chosen) < needed:
-        attempts += 1
-        if attempts > max_attempts:
-            raise RuntimeError(
-                f"val-negative top-up could not reach target count {needed} "
-                f"after {attempts - 1} attempts"
-            )
-        i = int(rng.choice(n, p=probs))
-        j = int(rng.choice(n, p=probs))
-        if i == j:
-            continue
-        pair = canonical_pair(nodes[i], nodes[j])
-        if pair in global_positive_edges or pair in seen:
+    seen: set[Pair] = set()
+    for _ in range(max(target * 100, 10_000)):
+        if len(chosen) == target:
+            return tuple(chosen)
+        u, v = rng.choice(endpoints), rng.choice(endpoints)
+        pair = canonical_pair(u, v)
+        if u == v or pair in positives or pair in seen:
             continue
         seen.add(pair)
         chosen.append(pair)
-    return tuple(existing) + tuple(chosen)
+    raise RuntimeError(f"validation negative sampling could not reach {target} rows")
 
 
 def derive_val_region_split(
@@ -354,81 +194,57 @@ def derive_val_region_split(
     *,
     params: ValRegionParams | None = None,
 ) -> ValRegionSplit:
-    """Derive the deterministic V_val region and the training/validation partition.
+    """Derive a pair-disjoint split solely from the complete train-side substrate.
 
-    Args:
-        train_nodes: All train-side node ids.
-        truth_edges: `train_graph.pkl`'s edge set (self-pairs included).
-        benchmark_negatives: Label-0 rows from `train_edges.txt` + `val_edges.txt`.
-        global_positive_edges: The full `positive_edges.txt` set (rejection set
-            for sampled validation negatives).
-        params: Region-derivation parameters; defaults to `ValRegionParams()`.
-
-    Returns:
-        The `ValRegionSplit`.
-
-    Raises:
-        ValueError: If `params.edge_fraction` is not in `(0, 1)`,
-            `params.n_regions < 1`, `train_nodes` is empty, a truth edge has an
-            endpoint outside `train_nodes`, or region growth exhausts every
-            frontier before reaching the target.
+    ``global_positive_edges`` is accepted by shared callers, but validation
+    negative rejection needs only induced validation truth, never test labels.
     """
     params = params if params is not None else ValRegionParams()
-    if not 0.0 < params.edge_fraction < 1.0:
-        raise ValueError(f"edge_fraction must be in (0, 1), got {params.edge_fraction}")
-    if params.n_regions < 1:
-        raise ValueError(f"n_regions must be >= 1, got {params.n_regions}")
-
+    if not 0.0 < params.positive_edge_fraction < 1.0:
+        raise ValueError("positive_edge_fraction must be in (0, 1)")
+    if params.root_neighbors < 0:
+        raise ValueError("root_neighbors must be non-negative")
     node_set = frozenset(train_nodes)
-    if not node_set:
-        raise ValueError("train_nodes must be non-empty")
-
-    canonical_truth = _canonicalize_truth_edges(truth_edges, node_set)
-    loopless_edges = frozenset((u, v) for u, v in canonical_truth if u != v)
-    full_graph = nx.Graph()
-    full_graph.add_nodes_from(node_set)
-    full_graph.add_edges_from(loopless_edges)
-
-    giant_nodes = _giant_component_nodes(full_graph)
-    component = full_graph.subgraph(giant_nodes).copy()
-    seeds, v_val, _region_membership = _derive_region_membership(component, params)
-
-    training_positives = frozenset(
-        (u, v) for u, v in canonical_truth if not (u in v_val and v in v_val)
-    )
-    val_positives = tuple(sorted((u, v) for u, v in canonical_truth if u in v_val and v in v_val))
-
-    canonical_negatives = [canonical_pair(u, v) for u, v in benchmark_negatives]
-    training_negatives = tuple(
-        pair for pair in canonical_negatives if not (pair[0] in v_val and pair[1] in v_val)
-    )
-    val_negatives_from_benchmark = [
-        pair for pair in canonical_negatives if pair[0] in v_val and pair[1] in v_val
-    ]
-    val_negatives = _fill_val_negatives(
-        v_val=v_val,
-        val_positives=val_positives,
-        existing=val_negatives_from_benchmark,
-        global_positive_edges=global_positive_edges,
-        seed=params.negative_seed,
-    )
-
-    g_val_simple = nx.Graph()
-    g_val_simple.add_nodes_from(v_val)
-    g_val_simple.add_edges_from((u, v) for u, v in val_positives if u != v)
-    buckets = sample_bfs_ball_buckets(
-        g_val_simple, sizes=params.bucket_sizes, per_size=params.buckets_per_size, salt=params.salt
-    )
-
+    truth = _canonicalize_truth_edges(truth_edges, node_set)
+    budget = int(len(truth) * params.positive_edge_fraction)
+    if budget < 1:
+        raise ValueError("positive edge budget must be non-empty")
+    if not params.bucket_sizes or min(params.bucket_sizes) < 1:
+        raise ValueError("bucket sizes must be positive")
+    graph = nx.Graph()
+    graph.add_nodes_from(sorted(node_set))
+    graph.add_edges_from(sorted(truth))
+    eligible = {
+        node
+        for component in nx.connected_components(graph)
+        if len(component) >= max(params.bucket_sizes)
+        for node in component
+    }
+    roots = sorted(node for node in eligible if len(graph[node]) == params.root_neighbors)
+    if not roots:
+        raise ValueError("no eligible root with the required neighbor count and component size")
+    root = random.Random(params.split_seed).choice(roots)
+    v_val = _bfs_positive_budget(graph, root, budget)
+    if len(v_val) < max(params.bucket_sizes):
+        raise ValueError("positive edge budget cannot support the requested bucket sizes")
+    val_positives = tuple(sorted((u, v) for u, v in truth if u in v_val and v in v_val))
+    negatives = [canonical_pair(u, v) for u, v in benchmark_negatives]
+    if any(u not in node_set or v not in node_set for u, v in negatives):
+        raise ValueError("benchmark negative endpoint outside train-side substrate")
     return ValRegionSplit(
         train_nodes=node_set,
         v_val=v_val,
-        region_seeds=seeds,
-        training_positives=training_positives,
-        training_negatives=training_negatives,
+        region_seeds=(root,),
+        training_positives=frozenset((u, v) for u, v in truth if not (u in v_val and v in v_val)),
+        training_negatives=tuple((u, v) for u, v in negatives if not (u in v_val and v in v_val)),
         val_positives=val_positives,
-        val_negatives=val_negatives,
-        buckets=buckets,
+        val_negatives=_sample_val_negatives(val_positives, seed=params.negative_seed),
+        buckets=sample_bfs_ball_buckets(
+            graph.subgraph(v_val),
+            sizes=params.bucket_sizes,
+            per_size=params.buckets_per_size,
+            seed=params.bucket_seed,
+        ),
         params=params,
     )
 
@@ -494,84 +310,28 @@ def val_ball_union_universe(split: ValRegionSplit) -> ValBallUnionUniverse:
     return ValBallUnionUniverse(u_idx=u_idx, v_idx=v_idx)
 
 
-def _bfs_ball(
-    graph: nx.Graph, seed: str, size: int, order_key: Callable[[str], tuple[bytes, str]]
-) -> set[str]:
-    """Grow a `size`-node hashed-frontier BFS ball from `seed`."""
-    visited = {seed}
-    ordered = [seed]
-    frontier = [seed]
-    while frontier and len(ordered) < size:
-        next_frontier = {
-            neighbor
-            for node in frontier
-            for neighbor in graph.neighbors(node)
-            if neighbor not in visited
-        }
-        frontier = sorted(next_frontier, key=order_key)
-        visited.update(frontier)
-        ordered.extend(frontier[: size - len(ordered)])
-    if len(ordered) != size:
-        raise ValueError(
-            f"component containing seed {seed!r} has fewer than {size} reachable nodes"
-        )
-    return set(ordered)
-
-
 def sample_bfs_ball_buckets(
     graph: nx.Graph,
     *,
     sizes: Sequence[int],
     per_size: int,
-    salt: str,
+    seed: int | str,
 ) -> dict[int, list[set[str]]]:
-    """Sample deterministic hashed-frontier BFS-ball buckets, mirroring the test protocol.
+    """Uniform roots with replacement and FIFO BFS, retaining sample overlaps.
 
-    For each size, seeds are drawn in hashed order from nodes whose component
-    has at least `size` nodes (a node not yet used as a seed for this size is
-    preferred; seeds are reused once every eligible node has served once), and
-    each ball grows via the same hashed-frontier idiom as region growth.
-    Overlapping balls (within or across draws) are expected.
-
-    Args:
-        graph: Graph to sample balls from.
-        sizes: Ball sizes to sample.
-        per_size: Number of balls to draw per size.
-        salt: Hash-ordering salt; combined with size and draw index so
-            different draws (and different sizes) get independent orderings.
-
-    Returns:
-        Size -> list of `per_size` node sets, each of exactly `size` nodes.
-
-    Raises:
-        ValueError: If no component has at least `size` nodes, for some size.
+    Require all nodes to reach each size; never silently condition the root
+    distribution on connected-component size.
     """
-    components = list(nx.connected_components(graph))
-    result: dict[int, list[set[str]]] = {}
-    for size in sizes:
-        eligible_nodes = sorted(
-            {node for component in components if len(component) >= size for node in component}
-        )
-        if not eligible_nodes:
-            raise ValueError(f"no component with at least {size} nodes for bucket sampling")
-
-        balls: list[set[str]] = []
-        used_seeds: set[str] = set()
-        for draw_index in range(per_size):
-
-            def order_key(
-                node: str, _draw_index: int = draw_index, _size: int = size
-            ) -> tuple[bytes, str]:
-                return hashlib.sha256(
-                    f"{salt}bucket|{_size}|{_draw_index}|{node}".encode()
-                ).digest(), node
-
-            candidates = [n for n in eligible_nodes if n not in used_seeds] or eligible_nodes
-            seed = min(candidates, key=order_key)
-            used_seeds.add(seed)
-            balls.append(_bfs_ball(graph, seed, size, order_key))
-        result[size] = balls
-    return result
+    if not sizes or per_size < 1 or any(size < 1 for size in sizes):
+        raise ValueError("bucket sizes and per_size must be positive")
+    if not graph or min(map(len, nx.connected_components(graph))) < max(sizes):
+        raise ValueError("every root must be able to reach every requested bucket size")
+    nodes = sorted(graph.nodes())
+    rng = random.Random(seed)
+    return {
+        size: [_bfs_ball(graph, rng.choice(nodes), size) for _ in range(per_size)]
+        for size in sorted(sizes)
+    }
 
 
 def region_fidelity_stats(
@@ -608,7 +368,7 @@ def region_fidelity_stats(
         giant,
         sizes=split.params.bucket_sizes,
         per_size=split.params.buckets_per_size,
-        salt=f"{split.params.salt}fidelity|",
+        seed=split.params.bucket_seed + 1,
     )
 
     stats: dict[str, float | int] = {
@@ -652,9 +412,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--strategy", type=str, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--edge-fraction", type=float, default=defaults.edge_fraction)
-    parser.add_argument("--n-regions", type=int, default=defaults.n_regions)
-    parser.add_argument("--salt", type=str, default=defaults.salt)
+    parser.add_argument(
+        "--positive-edge-fraction", type=float, default=defaults.positive_edge_fraction
+    )
+    parser.add_argument("--root-neighbors", type=int, default=defaults.root_neighbors)
+    parser.add_argument("--split-seed", type=int, default=defaults.split_seed)
+    parser.add_argument("--bucket-seed", type=int, default=defaults.bucket_seed)
     parser.add_argument("--bucket-sizes", type=int, nargs="+", default=list(defaults.bucket_sizes))
     parser.add_argument("--buckets-per-size", type=int, default=defaults.buckets_per_size)
     parser.add_argument("--negative-seed", type=int, default=defaults.negative_seed)
@@ -665,9 +428,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Derive V_val for one benchmark package and write a provenance JSON manifest."""
     args = _build_arg_parser().parse_args(argv)
     params = ValRegionParams(
-        edge_fraction=args.edge_fraction,
-        n_regions=args.n_regions,
-        salt=args.salt,
+        positive_edge_fraction=args.positive_edge_fraction,
+        root_neighbors=args.root_neighbors,
+        split_seed=args.split_seed,
+        bucket_seed=args.bucket_seed,
         bucket_sizes=tuple(args.bucket_sizes),
         buckets_per_size=args.buckets_per_size,
         negative_seed=args.negative_seed,
@@ -700,7 +464,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     fidelity = region_fidelity_stats(split, full_loopless)
 
     manifest = {
+        "schema_version": "pring_bfs_positive_budget_val_v1",
         "strategy": args.strategy,
+        "substrate_nodes": sorted(split.substrate_nodes),
+        "train_nodes": sorted(split.train_nodes),
         "params": asdict(params),
         "region_seeds": list(split.region_seeds),
         "v_val": sorted(split.v_val),
