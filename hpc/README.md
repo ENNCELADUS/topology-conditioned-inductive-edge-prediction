@@ -236,6 +236,11 @@ python -m src.experiments.g3_oracle \
 
 ## Disconnect-safe runs
 
+KD dumps now write training-only `kd_row_targets_v2` / `kd_ctx_targets_v2` banks.
+They contain no validation teacher targets; student patience monitors `val_task_loss`.
+Old banks with validation blocks must be regenerated for new runs. Do not replace code or banks
+under an active campaign; historical results retain their original validation monitor.
+
 The commands above run in the foreground; for disconnect safety keep the same runner
 and add only shell-level logging/backgrounding (or tmux):
 
@@ -278,3 +283,13 @@ before arranging a restart. The V3.1 students must not receive `--rescore-reason
 that flag belongs only to EgoStitch held-out scoring. A test-stage failure after
 publication does not require rebuilding the teacher or banks; the published student
 checkpoint remains available for test recovery.
+
+G_val learning-curve diagnostics use a separate output directory and the same teacher checkpoint:
+
+    hpc/run.sh kd-targets --validation --device cuda --config STUDENT_CONFIG --checkpoint TEACHER_CHECKPOINT --output ORACLE_VAL_BANK
+
+Set the student config's distill.validation_targets_path to ORACLE_VAL_BANK.
+This optional bank covers exactly val_cls pairs on G_val and only adds per-epoch diagnostic
+metrics. Training targets remain on G_train; early stopping uses validation task BCE.
+The validation mode supports the same --row-shard / --merge workflow and cannot be combined
+with --contexts. Rebuild banks for new runs; preserve banks used by active jobs.

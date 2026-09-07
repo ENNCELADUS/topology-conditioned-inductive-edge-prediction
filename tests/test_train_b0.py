@@ -610,7 +610,6 @@ class TestTrainLoopSyntheticPairMlp:
                 "val_auroc",
                 "val_auprc",
                 "val_task_loss",
-                "val_total_loss",
             }
 
     def test_checkpoint_save_reload_reproduces_logits_exactly(self) -> None:
@@ -1987,7 +1986,7 @@ def test_topology_from_metrics_row_rejects_legacy_full_universe_threshold() -> N
     assert _topology_from_metrics_row(row) is None
 
 
-def test_ddp_loop_topology_path_really_stops_on_val_total_loss(tmp_path: Path) -> None:
+def test_ddp_loop_topology_path_really_stops_on_val_task_loss(tmp_path: Path) -> None:
     """The topology path stops for real; patience is no longer counterfactual."""
     config_path = tmp_path / "cfg.yaml"
     _write_yaml_config(config_path, {"optim.epochs": 4, "eval.patience": 1})
@@ -2087,7 +2086,6 @@ def test_ddp_loop_defers_the_stop_to_the_next_topology_due_epoch(tmp_path: Path)
                 ),
                 threshold=0.3,
             ),
-            None,
             losses[epoch],
         )
 
@@ -2095,7 +2093,7 @@ def test_ddp_loop_defers_the_stop_to_the_next_topology_due_epoch(tmp_path: Path)
         model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
     ) -> ValidationOutcome:
         epoch = next_epoch()
-        return ValidationOutcome(_constant_metrics(), None, None, losses[epoch])
+        return ValidationOutcome(_constant_metrics(), None, losses[epoch])
 
     result = train_ddp_loop(
         _StochasticLossModel(),
@@ -2191,7 +2189,7 @@ def test_ddp_loop_topology_every_skips_rows_and_selects_topology_epochs(tmp_path
 
 
 def test_classification_only_ddp_loop_stops_on_loss_and_selects_by_auprc(tmp_path: Path) -> None:
-    """Patience counts on val_total_loss; the published epoch is still the AUPRC argmax.
+    """Patience counts on val_task_loss; the published epoch is still the AUPRC argmax.
 
     AUPRC rises every epoch while the loss rises after epoch 1, so a monitor that
     had not been swapped would run the full schedule. The selected epoch is the
@@ -2241,7 +2239,7 @@ def test_classification_only_ddp_loop_stops_on_loss_and_selects_by_auprc(tmp_pat
     assert result.best_epoch == 2
     assert result.stop_epoch == 2
     assert [entry["epoch"] for entry in result.history] == [1, 2]
-    assert [entry["val_total_loss"] for entry in result.history] == [0.30, 0.40]
+    assert [entry["val_task_loss"] for entry in result.history] == [0.30, 0.40]
     assert result.runtime_profile["epochs_completed"] == 2
     assert result.runtime_profile["stopped_early"] is True
 
@@ -2711,7 +2709,7 @@ def test_ddp_loop_resume_matches_uninterrupted_epoch_boundary(tmp_path: Path) ->
     assert finalization_only.best_epoch == uninterrupted.best_epoch
 
 
-def test_ddp_loop_resume_restores_the_val_total_loss_low_water_mark(tmp_path: Path) -> None:
+def test_ddp_loop_resume_restores_the_val_task_loss_low_water_mark(tmp_path: Path) -> None:
     """Patience must not reset across a resume.
 
     The prior attempt sets the low-water mark at epoch 1 (0.10) and burns one
@@ -2771,7 +2769,7 @@ def test_ddp_loop_resume_restores_the_val_total_loss_low_water_mark(tmp_path: Pa
     )
 
     assert [row["epoch"] for row in resumed.history] == [1, 2, 3]
-    assert [row["val_total_loss"] for row in resumed.history] == [0.10, 0.50, 0.20]
+    assert [row["val_task_loss"] for row in resumed.history] == [0.10, 0.50, 0.20]
     assert resumed.stopped_early is True
     assert resumed.stop_epoch == 3
 
@@ -2981,11 +2979,18 @@ def test_student_weighted_bce_matches_teacher_objective() -> None:
     model.label_smoothing = 0.0
     model.eval()
     labels = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    batch = {"emb_a": torch.randn(6, 3, 8), "emb_b": torch.randn(6, 3, 8),
-             "len_a": torch.full((6,), 3), "len_b": torch.full((6,), 3), "label": labels}
+    batch = {
+        "emb_a": torch.randn(6, 3, 8),
+        "emb_b": torch.randn(6, 3, 8),
+        "len_a": torch.full((6,), 3),
+        "len_b": torch.full((6,), 3),
+        "label": labels,
+    }
     output = model(batch)
     expected = e2e_weighted_bce_with_logits(
-        output["logits"].reshape_as(labels), labels, torch.ones_like(labels),
+        output["logits"].reshape_as(labels),
+        labels,
+        torch.ones_like(labels),
         positive_weight=5.0,
     )
     torch.testing.assert_close(output["loss"], expected)

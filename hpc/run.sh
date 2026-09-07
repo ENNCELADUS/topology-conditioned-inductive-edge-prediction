@@ -52,7 +52,7 @@ controls (`structure_control_6a_v3`, `structure_control_6e_v1`), which reuse
 the `full` arm's checkpoint and have no pipeline run of their own.
 
 The kd-targets command is a thin passthrough to `python -m
-src.distill.teacher_targets`. By default it dumps full-training-row + V_val-row
+src.distill.teacher_targets`. By default it dumps training-corpus row
 targets; pass `--contexts` to dump the shared epoch-indexed KD2 context banks.
 Both modes take one published `full_ego_oracle` checkpoint and a training
 `--config`. Use a fresh unique `--output` for every dump so stale shards cannot

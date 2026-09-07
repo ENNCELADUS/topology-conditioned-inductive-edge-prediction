@@ -1,58 +1,14 @@
-r"""Dump Full-Ego Pooled Oracle KD teacher targets over the trainer's official rows.
+r"""Dump training-only targets from a frozen Full-Ego teacher on G_train.
 
-CLI (full-row KD rework -- replaces the sampled anchor-context stream):
+Rows come from the student's shared dynamic training corpus. ``--contexts``
+dumps epoch-indexed strict-LLP training contexts. Both exclude V_val-internal
+pairs, preserve cross-boundary training edges, and use the same training graph
+as the teacher. The separate --validation mode scores fixed val_cls pairs on G_val for
+diagnostics only; it never adds them to training banks.
+The generator masks the queried edge during pair assembly. Cached node states
+remain reusable; pair scoring stays FP32 without autocast.
 
-    python -m src.distill.teacher_targets \\
-        --config configs/b0_v31_breadth_first.yaml \\
-        --checkpoint outputs/.../best.pt \\
-        --output outputs/distill/kd_row_targets_breadth_first --device cuda \\
-        [--rep-source topo|fused]
-
-Row universe: this module re-derives the trainer's own row lists
-(`src.train_b0.assemble_data` + `_dynamic_training_corpus`/`_val_cls_rows`) from the
-same training YAML rather than sampling anchor/context pairs -- the training
-block covers the unique union of sampled pairs across configured training epochs,
-in the trainer's exact corpus order (row_id == array position), so the artifact is directly
-joinable against it by position; the validation block covers the official
-V_val classification rows. See `src.distill.artifacts` for the resulting
-`kd_row_targets_v1` format.
-
-Query-edge masking (structural, not reimplemented here): the teacher is the
-`full_ego_oracle` generator, and its `stitch`
-(`src/model/egostitch/generator/full_oracle/generator.py`) already excludes
-the queried edge from both endpoints' structural context per pair -- the
-endpoints' neighbor channels drop the partner (``keep = values !=
-partners[owners]``) and the adjacency skips the query edge (``keep = found &
-~query_edge``). A positive training edge is therefore never visible in its
-own structural context, and because this masking is applied per pair inside
-`stitch`, not by mutating the underlying graph, the per-node encode-once
-cache (`encode_all_nodes`) -- which carries only row identity, never
-edge-masked state -- stays masking-safe: the same cached node state is
-correctly reusable across every row touching that node.
-
-Legality (never bind anything but a truth graph free of V_val-internal
-edges): the truth graph is `ValRegionSplit.build_training_graph()` --
-loopless training positives over every train node, so V_val nodes appear
-only through their cross-boundary neighbors, never through a V_val-internal
-edge, by construction. `assert_training_side_only` hard-refuses if a
-benchmark test-split node reaches the truth graph or the node universe, or if
-the truth graph somehow carries a V_val-internal edge.
-`assert_no_val_internal_training_rows` additionally hard-refuses a *training*
-row with both endpoints inside V_val (the validation block is exempt: those
-rows are the held-out V_val classification rows, scored only for
-validation-side diagnostics).
-
-Architecture: this module reuses `score_universe.py`'s lower-level,
-universe-agnostic building blocks directly (`_load_checkpoint`,
-`_install_oracle_context`, `_file_sha256`, `_shard_range`,
-`_oracle_truth_graph_sha256`) and mirrors its per-node encode-once cache +
-`build_pair_context_from_states`/`score_pair_context` pattern
-(``_score_egostitch_e2e``) rather than duplicating either. Every pair is
-scored fp32 with no autocast on the pair pass, matching the
-``egostitch_e2e_pair_fp32_v1`` contract `_score_egostitch_e2e` itself uses --
-this artifact's `teacher_logit` must be numerically consistent with what a
-training-time rescoring of the same checkpoint would produce, not merely
-close.
+Example: hpc/run.sh kd-targets --config STUDENT --checkpoint TEACHER --output BANK
 """
 
 from __future__ import annotations
@@ -80,7 +36,6 @@ from src.distill.context_sampler import (
     DEFAULT_RW_STEP,
     ContextBank,
     sample_context_banks,
-    sample_v_val_context_bank,
 )
 from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
 from src.model.egostitch.generator.full_oracle import FullOracleGenerator
@@ -190,9 +145,6 @@ def require_full_ego_oracle(model: EgoStitchModel) -> FullOracleGenerator:
 def assert_no_val_internal_training_rows(train_rows: Sequence[Pair], v_val: frozenset[str]) -> None:
     """Hard-refuse a training row with both endpoints inside V_val.
 
-    The validation block is exempt: `_val_cls_rows` rows are the held-out
-    V_val classification rows, scored only for validation-side diagnostics.
-
     Raises:
         ValueError: If any training row has both endpoints inside `v_val`.
     """
@@ -224,8 +176,8 @@ def _row_positions(
 
 
 def index_context_banks(
-    banks: Sequence[ContextBank], val_bank: ContextBank
-) -> tuple[NDArray[np.int32], NDArray[np.int32], tuple[KDContextBank, ...], KDContextBank]:
+    banks: Sequence[ContextBank],
+) -> tuple[NDArray[np.int32], NDArray[np.int32], tuple[KDContextBank, ...]]:
     """Stable-deduplicate all context pairs and join each CSR row to its score row."""
     pair_to_score: dict[tuple[int, int], int] = {}
     pair_a: list[int] = []
@@ -254,12 +206,10 @@ def index_context_banks(
         )
 
     indexed_banks = tuple(index_bank(bank) for bank in banks)
-    indexed_val_bank = index_bank(val_bank)
     return (
         np.asarray(pair_a, dtype=np.int32),
         np.asarray(pair_b, dtype=np.int32),
         indexed_banks,
-        indexed_val_bank,
     )
 
 
@@ -492,13 +442,10 @@ _STATS_EPS = 1e-12
 def build_stats_report(
     train_logit: NDArray[np.float32],
     train_label: NDArray[np.int8],
-    val_logit: NDArray[np.float32],
-    val_label: NDArray[np.int8],
 ) -> dict[str, object]:
-    """Per-block (train, val) entropy/calibration pre-check summary stats."""
+    """Training-target score and entropy summary statistics."""
     return {
         "train": _block_stats(train_logit, train_label),
-        "val": _block_stats(val_logit, val_label),
     }
 
 
@@ -721,7 +668,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--validation", action="store_true", help="Dump diagnostic-only val_cls targets on G_val"
+    )
+    mode.add_argument(
         "--contexts",
         action="store_true",
         help="Dump epoch-indexed strict-LLP context targets instead of official row targets",
@@ -770,8 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--row-shard",
         type=str,
         default=None,
-        help="'I/N': score only row shard I of N of the combined train+val row list "
-        "(resume sharding)",
+        help="'I/N': score only row shard I of N of the selected row list (resume sharding)",
     )
     parser.add_argument(
         "--merge",
@@ -790,7 +740,7 @@ def _finalize_context_artifact(
     pair_b_idx: NDArray[np.int32],
     teacher_logit: NDArray[np.float32],
     banks: Sequence[KDContextBank],
-    val_bank: KDContextBank,
+    forbidden_node_idx: NDArray[np.int32],
     checkpoint_id: str | None,
 ) -> None:
     write_kd_context_targets(
@@ -800,7 +750,7 @@ def _finalize_context_artifact(
         pair_b_idx=pair_b_idx,
         teacher_logit=teacher_logit,
         banks=banks,
-        val_bank=val_bank,
+        forbidden_node_idx=forbidden_node_idx,
         sampler_params={
             "rw_step": args.rw_step,
             "hops": args.hops,
@@ -821,7 +771,7 @@ def _finish_context_merge(
     pair_a_idx: NDArray[np.int32],
     pair_b_idx: NDArray[np.int32],
     banks: Sequence[KDContextBank],
-    val_bank: KDContextBank,
+    forbidden_node_idx: NDArray[np.int32],
     num_shards: int,
     *,
     checkpoint_id_override: str | None = None,
@@ -842,7 +792,7 @@ def _finish_context_merge(
         pair_b_idx,
         teacher_logit,
         banks,
-        val_bank,
+        forbidden_node_idx,
         checkpoint_id,
     )
 
@@ -855,12 +805,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     cfg = load_config(args.config)
     assembled = assemble_data(cfg, verify=True)
     split = assembled.val_split
-    val_rows, val_labels = _val_cls_rows(split, assembled.exclude_nodes)
 
-    truth_graph = truth_graph_for_kd(split)
-    node_ids = sorted(split.train_nodes - assembled.exclude_nodes)
-    test_nodes = frozenset(assembled.benchmark.split.test_nodes)
-    assert_training_side_only(node_ids, truth_graph, split, test_nodes)
+    if args.validation:
+        truth_graph = split.build_g_val_simple()
+        node_ids = sorted(split.v_val - assembled.exclude_nodes)
+    else:
+        truth_graph = truth_graph_for_kd(split)
+        node_ids = sorted(split.train_nodes - assembled.exclude_nodes)
+        test_nodes = frozenset(assembled.benchmark.split.test_nodes)
+        assert_training_side_only(node_ids, truth_graph, split, test_nodes)
 
     if args.contexts:
         banks = sample_context_banks(
@@ -874,17 +827,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             hops=args.hops,
             ns_rate=args.ns_rate,
         )
-        val_bank = sample_v_val_context_bank(
-            truth_graph,
-            v_val=split.v_val,
-            node_ids=node_ids,
-            rw_step=args.rw_step,
-            hops=args.hops,
-            ns_rate=args.ns_rate,
+        forbidden_node_idx = np.asarray(
+            [i for i, node in enumerate(node_ids) if node in split.v_val], dtype=np.int32
         )
-        pair_a_idx, pair_b_idx, indexed_banks, indexed_val_bank = index_context_banks(
-            banks, val_bank
-        )
+        pair_a_idx, pair_b_idx, indexed_banks = index_context_banks(banks)
         if args.merge:
             if args.row_shard is None:
                 raise ValueError("--merge requires --row-shard I/N to know the shard count")
@@ -896,7 +842,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 pair_a_idx,
                 pair_b_idx,
                 indexed_banks,
-                indexed_val_bank,
+                forbidden_node_idx,
                 num_shards,
             )
             return
@@ -967,7 +913,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             pair_b_idx,
             scored.teacher_logit,
             indexed_banks,
-            indexed_val_bank,
+            forbidden_node_idx,
             checkpoint_id,
         )
         if args.verify_sample > 0:
@@ -983,22 +929,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         return
 
-    corpus = _dynamic_training_corpus(cfg, assembled)
-    train_rows, train_labels = corpus.pairs, corpus.labels
-    assert_no_val_internal_training_rows(train_rows, split.v_val)
+    if args.validation:
+        rows, row_labels = _val_cls_rows(split, assembled.exclude_nodes)
+    else:
+        corpus = _dynamic_training_corpus(cfg, assembled)
+        rows, row_labels = corpus.pairs, corpus.labels
+        assert_no_val_internal_training_rows(rows, split.v_val)
 
     position = {node_id: i for i, node_id in enumerate(node_ids)}
-    combined_rows = train_rows + val_rows
-    a_idx, b_idx = _row_positions(combined_rows, position)
-    labels = np.array(train_labels + val_labels, dtype=np.int8)
-    n_train = len(train_rows)
-    n_total = len(combined_rows)
+    a_idx, b_idx = _row_positions(rows, position)
+    labels = np.array(row_labels, dtype=np.int8)
+    n_total = len(rows)
 
     if args.merge:
         if args.row_shard is None:
             raise ValueError("--merge requires --row-shard I/N to know the shard count")
         _, num_shards = _parse_shard(args.row_shard)
-        _finish_merge(args, node_ids, truth_graph, a_idx, b_idx, labels, n_train, num_shards)
+        _finish_merge(args, node_ids, truth_graph, a_idx, b_idx, labels, num_shards)
         return
 
     shard_range: tuple[int, int, int] | None = None
@@ -1059,7 +1006,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 a_idx,
                 b_idx,
                 labels,
-                n_train,
                 num_shards,
                 checkpoint_id_override=checkpoint_id,
             )
@@ -1075,9 +1021,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         batch_pairs=args.batch_pairs,
         rep_source=args.rep_source,
     )
-    _finalize_artifact(
-        args, node_ids, truth_graph, a_idx, b_idx, labels, n_train, scored, checkpoint_id
-    )
+    _finalize_artifact(args, node_ids, truth_graph, a_idx, b_idx, labels, scored, checkpoint_id)
     if args.verify_sample > 0:
         verify_sample(
             model,
@@ -1098,7 +1042,6 @@ def _finish_merge(
     a_idx: NDArray[np.int32],
     b_idx: NDArray[np.int32],
     labels: NDArray[np.int8],
-    n_train: int,
     num_shards: int,
     *,
     checkpoint_id_override: str | None = None,
@@ -1112,9 +1055,7 @@ def _finish_merge(
             raise ValueError(
                 f"KD teacher targets require model_family 'egostitch_e2e', got {model_family!r}"
             )
-    _finalize_artifact(
-        args, node_ids, truth_graph, a_idx, b_idx, labels, n_train, scored, checkpoint_id
-    )
+    _finalize_artifact(args, node_ids, truth_graph, a_idx, b_idx, labels, scored, checkpoint_id)
 
 
 def _finalize_artifact(
@@ -1124,7 +1065,6 @@ def _finalize_artifact(
     a_idx: NDArray[np.int32],
     b_idx: NDArray[np.int32],
     labels: NDArray[np.int8],
-    n_train: int,
     scored: ScoredRows,
     checkpoint_id: str | None,
 ) -> None:
@@ -1132,28 +1072,24 @@ def _finalize_artifact(
     write_kd_targets(
         args.output,
         node_ids=node_ids,
-        pair_a_idx=a_idx[:n_train],
-        pair_b_idx=b_idx[:n_train],
-        pair_label=labels[:n_train],
-        teacher_logit=scored.teacher_logit[:n_train],
-        teacher_rep=scored.teacher_rep[:n_train],
-        val_pair_a_idx=a_idx[n_train:],
-        val_pair_b_idx=b_idx[n_train:],
-        val_pair_label=labels[n_train:],
-        val_teacher_logit=scored.teacher_logit[n_train:],
-        val_teacher_rep=scored.teacher_rep[n_train:],
+        pair_a_idx=a_idx,
+        pair_b_idx=b_idx,
+        pair_label=labels,
+        teacher_logit=scored.teacher_logit,
+        teacher_rep=scored.teacher_rep,
         truth_graph_sha256=_oracle_truth_graph_sha256(truth_graph),
         checkpoint_path=args.checkpoint,
         checkpoint_sha256=checkpoint_sha256,
         checkpoint_id=checkpoint_id,
         rep_source=args.rep_source,
+        truth_source="validation_structure" if args.validation else "training_structure",
     )
     report = build_stats_report(
-        scored.teacher_logit[:n_train],
-        labels[:n_train],
-        scored.teacher_logit[n_train:],
-        labels[n_train:],
+        scored.teacher_logit,
+        labels,
     )
+    if args.validation:
+        report = {"validation": report["train"], "truth_source": "validation_structure"}
     write_stats_report(args.output, report)
 
 

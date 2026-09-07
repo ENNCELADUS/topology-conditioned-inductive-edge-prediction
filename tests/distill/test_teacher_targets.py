@@ -3,7 +3,7 @@
 Covers row-universe legality (training-side-only refusal, V_val-internal
 row quarantine, off-universe endpoint refusal), the query-edge masking
 property the whole KD design leans on, shard/merge round-tripping, the
-pre-check stats report, and the `kd_row_targets_v1` artifact round-trip.
+pre-check stats report, and the `kd_row_targets_v2` artifact round-trip.
 
 The CLI (`main`) itself -- checkpoint I/O, `--row-shard` process sharding,
 F0 caching -- is not covered by a synthetic end-to-end fixture here: it is
@@ -36,6 +36,7 @@ from src.model.egostitch.generator.egostitch import GeneratorNodeState
 from src.model.egostitch.generator.full_oracle import FullEgoGraph, FullOracleGenerator
 from src.model.egostitch.generator.null import NullGenerator
 from src.score_universe import _install_oracle_context, _shard_range
+from src.train_b0 import _val_cls_rows
 
 pytestmark = pytest.mark.unit
 
@@ -448,13 +449,11 @@ def test_merge_shards_raises_on_a_row_identity_mismatch(tmp_path: Path) -> None:
 def test_build_stats_report_shape_and_keys() -> None:
     train_logit = np.array([1.0, -1.0, 0.5], dtype=np.float32)
     train_label = np.array([1, 0, 1], dtype=np.int8)
-    val_logit = np.array([0.2], dtype=np.float32)
-    val_label = np.array([0], dtype=np.int8)
 
-    report = tt.build_stats_report(train_logit, train_label, val_logit, val_label)
+    report = tt.build_stats_report(train_logit, train_label)
 
-    assert set(report) == {"train", "val"}
-    for block_name, expected_n_rows in (("train", 3), ("val", 1)):
+    assert set(report) == {"train"}
+    for block_name, expected_n_rows in (("train", 3),):
         block = report[block_name]
         assert isinstance(block, dict)
         assert block["n_rows"] == expected_n_rows
@@ -473,10 +472,8 @@ def test_build_stats_report_shape_and_keys() -> None:
 def test_build_stats_report_histograms_are_empty_safe() -> None:
     train_logit = np.array([1.0, -1.0], dtype=np.float32)
     train_label = np.array([0, 0], dtype=np.int8)  # no positives at all
-    val_logit = np.array([], dtype=np.float32)
-    val_label = np.array([], dtype=np.int8)
 
-    report = tt.build_stats_report(train_logit, train_label, val_logit, val_label)
+    report = tt.build_stats_report(train_logit, train_label)
 
     train_block = report["train"]
     assert isinstance(train_block, dict)
@@ -489,13 +486,7 @@ def test_build_stats_report_histograms_are_empty_safe() -> None:
         "p90": 0.0,
     }
 
-    val_block = report["val"]
-    assert isinstance(val_block, dict)
-    assert val_block["n_rows"] == 0
-    assert val_block["label_prevalence"] == 0.0
-    val_overall = val_block["teacher_logit_overall"]
-    assert isinstance(val_overall, dict)
-    assert val_overall["count"] == 0
+    assert "val" not in report
 
 
 # --------------------------------------------------------------------------- artifact round-trip
@@ -511,11 +502,6 @@ def _write_toy_artifact(path: Path) -> None:
         pair_label=np.array([1, 0, 1], dtype=np.int8),
         teacher_logit=np.array([0.5, -0.3, 1.2], dtype=np.float32),
         teacher_rep=rng.standard_normal((3, 4)).astype(np.float16),
-        val_pair_a_idx=np.array([0], dtype=np.int32),
-        val_pair_b_idx=np.array([2], dtype=np.int32),
-        val_pair_label=np.array([0], dtype=np.int8),
-        val_teacher_logit=np.array([0.1], dtype=np.float32),
-        val_teacher_rep=rng.standard_normal((1, 4)).astype(np.float16),
         truth_graph_sha256="deadbeef",
         checkpoint_path=Path("checkpoint.pt"),
         checkpoint_sha256="cafebabe",
@@ -537,12 +523,17 @@ def test_load_kd_targets_has_no_seeds_surface(tmp_path: Path) -> None:
         loaded.teacher_logit, np.array([0.5, -0.3, 1.2], dtype=np.float32)
     )
     assert loaded.teacher_rep.shape == (3, 4)
-    np.testing.assert_array_equal(loaded.val_pair_a_idx, [0])
-    np.testing.assert_array_equal(loaded.val_pair_b_idx, [2])
-    np.testing.assert_array_equal(loaded.val_pair_label, [0])
-    np.testing.assert_array_equal(loaded.val_teacher_logit, np.array([0.1], dtype=np.float32))
-    assert loaded.val_teacher_rep.shape == (1, 4)
-    assert loaded.manifest["format"] == "kd_row_targets_v1"
+    assert not hasattr(loaded, "val_teacher_logit")
+    assert "n_val_rows" not in loaded.manifest
+    with np.load(artifact_dir / "targets.npz") as archive:
+        assert set(archive.files) == {
+            "pair_a_idx",
+            "pair_b_idx",
+            "pair_label",
+            "teacher_logit",
+            "teacher_rep",
+        }
+    assert loaded.manifest["format"] == "kd_row_targets_v2"
     assert loaded.manifest["truth_source"] == "training_structure"
     assert loaded.manifest["checkpoint_id"] == "abc123"
     assert not hasattr(loaded, "teacher_seeds")
@@ -584,7 +575,9 @@ def test_load_rejects_an_npz_carrying_a_legacy_anchor_offsets_array(tmp_path: Pa
         val_teacher_rep=rng.standard_normal((1, 4)).astype(np.float16),
         anchor_offsets=np.array([0, 1], dtype=np.int64),  # obsolete v2 array
     )
-    (artifact_dir / "manifest.json").write_text(json.dumps({"format": "kd_row_targets_v1"}))
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps({"format": "kd_row_targets_v2", "truth_source": "training_structure"})
+    )
     (artifact_dir / "node_ids.json").write_text(json.dumps(["a", "b"]))
 
     with pytest.raises(ValueError, match="arrays must be exactly"):
@@ -638,16 +631,14 @@ def test_index_context_banks_stably_deduplicates_and_preserves_csr_identity() ->
         _context_bank([0, 1], [0, 2, 3], [1, 1, 2], [True, False, True]),
         _context_bank([0, 1], [0, 1, 3], [2, 2, 0], [False, True, False]),
     )
-    val_bank = _context_bank([2], [0, 2], [0, 1], [True, False])
 
-    pair_a, pair_b, indexed, indexed_val = tt.index_context_banks(banks, val_bank)
+    pair_a, pair_b, indexed = tt.index_context_banks(banks)
 
-    np.testing.assert_array_equal(pair_a, [0, 1, 0, 1, 2, 2])
-    np.testing.assert_array_equal(pair_b, [1, 2, 2, 0, 0, 1])
+    np.testing.assert_array_equal(pair_a, [0, 1, 0, 1])
+    np.testing.assert_array_equal(pair_b, [1, 2, 2, 0])
     np.testing.assert_array_equal(indexed[0].score_idx, [0, 0, 1])
     np.testing.assert_array_equal(indexed[1].score_idx, [2, 1, 3])
-    np.testing.assert_array_equal(indexed_val.score_idx, [4, 5])
-    for source, joined in zip((*banks, val_bank), (*indexed, indexed_val), strict=True):
+    for source, joined in zip(banks, indexed, strict=True):
         anchors = np.repeat(joined.anchor_idx, np.diff(joined.anchor_offsets))
         np.testing.assert_array_equal(pair_a[joined.score_idx], anchors)
         np.testing.assert_array_equal(pair_b[joined.score_idx], source.partner_idx)
@@ -713,7 +704,7 @@ def test_finalize_context_artifact_has_no_teacher_rep(tmp_path: Path) -> None:
         pair_b,
         np.array([0.25, -0.5], dtype=np.float32),
         [bank],
-        val_bank,
+        val_bank.anchor_idx,
         "checkpoint-id",
     )
 
@@ -797,7 +788,46 @@ def test_finalize_context_artifact_records_cli_sampler_params(
         np.zeros(1, dtype=np.int32),
         np.zeros(1, dtype=np.float32),
         [],
-        empty_bank,
+        empty_bank.anchor_idx,
         "cafe0000",
     )
     assert captured["sampler_params"] == {"rw_step": 3, "hops": 3, "ns_rate": 5}
+
+
+def test_validation_cli_uses_g_val_and_exact_cls_pairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    split = _toy_split()
+    assembled = SimpleNamespace(val_split=split, exclude_nodes=frozenset())
+    monkeypatch.setattr(tt, "load_config", lambda path: object())
+    monkeypatch.setattr(tt, "assemble_data", lambda cfg, verify: assembled)
+    wrong_graph = Mock(side_effect=AssertionError("G_train must not score validation"))
+    monkeypatch.setattr(tt, "truth_graph_for_kd", wrong_graph)
+    finish = Mock()
+    monkeypatch.setattr(tt, "_finish_merge", finish)
+    tt.main(
+        [
+            "--config",
+            "student.yaml",
+            "--checkpoint",
+            "teacher.pt",
+            "--output",
+            str(tmp_path),
+            "--validation",
+            "--merge",
+            "--row-shard",
+            "0/2",
+        ]
+    )
+    args, nodes, graph, a, b, labels, n_shards = finish.call_args.args
+    pairs, expected_labels = _val_cls_rows(split, frozenset())
+    assert set(graph.nodes) == split.v_val
+    assert set(graph.edges) == set(split.build_g_val_simple().edges)
+    assert [(nodes[u], nodes[v]) for u, v in zip(a, b, strict=True)] == pairs
+    np.testing.assert_array_equal(labels, expected_labels)
+    assert n_shards == 2 and args.validation
+    wrong_graph.assert_not_called()

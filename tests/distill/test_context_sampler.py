@@ -9,7 +9,6 @@ from src.distill.context_sampler import (
     ContextBank,
     sample_context_bank,
     sample_context_banks,
-    sample_v_val_context_bank,
 )
 
 pytestmark = pytest.mark.unit
@@ -209,24 +208,6 @@ def test_epoch_bank_helper_uses_epoch_index() -> None:
 
     assert len(banks) == 3
     assert not np.array_equal(banks[0].partner_idx, banks[1].partner_idx)
-
-
-def test_v_val_diagnostic_bank_is_fixed_and_uses_only_feature_bearing_anchors() -> None:
-    graph = nx.Graph()
-    graph.add_nodes_from(["outside", "v_a", "v_b", "v_featureless"])
-    node_ids = ["outside", "v_a", "v_b"]
-    v_val = frozenset({"v_a", "v_b", "v_featureless"})
-
-    first = sample_v_val_context_bank(
-        graph, v_val=v_val, node_ids=node_ids, rw_step=1, hops=1, ns_rate=1
-    )
-    second = sample_v_val_context_bank(
-        graph, v_val=v_val, node_ids=node_ids, rw_step=1, hops=1, ns_rate=1
-    )
-
-    assert first.anchor_idx.tolist() == [1, 2]
-    np.testing.assert_array_equal(first.partner_idx, second.partner_idx)
-    assert first.partner_idx[~first.is_near].tolist() == [0, 0]
 
 
 def test_rejects_self_loops_and_an_empty_random_pool() -> None:

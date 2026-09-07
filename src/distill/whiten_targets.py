@@ -2,10 +2,10 @@ r"""Whitened-axis KD row targets for the ``kd_white`` arm.
 
 Projects a dumped teacher bank's ``teacher_rep`` onto its top PCA axes (fit on
 the training block), standardizes each retained axis to unit variance on the
-training rows, and packs the selected axes as a ``kd_row_targets_v1`` bank the
+training rows, and packs the selected axes as a ``kd_row_targets_v2`` bank the
 trainer regresses through the same auxiliary head as ``kd_struct``. Dropping
 axis 1 keeps the arm orthogonal to the logit KD (the top axis is the teacher
-logit); the V_val block is transformed with the training statistics.
+logit).
 
     python -m src.distill.whiten_targets --bank outputs/distill/kd_row_targets_pma1_breadth_first \\
         --axes 2-8 --output outputs/distill/kd_row_targets_pma1_white_breadth_first
@@ -34,15 +34,12 @@ class WhitenedAxes:
     """Top-``k`` PCA coordinates, unit variance on the training block."""
 
     train: F64
-    val: F64
     axis_std: F64
     var_share: F64
-    val_shift: F64
-    val_std: F64
 
 
-def whiten_axes(rep_tr: F64, rep_va: F64, *, k: int) -> WhitenedAxes:
-    """Project both blocks onto the training block's top-``k`` centered PCA axes.
+def whiten_axes(rep_tr: F64, *, k: int) -> WhitenedAxes:
+    """Project training representations onto their top-``k`` centered PCA axes.
 
     Raises:
         ValueError: If ``k`` exceeds the bank's dimensions or numerical rank.
@@ -56,10 +53,7 @@ def whiten_axes(rep_tr: F64, rep_va: F64, *, k: int) -> WhitenedAxes:
     if not np.all(axis_std > 0.0):
         raise ValueError(f"k={k} exceeds the bank's numerical rank")
     train = ((rep_tr - mu) @ vt[:k].T) / axis_std
-    val = ((rep_va - mu) @ vt[:k].T) / axis_std
-    return WhitenedAxes(
-        train, val, axis_std, var[:k] / var.sum(), val.mean(axis=0), val.std(axis=0)
-    )
+    return WhitenedAxes(train, axis_std, var[:k] / var.sum())
 
 
 def whitened_row_targets(bank: KDRowTargets, *, axes: tuple[int, int]) -> KDRowTargets:
@@ -71,9 +65,7 @@ def whitened_row_targets(bank: KDRowTargets, *, axes: tuple[int, int]) -> KDRowT
     first, last = axes
     if first < 1 or last < first:
         raise ValueError(f"axes must satisfy 1 <= first <= last, got {axes}")
-    white = whiten_axes(
-        bank.teacher_rep.astype(np.float64), bank.val_teacher_rep.astype(np.float64), k=last
-    )
+    white = whiten_axes(bank.teacher_rep.astype(np.float64), k=last)
     sel = slice(first - 1, last)
     names = [f"pc{i}" for i in range(first, last + 1)]
     manifest = {
@@ -83,7 +75,6 @@ def whitened_row_targets(bank: KDRowTargets, *, axes: tuple[int, int]) -> KDRowT
         "axes": list(range(first, last + 1)),
         "axis_std": white.axis_std[sel].tolist(),
         "axis_var_share": white.var_share[sel].tolist(),
-        "val_shift_whitened": white.val_shift[sel].tolist(),
     }
     return KDRowTargets(
         node_ids=bank.node_ids,
@@ -92,11 +83,6 @@ def whitened_row_targets(bank: KDRowTargets, *, axes: tuple[int, int]) -> KDRowT
         pair_label=bank.pair_label,
         teacher_logit=bank.teacher_logit,
         teacher_rep=white.train[:, sel].astype(np.float16),
-        val_pair_a_idx=bank.val_pair_a_idx,
-        val_pair_b_idx=bank.val_pair_b_idx,
-        val_pair_label=bank.val_pair_label,
-        val_teacher_logit=bank.val_teacher_logit,
-        val_teacher_rep=white.val[:, sel].astype(np.float16),
         manifest=manifest,
     )
 
@@ -125,11 +111,6 @@ def main(argv: list[str] | None = None) -> None:
         pair_label=out.pair_label,
         teacher_logit=out.teacher_logit,
         teacher_rep=out.teacher_rep,
-        val_pair_a_idx=out.val_pair_a_idx,
-        val_pair_b_idx=out.val_pair_b_idx,
-        val_pair_label=out.val_pair_label,
-        val_teacher_logit=out.val_teacher_logit,
-        val_teacher_rep=out.val_teacher_rep,
         truth_graph_sha256=str(bank.manifest.get("truth_graph_sha256", "")),
         checkpoint_path=Path(str(bank.manifest.get("checkpoint_path", ""))),
         checkpoint_sha256=str(bank.manifest.get("checkpoint_sha256", "")),

@@ -32,14 +32,12 @@ from src.distill.artifacts import (
     write_kd_targets,
 )
 from src.distill.config import DistillConfig
-from src.distill.losses import kd_dist_loss, kd_gram_loss, kd_logit_loss, kd_rank_loss, kd_rep_loss
-from src.distill.struct_targets import STRUCT_NAMES, structural_row_targets
-from src.eval.early_stopping import compose_val_total
+from src.distill.losses import kd_dist_loss, kd_gram_loss, kd_logit_loss, kd_rank_loss
+from src.distill.struct_targets import structural_row_targets
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.train_b0 import (
     KDContextStream,
     KDRowBank,
-    KDValDiagnostics,
     ValidationOutcome,
     _evaluate_distributed,
     _gather_global_relational_rows,
@@ -163,11 +161,6 @@ def _production_rank_bank_worker(
             pair_label=np.array([1, 0, 0], dtype=np.int8),
             teacher_logit=np.array([-1.0, 1.0, 0.5], dtype=np.float32),
             teacher_rep=np.zeros((3, 2), dtype=np.float16),
-            val_pair_a_idx=np.array([0], dtype=np.int32),
-            val_pair_b_idx=np.array([3], dtype=np.int32),
-            val_pair_label=np.array([1], dtype=np.int8),
-            val_teacher_logit=np.array([-1.0], dtype=np.float32),
-            val_teacher_rep=np.zeros((1, 2), dtype=np.float16),
             manifest={},
         )
         base = _ProductionRankToy()
@@ -183,8 +176,6 @@ def _production_rank_bank_worker(
             targets,
             train_pairs=[("n0", "n3"), ("n1", "n3"), ("n2", "n4")],
             train_labels=[1, 0, 0],
-            val_pairs=[("n0", "n3")],
-            val_labels=[1],
             model=base,
             device=torch.device("cpu"),
         )
@@ -265,7 +256,6 @@ def _context_stream_ddp_worker(
                 "grad": base.weight.grad.detach(),
                 "forward_calls": base.forward_calls,
                 "backward_calls": len(backward_calls),
-                "validation": stream.validation_diagnostics(model),
             },
             Path(result_dir) / f"context-stream-{rank}.pt",
         )
@@ -303,12 +293,6 @@ def _write_targets(
         else np.zeros((len(train_pairs), rep_dim), dtype=np.float32)
     )
 
-    v_pairs = val_pairs if val_pairs is not None else train_pairs[:1]
-    v_labels = val_labels if val_labels is not None else train_labels[:1]
-    v_a_idx, v_b_idx = _node_index(node_ids, v_pairs)
-    v_logit = np.asarray(teacher_logit[: len(v_pairs)], dtype=np.float32)
-    v_rep = rep[: len(v_pairs)]
-
     write_kd_targets(
         out_dir,
         node_ids=node_ids,
@@ -317,11 +301,6 @@ def _write_targets(
         pair_label=np.asarray(train_labels, dtype=np.int8),
         teacher_logit=np.asarray(teacher_logit, dtype=np.float32),
         teacher_rep=np.asarray(rep, dtype=np.float32),
-        val_pair_a_idx=v_a_idx,
-        val_pair_b_idx=v_b_idx,
-        val_pair_label=np.asarray(v_labels, dtype=np.int8),
-        val_teacher_logit=v_logit,
-        val_teacher_rep=v_rep,
         truth_graph_sha256="0" * 64,
         checkpoint_path=out_dir / "ckpt.pt",
         checkpoint_sha256="1" * 64,
@@ -368,7 +347,7 @@ def _context_fixture(
         pair_b_idx=partner_idx.copy(),
         teacher_logit=np.linspace(-2.0, 2.0, len(partner_idx), dtype=np.float32),
         banks=tuple(bank for _ in range(n_banks)),
-        val_bank=val_bank,
+        forbidden_node_idx=val_bank.anchor_idx,
         manifest={"n_banks": n_banks},
     )
     records = tuple(
@@ -421,7 +400,7 @@ def _ragged_context_fixture() -> tuple[KDContextTargets, PackedFeatureTable]:
         pair_b_idx=partner_idx.copy(),
         teacher_logit=np.linspace(-2.5, 2.0, len(partner_idx), dtype=np.float32),
         banks=(bank, bank),
-        val_bank=val_bank,
+        forbidden_node_idx=val_bank.anchor_idx,
         manifest={"n_banks": 2},
     )
     lengths = [1, 1, 1, 1, 1, 64, 160, 300, 500]
@@ -506,8 +485,6 @@ def _joint_official_losses(
         load_kd_targets(directory / "rows"),
         train_pairs=[("n0", "n3"), ("n1", "n3"), ("n2", "n3")],
         train_labels=[1, 0, 1],
-        val_pairs=[("n0", "n3")],
-        val_labels=[1],
         model=model,
         device=torch.device("cpu"),
     )
@@ -674,91 +651,6 @@ def test_context_stream_regroups_multiple_length_buckets_without_changing_loss()
     torch.testing.assert_close(reversed_loss, loss)
 
 
-@pytest.mark.parametrize("joint", [False, True], ids=["rank", "rank_rep"])
-def test_context_stream_spawned_ddp_accumulates_unequal_forwards_then_one_backward(
-    tmp_path: Path,
-    joint: bool,
-) -> None:
-    world_size = 2
-    if joint:
-        _write_targets(
-            tmp_path / "rows",
-            node_ids=["n0", "n1", "n2", "n3"],
-            train_pairs=[("n0", "n3"), ("n1", "n3"), ("n2", "n3")],
-            train_labels=[1, 0, 1],
-            teacher_logit=np.zeros(3, dtype=np.float32),
-            teacher_rep=np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=np.float32),
-        )
-    spawn(  # type: ignore[no-untyped-call]
-        _context_stream_ddp_worker,
-        args=(world_size, str(tmp_path / "context-stream-init"), str(tmp_path), joint),
-        nprocs=world_size,
-        join=True,
-    )
-    observed = [
-        torch.load(tmp_path / f"context-stream-{rank}.pt", weights_only=True)
-        for rank in range(world_size)
-    ]
-
-    targets, table = _ragged_context_fixture()
-    # The distributed global step groups are [0], [2, 1], [4, 3].
-    reference_targets = _reorder_context_targets(targets, [0, 2, 1, 4, 3])
-    reference = _ContextToy()
-    reference_losses = [
-        _context_stream(reference_targets, table).loss(reference, epoch=1, step=step, steps=3)[0]
-        for step in range(3)
-    ]
-    reference_loss = torch.stack(reference_losses).sum()
-    if joint:
-        task_loss, rep_loss = _joint_official_losses(reference, tmp_path, [0, 1, 2], 1)
-        reference_loss = reference_loss + task_loss + rep_loss
-    reference_loss.backward()  # type: ignore[no-untyped-call]
-    assert reference.weight.grad is not None
-
-    # Checkpointed context forwards recompute once inside the single backward.
-    assert [result["forward_calls"] for result in observed] == ([10, 5] if joint else [20, 10])
-    assert [result["backward_calls"] for result in observed] == [1, 1]
-    for result in observed:
-        torch.testing.assert_close(result["grad"], reference.weight.grad, atol=1e-6, rtol=1e-6)
-    expected = _context_stream(targets, table).validation_diagnostics(_ContextToy())
-    for result in observed:
-        assert result["validation"] == pytest.approx(expected)
-
-
-def test_context_stream_chunks_every_bucket_to_the_token_budget() -> None:
-    targets, table = _ragged_context_fixture()
-    reference = _ContextToy()
-    reference_loss, _ = _context_stream(targets, table).loss(reference, epoch=1, step=0, steps=1)
-
-    model = _ContextToy()
-    loss, _ = _context_stream(targets, table, token_budget=256).loss(
-        model, epoch=1, step=0, steps=1
-    )
-    # Buckets hold 6/5/3/2 rows at 128/256/384/512 tokens: 2 rows fit at 128,
-    # one row everywhere else (a row never splits, even above the budget).
-    assert model.forward_calls == 13
-    assert all(
-        size * boundary <= max(256, boundary)
-        for size, boundary in zip(model.batch_sizes, model.bucket_boundaries, strict=True)
-    )
-    torch.testing.assert_close(loss, reference_loss)
-    reference_loss.backward()  # type: ignore[no-untyped-call]
-    loss.backward()  # type: ignore[no-untyped-call]
-    assert reference.weight.grad is not None and model.weight.grad is not None
-    torch.testing.assert_close(model.weight.grad, reference.weight.grad)
-
-    validation = _context_stream(targets, table, token_budget=256).validation_diagnostics(model)
-    assert validation == pytest.approx(
-        _context_stream(targets, table).validation_diagnostics(_ContextToy())
-    )
-
-
-def test_context_stream_validation_refuses_sharding_without_a_process_group() -> None:
-    targets, table = _ragged_context_fixture()
-    with pytest.raises(RuntimeError, match="process group"):
-        _context_stream(targets, table, rank=0, world_size=2).validation_diagnostics(_ContextToy())
-
-
 def test_context_stream_telemetry_includes_live_counts_and_ties() -> None:
     targets, table = _context_fixture()
     stream = _context_stream(targets, table)
@@ -803,8 +695,6 @@ class TestKDRowBankJoin:
             targets,
             train_pairs=train_pairs,
             train_labels=train_labels,
-            val_pairs=val_pairs if val_pairs is not None else self._TRAIN_PAIRS[:1],
-            val_labels=val_labels if val_labels is not None else self._TRAIN_LABELS[:1],
             model=nn.Linear(1, 1),
             device=torch.device("cpu"),
         )
@@ -848,16 +738,6 @@ class TestKDRowBankJoin:
         with pytest.raises(ValueError, match="training block labels do not match"):
             self._bank(tmp_path, train_pairs=self._TRAIN_PAIRS, train_labels=[1, 1, 1, 0])
 
-    def test_mismatched_val_block_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError, match="validation block labels do not match"):
-            self._bank(
-                tmp_path,
-                train_pairs=self._TRAIN_PAIRS,
-                train_labels=self._TRAIN_LABELS,
-                val_pairs=self._TRAIN_PAIRS[:1],
-                val_labels=[1 - self._TRAIN_LABELS[0]],
-            )
-
 
 # --------------------------------------------------------------------------- (b) exact row IDs
 
@@ -881,8 +761,6 @@ def test_kd_loss_uses_exact_row_ids(tmp_path: Path) -> None:
         targets,
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
         model=nn.Linear(1, 1),
         device=torch.device("cpu"),
     )
@@ -919,8 +797,6 @@ def test_kd_rank_row_bank_is_telemetry_only(tmp_path: Path) -> None:
         load_kd_targets(tmp_path / "targets"),
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
         model=nn.Module(),
         device=torch.device("cpu"),
     )
@@ -950,8 +826,6 @@ def test_kd_gram_uses_shared_forward_pair_representations(tmp_path: Path) -> Non
         load_kd_targets(tmp_path / "targets"),
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
         model=nn.Module(),
         device=torch.device("cpu"),
     )
@@ -1054,8 +928,6 @@ def test_ddp_loop_one_forward_one_backward_per_batch_with_real_kd_bank(tmp_path:
         targets,
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
         model=model,
         device=torch.device("cpu"),
     )
@@ -1220,8 +1092,6 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
         targets,
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
         model=model,
         device=torch.device("cpu"),
     )
@@ -1238,7 +1108,7 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
         warmup_steps=1,
         artifact_dir=tmp_path / "attempt",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
-            _constant_metrics(), None, {"val_kd_logit_loss": 0.7}, 0.5
+            _constant_metrics(), None, 0.5, {"val_kd_logit_loss": 100.0}
         ),
         kd_bank=bank,
     )
@@ -1256,8 +1126,8 @@ def test_ddp_loop_kd_logit_telemetry_keys(tmp_path: Path) -> None:
     ):
         assert key in entry, f"missing telemetry key {key!r} in {sorted(entry)}"
     assert entry["val_task_loss"] == 0.5
-    # The monitored total mirrors the training objective: task + w_logit * KD.
-    assert entry["val_total_loss"] == pytest.approx(0.5 + 1.0 * 0.7)
+    assert "val_total_loss" not in entry
+    assert entry["val_kd_logit_loss"] == 100.0
 
 
 def test_epoch_telemetry_kd_logit_loss_is_unweighted_rows_weighted_mean(tmp_path: Path) -> None:
@@ -1277,8 +1147,6 @@ def test_epoch_telemetry_kd_logit_loss_is_unweighted_rows_weighted_mean(tmp_path
         load_kd_targets(tmp_path / "targets"),
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
         model=nn.Linear(1, 1),
         device=torch.device("cpu"),
     )
@@ -1331,8 +1199,6 @@ def test_epoch_telemetry_kd_rep_loss_derived_from_cos(tmp_path: Path) -> None:
         load_kd_targets(tmp_path / "targets"),
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
         model=model,
         device=torch.device("cpu"),
     )
@@ -1398,78 +1264,6 @@ class _RepDiagModel(nn.Module):
         }
 
 
-def test_evaluate_distributed_kd_rep_diagnostics() -> None:
-    n = 3
-    rep_dim = 4
-    rep_seed = torch.randn(n, rep_dim)
-    batch = {
-        "label": torch.tensor([1.0, 0.0, 1.0]),
-        "_row_id": torch.tensor([0, 1, 2]),
-        "logit_seed": torch.tensor([0.5, -0.5, 1.0]),
-        "rep_seed": rep_seed,
-    }
-    teacher_logit = torch.tensor([0.4, -0.6, 0.9])
-    kd_val = KDValDiagnostics(
-        arm="kd_rep",
-        teacher_logit=teacher_logit,
-        teacher_logit_np=teacher_logit.double().numpy(),
-        teacher_rep=rep_seed.clone().to(torch.float16),
-        teacher_latent=None,
-    )
-    outcome = _evaluate_distributed(
-        _RepDiagModel(),
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.arange(n),
-        kd_val=kd_val,
-    )
-    assert outcome.kd is not None
-    assert {
-        "val_kd_rep_cos",
-        "val_kd_rep_loss",
-        "val_kd_logit_corr",
-        "val_kd_logit_loss",
-        "val_kd_prob_mae",
-    } <= outcome.kd.keys()
-    assert outcome.kd["val_kd_rep_cos"] == pytest.approx(1.0, abs=1e-3)
-    assert outcome.kd["val_kd_rep_loss"] == pytest.approx(1.0 - outcome.kd["val_kd_rep_cos"])
-
-
-def test_evaluate_distributed_kd_rank_reports_deterministic_block_losses() -> None:
-    targets, table = _context_fixture()
-    diagnostics = _context_stream(targets, table).validation_diagnostics(_ContextToy())
-    assert diagnostics["val_kd_rank_loss"] >= 0.0
-    assert diagnostics["val_kd_dist_loss"] >= 0.0
-    assert 0.0 <= diagnostics["val_kd_rank_tie_fraction"] <= 1.0
-
-
-def test_evaluate_distributed_kd_gram_reports_deterministic_block_loss() -> None:
-    rep_seed = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
-    batch = {
-        "label": torch.tensor([1.0, 0.0]),
-        "_row_id": torch.tensor([0, 1]),
-        "logit_seed": torch.tensor([0.0, 0.0]),
-        "rep_seed": rep_seed,
-    }
-    teacher_logit = torch.zeros(2)
-    kd_val = KDValDiagnostics(
-        arm="kd_gram",
-        teacher_logit=teacher_logit,
-        teacher_logit_np=teacher_logit.double().numpy(),
-        teacher_rep=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        teacher_latent=None,
-    )
-    outcome = _evaluate_distributed(
-        _RepDiagModel(),
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.arange(2),
-        kd_val=kd_val,
-    )
-    assert outcome.kd is not None
-    assert outcome.kd["val_kd_gram_block_loss"] > 0.0
-
-
 def _smoothed_bce(logits: list[float], targets: list[float]) -> float:
     """Hand-rolled mean BCE-with-logits against probability targets."""
     per_row = [
@@ -1491,42 +1285,13 @@ def test_evaluate_distributed_reports_smoothed_task_bce() -> None:
         [batch],
         Accelerator(cpu=True),
         expected_row_ids=np.arange(2),
-        kd_val=None,
         label_smoothing=0.05,
     )
     smoothed = [1.0 * 0.95 + 0.025, 0.0 * 0.95 + 0.025]
     assert outcome.task_loss == pytest.approx(_smoothed_bce([0.5, -0.25], smoothed))
 
 
-def test_evaluate_distributed_kd_logit_loss_matches_teacher_prob_bce() -> None:
-    batch = {
-        "label": torch.tensor([1.0, 0.0]),
-        "_row_id": torch.tensor([0, 1]),
-        "logit_seed": torch.tensor([0.5, -0.5]),
-        "rep_seed": torch.randn(2, 3),
-    }
-    teacher_logit = torch.tensor([0.4, -0.6])
-    kd_val = KDValDiagnostics(
-        arm="kd_logit",
-        teacher_logit=teacher_logit,
-        teacher_logit_np=teacher_logit.double().numpy(),
-        teacher_rep=None,
-        teacher_latent=None,
-    )
-    outcome = _evaluate_distributed(
-        _RepDiagModel(),
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.arange(2),
-        kd_val=kd_val,
-    )
-    assert outcome.kd is not None
-    teacher_prob = [1.0 / (1.0 + math.exp(-0.4)), 1.0 / (1.0 + math.exp(0.6))]
-    expected = _smoothed_bce([0.5, -0.5], teacher_prob)
-    assert outcome.kd["val_kd_logit_loss"] == pytest.approx(expected)
-
-
-def test_evaluate_distributed_without_kd_val_leaves_kd_field_none() -> None:
+def test_evaluate_distributed_without_optional_oracle_bank() -> None:
     n = 2
     batch = {
         "label": torch.tensor([1.0, 0.0]),
@@ -1539,9 +1304,8 @@ def test_evaluate_distributed_without_kd_val_leaves_kd_field_none() -> None:
         [batch],
         Accelerator(cpu=True),
         expected_row_ids=np.arange(n),
-        kd_val=None,
     )
-    assert outcome.kd is None
+    assert not hasattr(outcome, "kd")
 
 
 # --------------------------------------------------------------------------- (h) arch checks
@@ -1570,8 +1334,6 @@ class TestKDRowBankArchChecks:
             targets,
             train_pairs=self._TRAIN_PAIRS,
             train_labels=self._TRAIN_LABELS,
-            val_pairs=self._TRAIN_PAIRS[:1],
-            val_labels=self._TRAIN_LABELS[:1],
             model=model,
             device=torch.device("cpu"),
         )
@@ -1606,11 +1368,8 @@ def _struct_targets(
     )
     return structural_row_targets(
         train_graph=graph,
-        val_graph=graph,
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:2],
-        val_labels=train_labels[:2],
     )
 
 
@@ -1627,8 +1386,6 @@ def test_kd_struct_bank_requires_matching_head_and_uses_mse_on_exact_rows() -> N
             targets,
             train_pairs=train_pairs,
             train_labels=train_labels,
-            val_pairs=train_pairs[:2],
-            val_labels=train_labels[:2],
             model=model,
             device=torch.device("cpu"),
         )
@@ -1668,8 +1425,6 @@ def test_kd_struct_head_present_without_weight_raises() -> None:
             targets,
             train_pairs=train_pairs,
             train_labels=[1, 0, 1, 0],
-            val_pairs=train_pairs[:2],
-            val_labels=[1, 0],
             model=V3_1(**_tiny_v31_kwargs(), kd_struct_dim=5),
             device=torch.device("cpu"),
         )
@@ -1687,44 +1442,6 @@ class _StructDiagModel(nn.Module):
         }
 
 
-def test_evaluate_distributed_kd_struct_reports_mse_and_per_descriptor_r2() -> None:
-    n = 4
-    target = torch.randn(n, 5)
-    # Rows arrive out of order; the diagnostics must re-align them by row id.
-    order = torch.tensor([2, 0, 3, 1])
-    pred = target[order] + torch.tensor([0.0, 0.1, 0.0, 0.0, 0.0])
-    batch = {
-        "label": torch.tensor([1.0, 0.0, 1.0, 0.0]),
-        "_row_id": order,
-        "logit_seed": torch.tensor([0.5, -0.5, 1.0, 0.0]),
-        "struct_seed": pred,
-    }
-    kd_val = KDValDiagnostics(
-        arm="kd_struct",
-        teacher_logit=torch.zeros(n),
-        teacher_logit_np=np.zeros(n),
-        teacher_rep=target.to(torch.float16),
-        teacher_latent=None,
-    )
-    outcome = _evaluate_distributed(
-        _StructDiagModel(),
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.arange(n),
-        kd_val=kd_val,
-    )
-    assert outcome.kd is not None
-    assert "val_kd_logit_corr" not in outcome.kd
-    assert outcome.kd["val_kd_struct_loss"] == pytest.approx(0.01 / 5, abs=1e-4)
-    r2 = {name: outcome.kd[f"val_kd_struct_r2_{name}"] for name in STRUCT_NAMES}
-    assert r2["log1p_cn"] == pytest.approx(1.0, abs=1e-3)
-    var_col1 = float(target[:, 1].var(unbiased=False))
-    assert r2["log1p_deg_sum"] == pytest.approx(1.0 - 0.01 / var_col1, abs=1e-2)
-    assert outcome.kd["val_kd_struct_loss"] == compose_val_total(
-        0.0, outcome.kd, DistillConfig(w_struct=1.0)
-    )
-
-
 def test_ddp_loop_kd_struct_end_to_end_on_cpu(tmp_path: Path) -> None:
     node_ids = [f"n{i}" for i in range(4)]
     train_pairs = _ring_pairs(node_ids)
@@ -1737,8 +1454,6 @@ def test_ddp_loop_kd_struct_end_to_end_on_cpu(tmp_path: Path) -> None:
         targets,
         train_pairs=train_pairs,
         train_labels=train_labels,
-        val_pairs=train_pairs[:2],
-        val_labels=train_labels[:2],
         model=model,
         device=torch.device("cpu"),
     )
@@ -1753,7 +1468,7 @@ def test_ddp_loop_kd_struct_end_to_end_on_cpu(tmp_path: Path) -> None:
         warmup_steps=1,
         artifact_dir=tmp_path / "attempt",
         evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
-            _constant_metrics(), None, {"val_kd_struct_loss": 0.7}, 0.5
+            _constant_metrics(), None, 0.5
         ),
         kd_bank=bank,
     )
@@ -1761,7 +1476,7 @@ def test_ddp_loop_kd_struct_end_to_end_on_cpu(tmp_path: Path) -> None:
     for key in ("train_kd_loss", "kd_struct_loss", "grad_norm_task", "grad_norm_kd"):
         assert key in entry, f"missing telemetry key {key!r} in {sorted(entry)}"
     assert "kd_logit_corr" not in entry
-    assert entry["val_total_loss"] == pytest.approx(0.5 + 0.7)
+    assert entry["val_task_loss"] == 0.5
 
 
 def _whitened_targets(
@@ -1772,7 +1487,6 @@ def _whitened_targets(
     return dataclasses.replace(
         base,
         teacher_rep=rng.normal(size=(len(train_pairs), 3)).astype(np.float16),
-        val_teacher_rep=rng.normal(size=(2, 3)).astype(np.float16),
         manifest={"rep_source": "whitened_axes", "descriptors": ["pc2", "pc3", "pc4"]},
     )
 
@@ -1785,121 +1499,6 @@ def test_kd_white_config_is_an_artifact_backed_auxiliary_arm() -> None:
     cfg = DistillConfig(w_white=1.0, targets_path="bank")
     assert cfg.arm == "kd_white" and cfg.active and cfg.aux_weight == 1.0
     assert DistillConfig(w_struct=2.0).aux_weight == 2.0
-    assert compose_val_total(0.5, {"val_kd_struct_loss": 0.25}, cfg) == pytest.approx(0.75)
-
-
-def test_kd_white_bank_regresses_artifact_axes_through_the_aux_head() -> None:
-    node_ids = [f"n{i}" for i in range(6)]
-    train_pairs = _ring_pairs(node_ids)
-    train_labels = [1, 0, 1, 0, 1, 1]
-    targets = _whitened_targets(node_ids, train_pairs, train_labels)
-    distill = DistillConfig(w_white=2.0, targets_path="bank")
-
-    def build(model: nn.Module) -> KDRowBank:
-        return KDRowBank(
-            distill,
-            targets,
-            train_pairs=train_pairs,
-            train_labels=train_labels,
-            val_pairs=train_pairs[:2],
-            val_labels=train_labels[:2],
-            model=model,
-            device=torch.device("cpu"),
-        )
-
-    with pytest.raises(RuntimeError, match="kd_struct_dim: 3"):
-        build(V3_1(**_tiny_v31_kwargs(), kd_struct_dim=5))
-    bank = build(V3_1(**_tiny_v31_kwargs(), kd_struct_dim=3))
-    pred = torch.randn(2, 3, requires_grad=True)
-    rows = torch.tensor([5, 0])
-    loss, stats = bank.loss({"_row_id": rows}, {"logits": torch.zeros(2), "kd_struct": pred})
-    expected = torch.nn.functional.mse_loss(
-        pred, torch.as_tensor(targets.teacher_rep[[5, 0]]).float()
-    )
-    assert torch.allclose(loss, 2.0 * expected, atol=1e-6)
-    assert "sum_s" not in stats
-    assert bank.epoch_telemetry(Accelerator(cpu=True), stats) == {
-        "kd_struct_loss": pytest.approx(expected.item(), rel=1e-5)
-    }
-    assert bank.val_diagnostics().rep_names == ("pc2", "pc3", "pc4")
-
-
-def test_evaluate_distributed_kd_white_names_r2_by_artifact_axes() -> None:
-    n = 4
-    target = torch.randn(n, 3)
-    batch = {
-        "label": torch.tensor([1.0, 0.0, 1.0, 0.0]),
-        "_row_id": torch.arange(n),
-        "logit_seed": torch.zeros(n),
-        "struct_seed": target,
-    }
-    kd_val = KDValDiagnostics(
-        arm="kd_white",
-        teacher_logit=torch.zeros(n),
-        teacher_logit_np=np.zeros(n),
-        teacher_rep=target.to(torch.float16),
-        teacher_latent=None,
-        rep_names=("pc2", "pc3", "pc4"),
-    )
-    outcome = _evaluate_distributed(
-        _StructDiagModel(),
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.arange(n),
-        kd_val=kd_val,
-    )
-    assert outcome.kd is not None
-    assert outcome.kd["val_kd_struct_loss"] == pytest.approx(0.0, abs=1e-5)
-    assert {k for k in outcome.kd if k.startswith("val_kd_struct_r2_")} == {
-        "val_kd_struct_r2_pc2",
-        "val_kd_struct_r2_pc3",
-        "val_kd_struct_r2_pc4",
-    }
-    assert "val_kd_logit_corr" not in outcome.kd
-
-
-def test_kd_rank_rep_row_bank_emits_weighted_cosine_and_logit_telemetry(tmp_path: Path) -> None:
-    node_ids = [f"n{i}" for i in range(4)]
-    train_pairs = _ring_pairs(node_ids)
-    train_labels = [1, 0, 1, 0]
-    teacher_rep = np.eye(4, dtype=np.float32)
-    _write_targets(
-        tmp_path / "targets",
-        node_ids=node_ids,
-        train_pairs=train_pairs,
-        train_labels=train_labels,
-        teacher_logit=np.array([1.0, -1.0, 0.5, -0.5], dtype=np.float32),
-        teacher_rep=teacher_rep,
-    )
-    model = nn.Module()
-    model.d_model = 4  # type: ignore[assignment]
-    bank = KDRowBank(
-        DistillConfig(
-            targets_path="t", context_targets_path="c", w_rank=0.1, w_dist=10.0, w_rep=2.0
-        ),
-        load_kd_targets(tmp_path / "targets"),
-        train_pairs=train_pairs,
-        train_labels=train_labels,
-        val_pairs=train_pairs[:1],
-        val_labels=train_labels[:1],
-        model=model,
-        device=torch.device("cpu"),
-    )
-    assert bank.arm == "kd_rank_rep"
-    assert bank.train_rep is not None
-    student_rep = torch.tensor([[1.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], requires_grad=True)
-    output = {"logits": torch.tensor([0.3, -0.7]), "pair_repr": student_rep}
-    loss, stats = bank.loss({"_row_id": torch.tensor([0, 1])}, output)
-    expected = 2.0 * kd_rep_loss(student_rep, torch.tensor(teacher_rep[[0, 1]]))
-    assert torch.allclose(loss, expected, atol=1e-6)
-    assert loss.requires_grad
-    assert stats["rows"] == 2.0
-    assert "sum_rep_cos" in stats and "sum_st" in stats
-    assert "sum_logit_bce" not in stats
-    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), stats)
-    assert {"kd_rep_cos", "kd_rep_loss", "kd_logit_corr", "kd_prob_mae"} <= telemetry.keys()
-    assert bank.global_relational is False
-    assert bank.val_diagnostics().teacher_rep is not None
 
 
 def test_context_stream_accepts_kd_rank_rep_and_rejects_arms_without_w_rank() -> None:
@@ -1946,56 +1545,6 @@ class _RankRepDiagModel(nn.Module):
         }
 
 
-def test_evaluate_distributed_kd_rank_rep_reports_rep_and_context_diagnostics() -> None:
-    targets, table = _context_fixture()
-    stream = _context_stream(targets, table)
-    n, rep_dim = 3, 4
-    rep_seed = torch.randn(n, rep_dim)
-    batch = {
-        "label": torch.tensor([1.0, 0.0, 1.0]),
-        "_row_id": torch.tensor([0, 1, 2]),
-        "logit_seed": torch.tensor([0.5, -0.5, 1.0]),
-        "rep_seed": rep_seed,
-    }
-    teacher_logit = torch.tensor([0.4, -0.6, 0.9])
-    kd_val = KDValDiagnostics(
-        arm="kd_rank_rep",
-        teacher_logit=teacher_logit,
-        teacher_logit_np=teacher_logit.double().numpy(),
-        teacher_rep=rep_seed.clone().to(torch.float16),
-        teacher_latent=None,
-        context_stream=stream,
-    )
-    outcome = _evaluate_distributed(
-        _RankRepDiagModel(),
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.arange(n),
-        kd_val=kd_val,
-    )
-    assert outcome.kd is not None
-    assert {
-        "val_kd_rep_cos",
-        "val_kd_rep_loss",
-        "val_kd_logit_corr",
-        "val_kd_logit_loss",
-        "val_kd_prob_mae",
-        "val_kd_rank_loss",
-        "val_kd_dist_loss",
-    } <= outcome.kd.keys()
-    assert outcome.kd["val_kd_rep_cos"] == pytest.approx(1.0, abs=1e-3)
-    distill = DistillConfig(
-        targets_path="t", context_targets_path="c", w_rank=0.1, w_dist=10.0, w_rep=1.0
-    )
-    assert outcome.task_loss is not None
-    assert compose_val_total(outcome.task_loss, outcome.kd, distill) == pytest.approx(
-        outcome.task_loss
-        + 0.1 * outcome.kd["val_kd_rank_loss"]
-        + 10.0 * outcome.kd["val_kd_dist_loss"]
-        + outcome.kd["val_kd_rep_loss"]
-    )
-
-
 def test_dynamic_epoch_rows_join_offline_union_targets(tmp_path: Path) -> None:
     from src.data.pairs import NegativeSampler
     from src.data.training_sampler import build_training_corpus
@@ -2017,8 +1566,6 @@ def test_dynamic_epoch_rows_join_offline_union_targets(tmp_path: Path) -> None:
         load_kd_targets(tmp_path / "targets"),
         train_pairs=corpus.pairs,
         train_labels=corpus.labels,
-        val_pairs=corpus.pairs[:1],
-        val_labels=corpus.labels[:1],
         model=nn.Linear(1, 1),
         device=torch.device("cpu"),
     )

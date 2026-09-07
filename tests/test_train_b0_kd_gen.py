@@ -21,7 +21,6 @@ from src.train_b0 import (
     ModelConfig,
     RuntimeConfig,
     _build_optimizer,
-    _evaluate_distributed,
     _run_probe_mode,
     _set_topo_gen_training_stage,
     _term_grad_norms,
@@ -129,11 +128,6 @@ def _targets(
         pair_label=np.array([1, 0], dtype=np.int8),
         teacher_logit=np.array([1.0, -1.0], dtype=np.float32),
         teacher_rep=train_rep,
-        val_pair_a_idx=np.array([0, 1] if two_val_classes else [0], dtype=np.int32),
-        val_pair_b_idx=np.array([2, 3] if two_val_classes else [2], dtype=np.int32),
-        val_pair_label=np.array(val_labels, dtype=np.int8),
-        val_teacher_logit=np.array([0.5, -0.5] if two_val_classes else [0.5], dtype=np.float32),
-        val_teacher_rep=val_rep,
         manifest={},
     )
     return targets, pairs, [1, 0], val_pairs, val_labels
@@ -156,21 +150,11 @@ def _bank(
             )
         )
         labels = targets.pair_label.astype(np.int64).tolist()
-        val_pairs = list(
-            zip(
-                node_ids[targets.val_pair_a_idx].tolist(),
-                node_ids[targets.val_pair_b_idx].tolist(),
-                strict=True,
-            )
-        )
-        val_labels = targets.val_pair_label.astype(np.int64).tolist()
     return KDRowBank(
         DistillConfig(targets_path="x", w_gen=w_gen),
         default_targets if targets is None else targets,
         train_pairs=pairs,
         train_labels=labels,
-        val_pairs=val_pairs,
-        val_labels=val_labels,
         model=model,
         device=torch.device("cpu"),
     )
@@ -330,8 +314,6 @@ def test_kd_gen_requires_topo_gen_both_directions() -> None:
             targets,
             train_pairs=pairs,
             train_labels=labels,
-            val_pairs=val_pairs,
-            val_labels=val_labels,
             model=_model(topo=True),
             device=torch.device("cpu"),
         )
@@ -464,30 +446,3 @@ def test_first_step_gradient_probe_sees_generator_loss() -> None:
     task_norm, kd_norm = _term_grad_norms(output["loss"], kd_loss, model)
     assert task_norm > 0.0
     assert kd_norm > 0.0
-
-
-def test_validation_injects_normalized_latent_preserves_rng_and_reports_cosine() -> None:
-    model = _model().train()
-    targets, *_ = _targets(two_val_classes=True)
-    bank = _bank(model, targets=targets)
-    batch = {
-        "_row_id": torch.tensor([0, 1]),
-        "emb_a": torch.randn(2, 4, 24),
-        "emb_b": torch.randn(2, 4, 24),
-        "len_a": torch.full((2,), 4, dtype=torch.long),
-        "len_b": torch.full((2,), 4, dtype=torch.long),
-        "label": torch.tensor([1.0, 0.0]),
-    }
-    rng_before = torch.random.get_rng_state().clone()
-    outcome = _evaluate_distributed(
-        model,
-        [batch],
-        Accelerator(cpu=True),
-        expected_row_ids=np.array([0, 1], dtype=np.int64),
-        kd_val=bank.val_diagnostics(),
-    )
-    assert torch.equal(torch.random.get_rng_state(), rng_before)
-    assert outcome.kd is not None
-    assert "val_kd_latent_cos" in outcome.kd
-    assert "val_kd_rep_cos" not in outcome.kd
-    assert "val_kd_rep_loss" not in outcome.kd

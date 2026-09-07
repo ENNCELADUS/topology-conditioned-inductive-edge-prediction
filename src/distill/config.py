@@ -3,8 +3,8 @@
 Consumed by the simple B0-protocol trainer (`src.train_b0`) as the optional
 top-level ``distill:`` config section. Teacher row targets are dumped once
 for every official training row (`src/distill/teacher_targets.py`, format
-``kd_row_targets_v1``). Arms with ``w_rank`` also consume a separate context
-bank (``kd_ctx_targets_v1``); other terms share the task-row forward. Exactly
+``kd_row_targets_v2``). Arms with ``w_rank`` also consume a separate context
+bank (``kd_ctx_targets_v2``); other terms share the task-row forward. Exactly
 one arm group's weight(s) may be nonzero at a time: ``kd_logit`` (`w_logit`,
 pointwise soft-target logit KD), ``kd_rank`` (`w_rank` + `w_dist`, anchor
 ranking/distribution KD), ``kd_rank_rep`` (kd_rank plus `w_rep`), ``kd_gram`` (`w_gram`,
@@ -41,10 +41,11 @@ class DistillConfig:
 
     Attributes:
         targets_path: Path to the dumped full-row teacher-target artifact
-            (`src/distill/teacher_targets.py`, format ``kd_row_targets_v1``).
+            (`src/distill/teacher_targets.py`, format ``kd_row_targets_v2``).
             Required whenever any weight below is nonzero.
-        context_targets_path: Path to the dumped ``kd_ctx_targets_v1`` artifact.
+        context_targets_path: Path to the dumped ``kd_ctx_targets_v2`` artifact.
             Required exactly when ``w_rank`` is active (kd_rank, kd_rank_rep).
+        validation_targets_path: Optional G_val oracle bank for learning-curve diagnostics only.
         w_logit: ``kd_logit`` weight -- pointwise binary soft-target KD,
             BCE(student_logit, sigmoid(teacher_logit)), on the training
             batch's own rows (GLNN family).
@@ -73,6 +74,7 @@ class DistillConfig:
 
     targets_path: str = ""
     context_targets_path: str = ""
+    validation_targets_path: str = ""
     w_logit: float = 0.0
     w_rank: float = 0.0
     w_dist: float = 0.0
@@ -177,7 +179,11 @@ class DistillConfig:
             if field_spec.name not in mapping:
                 continue
             raw = mapping[field_spec.name]
-            if field_spec.name in {"targets_path", "context_targets_path"}:
+            if field_spec.name in {
+                "targets_path",
+                "context_targets_path",
+                "validation_targets_path",
+            }:
                 if not isinstance(raw, str):
                     raise ValueError(f"distill.{field_spec.name} must be a string")
                 kwargs[field_spec.name] = raw

@@ -53,22 +53,17 @@ def test_structural_targets_self_pair_and_isolated_pair() -> None:
     np.testing.assert_allclose(out[1], 0.0)
 
 
-def test_structural_row_targets_zscore_train_rows_and_read_val_from_val_graph() -> None:
+def test_structural_row_targets_zscore_train_rows() -> None:
     nodes = ["a", "b", "c", "v1", "v2"]
     train_graph = _graph([("a", "b"), ("b", "c"), ("a", "v1")], nodes)
-    val_graph = _graph([("a", "b"), ("b", "c"), ("a", "v1"), ("v1", "v2")], nodes)
     train_pairs = [("a", "b"), ("a", "c"), ("b", "c"), ("c", "a")]
-    val_pairs = [("v1", "v2"), ("v2", "a")]
     targets = structural_row_targets(
         train_graph=train_graph,
-        val_graph=val_graph,
         train_pairs=train_pairs,
         train_labels=[1, 0, 1, 0],
-        val_pairs=val_pairs,
-        val_labels=[1, 0],
     )
     assert targets.node_ids == sorted(nodes)
-    assert targets.teacher_rep.shape == (4, 5) and targets.val_teacher_rep.shape == (2, 5)
+    assert targets.teacher_rep.shape == (4, 5)
     assert targets.teacher_logit.shape == (4,) and not targets.teacher_logit.any()
     assert targets.manifest["rep_source"] == STRUCT_REP_SOURCE
     mean = np.asarray(targets.manifest["train_mean"])
@@ -80,27 +75,3 @@ def test_structural_row_targets_zscore_train_rows_and_read_val_from_val_graph() 
     np.testing.assert_allclose(
         targets.teacher_rep.astype(np.float64), (raw_train - mean) / std, atol=2e-3
     )
-    # The val row v1-v2 reads its neighbourhood from the val graph: v1 keeps
-    # neighbour a after masking v2, so the raw degree sum is log1p(1) + 0.
-    raw_val = structural_targets(
-        val_graph, targets.node_ids, targets.val_pair_a_idx, targets.val_pair_b_idx
-    )
-    assert raw_val[0, 1] == pytest.approx(np.log1p(1))
-    np.testing.assert_allclose(
-        targets.val_teacher_rep.astype(np.float64), (raw_val - mean) / std, atol=2e-3
-    )
-    assert np.asarray(targets.val_pair_label).tolist() == [1, 0]
-
-
-def test_structural_row_targets_rejects_node_set_drift() -> None:
-    train_graph = _graph([("a", "b")], ["a", "b"])
-    val_graph = _graph([("a", "b")], ["a", "b", "c"])
-    with pytest.raises(ValueError, match="node set"):
-        structural_row_targets(
-            train_graph=train_graph,
-            val_graph=val_graph,
-            train_pairs=[("a", "b")],
-            train_labels=[1],
-            val_pairs=[("a", "b")],
-            val_labels=[1],
-        )

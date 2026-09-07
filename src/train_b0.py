@@ -94,14 +94,14 @@ from src.distill.losses import (
     kd_rep_loss,
     kd_struct_loss,
 )
-from src.distill.struct_targets import STRUCT_NAMES, structural_row_targets, substrate_graph
+from src.distill.struct_targets import structural_row_targets
+from src.distill.validation import OracleValidationBank
 from src.e2_pipeline import ProbeResult
 from src.eval.checkpoint_selection import (
     CheckpointCandidate,
     TopologyValidationMetrics,
     select_checkpoint,
 )
-from src.eval.early_stopping import compose_val_total, val_total_terms
 from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.eval.val_topology import (
     ValTopologyReference,
@@ -129,12 +129,12 @@ OnEval = Callable[[dict[str, object], bool, EdgeMetrics], None]
 
 
 class ValidationOutcome(NamedTuple):
-    """One validation pass: edge metrics, optional topology metrics, optional KD diagnostics."""
+    """One validation pass: edge metrics, optional topology metrics and task loss."""
 
     metrics: EdgeMetrics
     topology: ValTopologyResult | None
-    kd: dict[str, float] | None = None
     task_loss: float | None = None
+    diagnostics: dict[str, float] | None = None
 
 
 EvaluateFn = Callable[[nn.Module, Iterable[Batch], Accelerator], ValidationOutcome]
@@ -243,7 +243,7 @@ class EvalConfig:
 
     Attributes:
         patience: Early stop after this many evals without a lower total
-            validation loss (:func:`~src.eval.early_stopping.compose_val_total`).
+            validation task loss.
         eval_every: Evaluate every N epochs.
         topology_every: Run the V_val topology pass only on epochs divisible by
             N (the final epoch always runs it); classification metrics keep the
@@ -1236,7 +1236,7 @@ class TrainResult:
     Attributes:
         best_state_dict: CPU state dict of the selected checkpoint (mean rank, or
             val AUPRC when no topology candidates exist) -- never the patience
-            monitor, which counts on the total validation loss instead.
+            monitor, which counts on the validation task loss instead.
         best_epoch: Epoch (1-based) of the best checkpoint.
         best_val_metrics: Full val metrics of the best checkpoint.
         last_state_dict: CPU state dict at the end of training.
@@ -1244,7 +1244,7 @@ class TrainResult:
         last_val_metrics: Full val metrics of the final evaluation.
         history: One entry per evaluation: epoch, train_loss, val_auroc, val_auprc.
         stopped_early: Whether early stopping fired before ``optim.epochs``.
-        stop_epoch: Epoch at which patience exhausted on the total validation
+        stop_epoch: Epoch at which patience exhausted on the validation task
             loss and stopped the run; ``None`` when the run reached
             ``optim.epochs``.
         runtime_profile: Rank-zero timing/coverage payload for the fixed-epoch DDP
@@ -1300,7 +1300,7 @@ def _evaluate(
             `ValidationOutcome.task_loss`, matching the training objective.
 
     Returns:
-        A `ValidationOutcome` with `topology` and `kd` unset.
+        A `ValidationOutcome` with `topology` unset.
     """
     model.eval()
     labels_parts: list[np.ndarray] = []
@@ -1343,7 +1343,7 @@ def train_loop(
     Every ``eval_every`` epochs the val set is scored with
     :func:`~src.eval.edge_metrics.compute_edge_metrics` on ``sigmoid(logits)``;
     the best checkpoint is kept by val AUPRC while patience counts separately on
-    the total validation loss (:func:`~src.eval.early_stopping.compose_val_total`)
+    the validation task loss
     and stops training after ``patience`` evals without a lower total. A
     final-epoch eval always runs so at least one checkpoint exists.
 
@@ -1383,7 +1383,7 @@ def train_loop(
     best_metrics: EdgeMetrics | None = None
     best_epoch = 0
     last_metrics: EdgeMetrics | None = None
-    best_val_total = float("inf")
+    best_val_task_loss = float("inf")
     evals_without_improvement = 0
     stopped_early = False
     reached_max_steps = False
@@ -1445,29 +1445,28 @@ def train_loop(
                 "val_auroc": metrics.auroc,
                 "val_auprc": metrics.auprc,
             }
-            val_total: float | None = None
+            val_task_loss: float | None = None
             if outcome.task_loss is not None:
-                val_total = compose_val_total(outcome.task_loss, outcome.kd, cfg.distill)
+                val_task_loss = outcome.task_loss
                 entry["val_task_loss"] = outcome.task_loss
-                entry["val_total_loss"] = val_total
             history.append(entry)
             improved = best_metrics is None or metrics.auprc > best_metrics.auprc
             if improved:
                 best_metrics = metrics
                 best_epoch = epoch
                 best_state = _cpu_state_dict(accelerator, model)
-            if val_total is not None and val_total < best_val_total:
-                best_val_total = val_total
+            if val_task_loss is not None and val_task_loss < best_val_task_loss:
+                best_val_task_loss = val_task_loss
                 evals_without_improvement = 0
-            elif val_total is not None:
+            elif val_task_loss is not None:
                 evals_without_improvement += 1
             logger.info(
-                "eval epoch %d: train_loss %.4f val_auroc %.4f val_auprc %.4f val_total %s%s",
+                "eval epoch %d: train_loss %.4f val_auroc %.4f val_auprc %.4f val_task_loss %s%s",
                 epoch,
                 train_loss,
                 metrics.auroc,
                 metrics.auprc,
-                "n/a" if val_total is None else f"{val_total:.4f}",
+                "n/a" if val_task_loss is None else f"{val_task_loss:.4f}",
                 " (new best)" if improved else "",
             )
             if on_eval is not None:
@@ -1475,7 +1474,7 @@ def train_loop(
             if evals_without_improvement >= cfg.eval.patience:
                 stopped_early = True
                 logger.info(
-                    "early stopping at epoch %d (%d evals without val-total-loss improvement)",
+                    "early stopping at epoch %d (%d evals without val-task-loss improvement)",
                     epoch,
                     evals_without_improvement,
                 )
@@ -2312,8 +2311,8 @@ def _evaluate_distributed(
     accelerator: Accelerator,
     *,
     expected_row_ids: np.ndarray | None = None,
-    kd_val: KDValDiagnostics | None = None,
     label_smoothing: float = 0.0,
+    validation_bank: OracleValidationBank | None = None,
 ) -> ValidationOutcome:
     """Score the fixed cls validation set across all ranks and agree on the metrics.
 
@@ -2334,9 +2333,7 @@ def _evaluate_distributed(
             derived as ``arange`` over the gathered row count — a self-contained
             fallback that still catches duplicates and interior gaps; production
             binds the true set so truncation is caught too.
-        kd_val: Validation-row teacher targets for the KD diagnostics; ``None``
-            leaves `ValidationOutcome.kd` unset. For ``kd_gen``, injects the
-            normalized teacher latent before the diagnostic forward.
+        validation_bank: Optional G_val teacher targets, used only for diagnostics.
         label_smoothing: Symmetric binary smoothing ε applied to the labels for
             `ValidationOutcome.task_loss`, matching the training objective.
 
@@ -2350,79 +2347,26 @@ def _evaluate_distributed(
     row_id_parts: list[torch.Tensor] = []
     label_parts: list[torch.Tensor] = []
     logit_parts: list[torch.Tensor] = []
-    diag_parts: list[torch.Tensor] = []
-    relational_block = torch.zeros(3, dtype=torch.float64, device=accelerator.device)
-    inject_latent = kd_val is not None and kd_val.teacher_latent is not None
-    collect_diag = kd_val is not None and (
-        kd_val.arm in _REP_COS_ARMS or kd_val.arm in _AUX_HEAD_ARMS or inject_latent
-    )
-    rng_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
-    with torch.random.fork_rng(devices=rng_devices, enabled=inject_latent), torch.no_grad():
+    rep_parts: list[tuple[np.ndarray, np.ndarray]] = []
+    with torch.no_grad():
         for batch in val_loader:
             batch = _to_device(batch, accelerator.device)
-            if inject_latent:
-                assert kd_val is not None and kd_val.teacher_latent is not None
-                rows = batch["_row_id"]
-                batch["kd_teacher_latent"] = (
-                    kd_val.teacher_latent[rows].float() / kd_val.latent_scale
-                )
             output = model(batch)
+            if validation_bank is not None and validation_bank.rep_key is not None:
+                rep = output.get(validation_bank.rep_key)
+                if rep is None and validation_bank.rep_key == "kd_rep":
+                    rep = output.get("pair_repr")
+                if rep is None:
+                    raise RuntimeError("student forward omitted validation representation")
+                rep_parts.append(
+                    (batch["_row_id"].detach().cpu().numpy(), rep.detach().float().cpu().numpy())
+                )
             logits = output["logits"]
             if logits.dim() > 1 and logits.size(-1) == 1:
                 logits = logits.squeeze(-1)
             row_id_parts.append(batch["_row_id"].detach().to(torch.int64))
             label_parts.append(batch["label"].detach().to(torch.float32))
             logit_parts.append(logits.detach().to(torch.float32))
-            if kd_val is not None and kd_val.arm == "kd_gram":
-                rows = batch["_row_id"]
-                student_rep = output.get("pair_repr")
-                if student_rep is None or kd_val.teacher_rep is None:
-                    raise RuntimeError(
-                        "kd_gram validation block diagnostics require pair_repr and teacher_rep"
-                    )
-                if rows.numel() >= 2:
-                    relational_block[0] += kd_gram_loss(
-                        student_rep.float(), kd_val.teacher_rep[rows].float()
-                    ).double()
-                    relational_block[2] += 1.0
-            if collect_diag:
-                assert kd_val is not None
-                rows = batch["_row_id"]
-                if kd_val.arm in _REP_COS_ARMS:
-                    student_rep = output.get("kd_rep")
-                    if student_rep is None:
-                        student_rep = output.get("pair_repr")
-                    if student_rep is None:
-                        raise RuntimeError(
-                            "kd_rep validation diagnostics require kd_rep or pair_repr in "
-                            "the model forward output"
-                        )
-                    assert kd_val.teacher_rep is not None
-                    teacher_rep = kd_val.teacher_rep[rows].float()
-                    diag = nn.functional.cosine_similarity(
-                        student_rep.float(), teacher_rep, dim=-1, eps=1e-8
-                    )
-                elif kd_val.arm in _AUX_HEAD_ARMS:
-                    struct_pred = output.get("kd_struct")
-                    if struct_pred is None:
-                        raise RuntimeError("kd_struct validation diagnostics require kd_struct")
-                    diag = struct_pred
-                else:  # kd_gen
-                    latent_sample = output.get("gen_latent_sample")
-                    if latent_sample is None:
-                        raise RuntimeError(
-                            "kd_gen validation diagnostics require gen_latent_sample"
-                        )
-                    teacher_latent = batch["kd_teacher_latent"]
-                    diag = nn.functional.cosine_similarity(
-                        latent_sample.float(), teacher_latent.float(), dim=-1, eps=1e-8
-                    )
-                diag_parts.append(diag.detach().to(torch.float32))
-        context_metrics = (
-            kd_val.context_stream.validation_diagnostics(model)
-            if kd_val is not None and kd_val.context_stream is not None
-            else None
-        )
     model.train()
 
     device = accelerator.device
@@ -2441,10 +2385,6 @@ def _evaluate_distributed(
         if logit_parts
         else torch.empty(0, dtype=torch.float32, device=device)
     )
-    local_diag = (
-        torch.cat(diag_parts) if diag_parts else torch.empty(0, dtype=torch.float32, device=device)
-    )
-
     padded_row_ids = accelerator.pad_across_processes(local_row_ids, dim=0, pad_index=-1)
     padded_labels = accelerator.pad_across_processes(local_labels, dim=0, pad_index=-1)
     padded_logits = accelerator.pad_across_processes(local_logits, dim=0, pad_index=0)
@@ -2452,14 +2392,6 @@ def _evaluate_distributed(
     gathered_row_ids = accelerator.gather(padded_row_ids)
     gathered_labels = accelerator.gather(padded_labels)
     gathered_logits = accelerator.gather(padded_logits)
-    gathered_diag: torch.Tensor | None = None
-    if collect_diag:
-        padded_diag = accelerator.pad_across_processes(local_diag, dim=0, pad_index=0)
-        gathered_diag = accelerator.gather(padded_diag)
-    reduced_relational_block = relational_block
-    if kd_val is not None and kd_val.arm == "kd_gram":
-        reduced_relational_block = accelerator.reduce(relational_block, reduction="sum")
-
     # Coverage must be validated symmetrically: accelerator.gather returns the
     # full gathered tensors on EVERY rank, so every rank masks the padding and
     # runs the same coverage check. A duplicate/missing row then raises
@@ -2469,13 +2401,10 @@ def _evaluate_distributed(
     row_ids_np = gathered_row_ids.cpu().numpy()
     labels_np = gathered_labels.cpu().numpy()
     logits_np = gathered_logits.cpu().numpy()
-    diag_np = gathered_diag.cpu().numpy() if gathered_diag is not None else None
     keep = row_ids_np >= 0
     row_ids_np = row_ids_np[keep]
     labels_np = labels_np[keep]
     logits_np = logits_np[keep]
-    if diag_np is not None:
-        diag_np = diag_np[keep]
     expected = (
         expected_row_ids
         if expected_row_ids is not None
@@ -2488,6 +2417,18 @@ def _evaluate_distributed(
         expected_row_ids=expected,
     )
 
+    all_rep_parts = (
+        gather_object(rep_parts)
+        if validation_bank is not None and validation_bank.rep_key is not None
+        else []
+    )
+    diagnostics = None
+    if validation_bank is not None:
+        rep_sorted = None
+        if all_rep_parts:
+            rep_ids = np.concatenate([part[0] for part in all_rep_parts])
+            rep_sorted = np.concatenate([part[1] for part in all_rep_parts])[np.argsort(rep_ids)]
+        diagnostics = validation_bank.metrics(logits_sorted, rep_sorted)
     outcome_payload: list[dict[str, object] | None] = [None]
     if accelerator.is_main_process:
         probs = _stable_sigmoid(logits_sorted.astype(np.float64))
@@ -2500,60 +2441,19 @@ def _evaluate_distributed(
             outcome_dict["task_loss"] = _stable_bce_with_logits(
                 logits_sorted.astype(np.float64), smoothed
             )
-        if kd_val is not None:
-            kd_metrics: dict[str, float] = {}
-            if diag_np is not None and diag_np.size > 0 and kd_val.arm in _AUX_HEAD_ARMS:
-                assert kd_val.teacher_rep is not None
-                pred = diag_np[np.argsort(row_ids_np)].astype(np.float64)
-                target = kd_val.teacher_rep.float().cpu().numpy().astype(np.float64)
-                resid = ((pred - target) ** 2).sum(axis=0)
-                total = ((target - target.mean(axis=0)) ** 2).sum(axis=0)
-                kd_metrics["val_kd_struct_loss"] = float(resid.sum() / pred.size)
-                for name, r2 in zip(
-                    kd_val.rep_names, 1.0 - resid / np.maximum(total, 1e-12), strict=True
-                ):
-                    kd_metrics[f"val_kd_struct_r2_{name}"] = float(r2)
-            elif diag_np is not None and diag_np.size > 0:
-                key = "val_kd_rep_cos" if kd_val.arm in _REP_COS_ARMS else "val_kd_latent_cos"
-                kd_metrics[key] = float(diag_np.mean())
-                if kd_val.arm in _REP_COS_ARMS:
-                    kd_metrics["val_kd_rep_loss"] = 1.0 - kd_metrics[key]
-            logits64 = logits_sorted.astype(np.float64)
-            teacher64 = kd_val.teacher_logit_np
-            if logits64.shape[0] > 0 and kd_val.arm not in _AUX_HEAD_ARMS:
-                kd_metrics["val_kd_logit_corr"] = _pearson_from_moments(
-                    float(logits64.sum()),
-                    float(teacher64.sum()),
-                    float((logits64 * logits64).sum()),
-                    float((teacher64 * teacher64).sum()),
-                    float((logits64 * teacher64).sum()),
-                    float(logits64.shape[0]),
-                )
-                prob_err = np.abs(_stable_sigmoid(logits64) - _stable_sigmoid(teacher64))
-                kd_metrics["val_kd_prob_mae"] = float(prob_err.mean())
-                kd_metrics["val_kd_logit_loss"] = _stable_bce_with_logits(
-                    logits64, _stable_sigmoid(teacher64)
-                )
-            block_count = float(reduced_relational_block[2].item())
-            if context_metrics is not None:
-                kd_metrics.update(context_metrics)
-            if block_count > 0.0 and kd_val.arm == "kd_gram":
-                kd_metrics["val_kd_gram_block_loss"] = (
-                    float(reduced_relational_block[0].item()) / block_count
-                )
-            outcome_dict["kd"] = kd_metrics
+        if diagnostics is not None:
+            outcome_dict["diagnostics"] = diagnostics
         outcome_payload[0] = outcome_dict
 
     broadcast_object_list(outcome_payload, from_process=0)
     payload = outcome_payload[0]
     if payload is None:  # pragma: no cover - broadcast always populates rank>0
         raise RuntimeError("distributed validation failed to broadcast metrics")
-    kd_result = cast(dict[str, float] | None, payload.get("kd")) if kd_val is not None else None
     return ValidationOutcome(
         metrics=EdgeMetrics(**cast(dict[str, Any], payload["metrics"])),
         topology=None,
-        kd=kd_result,
         task_loss=cast(float | None, payload.get("task_loss")),
+        diagnostics=cast(dict[str, float] | None, payload.get("diagnostics")),
     )
 
 
@@ -2696,8 +2596,8 @@ def _evaluate_two_pass(
     *,
     expected_row_ids: np.ndarray,
     topology_eval_fn: TopologyEvalFn,
-    kd_val: KDValDiagnostics | None = None,
     label_smoothing: float = 0.0,
+    validation_bank: OracleValidationBank | None = None,
 ) -> ValidationOutcome:
     """Run the cls and V_val-topology validation passes and merge their outcomes."""
     cls_outcome = _evaluate_distributed(
@@ -2705,15 +2605,15 @@ def _evaluate_two_pass(
         val_loader,
         accelerator,
         expected_row_ids=expected_row_ids,
-        kd_val=kd_val,
         label_smoothing=label_smoothing,
+        validation_bank=validation_bank,
     )
     topology = topology_eval_fn(model, accelerator)
     return ValidationOutcome(
         metrics=cls_outcome.metrics,
         topology=topology,
-        kd=cls_outcome.kd,
         task_loss=cls_outcome.task_loss,
+        diagnostics=cls_outcome.diagnostics,
     )
 
 
@@ -2747,38 +2647,6 @@ def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | No
         ),
         threshold=float(cast(float, row["val_threshold"])),
     )
-
-
-@dataclass(frozen=True)
-class KDValDiagnostics:
-    """Validation-row teacher targets for the validation-only KD diagnostics.
-
-    Attributes:
-        arm: The active KD arm.
-        teacher_logit: ``(n_val,)`` fp32 teacher logits, on the training device.
-        teacher_logit_np: ``(n_val,)`` fp64 CPU copy, aligned with V_val
-            classification row ids ``0..n_val-1`` -- the row order
-            `validate_gathered_validation` sorts scored logits into.
-        teacher_rep: ``(n_val, rep_dim)`` fp16 teacher pooled embeddings (or
-            z-scored descriptors for ``kd_struct``), on the training device;
-            populated for the cosine arms, ``kd_gram``, and the aux-head arms.
-        teacher_latent: ``(n_val, latent_dim)`` fp16 teacher latents, on the
-            training device; populated only for ``kd_gen`` and normalized at use.
-        latent_scale: Artifact-wide teacher latent RMS used for normalization.
-        rep_names: Per-column names of ``teacher_rep`` for the auxiliary-head
-            R^2 telemetry (descriptors for ``kd_struct``, whitened axes for ``kd_white``).
-        context_stream: Fixed V_val context bank used only for ``kd_rank``
-            rank/distribution/tie diagnostics.
-    """
-
-    arm: str
-    teacher_logit: torch.Tensor
-    teacher_logit_np: np.ndarray
-    teacher_rep: torch.Tensor | None
-    teacher_latent: torch.Tensor | None
-    latent_scale: float = 1.0
-    context_stream: KDContextStream | None = None
-    rep_names: tuple[str, ...] = STRUCT_NAMES
 
 
 def _pearson_from_moments(
@@ -2918,8 +2786,8 @@ class KDContextStream:
             [i for i, node in enumerate(targets.node_ids) if node in forbidden_internal_nodes],
             dtype=np.int32,
         )
-        if not np.array_equal(targets.val_bank.anchor_idx, expected_val):
-            raise ValueError("KD context validation anchors do not match the V_val identity")
+        if not np.array_equal(targets.forbidden_node_idx, expected_val):
+            raise ValueError("KD context quarantine nodes do not match the V_val identity")
 
         self._distill = distill
         self._targets = targets
@@ -3135,64 +3003,13 @@ class KDContextStream:
             "kd_dist_live_anchors": anchors,
         }
 
-    def _gather_val_rows(self, bank: KDContextBank, local: torch.Tensor) -> torch.Tensor:
-        """Concatenate every rank's stripe of V_val context rows, rank order."""
-        counts = [
-            int(
-                np.diff(bank.anchor_offsets)[
-                    self._anchor_positions(bank, rank=r, steps=1, step=0)
-                ].sum()
-            )
-            for r in range(self._world_size)
-        ]
-        width = max(counts)  # collectives need equal shapes: pad, gather, trim
-        padded = torch.zeros(width, dtype=local.dtype, device=local.device)
-        padded[: local.numel()] = local
-        parts = [torch.empty_like(padded) for _ in counts]
-        dist.all_gather(parts, padded)
-        return torch.cat([part[:n] for part, n in zip(parts, counts, strict=True)])
-
-    def validation_diagnostics(self, model: nn.Module) -> dict[str, float]:
-        """Score the fixed V_val context bank without gradients.
-
-        Anchors are striped across ranks and the rows all-gathered, so every
-        rank returns identical values.
-
-        Raises:
-            RuntimeError: If ``world_size > 1`` without an initialized
-                process group (a partial bank would score silently).
-        """
-        bank = self._targets.val_bank
-        every = range(len(bank.anchor_idx))
-        positions = self._anchor_positions(bank, rank=self._rank, steps=1, step=0)
-        if self._world_size > 1 and not (dist.is_available() and dist.is_initialized()):
-            raise RuntimeError("sharded KD context validation needs a process group")
-        with torch.no_grad():
-            student, teacher, groups = self._score(model, bank, positions)
-            groups = torch.as_tensor(positions, dtype=torch.int64, device=groups.device)[groups]
-            if self._world_size > 1:
-                student = self._gather_val_rows(bank, student)
-                teacher = self._gather_val_rows(bank, teacher)
-                groups = self._gather_val_rows(bank, groups)
-            pair_count, anchor_count = self._live_counts(bank, every)
-            rank = kd_rank_loss(student, teacher, groups, margin=self._distill.margin)
-            distribution = kd_dist_loss(student, teacher, groups)
-            ties, tie_pairs = self._tie_counts(teacher, groups, self._distill.margin)
-        return {
-            "val_kd_rank_loss": float(rank.item()),
-            "val_kd_dist_loss": float(distribution.item()),
-            "val_kd_rank_tie_fraction": ties / max(tie_pairs, 1),
-            "val_kd_rank_live_pairs": float(pair_count),
-            "val_kd_dist_live_anchors": float(anchor_count),
-        }
-
 
 class KDRowBank:
     """Official-row targets for telemetry and non-rank same-batch KD terms.
 
     Replaces the old `KDStream` sampled anchor-context second forward: a
     teacher target exists for every official training row
-    (`src/distill/teacher_targets.py`, format ``kd_row_targets_v1``), joined
+    (`src/distill/teacher_targets.py`, format ``kd_row_targets_v2``), joined
     to the trainer's own rows by ``batch["_row_id"]``. Non-rank KD terms use
     the task forward; ``kd_rank`` keeps only logit/probability telemetry here,
     while ``kd_rank_rep`` also adds per-row cosine KD. Both arms get their
@@ -3211,8 +3028,6 @@ class KDRowBank:
         *,
         train_pairs: Sequence[Pair],
         train_labels: Sequence[int],
-        val_pairs: Sequence[Pair],
-        val_labels: Sequence[int],
         model: nn.Module,
         device: torch.device,
     ) -> None:
@@ -3225,15 +3040,12 @@ class KDRowBank:
                 row-id order (row_id == position), the unique multi-epoch pair union
                 from `_dynamic_training_corpus`.
             train_labels: Labels aligned with `train_pairs`.
-            val_pairs: The trainer's V_val classification rows, in exact
-                row-id order -- `_val_cls_rows`'s pairs.
-            val_labels: Labels aligned with `val_pairs`.
             model: The scorer, unwrapped or not (unwrapped internally), used
                 only to validate the architecture.
             device: The training device the row tensors are staged onto.
 
         Raises:
-            ValueError: If either row block does not equal the trainer's own
+            ValueError: If the training row block does not equal the trainer's own
                 rows, in order, exactly once. This subsumes the old
                 allowed-nodes/V_val-boundary checks entirely: the joined rows
                 ARE the trainer's own quarantined rows, so a row-exact join
@@ -3241,6 +3053,8 @@ class KDRowBank:
             RuntimeError: On a `kd_rep_head`/`d_model` width mismatch between
                 the artifact and the model.
         """
+        if targets.manifest.get("truth_source") == "validation_structure":
+            raise ValueError("G_val diagnostics cannot supply training KD targets")
         self.arm = distill.arm
         self._w_logit = distill.w_logit
         self._w_gram = distill.w_gram
@@ -3258,16 +3072,6 @@ class KDRowBank:
             pairs=train_pairs,
             labels=train_labels,
         )
-        self._verify_join(
-            block_name="validation",
-            a_idx=targets.val_pair_a_idx,
-            b_idx=targets.val_pair_b_idx,
-            label=targets.val_pair_label,
-            node_ids_arr=node_ids_arr,
-            pairs=val_pairs,
-            labels=val_labels,
-        )
-
         raw_model = _unwrapped_model(model)
         kd_rep_head = getattr(raw_model, "kd_rep_head", None)
 
@@ -3335,31 +3139,6 @@ class KDRowBank:
         self.train_rep: torch.Tensor | None = None
         if self.arm in {"kd_gram", "kd_gen"} | _REP_COS_ARMS | _AUX_HEAD_ARMS:
             self.train_rep = torch.as_tensor(targets.teacher_rep, dtype=torch.float16, device="cpu")
-        val_teacher_rep: torch.Tensor | None = None
-        if self.arm in {"kd_gram"} | _REP_COS_ARMS | _AUX_HEAD_ARMS:
-            val_teacher_rep = torch.as_tensor(
-                targets.val_teacher_rep, dtype=torch.float16, device=device
-            )
-        val_teacher_latent: torch.Tensor | None = None
-        if self.arm == "kd_gen":
-            val_teacher_latent = torch.as_tensor(
-                targets.val_teacher_rep, dtype=torch.float16, device=device
-            )
-        self._val = KDValDiagnostics(
-            arm=self.arm,
-            teacher_logit=torch.as_tensor(
-                targets.val_teacher_logit, dtype=torch.float32, device=device
-            ),
-            teacher_logit_np=np.asarray(targets.val_teacher_logit, dtype=np.float64),
-            teacher_rep=val_teacher_rep,
-            teacher_latent=val_teacher_latent,
-            latent_scale=self._latent_scale,
-            rep_names=(
-                tuple(str(n) for n in cast(list[object], targets.manifest["descriptors"]))
-                if self.arm in _AUX_HEAD_ARMS
-                else STRUCT_NAMES
-            ),
-        )
 
     @staticmethod
     def _verify_join(
@@ -3590,10 +3369,6 @@ class KDRowBank:
                     )
         return telemetry
 
-    def val_diagnostics(self) -> KDValDiagnostics:
-        """Return the staged validation-row teacher targets for `_evaluate_distributed`."""
-        return self._val
-
     @property
     def global_relational(self) -> bool:
         """Whether the arm's KD scalar already covers the global DDP step."""
@@ -3693,8 +3468,7 @@ def train_ddp_loop(
 
     Trains up to ``cfg.optim.epochs`` epochs with a validation after every epoch
     (the V_val topology pass on the ``eval.topology_every`` cadence). Patience
-    counts on the total validation loss
-    (:func:`~src.eval.early_stopping.compose_val_total`) and really stops the run;
+    counts on the validation task loss and really stops the run;
     checkpoint selection stays independent -- the six-criterion mean rank, or
     validation AUPRC alone when ``eval.classification_only`` skips the topology
     pass. Tail batches are loss-scaled with
@@ -3753,7 +3527,7 @@ def train_ddp_loop(
     history: list[dict[str, object]] = []
     metrics_by_epoch: dict[int, EdgeMetrics] = {}
     topology_by_epoch: dict[int, ValTopologyResult | None] = {}
-    best_val_total = float("inf")
+    best_val_task_loss = float("inf")
     last_metrics: EdgeMetrics | None = None
     evals_without_improvement = 0
     stop_epoch: int | None = None
@@ -3932,11 +3706,11 @@ def train_ddp_loop(
         # The persisted rows are the monitor's only state; an attempt written
         # before this key existed cannot reach here at all, because its
         # `training_state.pt` lacks `stop_epoch` and the load above raises.
-        best_val_total = min(
+        best_val_task_loss = min(
             (
                 float(cast(float, value))
                 for row in metrics_rows
-                if (value := row.get("val_total_loss")) is not None
+                if (value := row.get("val_task_loss")) is not None
             ),
             default=float("inf"),
         )
@@ -4217,14 +3991,16 @@ def train_ddp_loop(
             "val_ece": metrics.ece,
             "val_brier": metrics.brier,
         }
-        val_total: float | None = None
+        val_task_loss: float | None = None
         if outcome.task_loss is not None:
-            val_total = compose_val_total(outcome.task_loss, outcome.kd, cfg.distill)
+            val_task_loss = outcome.task_loss
             entry["val_task_loss"] = outcome.task_loss
-            entry["val_total_loss"] = val_total
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
+        if outcome.diagnostics is not None:
+            entry.update(outcome.diagnostics)
+            entry["val_kd_truth_source"] = "validation_structure"
         if kd_bank is not None or kd_context_stream is not None:
             grad_norm_tensor = accelerator.reduce(
                 torch.tensor(
@@ -4234,8 +4010,6 @@ def train_ddp_loop(
             )
             entry["grad_norm_task"] = float(grad_norm_tensor[0].item())
             entry["grad_norm_kd"] = float(grad_norm_tensor[1].item())
-        if outcome.kd is not None:
-            entry.update(outcome.kd)
         if outcome.topology is not None:
             entry.update(
                 {
@@ -4252,12 +4026,12 @@ def train_ddp_loop(
         topology_by_epoch[epoch] = outcome.topology
         # No monitor value (zero validation rows) leaves patience untouched: a
         # missing measurement is not evidence of stagnation.
-        improved = val_total is not None and val_total < best_val_total
+        improved = val_task_loss is not None and val_task_loss < best_val_task_loss
         if improved:
-            assert val_total is not None
-            best_val_total = val_total
+            assert val_task_loss is not None
+            best_val_task_loss = val_task_loss
             evals_without_improvement = 0
-        elif val_total is not None:
+        elif val_task_loss is not None:
             evals_without_improvement += 1
             # Defer an exhausted patience to the next topology-due epoch: only
             # those epochs produce a `CheckpointCandidate`, so stopping between
@@ -4274,14 +4048,14 @@ def train_ddp_loop(
         if accelerator.is_main_process:
             logger.info(
                 "ddp eval epoch %d/%d: train_loss %.4f val_auroc %.4f val_auprc %.4f "
-                "val_total %s%s",
+                "val_task_loss %s%s",
                 epoch,
                 cfg.optim.epochs,
                 train_loss,
                 metrics.auroc,
                 metrics.auprc,
-                "n/a" if val_total is None else f"{val_total:.4f}",
-                " (new val-total low)" if improved else "",
+                "n/a" if val_task_loss is None else f"{val_task_loss:.4f}",
+                " (new val-task-loss low)" if improved else "",
             )
         per_epoch_profiles.append(
             {
@@ -4401,7 +4175,7 @@ def train_ddp_loop(
             stopped_early = True
             if accelerator.is_main_process:
                 logger.info(
-                    "early stopping at epoch %d (%d evals without val-total-loss improvement)",
+                    "early stopping at epoch %d (%d evals without val-task-loss improvement)",
                     epoch,
                     cfg.eval.patience,
                 )
@@ -4926,17 +4700,13 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
 
     kd_bank: KDRowBank | None = None
     kd_context_stream: KDContextStream | None = None
-    kd_val: KDValDiagnostics | None = None
     if cfg.distill is not None and cfg.distill.active:
         corpus = _dynamic_training_corpus(cfg, assembled)
         if cfg.distill.arm == "kd_struct":
             targets = structural_row_targets(
                 train_graph=val_split.build_training_graph(),
-                val_graph=substrate_graph(val_split, assembled.benchmark.split.train_graph),
                 train_pairs=corpus.pairs,
                 train_labels=corpus.labels,
-                val_pairs=val_cls_pairs,
-                val_labels=val_cls_labels,
             )
         else:
             targets = load_kd_targets(Path(cfg.distill.targets_path))
@@ -4945,12 +4715,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             targets,
             train_pairs=corpus.pairs,
             train_labels=corpus.labels,
-            val_pairs=val_cls_pairs,
-            val_labels=val_cls_labels,
             model=model,
             device=accelerator.device,
         )
-        kd_val = kd_bank.val_diagnostics()
         if cfg.distill.w_rank > 0.0:
             context_targets = load_kd_context_targets(Path(cfg.distill.context_targets_path))
             kd_context_stream = KDContextStream(
@@ -4964,7 +4731,6 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 world_size=accelerator.num_processes,
                 token_budget=cfg.data.token_budget,
             )
-            kd_val = replace(kd_val, context_stream=kd_context_stream)
         if accelerator.is_main_process:
             logger.info(
                 "KD active: arm=%s targets=%s context_targets=%s",
@@ -4978,9 +4744,18 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     )
     if accelerator.is_main_process:
         logger.info(
-            "early-stop monitor: val_total_loss = %s (patience %d)",
-            " + ".join(val_total_terms(cfg.distill)),
+            "early-stop monitor: val_task_loss (patience %d)",
             cfg.eval.patience,
+        )
+    validation_bank = None
+    if cfg.distill is not None and cfg.distill.validation_targets_path:
+        validation_bank = OracleValidationBank(
+            load_kd_targets(
+                Path(cfg.distill.validation_targets_path), truth_source="validation_structure"
+            ),
+            cfg.distill,
+            val_cls_pairs,
+            val_cls_labels,
         )
     reference: ValTopologyReference | None = None
     cls_evaluate_fn = cast(
@@ -4988,8 +4763,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         functools.partial(
             _evaluate_distributed,
             expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
-            kd_val=kd_val,
             label_smoothing=val_label_smoothing,
+            validation_bank=validation_bank,
         ),
     )
     evaluate_cls_fn: EvaluateFn | None = None
@@ -5031,8 +4806,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                         reference=reference,
                     ),
                 ),
-                kd_val=kd_val,
                 label_smoothing=val_label_smoothing,
+                validation_bank=validation_bank,
             ),
         )
 

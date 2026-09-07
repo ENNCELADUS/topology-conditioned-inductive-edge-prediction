@@ -195,29 +195,6 @@ def sample_context_banks(
     )
 
 
-def sample_v_val_context_bank(
-    truth_graph: nx.Graph,
-    *,
-    v_val: frozenset[str],
-    node_ids: Sequence[str],
-    rw_step: int = DEFAULT_RW_STEP,
-    hops: int = DEFAULT_HOPS,
-    ns_rate: int = DEFAULT_NS_RATE,
-) -> ContextBank:
-    """Build the fixed, diagnostics-only V_val context bank."""
-    return sample_context_bank(
-        truth_graph,
-        anchor_ids=sorted(v_val.intersection(node_ids)),
-        node_ids=node_ids,
-        forbidden_internal=v_val,
-        seed=V_VAL_DIAGNOSTIC_SEED,
-        epoch=0,
-        rw_step=rw_step,
-        hops=hops,
-        ns_rate=ns_rate,
-    )
-
-
 __all__ = [
     "DEFAULT_HOPS",
     "DEFAULT_NS_RATE",
@@ -226,5 +203,4 @@ __all__ = [
     "ContextBank",
     "sample_context_bank",
     "sample_context_banks",
-    "sample_v_val_context_bank",
 ]

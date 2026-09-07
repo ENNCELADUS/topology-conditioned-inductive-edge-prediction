@@ -55,7 +55,7 @@ def _write_artifact(path: Path, *, teacher_logit: np.ndarray | None = None) -> N
                 near=[True, True, False, True],
             ),
         ),
-        val_bank=_bank(anchors=[1], offsets=[0, 1], partners=[0], scores=[4], near=[False]),
+        forbidden_node_idx=np.array([1], dtype=np.int32),
         sampler_params={"rw_step": 3, "hops": 2, "ns_rate": 1},
         seed=0,
         truth_graph_sha256="truth-provenance",
@@ -81,17 +81,21 @@ def test_context_targets_round_trip_preserves_deduplicated_bank_joins(tmp_path: 
 
     assert loaded.node_ids == ["a", "b", "c"]
     assert loaded.teacher_logit.dtype == np.float32
+    assert not hasattr(loaded, "val_bank")
+    with np.load(artifact_dir / "targets.npz") as archive:
+        assert not any(name.startswith("val_") for name in archive.files)
+    np.testing.assert_array_equal(loaded.forbidden_node_idx, [1])
     np.testing.assert_array_equal(loaded.pair_a_idx, [0, 0, 1, 2, 1])
     np.testing.assert_array_equal(loaded.pair_b_idx, [1, 2, 2, 0, 0])
     assert len(loaded.banks) == 2
     np.testing.assert_array_equal(loaded.banks[0].score_idx, [0, 1, 2, 3])
     np.testing.assert_array_equal(loaded.banks[1].score_idx, [1, 2, 4, 3])
     np.testing.assert_array_equal(loaded.banks[1].partner_idx, [2, 2, 0, 0])
-    assert loaded.manifest["format"] == "kd_ctx_targets_v1"
+    assert loaded.manifest["format"] == "kd_ctx_targets_v2"
     assert loaded.manifest["sampler_params"] == {"rw_step": 3, "hops": 2, "ns_rate": 1}
     assert loaded.manifest["seed"] == 0
     assert loaded.manifest["n_banks"] == 2
-    assert loaded.manifest["n_val_anchors"] == 1
+    assert loaded.manifest["n_forbidden_nodes"] == 1
     assert loaded.manifest["checkpoint_id"] == "teacher-7"
     assert "npz_sha256" not in loaded.manifest
     assert "node_ids_sha256" not in loaded.manifest
@@ -151,34 +155,6 @@ def test_context_targets_reject_v_val_internal_training_pair(tmp_path: Path) -> 
         load_kd_context_targets(artifact_dir)
 
 
-def test_context_targets_reject_v_val_internal_validation_pair(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "context-targets"
-    _write_artifact(artifact_dir)
-    _replace_npz_array(
-        artifact_dir,
-        "pair_b_idx",
-        np.asarray([1, 2, 2, 0, 1], dtype=np.int32),
-    )
-    _replace_npz_array(
-        artifact_dir,
-        "val_partner_idx",
-        np.asarray([1], dtype=np.int32),
-    )
-    _replace_npz_array(
-        artifact_dir,
-        "bank_001_partner_idx",
-        np.asarray([2, 2, 2, 0], dtype=np.int32),
-    )
-    _replace_npz_array(
-        artifact_dir,
-        "bank_001_score_idx",
-        np.asarray([1, 2, 2, 3], dtype=np.int32),
-    )
-
-    with pytest.raises(ValueError, match="validation context bank contains a V_val-internal pair"):
-        load_kd_context_targets(artifact_dir)
-
-
 def test_context_targets_reject_non_fp32_logits(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "context-targets"
     _write_artifact(artifact_dir)
@@ -198,9 +174,9 @@ def test_context_targets_reject_universe_or_manifest_drift(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="universe/order"):
         load_kd_context_targets(artifact_dir, expected_node_ids=["a", "c", "b"])
-    with pytest.raises(ValueError, match="expected_val_anchor_idx"):
+    with pytest.raises(ValueError, match="expected_forbidden_node_idx"):
         load_kd_context_targets(
-            artifact_dir, expected_val_anchor_idx=np.asarray([2], dtype=np.int32)
+            artifact_dir, expected_forbidden_node_idx=np.asarray([2], dtype=np.int32)
         )
 
     manifest_path = artifact_dir / "manifest.json"

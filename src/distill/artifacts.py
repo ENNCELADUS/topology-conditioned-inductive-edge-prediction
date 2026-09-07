@@ -1,29 +1,11 @@
-"""KD teacher-target artifacts: `targets.npz` + `manifest.json` + `node_ids.json`.
+"""Training-only KD banks, scored by the frozen teacher on the training graph.
 
-Written by `src.distill.teacher_targets` and read by the KD trainer
-(`src/train_b0.py`). Format tag ``"kd_row_targets_v1"``. `truth_source` is
-always ``"training_structure"``: the V_val-quarantined training graph over
-all train nodes (cross-boundary edges included, V_val-internal pairs
-excluded). Teacher inference applies query-edge masking -- a positive
-training edge is never visible in its own structural context (structural in
-the full-ego oracle generator's stitch).
-
-`targets.npz` holds two row blocks (dtype pinned per array; see
-`_ARRAY_DTYPES`):
-
-- Training block: one row per official training row, in the trainer's exact
-  row order (row_id == array position), directly joinable against it.
-  ``pair_a_idx``/``pair_b_idx`` int32 node indices, ``pair_label`` int8,
-  ``teacher_logit`` fp32, ``teacher_rep`` fp16 ``(n_rows, rep_dim)`` -- the
-  dump-side symmetrized teacher pooled pair embedding
-  ``0.5 * (pooled_ab + pooled_ba)``.
-- Validation block: the same five arrays, ``val_``-prefixed, one row per
-  official V_val classification row in that fixed order, backing
-validation-only KD diagnostics.
-
-The sibling ``"kd_ctx_targets_v1"`` format keeps a deduplicated fp32
-``(anchor, partner, teacher_logit)`` score table. Each epoch bank and the
-fixed validation diagnostic bank store CSR rows plus indices into that table.
+Row targets cover the student's deduplicated multi-epoch training corpus with
+exact pair/label joins. Context targets store training CSR banks and a unique
+score table. ``forbidden_node_idx`` records the V_val pair quarantine; it is
+boundary metadata, not a validation bank. No validation teacher targets are
+stored in training banks. A separate oracle_val_diagnostics_v1 row artifact
+uses validation_structure; its loader requires that context explicitly.
 """
 
 from __future__ import annotations
@@ -34,13 +16,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
-KD_ROW_TARGETS_FORMAT = "kd_row_targets_v1"
-KD_CONTEXT_TARGETS_FORMAT = "kd_ctx_targets_v1"
+KD_ROW_TARGETS_FORMAT = "kd_row_targets_v2"
+KD_CONTEXT_TARGETS_FORMAT = "kd_ctx_targets_v2"
 TRUTH_SOURCE = "training_structure"
 
 _NPZ_NAME = "targets.npz"
@@ -55,11 +37,6 @@ _ARRAY_DTYPES: dict[str, type] = {
     "pair_label": np.int8,
     "teacher_logit": np.float32,
     "teacher_rep": np.float16,
-    "val_pair_a_idx": np.int32,
-    "val_pair_b_idx": np.int32,
-    "val_pair_label": np.int8,
-    "val_teacher_logit": np.float32,
-    "val_teacher_rep": np.float16,
 }
 
 
@@ -73,11 +50,6 @@ class KDRowTargets:
     pair_label: NDArray[np.int8]
     teacher_logit: NDArray[np.float32]
     teacher_rep: NDArray[np.float16]
-    val_pair_a_idx: NDArray[np.int32]
-    val_pair_b_idx: NDArray[np.int32]
-    val_pair_label: NDArray[np.int8]
-    val_teacher_logit: NDArray[np.float32]
-    val_teacher_rep: NDArray[np.float16]
     manifest: dict[str, object]
 
 
@@ -101,7 +73,7 @@ class KDContextTargets:
     pair_b_idx: NDArray[np.int32]
     teacher_logit: NDArray[np.float32]
     banks: tuple[KDContextBank, ...]
-    val_bank: KDContextBank
+    forbidden_node_idx: NDArray[np.int32]
     manifest: dict[str, object]
 
 
@@ -175,17 +147,13 @@ def write_kd_targets(
     pair_label: NDArray[np.integer],
     teacher_logit: NDArray[np.floating],
     teacher_rep: NDArray[np.floating],
-    val_pair_a_idx: NDArray[np.integer],
-    val_pair_b_idx: NDArray[np.integer],
-    val_pair_label: NDArray[np.integer],
-    val_teacher_logit: NDArray[np.floating],
-    val_teacher_rep: NDArray[np.floating],
     truth_graph_sha256: str,
     checkpoint_path: Path,
     checkpoint_sha256: str,
     checkpoint_id: str | None,
     rep_source: str,
     manifest_extra: Mapping[str, object] | None = None,
+    truth_source: Literal["training_structure", "validation_structure"] = "training_structure",
 ) -> None:
     """Write one validated KD row-targets artifact directory.
 
@@ -193,17 +161,14 @@ def write_kd_targets(
     (``topo``: the encoder's pooled summary; ``fused``: the classifier's
     pre-head pair feature).
 
-    The training block must cover the official training rows in the
-    trainer's exact row order (row_id == array position); the validation
-    block covers the official V_val classification rows in their fixed
-    order.
+    The training block covers the multi-epoch scoring corpus in the
+    trainer's exact row order (row_id == array position).
 
     Raises:
-        ValueError: If either block's arrays disagree on row count, is
+        ValueError: If the training block's arrays disagree on row count, is
             empty, contains an out-of-range pair index, a non-finite
             `teacher_logit`/`teacher_rep` value, a non-binary `pair_label`,
-            or a `teacher_rep`/`val_teacher_rep` rank other than 2; if the
-            two blocks' `rep_dim` disagree.
+            or a `teacher_rep` rank other than 2.
     """
     n_nodes = len(node_ids)
     n_rows = _validate_block(
@@ -215,19 +180,7 @@ def write_kd_targets(
         logit=teacher_logit,
         rep=teacher_rep,
     )
-    n_val_rows = _validate_block(
-        block_name="validation",
-        n_nodes=n_nodes,
-        a_idx=val_pair_a_idx,
-        b_idx=val_pair_b_idx,
-        label=val_pair_label,
-        logit=val_teacher_logit,
-        rep=val_teacher_rep,
-    )
     rep_dim = np.asarray(teacher_rep).shape[1]
-    if np.asarray(val_teacher_rep).shape[1] != rep_dim:
-        raise ValueError("teacher_rep and val_teacher_rep must share the same rep_dim")
-
     output_dir.mkdir(parents=True, exist_ok=True)
     npz_path = output_dir / _NPZ_NAME
     arrays: dict[str, NDArray[np.generic]] = {
@@ -236,11 +189,6 @@ def write_kd_targets(
         "pair_label": np.asarray(pair_label, dtype=np.int8),
         "teacher_logit": np.asarray(teacher_logit, dtype=np.float32),
         "teacher_rep": np.asarray(teacher_rep, dtype=np.float16),
-        "val_pair_a_idx": np.asarray(val_pair_a_idx, dtype=np.int32),
-        "val_pair_b_idx": np.asarray(val_pair_b_idx, dtype=np.int32),
-        "val_pair_label": np.asarray(val_pair_label, dtype=np.int8),
-        "val_teacher_logit": np.asarray(val_teacher_logit, dtype=np.float32),
-        "val_teacher_rep": np.asarray(val_teacher_rep, dtype=np.float16),
     }
     np.savez(npz_path, **cast(dict[str, Any], arrays))
     npz_sha256 = _sha256_file(npz_path)
@@ -251,15 +199,16 @@ def write_kd_targets(
 
     label_arr = np.asarray(pair_label)
     manifest: dict[str, object] = {
-        "format": KD_ROW_TARGETS_FORMAT,
-        "truth_source": TRUTH_SOURCE,
+        "format": (
+            KD_ROW_TARGETS_FORMAT if truth_source == TRUTH_SOURCE else "oracle_val_diagnostics_v1"
+        ),
+        "truth_source": truth_source,
         "truth_graph_sha256": truth_graph_sha256,
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_id": checkpoint_id,
         "n_nodes": n_nodes,
         "n_rows": n_rows,
-        "n_val_rows": n_val_rows,
         "n_positive_rows": int(np.sum(label_arr)),
         "rep_dim": int(rep_dim),
         "rep_source": rep_source,
@@ -274,7 +223,7 @@ def write_kd_targets(
     )
 
 
-def load_kd_targets(path: Path) -> KDRowTargets:
+def load_kd_targets(path: Path, *, truth_source: str = TRUTH_SOURCE) -> KDRowTargets:
     """Load one KD row-targets artifact directory.
 
     Digest/format verification was deliberately removed (user decision,
@@ -282,10 +231,11 @@ def load_kd_targets(path: Path) -> KDRowTargets:
 
     Args:
         path: Artifact directory.
+        truth_source: Required structural context; prevents using G_val targets for training.
 
     Raises:
         ValueError: If a file is missing, the npz array set is not exactly
-            the ten required names.
+            the five required names.
     """
     manifest_path = path / _MANIFEST_NAME
     node_ids_path = path / _NODE_IDS_NAME
@@ -293,6 +243,8 @@ def load_kd_targets(path: Path) -> KDRowTargets:
     if not manifest_path.is_file():
         raise ValueError(f"KD target artifact {path} is missing {_MANIFEST_NAME}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("truth_source") != truth_source:
+        raise ValueError(f"KD target truth_source must be {truth_source!r}")
     if not npz_path.is_file():
         raise ValueError(f"KD target artifact {path} is missing {_NPZ_NAME}")
     if not node_ids_path.is_file():
@@ -312,11 +264,6 @@ def load_kd_targets(path: Path) -> KDRowTargets:
         pair_label = np.asarray(archive["pair_label"], dtype=np.int8)
         teacher_logit = np.asarray(archive["teacher_logit"], dtype=np.float32)
         teacher_rep = np.asarray(archive["teacher_rep"], dtype=np.float16)
-        val_pair_a_idx = np.asarray(archive["val_pair_a_idx"], dtype=np.int32)
-        val_pair_b_idx = np.asarray(archive["val_pair_b_idx"], dtype=np.int32)
-        val_pair_label = np.asarray(archive["val_pair_label"], dtype=np.int8)
-        val_teacher_logit = np.asarray(archive["val_teacher_logit"], dtype=np.float32)
-        val_teacher_rep = np.asarray(archive["val_teacher_rep"], dtype=np.float16)
 
     return KDRowTargets(
         node_ids=node_ids,
@@ -325,11 +272,6 @@ def load_kd_targets(path: Path) -> KDRowTargets:
         pair_label=pair_label,
         teacher_logit=teacher_logit,
         teacher_rep=teacher_rep,
-        val_pair_a_idx=val_pair_a_idx,
-        val_pair_b_idx=val_pair_b_idx,
-        val_pair_label=val_pair_label,
-        val_teacher_logit=val_teacher_logit,
-        val_teacher_rep=val_teacher_rep,
         manifest=manifest,
     )
 
@@ -340,7 +282,7 @@ def _context_array_names(n_banks: int) -> set[str]:
     names.update(
         f"bank_{bank_idx:03d}_{suffix}" for bank_idx in range(n_banks) for suffix in suffixes
     )
-    names.update(f"val_{suffix}" for suffix in suffixes)
+    names.add("forbidden_node_idx")
     return names
 
 
@@ -421,16 +363,19 @@ def _validate_context_quarantine(
     banks: Sequence[KDContextBank],
     *,
     n_nodes: int,
-    val_bank: KDContextBank,
+    forbidden_node_idx: NDArray[np.int32],
 ) -> None:
+    if (
+        forbidden_node_idx.ndim != 1
+        or ((forbidden_node_idx < 0) | (forbidden_node_idx >= n_nodes)).any()
+    ):
+        raise ValueError("invalid forbidden_node_idx")
     forbidden = np.zeros(n_nodes, dtype=np.bool_)
-    forbidden[val_bank.anchor_idx] = True
+    forbidden[forbidden_node_idx] = True
     for bank_idx, bank in enumerate(banks):
         anchors = np.repeat(bank.anchor_idx, np.diff(bank.anchor_offsets))
         if bool((forbidden[anchors] & forbidden[bank.partner_idx]).any()):
             raise ValueError(f"context bank {bank_idx} contains a V_val-internal pair")
-    if bool(forbidden[val_bank.partner_idx].any()):
-        raise ValueError("validation context bank contains a V_val-internal pair")
 
 
 def _context_bank_arrays(prefix: str, bank: KDContextBank) -> dict[str, NDArray[np.generic]]:
@@ -451,7 +396,7 @@ def write_kd_context_targets(
     pair_b_idx: NDArray[np.integer],
     teacher_logit: NDArray[np.floating],
     banks: Sequence[KDContextBank],
-    val_bank: KDContextBank,
+    forbidden_node_idx: NDArray[np.int32],
     sampler_params: Mapping[str, object],
     seed: int,
     truth_graph_sha256: str,
@@ -482,18 +427,8 @@ def write_kd_context_targets(
             pair_b_idx=pair_b_idx,
             require_full_universe=True,
         )
-    _validate_context_bank(
-        val_bank,
-        label="validation context bank",
-        n_nodes=n_nodes,
-        pair_a_idx=pair_a_idx,
-        pair_b_idx=pair_b_idx,
-        require_full_universe=False,
-    )
-    if len(val_bank.anchor_idx) == 0:
-        raise ValueError("validation context bank must contain its V_val anchors")
-    _validate_context_quarantine(banks, n_nodes=n_nodes, val_bank=val_bank)
-    referenced = np.concatenate([bank.score_idx for bank in (*banks, val_bank)])
+    _validate_context_quarantine(banks, n_nodes=n_nodes, forbidden_node_idx=forbidden_node_idx)
+    referenced = np.concatenate([bank.score_idx for bank in banks])
     if not np.array_equal(np.unique(referenced), np.arange(n_scores)):
         raise ValueError("every unique context score must be referenced by a bank")
 
@@ -505,7 +440,7 @@ def write_kd_context_targets(
     }
     for bank_idx, bank in enumerate(banks):
         arrays.update(_context_bank_arrays(f"bank_{bank_idx:03d}_", bank))
-    arrays.update(_context_bank_arrays("val_", val_bank))
+    arrays["forbidden_node_idx"] = np.asarray(forbidden_node_idx, dtype=np.int32)
     np.savez(output_dir / _NPZ_NAME, **cast(dict[str, Any], arrays))
 
     node_ids_bytes = json.dumps(list(node_ids)).encode("utf-8")
@@ -522,7 +457,7 @@ def write_kd_context_targets(
         "n_banks": len(banks),
         "n_nodes": n_nodes,
         "n_scores": n_scores,
-        "n_val_anchors": len(val_bank.anchor_idx),
+        "n_forbidden_nodes": len(forbidden_node_idx),
         "teacher_logit_dtype": "float32",
         "created_utc": datetime.now(UTC).isoformat(),
     }
@@ -564,14 +499,14 @@ def load_kd_context_targets(
     path: Path,
     *,
     expected_node_ids: Sequence[str] | None = None,
-    expected_val_anchor_idx: NDArray[np.integer] | None = None,
+    expected_forbidden_node_idx: NDArray[np.integer] | None = None,
 ) -> KDContextTargets:
-    """Load and validate one ``kd_ctx_targets_v1`` artifact.
+    """Load and validate one ``kd_ctx_targets_v2`` artifact.
 
     Digests and provenance strings are deliberately not gates. Passing
     ``expected_node_ids`` enables the trainer to fail closed on universe and
-    ordering drift at the artifact boundary; ``expected_val_anchor_idx`` does
-    the same for the V_val diagnostic/quarantine identity.
+    ordering drift at the artifact boundary; ``expected_forbidden_node_idx`` does
+    the same for the V_val quarantine identity.
     """
     manifest_path = path / _MANIFEST_NAME
     node_ids_path = path / _NODE_IDS_NAME
@@ -609,7 +544,9 @@ def load_kd_context_targets(
         banks = tuple(
             _load_context_bank(archive, f"bank_{bank_idx:03d}_") for bank_idx in range(n_banks)
         )
-        val_bank = _load_context_bank(archive, "val_")
+        forbidden_node_idx = cast(
+            NDArray[np.int32], _load_context_array(archive, "forbidden_node_idx", np.int32)
+        )
 
     n_scores = _validate_context_score_table(
         n_nodes=len(node_ids),
@@ -626,27 +563,19 @@ def load_kd_context_targets(
             pair_b_idx=pair_b_idx,
             require_full_universe=True,
         )
-    _validate_context_bank(
-        val_bank,
-        label="validation context bank",
-        n_nodes=len(node_ids),
-        pair_a_idx=pair_a_idx,
-        pair_b_idx=pair_b_idx,
-        require_full_universe=False,
-    )
-    if len(val_bank.anchor_idx) == 0:
-        raise ValueError("validation context bank must contain its V_val anchors")
-    if expected_val_anchor_idx is not None and not np.array_equal(
-        val_bank.anchor_idx, np.asarray(expected_val_anchor_idx)
+    if expected_forbidden_node_idx is not None and not np.array_equal(
+        forbidden_node_idx, expected_forbidden_node_idx
     ):
-        raise ValueError("validation context anchors do not match expected_val_anchor_idx")
-    _validate_context_quarantine(banks, n_nodes=len(node_ids), val_bank=val_bank)
-    referenced = np.concatenate([bank.score_idx for bank in (*banks, val_bank)])
+        raise ValueError("context quarantine nodes do not match expected_forbidden_node_idx")
+    _validate_context_quarantine(
+        banks, n_nodes=len(node_ids), forbidden_node_idx=forbidden_node_idx
+    )
+    referenced = np.concatenate([bank.score_idx for bank in banks])
     if not np.array_equal(np.unique(referenced), np.arange(n_scores)):
         raise ValueError("every unique context score must be referenced by a bank")
     n_nodes_value = manifest.get("n_nodes")
     n_scores_value = manifest.get("n_scores")
-    n_val_anchors_value = manifest.get("n_val_anchors")
+    n_forbidden_nodes = manifest.get("n_forbidden_nodes")
     if (
         not isinstance(n_nodes_value, int)
         or isinstance(n_nodes_value, bool)
@@ -654,9 +583,9 @@ def load_kd_context_targets(
         or not isinstance(n_scores_value, int)
         or isinstance(n_scores_value, bool)
         or n_scores_value != n_scores
-        or not isinstance(n_val_anchors_value, int)
-        or isinstance(n_val_anchors_value, bool)
-        or n_val_anchors_value != len(val_bank.anchor_idx)
+        or not isinstance(n_forbidden_nodes, int)
+        or isinstance(n_forbidden_nodes, bool)
+        or n_forbidden_nodes != len(forbidden_node_idx)
     ):
         raise ValueError("context target manifest row/universe counts do not match its arrays")
     return KDContextTargets(
@@ -665,7 +594,7 @@ def load_kd_context_targets(
         pair_b_idx=pair_b_idx,
         teacher_logit=teacher_logit,
         banks=banks,
-        val_bank=val_bank,
+        forbidden_node_idx=forbidden_node_idx,
         manifest=manifest,
     )
 

@@ -166,7 +166,9 @@ class TestConfigIntegration:
         assert scheduler.div_factor == 25.0
         assert scheduler.final_div_factor == 10000.0
         assert scheduler.anneal_strategy == "cos"
-        assert cfg.model.config["label_smoothing"] == 0.05
+        assert cfg.model.config["label_smoothing"] == 0.0
+        assert cfg.model.config["positive_weight"] == 5.0
+        assert cfg.data.negative_ratio == 5
 
 
 # --------------------------------------------------------------------------- building
