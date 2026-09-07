@@ -21,6 +21,10 @@ selected method. Every piece of writing must explain how its context helps decid
 - Students (`model.family: v3_1`, endpoint-only): `kd_logit` (GLNN soft logits), `kd_rank`
   (strict-LLP rank + distribution matching over context banks), `kd_gram` (SPKD cosine-Gram),
   `kd_rep` (per-row representation cosine); `kd_rank_rep` is the joint variant. Control: `b1_kd_control`.
+- Structural arms (`model.family: v3_1`, top-level `struct:` block, no teacher): `struct_bce`
+  (sampler-matched baseline), `struct_grand` (ported soft-GS + RD), `struct_new` (neighbour rank +
+  node-wise degree + open/closed motif). One sampled training subgraph per step supervises the
+  output adjacency; the inference interface is unchanged.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.
@@ -51,6 +55,8 @@ Pytest uses `--dist loadfile` because tests share in-file state; never use `--di
 ```bash
 rtk proxy hpc/run.sh train configs/b0_v31_breadth_first.yaml
 rtk proxy hpc/run.sh train configs/b1_kd_logit_breadth_first.yaml
+rtk proxy hpc/run.sh train configs/struct_bce_breadth_first.yaml
+.venv/bin/python -m src.experiments.struct_hpo --arm grand   # or --arm new; 10-trial study each
 ```
 
 ## Architecture

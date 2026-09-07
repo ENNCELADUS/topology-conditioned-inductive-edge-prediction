@@ -53,8 +53,9 @@ a pair universe, predictions are assembled into $\widehat G_\tau$ only for evalu
 
 **Evidence classes.** A *comparator* is a frozen model or score artifact evaluated without changing its checkpoint or opening new test-dependent choices; a *formal result* follows this fixed pre-test protocol.
 
-**Model selection.** Training early-stops on total val loss (patience 10): the val task BCE plus
-each active KD term's val counterpart at its training weight. The published checkpoint is chosen
+**Model selection.** Training early-stops on the validation task BCE alone (`val_task_loss`,
+patience 10); KD and structural validation terms are logged as diagnostics and never enter the
+monitor. The published checkpoint is chosen
 independently, by mean rank over V_val AUPRC plus the five bucket-topology metrics (§1.3).
 
 **Topology threshold.** Selected on the `V_val` 20--200-node sampled-set pair union. Define `D_RD(t)` as the size-bucket
@@ -96,6 +97,9 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 | kd_rank_rep | strict-LLP rank + distribution KD plus per-row pair-representation cosine | PMA(4) Full-Ego Oracle context bank + row bank | `w_rank` log-uniform [0.01, 1]; `w_dist` log-uniform [0.1, 100]; `w_rep` log-uniform [0.01, 100]; bank and margin inherited from kd_ranking | joint logit + representation transfer |
 | kd_gram | SPKD-style cosine-Gram relational match (Tung & Mori 2019) | PMA(4) Full-Ego Oracle row bank | `w_gram ∈ {0.01, 0.1, 1, 10, 100}` | relational-geometry arm |
 | kd_generation | pair-latent generative head | PMA(1) Full-Ego Oracle latent bank | none; `w_gen=1` fixed (det/EDM variants compared) | generative test |
+| struct_bce | none (structural stream, BCE only) | — | none | sampler-matched structural baseline |
+| struct_grand | GRAND soft-GS + log-ratio RD on the structural stream | — | `gs`, `rd` log-uniform [0.1, 2.0] | ported density/overlap terms |
+| struct_new | neighbour ranking + node-wise degree + open/closed motif counts on the structural stream | — | `rank` [0.1, 3.0], `degree` [0.01, 1.0], `motif` [0.01, 1.0], log-uniform | direct output-adjacency supervision |
 | Oracles | observed topology | Full-Ego graph → GRIT → PMA | none (diagnostic only) | diagnostic ceilings |
 
 ![Teacher and student architecture](results/kd_rep_audit/teacher_architecture.svg)
@@ -110,6 +114,14 @@ and kd_rank_rep (12 trials: w_rank × w_dist × w_rep, bank/margin inherited). B
 The best configuration per arm runs the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
 
 The `kd_rank_rep` study completed all 12 trials (four priors plus eight guided trials), with context bank `h2ns3` and margin 0.1 fixed. Trial 5 was selected for held-out evaluation; its published checkpoint is epoch 20. Its weights and V_val selection metrics are recorded in §4.6.
+
+The structural arms are not KD: each optimizer step adds one sampled 40-node training subgraph
+(32 locally expanded nodes from a BFS, wedge/triangle, or two-ball bridge seed at a 50/25/25 mix,
+plus 8 uniform background nodes) whose legal pairs are forwarded and scored as a logit matrix.
+`struct_grand` and `struct_new` each run a 10-trial constrained MO-TPE study
+(`src/experiments/struct_hpo.py`, 2 enqueued priors, 3 startup trials, same objectives and RD
+band as the KD sweeps); the winner per arm is the five-metric undominated verdict plus human pick and
+runs the held-out protocol once. `struct_bce` is a single run and the first comparator for both.
 
 ## 2. Main results — edge and assembled topology
 
@@ -138,6 +150,14 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 `kd_rank_rep` Trial 5: [held-out report](results/kd_rank_rep_hpo/test_report.json), seed 0, checkpoint epoch 20. Classification and topology logit thresholds are frozen on validation at −1.7578125 and 2.671875, respectively; §4.6 separately reports training-time V_val telemetry.
 
 ## 3. Ablations and sensitivity
+
+### 3.1 Structural stream (wave 1, new split)
+
+Design: [spec](superpowers/specs/2026-09-07-structural-stream-topology-losses-design.md). Terms
+reduce only over legal pairs (distinct nodes, not both in V_val, feature-bearing). Wave 1 compares
+the `struct_grand` and `struct_new` winners against `struct_bce`, then against the new-split
+`b1_kd_control` once it exists, reporting the pairwise and five topology numbers together and
+checking the selected epoch before crediting a term. Results: pending.
 
 ## 4. Analysis
 
