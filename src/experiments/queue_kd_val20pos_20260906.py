@@ -126,7 +126,6 @@ def main() -> None:
                 status("training_and_testing", arm=arm)
                 run([
                     "bash", "hpc/run.sh", "train", str(CONFIGS / f"{arm}.yaml"),
-                    "--rescore-reason", "Fresh teacher and 20-percent-positive validation split",
                 ], f"{arm}.log")
                 require_complete(ROOT / arm)
             status("complete", arms=ARMS)

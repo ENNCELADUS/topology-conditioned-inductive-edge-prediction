@@ -58,6 +58,8 @@ def test_chain_runs_each_test_before_next_arm(
 
     def run(command: list[str], log_name: str) -> None:
         assert "--skip-test" not in command
+        # V3.1 has no EgoStitch test-access ledger; its scorer rejects this flag.
+        assert "--rescore-reason" not in command
         arm = Path(command[3]).stem
         events.append(arm)
         _completed(tmp_path / arm)

@@ -274,5 +274,7 @@ nohup .venv/bin/python -u -m src.experiments.queue_kd_val20pos_20260906 \
 ```
 
 It refuses an existing target bank or student output directory; investigate failures
-before arranging a restart. Its `--rescore-reason` records intentional testing of the
-fresh models under the new split.
+before arranging a restart. The V3.1 students must not receive `--rescore-reason`:
+that flag belongs only to EgoStitch held-out scoring. A test-stage failure after
+publication does not require rebuilding the teacher or banks; the published student
+checkpoint remains available for test recovery.
