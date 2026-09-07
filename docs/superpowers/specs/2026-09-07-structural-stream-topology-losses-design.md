@@ -2,7 +2,7 @@
 
 **Status (2026-09-07):** approved design, not yet implemented.
 **Scope:** one implementation wave on `src/` (new sampler, new loss module, one new stream in
-`train_b0`), three configs, tests, and the matching doc updates.
+`train_b0`), one Optuna driver, three configs, tests, and the matching doc updates.
 
 ## 1. Goal and claim
 
@@ -33,7 +33,7 @@ test is therefore whether structural supervision improves *ranking and relative 
 - The structural stream keeps a BCE term on its own legal pairs; the new terms are *added* to it,
   so the sampler-matched baseline (`struct_bce`) differs from each arm only by the added terms.
 - The GRAND re-run in the old repository is out of scope.
-- Wave 1 launches three runs: `struct_bce`, `struct_grand`, `struct_new` (§8). No control retrain.
+- Wave 1: one `struct_bce` run plus a 10-trial Optuna study for each weighted arm (§8). No control retrain.
 
 ## 3. Sampler — `src/data/struct_sampler.py` (new)
 
@@ -171,24 +171,50 @@ count is rejected. Weights all zero is rejected (use no block instead).
   logged as `val_struct_*`. They feed nothing: early stopping stays on `val_task_loss`
   (commit 5e8c34d) and checkpoint selection stays the six-criterion mean rank.
 
-## 8. Arms and comparators
+## 8. Arms, HPO, and comparators
 
-Wave 1, new V_val split, seed 0, 25 epochs, identical to the control YAML except the block below.
+The GRAND weights were tuned on another benchmark, protocol and regime, and the new weights are
+untested guesses, so a single point per arm cannot rank `grand` against `new`. Each weighted arm
+therefore gets its own Optuna study with a 10-trial budget; the baseline has no weights and is a
+single run. All runs: new V_val split, seed 0, 25 epochs, identical to the control YAML except
+the `struct` block.
 
-| Config | `struct.weights` (nonzero) | Role |
-|---|---|---|
-| `configs/struct_bce_breadth_first.yaml` | bce 1 | sampler-matched baseline |
-| `configs/struct_grand_breadth_first.yaml` | bce 1, gs 0.70, rd 0.90 | GRAND `topo_gs_rd_bce_low` point |
-| `configs/struct_new_breadth_first.yaml` | bce 1, rank 1, degree 0.1, motif 0.1 | new objective |
+### 8.1 Baseline (single run)
 
-Output dirs `outputs/struct/<name>`. Launch: `hpc/run.sh train <config>` (pack → train →
-publish → test), with `OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` when the three share the box.
+`configs/struct_bce_breadth_first.yaml`: `weights: {bce: 1}`, output `outputs/struct/bce`.
+Launched with `hpc/run.sh train` (pack → train → publish → test).
+
+### 8.2 Studies — `src/experiments/struct_hpo.py` (new)
+
+One driver, `--arm {grand,new}`, reusing `SweepSpec` and `run_sweep` from
+`src/experiments/kd_rank_strict_hpo.py` unchanged: ask-and-tell constrained MO-TPE, objectives
+GS (max) and geometric-mean of the three MMD ratios (min) at the selected epoch, soft constraint
+`|log RD| <= 0.05`, one `hpc/run.sh train <trial.yaml> --skip-test` per trial, `optuna.db`
+under the sweep dir, resume by reconciling running trials, three consecutive failures abort.
+The struct-specific parts are the search space and a config writer that overrides only
+`struct.weights` and `output_dir` and validates the block through `StructConfig.from_mapping`.
+
+| Arm | Base config | Searched weights (log-uniform) | Fixed | Enqueued priors | Startup |
+|---|---|---|---|---|---:|
+| `grand` | `configs/struct_grand_breadth_first.yaml` | `gs ∈ [0.1, 2.0]`, `rd ∈ [0.1, 2.0]` | `bce 1`, all else 0 | (0.70, 0.90), (0.35, 0.45) | 3 |
+| `new` | `configs/struct_new_breadth_first.yaml` | `rank ∈ [0.1, 3.0]`, `degree ∈ [0.01, 1.0]`, `motif ∈ [0.01, 1.0]` | `bce 1`, all else 0 | (1, 0.1, 0.1), (1, 0.03, 0.03) | 3 |
+
+Study names `struct_grand` and `struct_new`; sweep dirs `outputs/struct_hpo/<arm>`;
+`--n-trials 10`. Priors count toward the budget. The two studies run sequentially on one box
+or concurrently on two, with `OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` exported when sharing.
+
+### 8.3 Selection and test
+
+Per arm, the winner is the frozen five-metric undominated verdict plus the human pick, exactly as
+for the KD sweeps; it runs the held-out test protocol once via `hpc/run.sh test` on its published
+checkpoint. The baseline's test comes from its own pipeline run. Only three test reports exist
+after wave 1: `struct_bce`, the `grand` winner, the `new` winner.
 
 Comparison rules: report the five topology numbers and the pairwise numbers together; compare
-each arm against `struct_bce` first and against the new-split `b1_kd_control` once it exists;
+each winner against `struct_bce` first and against the new-split `b1_kd_control` once it exists;
 check the selected epoch before crediting a term. Follow-up ablations reuse this code with new
-configs only: each new term alone, `deg_mmd 0.15` versus `degree 0.1`, `rank` with `bce 0`,
-and `nodes` 20 and 60.
+configs only, at the winners' weights: each new term alone, `deg_mmd 0.15` versus the selected
+`degree`, `rank` with `bce 0`, and `nodes` 20 and 60.
 
 ## 9. Tests
 
@@ -204,16 +230,22 @@ and `nodes` 20 and 60.
 - `tests/test_struct_stream.py`: 2-rank DDP gradient agreement with the single-process path,
   following the joint-KD DDP test (d4fd396); chunk assembly reproduces a direct full forward's
   logits; a config with the block absent leaves the task loss bit-identical.
+- `tests/test_struct_hpo.py`: the writer changes only `struct.weights` and `output_dir` and
+  rejects an illegal block; `suggest` stays inside the boxes; both arms' `SweepSpec`s carry the
+  documented priors and startup counts; the driver never edits `autoresearch/` or `configs/sweep/`.
 - `pytest -m "not slow and not integration"`, `ruff`, `mypy --strict` all green before commit.
 
 ## 10. Documentation updates in the same change
 
-- `docs/03-experiments.md`: §1.4 gains the three structural arms; a new §3 entry describes the
-  structural stream, sampler, terms and the wave-1 comparison rule; the stale sentence in §1.2
-  claiming early stopping uses total val loss plus KD terms is corrected to `val_task_loss` only.
+- `docs/03-experiments.md`: §1.4 gains the three structural arms with their searched
+  hyperparameters; §1.5 records the two 10-trial studies beside the KD sweeps; a new §3 entry
+  describes the structural stream, sampler, terms and the wave-1 comparison rule; the stale
+  sentence in §1.2 claiming early stopping uses total val loss plus KD terms is corrected to
+  `val_task_loss` only.
 - `CLAUDE.md` / `AGENTS.md`: the active method set paragraph adds the structural arms
   (`struct_bce`, `struct_grand`, `struct_new`) and the `struct:` block; the Commands section adds
-  one launch line.
+  the baseline launch line and the two sweep commands.
+- `hpc/README.md`: the two sweep commands and their resume behaviour.
 - `docs/results/struct/README.md` is created when the first run completes, not now.
 
 ## 11. Non-goals
