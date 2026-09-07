@@ -70,6 +70,7 @@ from src.data.pairs import (
     collate_token_pairs,
 )
 from src.data.partition import build_g_struct
+from src.data.struct_sampler import StructEpochPlan, StructSampler, StructSubgraph
 from src.data.training_sampler import TrainingCorpus, build_training_corpus
 from src.data.val_region import (
     Pair,
@@ -95,6 +96,7 @@ from src.distill.losses import (
     kd_struct_loss,
 )
 from src.distill.struct_config import StructConfig
+from src.distill.struct_losses import hard_struct_errors, struct_total
 from src.distill.struct_targets import structural_row_targets
 from src.distill.validation import OracleValidationBank
 from src.e2_pipeline import ProbeResult
@@ -3012,6 +3014,254 @@ class KDContextStream:
         }
 
 
+class StructStream:
+    """One sampled training subgraph per optimizer step, scored as a logit matrix.
+
+    Sibling of :class:`KDContextStream`: the plan for ``(seed, epoch)`` is
+    identical on every rank; rank ``r`` of ``W`` takes plan positions
+    ``r, r+W, ...`` and spreads them across its steps exactly once. Legal pairs
+    are bucketed by token boundary, chunked to the token budget, and forwarded
+    through the unwrapped model under activation checkpointing; the loss is
+    computed on the assembled ``n x n`` matrix (`src/distill/struct_losses.py`).
+    """
+
+    def __init__(
+        self,
+        config: StructConfig,
+        sampler: StructSampler,
+        table: PackedFeatureTable,
+        *,
+        rank: int,
+        world_size: int,
+        token_budget: int,
+        positive_weight: float,
+        label_smoothing: float,
+        seed: int,
+        val_sampler: StructSampler | None = None,
+    ) -> None:
+        if token_budget < 1:
+            raise ValueError(f"struct token budget must be positive, got {token_budget}")
+        if rank < 0 or rank >= world_size or world_size < 1:
+            raise ValueError(f"invalid struct rank/world size: {rank}/{world_size}")
+        self.config = config
+        self._sampler = sampler
+        self._val_sampler = val_sampler
+        self._table = table
+        self._rank = rank
+        self._world_size = world_size
+        self._token_budget = token_budget
+        self._positive_weight = float(positive_weight)
+        self._label_smoothing = float(label_smoothing)
+        self._seed = int(seed)
+        self._node_index = table.manifest.node_index()
+        self._plan: StructEpochPlan | None = None
+        self._plan_coverage: dict[str, float] = {}
+        self._val_plan: StructEpochPlan | None = None
+        self.last_terms: dict[str, torch.Tensor] = {}
+        self.last_subgraph: StructSubgraph | None = None
+
+    # ------------------------------------------------------------ planning
+
+    def _epoch_plan(self, epoch: int, steps: int) -> StructEpochPlan:
+        count = self.config.subgraphs_per_epoch
+        if count is None:
+            count = steps
+        if count > steps:
+            raise ValueError(
+                f"struct.subgraphs_per_epoch ({count}) exceeds the epoch's {steps} optimizer steps"
+            )
+        if self._plan is None or self._plan.epoch != epoch or len(self._plan.subgraphs) != count:
+            self._plan = self._sampler.plan(seed=self._seed, epoch=epoch, count=count)
+            self._plan_coverage = self._sampler.coverage(self._plan)
+        return self._plan
+
+    def _positions(self, size: int, *, rank: int, steps: int, step: int) -> list[int]:
+        shard = list(range(rank, size, self._world_size))
+        start, stop = KDContextStream._step_slice(len(shard), steps, step)
+        return shard[start:stop]
+
+    # ------------------------------------------------------------ forward
+
+    def _score(
+        self, model: nn.Module, subgraph: StructSubgraph
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the assembled symmetric logit matrix, the target, and the mask."""
+        device = self._table.tokens.device
+        mask_np = self._sampler.legal_mask(subgraph)
+        target = torch.from_numpy(self._sampler.adjacency(subgraph)).to(device)
+        mask = torch.from_numpy(mask_np).to(device)
+        n = len(subgraph.nodes)
+        packed = [self._node_index[node] for node in subgraph.nodes]
+        lengths = self._table.manifest.nodes
+        pairs = [(i, j) for i in range(n) for j in range(i + 1, n) if mask_np[i, j] > 0]
+        logits = torch.zeros(n, n, dtype=torch.float32, device=device)
+        if not pairs:
+            return logits, target, mask
+        buckets: dict[int, list[int]] = {boundary: [] for boundary in BUCKET_BOUNDARIES}
+        for row, (i, j) in enumerate(pairs):
+            max_length = max(lengths[packed[i]].length, lengths[packed[j]].length)
+            boundary = next((value for value in BUCKET_BOUNDARIES if max_length <= value), None)
+            if boundary is None:
+                raise ValueError(
+                    f"struct packed length {max_length} exceeds {BUCKET_BOUNDARIES[-1]}"
+                )
+            buckets[boundary].append(row)
+        raw_model = _unwrapped_model(model)
+        parts: list[torch.Tensor] = []
+        rows_a: list[int] = []
+        rows_b: list[int] = []
+        for boundary, rows in buckets.items():
+            per_chunk = max(1, self._token_budget // boundary)
+            for start in range(0, len(rows), per_chunk):
+                chunk = rows[start : start + per_chunk]
+                anchor = torch.as_tensor(
+                    [packed[pairs[r][0]] for r in chunk], dtype=torch.int64, device=device
+                )
+                partner = torch.as_tensor(
+                    [packed[pairs[r][1]] for r in chunk], dtype=torch.int64, device=device
+                )
+
+                def forward(
+                    anchor: torch.Tensor, partner: torch.Tensor, boundary: int
+                ) -> torch.Tensor:
+                    # `boundary` is explicit: a closure over the loop variable
+                    # would recompute every chunk at the last bucket.
+                    emb_a, len_a = self._table.gather_nodes(anchor, boundary)
+                    emb_b, len_b = self._table.gather_nodes(partner, boundary)
+                    output = cast(
+                        dict[str, torch.Tensor],
+                        raw_model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
+                    )
+                    out = output["logits"]
+                    if out.dim() > 1 and out.size(-1) == 1:
+                        out = out.squeeze(-1)
+                    return out.float()
+
+                if torch.is_grad_enabled():
+                    chunk_logits = cast(
+                        torch.Tensor,
+                        checkpoint(forward, anchor, partner, boundary, use_reentrant=False),
+                    )
+                else:
+                    chunk_logits = forward(anchor, partner, boundary)
+                parts.append(chunk_logits)
+                rows_a.extend(pairs[r][0] for r in chunk)
+                rows_b.extend(pairs[r][1] for r in chunk)
+        flat = torch.cat(parts)
+        index_a = torch.as_tensor(rows_a, dtype=torch.int64, device=device)
+        index_b = torch.as_tensor(rows_b, dtype=torch.int64, device=device)
+        logits = logits.index_put((index_a, index_b), flat).index_put((index_b, index_a), flat)
+        return logits, target, mask
+
+    # ------------------------------------------------------------ training
+
+    def loss(
+        self, model: nn.Module, *, epoch: int, step: int, steps: int
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Weighted structural loss for this rank's subgraph(s) at ``step`` (zero when none)."""
+        plan = self._epoch_plan(epoch, steps)
+        positions = self._positions(len(plan.subgraphs), rank=self._rank, steps=steps, step=step)
+        zero = next(model.parameters()).sum() * 0.0
+        self.last_terms = {}
+        self.last_subgraph = None
+        stats: dict[str, float] = {"struct_pairs": 0.0, "struct_subgraphs": 0.0}
+        if not positions:
+            return zero, stats
+        total = zero
+        for position in positions:
+            subgraph = plan.subgraphs[position]
+            self.last_subgraph = subgraph
+            logits, target, mask = self._score(model, subgraph)
+            pair_count = float(torch.triu(mask, diagonal=1).sum().item())
+            if pair_count == 0.0:
+                continue
+            term_total, terms = struct_total(
+                logits,
+                target,
+                mask,
+                self.config,
+                positive_weight=self._positive_weight,
+                label_smoothing=self._label_smoothing,
+            )
+            total = total + term_total
+            self.last_terms = terms
+            stats["struct_pairs"] += pair_count
+            stats["struct_subgraphs"] += 1.0
+            for key, term in terms.items():
+                stats[f"sum_{key}"] = stats.get(f"sum_{key}", 0.0) + float(term.detach().item())
+            for key, value in self._sampler.statistics(subgraph).items():
+                stats[f"sum_{key}"] = stats.get(f"sum_{key}", 0.0) + value
+        return total, stats
+
+    def epoch_telemetry(self, accelerator: Accelerator, sums: dict[str, float]) -> dict[str, float]:
+        """Reduce rank-local sums into per-subgraph means plus plan coverage."""
+        keys = sorted(sums)
+        reduced = accelerator.reduce(
+            torch.tensor(
+                [sums[key] for key in keys], device=accelerator.device, dtype=torch.float64
+            ),
+            reduction="sum",
+        )
+        values = {key: float(reduced[index].item()) for index, key in enumerate(keys)}
+        count = max(values.get("struct_subgraphs", 0.0), 1.0)
+        telemetry: dict[str, float] = {"struct_pairs": values.get("struct_pairs", 0.0)}
+        for key in self.config.active_weights:
+            telemetry[f"struct_{key}_loss"] = values.get(f"sum_{key}", 0.0) / count
+        for key, value in values.items():
+            if key.startswith("sum_struct_"):
+                telemetry[key[len("sum_") :]] = value / count
+        telemetry.update(self._plan_coverage)
+        return telemetry
+
+    # ------------------------------------------------------------ validation
+
+    def validation_telemetry(
+        self, model: nn.Module, accelerator: Accelerator, *, threshold: float | None
+    ) -> dict[str, float]:
+        """Score the fixed V_val diagnostic subgraphs (this rank's stripe) and reduce means."""
+        if self._val_sampler is None or self.config.val_subgraphs == 0:
+            return {}
+        if self._val_plan is None:
+            self._val_plan = self._val_sampler.plan(
+                seed=self._seed, epoch=0, count=self.config.val_subgraphs
+            )
+        positions = list(range(self._rank, len(self._val_plan.subgraphs), self._world_size))
+        was_training = model.training
+        model.eval()
+        sums: dict[str, float] = {"count": 0.0}
+        with torch.no_grad():
+            for position in positions:
+                subgraph = self._val_plan.subgraphs[position]
+                logits, target, mask = self._score(model, subgraph)
+                _, terms = struct_total(
+                    logits,
+                    target,
+                    mask,
+                    self.config,
+                    positive_weight=self._positive_weight,
+                    label_smoothing=self._label_smoothing,
+                )
+                sums["count"] += 1.0
+                for key, term in terms.items():
+                    name = f"val_struct_{key}_loss"
+                    sums[name] = sums.get(name, 0.0) + float(term.item())
+                if threshold is not None:
+                    for key, value in hard_struct_errors(logits, target, mask, threshold).items():
+                        name = f"val_struct_{key}"
+                        sums[name] = sums.get(name, 0.0) + value
+        model.train(was_training)
+        keys = sorted(sums)
+        reduced = accelerator.reduce(
+            torch.tensor(
+                [sums[key] for key in keys], device=accelerator.device, dtype=torch.float64
+            ),
+            reduction="sum",
+        )
+        values = {key: float(reduced[index].item()) for index, key in enumerate(keys)}
+        count = max(values.pop("count", 0.0), 1.0)
+        return {key: value / count for key, value in values.items()}
+
+
 class KDRowBank:
     """Official-row targets for telemetry and non-rank same-batch KD terms.
 
@@ -3430,18 +3680,19 @@ def _term_grad_norms(
     loop guarantees that rank-symmetric call. A term with no grad_fn (e.g. a
     constant KD loss from a test double) reports a 0.0 norm rather than raising.
     """
+    return _grad_norm(task_loss, model), _grad_norm(kd_loss, model)
+
+
+def _grad_norm(term: torch.Tensor, model: nn.Module) -> float:
+    """L2 norm of ``term``'s gradient over trainable parameters (0.0 when it has no graph)."""
+    if not term.requires_grad:
+        return 0.0
     params = [p for p in model.parameters() if p.requires_grad]
-
-    def _term_norm(term: torch.Tensor) -> float:
-        if not term.requires_grad:
-            return 0.0
-        grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
-        squares = [g.float().pow(2).sum() for g in grads if g is not None]
-        if not squares:
-            return 0.0
-        return float(torch.stack(squares).sum().sqrt().item())
-
-    return _term_norm(task_loss), _term_norm(kd_loss)
+    grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+    squares = [g.float().pow(2).sum() for g in grads if g is not None]
+    if not squares:
+        return 0.0
+    return float(torch.stack(squares).sum().sqrt().item())
 
 
 def _topology_due(
