@@ -3720,6 +3720,7 @@ def train_ddp_loop(
     evaluate_cls_fn: EvaluateFn | None = None,
     kd_bank: KDRowBank | None = None,
     kd_context_stream: KDContextStream | None = None,
+    struct_stream: StructStream | None = None,
     require_topology: bool = False,
     val_topology_reference: ValTopologyReference | None = None,
 ) -> TrainResult:
@@ -3756,6 +3757,8 @@ def train_ddp_loop(
             per-step loss is added to the scaled supervised loss before the
             shared backward, computed from the SAME student forward pass.
         kd_context_stream: Optional rank-sharded context targets for `kd_rank`.
+        struct_stream: Optional structural subgraph stream; its weighted loss joins
+            the shared backward and its terms are logged as ``struct_*``.
         require_topology: When True, selection raises instead of falling back
             to max-AUPRC if any topology-due epoch has no topology metrics
             (production, e.g. a resume across the V_val protocol change).
@@ -3992,6 +3995,10 @@ def train_ddp_loop(
         local_loss_weight = 0.0
         epoch_kd_loss_sum = 0.0
         epoch_kd_sums: dict[str, float] = {}
+        epoch_struct_loss_sum = 0.0
+        epoch_struct_sums: dict[str, float] = {}
+        epoch_struct_seconds = 0.0
+        grad_norm_struct: dict[str, float] = {}
         grad_norm_task = 0.0
         grad_norm_kd = 0.0
         epoch_steps = 0
@@ -4007,8 +4014,12 @@ def train_ddp_loop(
 
         epoch_wall_start = time.monotonic()
         epoch_loader = train_loader_factory(epoch)
-        if kd_context_stream is not None and not isinstance(epoch_loader, Sized):
-            raise TypeError("kd_rank requires a training loader with a known step count")
+        if (kd_context_stream is not None or struct_stream is not None) and not isinstance(
+            epoch_loader, Sized
+        ):
+            raise TypeError(
+                "kd_rank and struct streams require a training loader with a known step count"
+            )
         epoch_step_count = len(epoch_loader) if isinstance(epoch_loader, Sized) else 0
         iterator = iter(epoch_loader)
         while True:
@@ -4077,6 +4088,21 @@ def train_ddp_loop(
                     grad_norm_task, grad_norm_kd = _term_grad_norms(loss, kd_loss, model)
                 loss = loss + kd_loss
                 epoch_kd_loss_sum += float(kd_loss.detach().float().item())
+            if struct_stream is not None:
+                struct_start = time.monotonic()
+                struct_loss, struct_stats = struct_stream.loss(
+                    model, epoch=epoch, step=epoch_steps, steps=epoch_step_count
+                )
+                for key, value in struct_stats.items():
+                    epoch_struct_sums[key] = epoch_struct_sums.get(key, 0.0) + value
+                if epoch_steps == 0:
+                    grad_norm_struct = {
+                        key: _grad_norm(term, model)
+                        for key, term in struct_stream.last_terms.items()
+                    }
+                loss = loss + struct_loss
+                epoch_struct_loss_sum += float(struct_loss.detach().float().item())
+                epoch_struct_seconds += time.monotonic() - struct_start
 
             if not _all_ranks_loss_finite(loss, accelerator):
                 raise RuntimeError(f"non-finite training loss on at least one rank (epoch {epoch})")
@@ -4217,6 +4243,36 @@ def train_ddp_loop(
             epoch_kd_telemetry = kd_bank.epoch_telemetry(accelerator, epoch_kd_sums)
         if kd_context_stream is not None and epoch_steps > 0:
             epoch_kd_telemetry.update(kd_context_stream.epoch_telemetry(accelerator, epoch_kd_sums))
+        epoch_struct_telemetry: dict[str, float] = {}
+        if struct_stream is not None and epoch_steps > 0:
+            global_struct_loss = accelerator.reduce(
+                torch.tensor(epoch_struct_loss_sum, device=accelerator.device, dtype=torch.float64),
+                reduction="sum",
+            )
+            epoch_struct_telemetry["train_struct_loss"] = float(global_struct_loss.item()) / float(
+                epoch_steps * world_size
+            )
+            epoch_struct_telemetry.update(
+                struct_stream.epoch_telemetry(accelerator, epoch_struct_sums)
+            )
+            struct_seconds = accelerator.gather(
+                torch.tensor([epoch_struct_seconds], device=accelerator.device, dtype=torch.float64)
+            )
+            epoch_struct_telemetry["struct_seconds"] = float(struct_seconds.max().item())
+            struct_keys = sorted(grad_norm_struct)
+            if struct_keys:
+                struct_norms = accelerator.reduce(
+                    torch.tensor(
+                        [grad_norm_struct[key] for key in struct_keys],
+                        device=accelerator.device,
+                        dtype=torch.float64,
+                    ),
+                    reduction="mean",
+                )
+                for index, key in enumerate(struct_keys):
+                    epoch_struct_telemetry[f"grad_norm_struct_{key}"] = float(
+                        struct_norms[index].item()
+                    )
         validation_start = time.monotonic()
         run_topology = _topology_due(
             epoch,
@@ -4257,6 +4313,20 @@ def train_ddp_loop(
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
+        if epoch_struct_telemetry:
+            epoch_wall = max(time.monotonic() - epoch_wall_start, 1e-9)
+            epoch_struct_telemetry["struct_wall_fraction"] = (
+                epoch_struct_telemetry["struct_seconds"] / epoch_wall
+            )
+            entry.update(epoch_struct_telemetry)
+        if struct_stream is not None and run_topology:
+            entry.update(
+                struct_stream.validation_telemetry(
+                    model,
+                    accelerator,
+                    threshold=outcome.topology.threshold if outcome.topology is not None else None,
+                )
+            )
         if outcome.diagnostics is not None:
             entry.update(outcome.diagnostics)
             entry["val_kd_truth_source"] = "validation_structure"
@@ -4998,6 +5068,47 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 cfg.distill.context_targets_path or None,
             )
 
+    struct_stream: StructStream | None = None
+    if cfg.struct is not None:
+        struct_model_kwargs = resolve_model_kwargs(cfg.model)
+        struct_sampler = StructSampler(
+            val_split.build_training_graph(),
+            nodes=cfg.struct.nodes,
+            background_nodes=cfg.struct.background_nodes,
+            mix=cfg.struct.mix,
+            v_val=val_split.v_val,
+            exclude_nodes=assembled.exclude_nodes,
+        )
+        val_struct_sampler = StructSampler(
+            val_split.build_g_val_simple(),
+            nodes=cfg.struct.nodes,
+            background_nodes=cfg.struct.background_nodes,
+            mix=cfg.struct.mix,
+            v_val=frozenset(),
+            exclude_nodes=assembled.exclude_nodes,
+        )
+        struct_stream = StructStream(
+            cfg.struct,
+            struct_sampler,
+            table,
+            rank=accelerator.process_index,
+            world_size=accelerator.num_processes,
+            token_budget=cfg.data.token_budget,
+            positive_weight=float(cast(float, struct_model_kwargs.get("positive_weight", 1.0))),
+            label_smoothing=float(cast(float, struct_model_kwargs.get("label_smoothing", 0.0))),
+            seed=cfg.seed,
+            val_sampler=val_struct_sampler,
+        )
+        if accelerator.is_main_process:
+            logger.info(
+                "struct active: arm=%s weights=%s nodes=%d background=%d mix=%s",
+                cfg.struct.arm,
+                cfg.struct.active_weights,
+                cfg.struct.nodes,
+                cfg.struct.background_nodes,
+                cfg.struct.mix,
+            )
+
     val_label_smoothing = float(
         cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
     )
@@ -5104,6 +5215,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     evaluate_cls_fn=evaluate_cls_fn,
                     kd_bank=kd_bank,
                     kd_context_stream=kd_context_stream,
+                    struct_stream=struct_stream,
                     require_topology=not cfg.eval.classification_only,
                 ),
             )
@@ -5145,6 +5257,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         evaluate_cls_fn=evaluate_cls_fn,
         kd_bank=kd_bank,
         kd_context_stream=kd_context_stream,
+        struct_stream=struct_stream,
         require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
     )

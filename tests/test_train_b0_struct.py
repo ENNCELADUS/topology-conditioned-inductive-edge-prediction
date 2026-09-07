@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import networkx as nx
@@ -11,8 +13,23 @@ from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable, 
 from src.data.struct_sampler import StructSampler
 from src.distill.struct_config import StructConfig
 from src.distill.struct_losses import struct_total
-from src.train_b0 import StructStream, _grad_norm, config_to_dict, load_config
+from src.train_b0 import (
+    StructStream,
+    ValidationOutcome,
+    _grad_norm,
+    config_to_dict,
+    load_config,
+    train_ddp_loop,
+)
 from torch import nn
+
+from tests.test_train_b0 import (
+    _batch_of,
+    _constant_metrics,
+    _make_synthetic_pair_dataset,
+    _tiny_config,
+    _TinyPairMLP,
+)
 
 
 def _control_yaml() -> dict[str, object]:
@@ -257,3 +274,111 @@ def test_epoch_and_validation_telemetry_keys() -> None:
     assert stream.last_terms.keys() == {"bce", "rank", "degree", "motif"}
     assert _grad_norm(stream.last_terms["bce"], model) > 0.0
     assert _grad_norm(torch.tensor(1.0), model) == 0.0
+
+
+# --------------------------------------------------------------------------- loop wiring
+
+
+def _task_batch() -> dict[str, torch.Tensor]:
+    batch = _batch_of(_make_synthetic_pair_dataset(8, input_dim=4, seed=1))
+    batch["_row_id"] = torch.arange(8)
+    batch["_local_pair_count"] = torch.tensor(8)
+    batch["_global_pair_count"] = torch.tensor(8)
+    return batch
+
+
+class _MLPOnTokens(_TinyPairMLP):
+    """Serve the task batch and the stream's packed token batches.
+
+    Task batches carry `x_a`/`x_b`; stream batches carry (B, L, 1) `emb_a`/`emb_b`
+    tokens, mean-pooled and widened to `input_dim`.
+    """
+
+    def forward(
+        self, batch: dict[str, torch.Tensor] | None = None, **kwargs: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        merged = dict(batch or {})
+        merged.update(kwargs)
+        if "emb_a" in merged:
+            merged = {
+                "x_a": merged["emb_a"].mean(dim=1).expand(-1, 4),
+                "x_b": merged["emb_b"].mean(dim=1).expand(-1, 4),
+            }
+        return super().forward(merged)
+
+
+def test_struct_stream_changes_weights_and_logs_keys(tmp_path: Path) -> None:
+    sampler, table = _struct_fixture()
+    struct_cfg = StructConfig.from_mapping(
+        {
+            "nodes": 8,
+            "background_nodes": 2,
+            "val_subgraphs": 2,
+            "weights": {"bce": 1.0, "motif": 0.1},
+        }
+    )
+    cfg = replace(_tiny_config(epochs=2), struct=struct_cfg)
+
+    def _run(subdir: str, with_stream: bool) -> dict[str, torch.Tensor]:
+        torch.manual_seed(7)
+        model = _MLPOnTokens(input_dim=4, hidden_dims=(8,), dropout=0.0)
+        stream = (
+            StructStream(
+                struct_cfg,
+                sampler,
+                table,
+                rank=0,
+                world_size=1,
+                token_budget=1 << 20,
+                positive_weight=5.0,
+                label_smoothing=0.0,
+                seed=0,
+                val_sampler=sampler,
+            )
+            if with_stream
+            else None
+        )
+        batch = _task_batch()
+        result = train_ddp_loop(
+            model,
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(cpu=True),
+            warmup_steps=1,
+            artifact_dir=tmp_path / subdir,
+            evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(
+                _constant_metrics(), None
+            ),
+            struct_stream=stream,
+        )
+        return result.last_state_dict
+
+    with_stream = _run("struct", True)
+    without = _run("plain", False)
+    assert any(not torch.equal(with_stream[key], without[key]) for key in with_stream), (
+        "the structural loss must move the weights"
+    )
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "struct" / "metrics.jsonl").read_text().splitlines()
+    ]
+    last = rows[-1]
+    for key in (
+        "train_struct_loss",
+        "struct_bce_loss",
+        "struct_motif_loss",
+        "grad_norm_struct_bce",
+        "grad_norm_struct_motif",
+        "struct_pairs",
+        "struct_seconds",
+        "struct_wall_fraction",
+        "struct_components",
+        "struct_positive_coverage",
+        "val_struct_bce_loss",
+    ):
+        assert key in last, key
+    plain_rows = [
+        json.loads(line) for line in (tmp_path / "plain" / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert not any(k.startswith(("struct_", "val_struct_", "train_struct")) for k in plain_rows[-1])
