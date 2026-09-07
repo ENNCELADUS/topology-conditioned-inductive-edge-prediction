@@ -94,6 +94,7 @@ from src.distill.losses import (
     kd_rep_loss,
     kd_struct_loss,
 )
+from src.distill.struct_config import StructConfig
 from src.distill.struct_targets import structural_row_targets
 from src.distill.validation import OracleValidationBank
 from src.e2_pipeline import ProbeResult
@@ -293,6 +294,7 @@ class Config:
         runtime: Optional DDP runtime contract.
         distill: Optional B1 KD section; ``None`` or all-zero weights keep the
             plain supervised protocol.
+        struct: Optional structural-stream section; ``None`` keeps the plain protocol.
     """
 
     model: ModelConfig
@@ -304,6 +306,7 @@ class Config:
     mixed_precision: str
     runtime: RuntimeConfig | None = None
     distill: DistillConfig | None = None
+    struct: StructConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -698,6 +701,7 @@ def load_config(path: Path) -> Config:
             "mixed_precision",
             "runtime",
             "distill",
+            "struct",
         ),
         "<top level>",
     )
@@ -847,6 +851,9 @@ def load_config(path: Path) -> Config:
     distill: DistillConfig | None = None
     if "distill" in raw:
         distill = DistillConfig.from_mapping(_as_mapping(raw["distill"], "distill"))
+    struct: StructConfig | None = None
+    if "struct" in raw:
+        struct = StructConfig.from_mapping(_as_mapping(raw["struct"], "struct"))
 
     return Config(
         model=model,
@@ -858,6 +865,7 @@ def load_config(path: Path) -> Config:
         mixed_precision=mixed_precision,
         runtime=runtime,
         distill=distill,
+        struct=struct,
     )
 
 
