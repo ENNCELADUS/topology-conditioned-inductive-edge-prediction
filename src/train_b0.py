@@ -3080,15 +3080,25 @@ class StructStream:
         start, stop = KDContextStream._step_slice(len(shard), steps, step)
         return shard[start:stop]
 
+    def _global_step_count(self, size: int, *, steps: int, step: int) -> int:
+        return sum(
+            len(self._positions(size, rank=rank, steps=steps, step=step))
+            for rank in range(self._world_size)
+        )
+
     # ------------------------------------------------------------ forward
 
     def _score(
-        self, model: nn.Module, subgraph: StructSubgraph
+        self, model: nn.Module, subgraph: StructSubgraph, sampler: StructSampler
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the assembled symmetric logit matrix, the target, and the mask."""
+        """Return the assembled symmetric logit matrix, the target, and the mask.
+
+        ``sampler`` must be the one that produced ``subgraph``: the training
+        sampler masks V_val-internal pairs, the validation sampler keeps them.
+        """
         device = self._table.tokens.device
-        mask_np = self._sampler.legal_mask(subgraph)
-        target = torch.from_numpy(self._sampler.adjacency(subgraph)).to(device)
+        mask_np = sampler.legal_mask(subgraph)
+        target = torch.from_numpy(sampler.adjacency(subgraph)).to(device)
         mask = torch.from_numpy(mask_np).to(device)
         n = len(subgraph.nodes)
         packed = [self._node_index[node] for node in subgraph.nodes]
@@ -3161,17 +3171,22 @@ class StructStream:
         """Weighted structural loss for this rank's subgraph(s) at ``step`` (zero when none)."""
         plan = self._epoch_plan(epoch, steps)
         positions = self._positions(len(plan.subgraphs), rank=self._rank, steps=steps, step=step)
+        global_count = self._global_step_count(len(plan.subgraphs), steps=steps, step=step)
         zero = next(model.parameters()).sum() * 0.0
         self.last_terms = {}
         self.last_subgraph = None
         stats: dict[str, float] = {"struct_pairs": 0.0, "struct_subgraphs": 0.0}
         if not positions:
             return zero, stats
+        # DDP averages gradients over ranks while the plan stripes subgraphs across
+        # them, so rescale the rank-local sum by world_size * local / global (as the
+        # KD context stream does) to keep struct.weights world-size independent.
+        scale = self._world_size * len(positions) / global_count if global_count else 0.0
         total = zero
         for position in positions:
             subgraph = plan.subgraphs[position]
             self.last_subgraph = subgraph
-            logits, target, mask = self._score(model, subgraph)
+            logits, target, mask = self._score(model, subgraph, self._sampler)
             pair_count = float(torch.triu(mask, diagonal=1).sum().item())
             if pair_count == 0.0:
                 continue
@@ -3191,7 +3206,7 @@ class StructStream:
                 stats[f"sum_{key}"] = stats.get(f"sum_{key}", 0.0) + float(term.detach().item())
             for key, value in self._sampler.statistics(subgraph).items():
                 stats[f"sum_{key}"] = stats.get(f"sum_{key}", 0.0) + value
-        return total, stats
+        return total * scale, stats
 
     def epoch_telemetry(self, accelerator: Accelerator, sums: dict[str, float]) -> dict[str, float]:
         """Reduce rank-local sums into per-subgraph means plus plan coverage."""
@@ -3232,7 +3247,7 @@ class StructStream:
         with torch.no_grad():
             for position in positions:
                 subgraph = self._val_plan.subgraphs[position]
-                logits, target, mask = self._score(model, subgraph)
+                logits, target, mask = self._score(model, subgraph, self._val_sampler)
                 _, terms = struct_total(
                     logits,
                     target,

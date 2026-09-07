@@ -186,25 +186,35 @@ def test_stream_assembles_the_same_logits_as_a_direct_forward() -> None:
     assert stats["struct_pairs"] == float(len(rows))
 
 
-def test_one_rank_and_two_rank_gradients_match() -> None:
+def test_two_rank_ddp_mean_equals_mean_raw_loss_of_live_subgraphs() -> None:
+    """DDP averages rank losses; the stream rescales so that average is the per-subgraph mean.
+
+    With one rank every step carries exactly one subgraph, so its loss is that subgraph's
+    raw loss. With two ranks the plan stripes unevenly across steps; at every step the
+    rank-averaged loss must equal the mean raw loss of the subgraphs live at that step,
+    so ``struct.weights`` mean the same thing at any world size.
+    """
     sampler, table = _struct_fixture()
     steps = 3
-
-    def _grads(rank: int, world_size: int) -> torch.Tensor:
-        model = _StructToy()
-        total: torch.Tensor | None = None
-        for step in range(steps):
-            loss, _ = _stream(sampler, table, rank=rank, world_size=world_size).loss(
-                model, epoch=2, step=step, steps=steps
-            )
-            total = loss if total is None else total + loss
-        assert total is not None
-        (grad,) = torch.autograd.grad(total, [model.weight])
-        return grad
-
-    single = _grads(0, 1)
-    two = _grads(0, 2) + _grads(1, 2)
-    torch.testing.assert_close(single, two)
+    model = _StructToy()
+    single = _stream(sampler, table, rank=0, world_size=1)
+    raw = [float(single.loss(model, epoch=2, step=t, steps=steps)[0]) for t in range(steps)]
+    ranks = [_stream(sampler, table, rank=r, world_size=2) for r in range(2)]
+    live_steps = 0
+    for step in range(steps):
+        ddp_mean = sum(float(s.loss(model, epoch=2, step=step, steps=steps)[0]) for s in ranks) / 2
+        live = [
+            position
+            for r in range(2)
+            for position in ranks[r]._positions(steps, rank=r, steps=steps, step=step)
+        ]
+        if not live:
+            assert ddp_mean == 0.0
+            continue
+        live_steps += 1
+        expected = sum(raw[position] for position in live) / len(live)
+        assert ddp_mean == pytest.approx(expected, rel=1e-5)
+    assert live_steps >= 2  # the fixture really exercises a multi-subgraph step
 
 
 def test_plan_longer_than_steps_is_rejected_and_shorter_plan_yields_zero_steps() -> None:
@@ -234,6 +244,34 @@ def test_plan_longer_than_steps_is_rejected_and_shorter_plan_yields_zero_steps()
     assert (first["struct_pairs"] > 0) != (second["struct_pairs"] > 0)
     if second["struct_pairs"] == 0.0:
         assert zero.requires_grad and float(zero) == 0.0
+
+
+def test_validation_scores_the_gold_val_graph_with_the_val_sampler() -> None:
+    # The training sampler masks every V_val-internal pair; a V_val-only diagnostic subgraph
+    # must be masked and targeted by the validation sampler, or every val term collapses to 0.
+    train_sampler, table = _struct_fixture()
+    v_val = frozenset(f"n{i}" for i in range(8))
+    train_sampler = StructSampler(
+        train_sampler.graph,
+        nodes=8,
+        background_nodes=2,
+        mix={"bfs": 0.5, "motif": 0.25, "bridge": 0.25},
+        v_val=v_val,
+        exclude_nodes=frozenset(),
+    )
+    val_graph = train_sampler.graph.subgraph(v_val).copy()
+    val_sampler = StructSampler(
+        val_graph,
+        nodes=8,
+        background_nodes=0,
+        mix={"bfs": 1.0, "motif": 0.0, "bridge": 0.0},
+        v_val=frozenset(),
+        exclude_nodes=frozenset(),
+    )
+    stream = _stream(train_sampler, table, weights={"bce": 1.0}, val_sampler=val_sampler)
+    val = stream.validation_telemetry(_StructToy(), Accelerator(cpu=True), threshold=0.0)
+    assert val["val_struct_bce_loss"] > 0.0
+    assert val["val_struct_hard_degree_mae"] > 0.0
 
 
 def test_epoch_and_validation_telemetry_keys() -> None:
