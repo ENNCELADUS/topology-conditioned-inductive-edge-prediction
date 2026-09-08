@@ -1207,7 +1207,7 @@ def assemble_data(
     )
 
     training_positives, _ = _training_rows(val_split, exclude)
-    g_struct = build_g_struct(bench.split.train_nodes, training_positives)
+    g_struct = build_g_struct(val_split.train_nodes, training_positives)
     degrees = {str(node): int(degree) for node, degree in g_struct.degree()}
 
     return AssembledData(
@@ -1717,9 +1717,9 @@ def _shuffled_pairs_and_labels(
 def _build_negative_sampler(assembled: AssembledData) -> NegativeSampler:
     """Build the degree-corrected negative sampler over featureful train nodes.
 
-    Rejects V_val-internal pairs like a global positive.
+    The universe excludes V_val, so no sampled negative touches a held-out node.
     """
-    train_universe = sorted(set(assembled.benchmark.split.train_nodes) - assembled.exclude_nodes)
+    train_universe = sorted(set(assembled.val_split.train_nodes) - assembled.exclude_nodes)
     return NegativeSampler(
         train_universe,
         assembled.degrees,

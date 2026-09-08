@@ -97,8 +97,8 @@ checkpoint.
 
 ## EgoStitch E2E
 
-EgoStitch E2E trains on train-side positives outside V_val and validates on the V_val region split
-(pair-disjoint, not node-disjoint). It may not read V_val-internal pairs during training; that
+EgoStitch E2E trains on train-side positives that do not touch V_val and validates on the V_val
+region split (node-held-out). It may not read any pair touching V_val during training; that
 boundary is checked inside the worker, and the command runs directly in the repository checkout.
 
 The sole exception is an explicitly configured true-Oracle diagnostic:

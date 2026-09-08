@@ -63,10 +63,9 @@ _CONTEXT_SEED = 0
 def truth_graph_for_kd(split: ValRegionSplit) -> nx.Graph:
     """Training-side truth graph: loopless training positives over every train node.
 
-    By construction (`ValRegionSplit.training_positives` excludes any pair
-    with both endpoints in `split.v_val`), this graph has zero V_val-internal
-    edges: V_val nodes appear here only through their cross-boundary
-    neighbors.
+    By construction (`ValRegionSplit.train_nodes` excludes V_val and
+    `training_positives` excludes any pair touching it), this graph contains
+    no V_val node and no V_val edge.
     """
     return split.build_training_graph()
 
@@ -79,9 +78,10 @@ def assert_training_side_only(
 ) -> None:
     """Hard-refuse test-split leakage, an off-universe node, or a V_val-internal truth edge.
 
-    V_val nodes are legitimately part of `split.train_nodes` and `truth_graph`
-    (cross-boundary edges are not quarantined); only a V_val-*internal* edge
-    is illegal here (row-level quarantine is `assert_no_val_internal_training_rows`).
+    V_val is outside `split.train_nodes`, so any V_val node in `node_ids` or
+    `truth_graph` fails the training-universe check; the V_val-internal edge
+    check is kept as an explicit last line of defence (row-level quarantine is
+    `assert_no_val_internal_training_rows`).
 
     Raises:
         ValueError: If `node_ids` overlaps the benchmark test split; `node_ids`

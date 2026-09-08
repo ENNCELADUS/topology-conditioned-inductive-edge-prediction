@@ -1017,11 +1017,13 @@ class TestAssembleDataFeatureCoverageGate:
         assert assembled.dropped_pair_counts["train_edges.txt"] == 0
         assert assembled.dropped_pair_counts["val_edges.txt"] == 0
         assert len(assembled.val_split.v_val) == 5
-        assert assembled.val_split.v_val <= assembled.val_split.train_nodes
-        assert set(assembled.degrees) <= assembled.val_split.train_nodes
-        assert len(assembled.training_positives) == 5
-        assert assembled.degrees["node_000005"] == 1
-        assert all(assembled.degrees[f"node_{i:06d}"] == 0 for i in range(1, 5))
+        # Node-held-out: V_val leaves the training universe and the boundary
+        # edge (node_000005, node_000006) is dropped with it.
+        assert not assembled.val_split.v_val & assembled.val_split.train_nodes
+        assert set(assembled.degrees) == assembled.val_split.train_nodes
+        assert len(assembled.training_positives) == 4
+        assert all(f"node_{i:06d}" not in assembled.degrees for i in range(1, 6))
+        assert assembled.degrees["node_000006"] == 1
 
 
 class TestV31TrainingLoader:
@@ -1083,6 +1085,10 @@ def _synthetic_v31_pack_fixture(
             root=data_root,
             strategy="synthetic",
             expected_missing_features=["node_000012"],
+            # The node-held-out training universe is five path nodes (four
+            # positives, eleven possible negatives), too small for the
+            # production 1:5 ratio.
+            negative_ratio=2,
         ),
         runtime=replace(
             cfg.runtime,

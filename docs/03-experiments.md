@@ -10,21 +10,21 @@
 |---|---:|---:|---|
 | Full reference graph | 10,090 | 122,092 | positive graph truth only |
 | Train-side substrate (`train_graph.pkl`) | 8,072 | 47,762 | original train⁺∪val⁺ graph and pair pool, before the internal split |
-| ↳ Effective training (new protocol) | 8,072 | 37,989 | V_val-internal pairs excluded; boundary pairs retained |
-| ↳ `V_val` region (new protocol) | 1,250 | 9,773 | pair-disjoint validation |
-| ↳ Included training boundary | — | 12,327 | already counted in effective training |
+| ↳ Effective training (node-held-out protocol) | 7,203 | 31,623 | every pair touching V_val excluded |
+| ↳ `V_val` region (node-held-out protocol) | 869 | 4,703 | node-held-out validation |
+| ↳ Dropped boundary | — | 11,436 | cross-boundary positives, held out from training |
 | Test graph | disjoint 2,018 | 30,128 | held out until final evaluation |
 | Loopless test candidate universe | same 2,018 | — | all 2,035,153 unordered distinct-node pairs |
 
-The primary strategy is `breadth_first`. New V_val uses a single sorted-neighbor FIFO BFS, root neighbor count 5, split seed 42, and a strict upper bound of 20% of substrate positive pairs (including self-loops); the FIFO prefix contains 10,719 positives against a 10,728 cap. V_val is pair-disjoint: only internal pairs are held out, and all boundary pairs remain training samples. Its nodes are exposed through training; test nodes remain disjoint. Inner BFS buckets use seed 43 and 50 uniform-root draws with replacement per size 20–200. Classification validation is balanced with fresh positive-endpoint-frequency negative sampling (seed 0); effective fit need not be balanced. Edge counts above exclude loops. [Sampling design](superpowers/specs/2026-09-06-pring-node-disjoint-validation-design.md) and [current split](../data/val_region/breadth_first.json).
+The primary strategy is `breadth_first`. V_val uses a single sorted-neighbor FIFO BFS, root neighbor count 5, split seed 42, and a strict upper bound of 10% of substrate positive pairs (including self-loops); the FIFO prefix contains 5,347 positives (644 self-loops) against a 5,364 cap. V_val is node-held-out: its 869 nodes leave the training universe, and every pair touching them (internal and cross-boundary, positive and benchmark negative) is held out, so training sees 7,203 nodes and 36,857 positives (31,623 loopless) and dynamic negatives never touch V_val. This mirrors the official train/test boundary; test nodes remain disjoint. Inner BFS buckets use seed 43 and 50 uniform-root draws with replacement per size 20–200. Classification validation is balanced with fresh positive-endpoint-frequency negative sampling (seed 0); effective fit need not be balanced. Edge counts above exclude loops. [Sampling design](superpowers/specs/2026-09-08-node-held-out-validation-design.md) and [current split](../data/val_region/breadth_first.json).
 
-**Result provenance:** all model results below predate this change and used the old pair-disjoint V_val (2,553 nodes; 9,528 non-self edges; effective training 38,234 non-self edges with boundary pairs retained). No model has yet been retrained/evaluated under the new single-BFS protocol. These historical results must not be interpreted as new-protocol evidence.
+**Result provenance:** all model results below predate this change. Results before 2026-09-06 used the old pair-disjoint V_val (2,553 nodes; 9,528 non-self edges; effective training 38,234 non-self edges with boundary pairs retained); the 2026-09-06 pair-disjoint 20% split (1,250 nodes, 10,719 positives) was never used for a published arm. The node-held-out rule was adopted after the 2026-09-07 KD1 diagnostic (branch `codex/node-heldout-diagnostic-20260907`, 20% budget, 30,594 training positives, teacher not node-held-out): its V_val-selected threshold replayed on held-out test gave AUROC 0.7222, AUPRC 0.7494, F1 0.6879, GS 0.4255, RD 0.6779, degree/clustering/spectral MMD ratios 5.78/5.14/9.92, whereas pair-disjoint selection had not transferred. The budget was then cut from 20% to 10% of positives (869 nodes, 10.8% of substrate nodes) to recover training positives (30,594 → 36,857); the boundary loss barely moves above ~800 nodes, so the trade is nearly 1:1 in that range. No arm has been retrained under the 10% node-held-out split yet. Historical results must not be interpreted as current-protocol evidence.
 
 **Dynamic training negatives:** `src/data/training_sampler.py:enumerate_edge_stream`
 is shared by Full-Ego and V3.1. It proposes negatives through a 50:50 mixture of
 uniform node pairs (with self-pair boost) and degree-weighted positive-endpoint
-replacement, rejecting known positives, within-call duplicates and V_val-internal
-pairs. Cross-boundary pairs remain legal. Students use one global sampling rank
+replacement, rejecting known positives and within-call duplicates; the sampling
+universe excludes V_val, so no negative touches a held-out node. Students use one global sampling rank
 (seed, epoch, rank=0), then distribute batches; Full-Ego retains its original
 per-rank sampling. Thus student membership is GPU-count independent, while the
 teacher and student share the sampler rather than necessarily identical multi-GPU

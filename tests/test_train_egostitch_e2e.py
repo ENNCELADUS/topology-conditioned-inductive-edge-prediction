@@ -2434,14 +2434,15 @@ class TestPrepareAndAssembleE2E:
         assert audit["training_feature_stats_rows"] == data.feature_stats.n_rows
         assert data.feature_stats.n_rows == len(data.train_nodes)
 
-    def test_assembly_statistics_span_the_full_training_universe(
+    def test_assembly_statistics_span_the_training_universe_only(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Validation nodes remain in the training universe through boundary pairs."""
+        """V_val rows are in the F0 matrix but outside the statistics/training universe."""
         data = self._assemble_holdout_e2e_data(tmp_path, monkeypatch)
         assert data.feature_stats is not None
         assert data.validation_nodes  # precondition: V_val rows really are in the matrix
-        assert set(data.validation_nodes) <= set(data.train_nodes)
+        assert set(data.validation_nodes) <= set(data.node_index)
+        assert not set(data.validation_nodes) & set(data.train_nodes)
         assert set(data.target_builder.graph) == set(data.train_nodes)
 
         expected = compute_feature_stats(

@@ -63,9 +63,9 @@ hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
   --worker-module src.train_egostitch --run-kind formal   # or another trained-arm config
 ```
 
-The run retains all training positives except V_val-internal pairs and samples
-five negatives per positive each epoch, sharing the Full-Ego sampler and retaining cross-boundary samples
-(single-root FIFO BFS capped at 20% of substrate positive pairs, including loops; pair-disjoint validation),
+The run trains on every substrate positive that does not touch V_val and samples
+five negatives per positive each epoch from the V_val-free training universe, sharing the Full-Ego sampler
+(single-root FIFO BFS capped at 10% of substrate positive pairs, including loops; node-held-out validation),
 validates on fixed PRING-style BFS buckets, and executes `pack → train → publish → test` through the
 shared orchestrator. Quality telemetry (eligibility, liveness, slot collapse, margins)
 is recorded but never blocks completion, publication, scoring, or evaluation.

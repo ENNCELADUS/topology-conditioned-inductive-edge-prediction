@@ -1882,11 +1882,10 @@ def prepare_pack(
         store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
         train_nodes = sorted(split.train_nodes)
         validation_nodes = sorted(split.v_val)
-        # V_val is a subset of the training universe by construction (cross-
-        # boundary edges stay legal training-side signal), so the operative F0
-        # set is exactly the training universe -- no separate union is needed
-        # the way the retired V_fit/V_hold disjoint split required.
-        operative = train_nodes
+        # V_val is held out of the training universe, so the F0 pack must
+        # cover the whole substrate (training universe plus V_val); feature
+        # statistics below are fitted on the training universe only.
+        operative = sorted(split.substrate_nodes)
         if raw_cold:
             assert raw_pack_dir is not None
             raw_manifest = packed_features.build_packed_features(
@@ -2184,11 +2183,9 @@ def _assemble_e2e_data(
     train_nodes = sorted(split.train_nodes)
     validation_nodes: tuple[str, ...] = tuple(sorted(split.v_val))
     validation_positive_edges: tuple[tuple[str, str], ...] = split.val_positives
-    # V_val is a subset of the training universe by construction (cross-
-    # boundary edges stay legal training-side signal), so the F0 universe this
-    # assembly needs is exactly the training universe -- no separate union of
-    # a disjoint fit/hold split.
-    allowed_nodes = train_nodes
+    # V_val is held out of the training universe, so the F0 matrix must cover
+    # the whole substrate; feature statistics are fitted on `train_nodes` only.
+    allowed_nodes = sorted(split.substrate_nodes)
 
     store = FeatureStore(cfg.data.root / _FEATURES_SUBDIR)
     f0_cache = (pack_dir / _PACK_F0_FILENAME) if pack_dir is not None else cfg.data.f0_cache

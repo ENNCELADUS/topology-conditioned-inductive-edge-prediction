@@ -144,13 +144,15 @@ stay fail-closed. `complete.json` means published, not evaluated: held-out evide
 - Self-loops: training structural targets strip them; canonical MMD descriptors and official GS/RD
   subgraphs keep them, as the benchmark evaluator does.
 - Grounding, when used, is universe-scoped (`train`, `V_val`, test): no cache crosses universes;
-  training may not read V_val-internal pairs (cross-boundary edges do train).
+  training may not read any pair touching V_val (cross-boundary edges are held out too).
 - Topology and classification share the same train positives (no message/supervision split):
   loopless projection for topology, self-pairs kept for classification, and edge-stream structural
   targets must drop the queried partner and decrement its degree.
-- `V_val` (`val_region.py`): K=5 dispersed-seed hashed-frontier BFS on `train_graph.pkl`'s loopless
-  giant component, stopped at 20% induced loopless edges — pair-disjoint only, never "fully
-  inductive". It invalidated every V_hold-keyed cache, pack, threshold, and result.
+- `V_val` (`val_region.py`): one sorted-neighbor FIFO BFS from a seeded 5-neighbor root on
+  `train_graph.pkl`, stopped before exceeding 10% of substrate positive pairs (loops counted once):
+  869 nodes, 5,347 positives. Node-held-out since 2026-09-08: V_val leaves the training universe and
+  every pair touching it is dropped (training = 7,203 nodes, 36,857 positives), mirroring the
+  train/test boundary. Each V_val change invalidated every split-keyed cache, pack, bank, threshold, and result.
 - KD banks are keyed to the teacher checkpoint and the split: a re-trained teacher or a moved V_val
   boundary invalidates `outputs/distill/*` wholesale. `src/distill/artifacts.py` loads only the
   `kd_row_targets_v1` / `kd_ctx_targets_v1` formats and raises on row-coverage mismatch.

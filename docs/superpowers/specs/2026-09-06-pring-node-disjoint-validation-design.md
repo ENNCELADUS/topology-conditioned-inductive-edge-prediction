@@ -1,6 +1,11 @@
 # PRING-style BFS validation with a positive-edge budget
 
-Status: implemented on 2026-09-06. The user revised the budget from 20% of nodes
+Status: superseded on 2026-09-08 by
+[node-held-out validation](2026-09-08-node-held-out-validation-design.md): the
+budget is now 10% of positives and every pair touching V_val is held out.
+The BFS growth, bucket, and negative-sampling rules below still apply.
+
+Original status: implemented on 2026-09-06. The user revised the budget from 20% of nodes
 to an upper bound of approximately 20% of positive pairs. Cross-boundary training
 samples remain retained. The historical filename is unchanged; this is
 **pair-disjoint validation**, not node-disjoint validation.

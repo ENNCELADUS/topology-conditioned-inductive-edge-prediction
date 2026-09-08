@@ -17,9 +17,10 @@ imported, per house convention):
   (`derive_vval_nodes`, no CLI override) internally calls
   `sample_bfs_ball_buckets` with `ValRegionParams()`'s own fixed
   `bucket_sizes` (up to 200 nodes), so the graph must be large enough for
-  that regardless of `--sizes`/`--vval-sizes` -- a ~1200-node graph reliably
-  derives a several-hundred-node V_val region (verified empirically: this
-  derivation itself takes well under a second, it is pure graph traversal).
+  that regardless of `--sizes`/`--vval-sizes` -- a ~2400-node graph reliably
+  derives a several-hundred-node V_val region under the 10% positive budget
+  (verified empirically: this derivation itself takes well under a second, it
+  is pure graph traversal).
 """
 
 from __future__ import annotations
@@ -310,13 +311,13 @@ def _write_train_graph(data_root: Path, strategy: str, graph: nx.Graph) -> None:
         pickle.dump(graph, f)
 
 
-def _make_large_graph(n: int = 1200) -> nx.Graph:
+def _make_large_graph(n: int = 2400) -> nx.Graph:
     """A graph large enough for the canonical V_val derivation to succeed.
 
     Its own fixed `ValRegionParams().bucket_sizes` (up to 200 nodes) needs a
-    V_val region of at least 200 nodes; empirically a 1200-node Watts-Strogatz
-    graph derives one several hundred nodes wide (see module docstring),
-    comfortably clearing that floor.
+    V_val region of at least 200 nodes; under the 10% positive budget a
+    2400-node Watts-Strogatz graph derives a 358-node region (see module
+    docstring), comfortably clearing that floor.
     """
     base = nx.connected_watts_strogatz_graph(n, k=4, p=0.3, seed=0)
     return nx.relabel_nodes(base, {i: f"node_{i:06d}" for i in base.nodes()})

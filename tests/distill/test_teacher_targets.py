@@ -180,16 +180,27 @@ def test_refuses_a_truth_graph_containing_a_v_val_internal_edge() -> None:
     a, b = sorted(split.v_val)[:2]
     truth.add_edge(a, b)
 
-    with pytest.raises(ValueError, match="V_val-internal edge"):
+    # V_val is outside the training universe, so the universe check fires first.
+    with pytest.raises(ValueError, match="outside the training"):
         tt.assert_training_side_only(node_ids, truth, split, frozenset())
 
 
-def test_accepts_a_clean_training_universe_that_legitimately_contains_v_val_nodes() -> None:
+def test_refuses_a_node_universe_containing_a_v_val_node() -> None:
+    split = _toy_split()
+    node_ids = sorted(split.train_nodes | {next(iter(split.v_val))})
+    truth = tt.truth_graph_for_kd(split)
+
+    with pytest.raises(ValueError, match="outside the training universe"):
+        tt.assert_training_side_only(node_ids, truth, split, frozenset())
+
+
+def test_accepts_a_clean_training_universe_that_excludes_v_val_nodes() -> None:
     split = _toy_split()
     node_ids = sorted(split.train_nodes)
     truth = tt.truth_graph_for_kd(split)
 
-    assert split.v_val & set(node_ids), "V_val nodes must remain part of the training universe"
+    assert not split.v_val & set(node_ids), "V_val nodes are held out of the training universe"
+    assert not split.v_val & set(truth.nodes)
     tt.assert_training_side_only(node_ids, truth, split, frozenset())  # must not raise
 
 

@@ -1,9 +1,10 @@
-"""PRING-style pair-disjoint V_val inside the original train-side substrate.
+"""PRING-style node-held-out V_val inside the original train-side substrate.
 
-A single seeded FIFO BFS admits at most 20% of substrate positive pairs, including
-self-loops. Training retains boundary
-pairs and excludes only validation-internal pairs. Fixed BFS buckets and
-endpoint-frequency classification negatives come from the validation induced graph.
+A single seeded FIFO BFS admits at most 10% of substrate positive pairs, including
+self-loops. V_val nodes are removed from the training universe: every pair touching
+V_val (internal and cross-boundary, positive and negative) is held out, mirroring
+the official train/test boundary. Fixed BFS buckets and endpoint-frequency
+classification negatives come from the validation induced graph.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ Pair = tuple[str, str]
 class ValRegionParams:
     """Fixed production defaults; explicit overrides support small test graphs."""
 
-    positive_edge_fraction: float = 0.20
+    positive_edge_fraction: float = 0.10
     root_neighbors: int = 5
     split_seed: int = 42
     bucket_seed: int = 43
@@ -49,8 +50,9 @@ class ValRegionParams:
 class ValRegionSplit:
     """Validation membership and disjoint training/validation pair partitions.
 
-    ``train_nodes`` contains the complete train-side substrate, including V_val.
-    Boundary pairs remain training samples; only V_val-internal pairs are held out.
+    ``train_nodes`` is the substrate minus V_val. Every pair touching V_val is
+    held out from training, including cross-boundary positives and negatives;
+    ``substrate_nodes`` restores the complete train-side node set.
     """
 
     train_nodes: frozenset[str]
@@ -65,7 +67,7 @@ class ValRegionSplit:
 
     @property
     def substrate_nodes(self) -> frozenset[str]:
-        """Original train-side membership before the internal pair holdout."""
+        """Original train-side membership before the node holdout."""
         return self.train_nodes | self.v_val
 
     def build_training_graph(self) -> nx.Graph:
@@ -194,7 +196,7 @@ def derive_val_region_split(
     *,
     params: ValRegionParams | None = None,
 ) -> ValRegionSplit:
-    """Derive a pair-disjoint split solely from the complete train-side substrate.
+    """Derive a node-held-out split solely from the complete train-side substrate.
 
     ``global_positive_edges`` is accepted by shared callers, but validation
     negative rejection needs only induced validation truth, never test labels.
@@ -232,11 +234,11 @@ def derive_val_region_split(
     if any(u not in node_set or v not in node_set for u, v in negatives):
         raise ValueError("benchmark negative endpoint outside train-side substrate")
     return ValRegionSplit(
-        train_nodes=node_set,
+        train_nodes=node_set - v_val,
         v_val=v_val,
         region_seeds=(root,),
-        training_positives=frozenset((u, v) for u, v in truth if not (u in v_val and v in v_val)),
-        training_negatives=tuple((u, v) for u, v in negatives if not (u in v_val and v in v_val)),
+        training_positives=frozenset((u, v) for u, v in truth if u not in v_val and v not in v_val),
+        training_negatives=tuple((u, v) for u, v in negatives if u not in v_val and v not in v_val),
         val_positives=val_positives,
         val_negatives=_sample_val_negatives(val_positives, seed=params.negative_seed),
         buckets=sample_bfs_ball_buckets(

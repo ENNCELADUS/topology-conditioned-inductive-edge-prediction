@@ -58,8 +58,8 @@ def _path_graph(n: int) -> nx.Graph:
     return graph
 
 
-class TestPairDisjointSampling:
-    def test_order_independent_partition_retains_boundary_pairs(self) -> None:
+class TestNodeHeldOutSampling:
+    def test_order_independent_partition_drops_every_pair_touching_v_val(self) -> None:
         nodes = _grid_nodes(6, 6)
         edges = _grid_edges(6, 6)
         negatives = list(itertools.combinations(nodes, 2))
@@ -75,7 +75,8 @@ class TestPairDisjointSampling:
         assert split == replay
         assert len(split.val_positives) <= int(0.4 * len(truth))
         assert split.substrate_nodes == frozenset(nodes)
-        assert split.v_val <= split.train_nodes == frozenset(nodes)
+        assert split.v_val and not split.v_val & split.train_nodes
+        assert split.train_nodes | split.v_val == frozenset(nodes)
         assert set(split.build_training_graph()) == split.train_nodes
         assert nx.is_connected(split.build_g_val_simple())
         assert all(
@@ -87,9 +88,9 @@ class TestPairDisjointSampling:
             (negatives, split.training_negatives),
         ):
             boundary = {(u, v) for u, v in original if (u in split.v_val) != (v in split.v_val)}
-            assert boundary and boundary <= set(retained)
+            assert boundary and not boundary & set(retained)
             assert set(retained) == {
-                (u, v) for u, v in original if not (u in split.v_val and v in split.v_val)
+                (u, v) for u, v in original if u not in split.v_val and v not in split.v_val
             }
         assert not set(split.training_positives) & set(split.val_positives)
         assert not set(split.training_negatives) & set(split.val_negatives)
