@@ -64,6 +64,6 @@ runtime:
   memory_limit_gib: 85.0
   probe_warmup_steps: 10
   probe_timed_steps: 30
-seed: 47
+seed: 0
 output_dir: outputs/split20260908/b0_v31
 mixed_precision: "bf16" # pinned for the H20 E2 target
