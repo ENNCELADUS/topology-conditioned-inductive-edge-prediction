@@ -84,8 +84,8 @@ hpc/run.sh train configs/struct_bce_breadth_first.yaml              # structural
 .venv/bin/python -m src.experiments.struct_hpo --arm new             # 10-trial study, outputs/struct_hpo/new
 ```
 KD sweeps go through `hpc/sweep_kd_hpo.sh` or the Optuna drivers `src/experiments/kd_rank_*_hpo.py`
-(which dump missing banks), never a hand-launched grid. When more than one torch job shares the
-box, export `OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` as the sweep script does, or the jobs spin-wait.
+(which dump missing banks), never a hand-launched grid. `hpc/run.sh` caps `OMP_NUM_THREADS` and
+`MKL_NUM_THREADS` at 16 unless the caller sets them; uncapped torch jobs sharing the box spin-wait.
 
 Codex review recipe: `CODEX_HOME=<scratch>/codex-home codex review --base <sha> > wave-review.txt 2>&1`,
 backgrounded — ~200 KB of output must never land in context; read the file when it finishes. That

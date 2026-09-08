@@ -109,6 +109,9 @@ assert_runtime() {
 
 export PYTHONUNBUFFERED=1
 export UV_CACHE_DIR="/2023533015/.uv/cache"
+# Three containers share the host's 224 cores; uncapped torch/BLAS threads
+# spin-wait against each other whenever two jobs overlap. Callers may override.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-16}"
 
 assert_runtime
 cd "${EXPECTED_REPO_ROOT}"

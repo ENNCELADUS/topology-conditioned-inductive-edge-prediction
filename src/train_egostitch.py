@@ -44,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from numpy.typing import NDArray
 
@@ -104,6 +104,7 @@ from src.model.egostitch.generator.oracle import OracleStructGenerator, build_or
 from src.model.egostitch.graph import GraphEmbedding, ImaginedGraph
 from src.model.egostitch.registry import build_encoder
 from src.train_b0 import (
+    PROCESS_GROUP_TIMEOUT,
     EvalConfig,
     ModelConfig,
     _as_float,
@@ -147,7 +148,10 @@ def build_egostitch_ddp_accelerator(
     """Build the EgoStitch distributed accelerator."""
     return Accelerator(
         mixed_precision=mixed_precision,
-        kwargs_handlers=[_egostitch_ddp_kwargs(find_unused_parameters=find_unused_parameters)],
+        kwargs_handlers=[
+            _egostitch_ddp_kwargs(find_unused_parameters=find_unused_parameters),
+            InitProcessGroupKwargs(timeout=PROCESS_GROUP_TIMEOUT),
+        ],
     )
 
 

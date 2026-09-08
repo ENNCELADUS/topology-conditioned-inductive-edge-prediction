@@ -27,8 +27,9 @@ cd /2023533015/topology-conditioned-inductive-edge-prediction
 ```
 
 Each container sees only its own GPUs, so jobs on different containers never contend
-for a GPU, but they share the host's 224 CPU cores: export
-`OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` for every concurrent torch job. A `nohup` launch
+for a GPU, but they share the host's 224 CPU cores: `hpc/run.sh` exports
+`OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` unless the caller sets them, and every other torch
+process (Optuna drivers, bank dumps) must cap them the same way. A `nohup` launch
 inside a single `ssh` command can hang that session; launch, exit, and verify the process
 from a fresh session.
 

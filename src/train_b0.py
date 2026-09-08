@@ -36,7 +36,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import cycle, islice
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypeVar, cast
@@ -46,7 +46,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 from torch.utils.checkpoint import checkpoint
@@ -1975,6 +1975,13 @@ class _EpochIndexSampler(Sampler[int]):
         start, stop = self._offsets[self._epoch]
         return stop - start
 
+    def epoch_length(self, epoch: int) -> int:
+        """Return the batch count of ``epoch`` without touching the selected epoch."""
+        if epoch not in self._offsets:
+            raise ValueError(f"no packed training plan for epoch {epoch}")
+        start, stop = self._offsets[epoch]
+        return stop - start
+
 
 class _EpochGpuBatchIterable(GpuBatchIterable):
     """Reuse one DataLoader while selecting the requested epoch at iteration time."""
@@ -1995,6 +2002,18 @@ class _EpochGpuBatchIterable(GpuBatchIterable):
     def __iter__(self) -> Iterator[Batch]:
         self._sampler.set_epoch(self._epoch)
         yield from super().__iter__()
+
+    def __len__(self) -> int:
+        """Return this epoch's exact step count.
+
+        The shared DataLoader's ``len`` reads the sampler's *selected* epoch,
+        which ``__iter__`` only sets when iteration starts, so the training loop
+        (which sizes the KD-context and structural streams from ``len`` before
+        iterating) would otherwise see the previous epoch's count. Epoch plans
+        differ by a step, so that silently mis-sliced the streams and raised
+        ``invalid KD context step`` on the first longer epoch.
+        """
+        return self._sampler.epoch_length(self._epoch)
 
 
 def _wrap_compact_loader(
@@ -2183,6 +2202,14 @@ def _build_packed_v3_1_loaders(
 # --------------------------------------------------------------------------- DDP training
 
 
+# Collective timeout for both DDP workers. The main rank alone selects the V_val
+# topology threshold (bucketed MMD cascade) and writes checkpoints after every
+# epoch's distributed scoring while the other ranks wait in the next all-reduce;
+# on the 2026-09-08 split that work exceeded NCCL's 600 s default and the
+# watchdog aborted the teacher. Real hangs still surface, just later.
+PROCESS_GROUP_TIMEOUT = timedelta(hours=2)
+
+
 def build_ddp_accelerator(mixed_precision: str) -> Accelerator:
     """Build the multi-H20 DDP accelerator with the pinned communication settings.
 
@@ -2198,7 +2225,10 @@ def build_ddp_accelerator(mixed_precision: str) -> Accelerator:
         find_unused_parameters=False,
         gradient_as_bucket_view=True,
     )
-    return Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[kwargs])
+    return Accelerator(
+        mixed_precision=mixed_precision,
+        kwargs_handlers=[kwargs, InitProcessGroupKwargs(timeout=PROCESS_GROUP_TIMEOUT)],
+    )
 
 
 def scale_ddp_mean_loss(

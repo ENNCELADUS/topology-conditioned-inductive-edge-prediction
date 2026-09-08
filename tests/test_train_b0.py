@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from src.data.artifacts import ArtifactVerificationError
-from src.data.distributed_pairs import CompactPairBatchDataset, PairBatchSpec
+from src.data.distributed_pairs import CompactPairBatch, CompactPairBatchDataset, PairBatchSpec
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.data.pairs import TokenPairDataset
 from src.data.val_region import ValRegionParams, val_ball_union_universe
@@ -52,6 +52,7 @@ from src.train_b0 import (
     _cycle_assembled_batches,
     _dynamic_training_corpus,
     _EpochGpuBatchIterable,
+    _EpochIndexSampler,
     _evaluate_distributed,
     _evaluate_two_pass,
     _evaluate_val_universe,
@@ -79,7 +80,7 @@ from src.train_b0 import (
     validate_gathered_validation,
     write_outputs,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
 pytestmark = pytest.mark.unit
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1206,6 +1207,46 @@ def test_packed_loader_reuses_one_dataloader_across_epochs(
     assert isinstance(epoch_one, GpuBatchIterable)
     assert isinstance(epoch_two, GpuBatchIterable)
     assert epoch_one._source is epoch_two._source
+
+
+def test_epoch_loader_len_is_its_own_epoch_before_iteration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``len`` must size the KD/struct streams for the epoch about to run.
+
+    The training loop reads ``len(epoch_loader)`` before ``iter`` selects the
+    epoch on the shared sampler; per-epoch plans differ by a step, so reading
+    the sampler's stale epoch mis-sliced the streams (struct_bce, 2026-09-08).
+    """
+    _cfg, _assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    sampler = _EpochIndexSampler({1: (0, 3), 2: (3, 7)})
+    # Only ``len`` is exercised, so any 7-item source stands in for compact batches.
+    loader = cast(
+        DataLoader[CompactPairBatch],
+        DataLoader(TensorDataset(torch.arange(7)), batch_size=None, sampler=sampler),
+    )
+    epoch_two = _EpochGpuBatchIterable(loader, table, sampler, 2, np.zeros(0, dtype=np.int64))
+    epoch_one = _EpochGpuBatchIterable(loader, table, sampler, 1, np.zeros(0, dtype=np.int64))
+
+    assert len(epoch_two) == 4  # the sampler still points at epoch 1 here
+    assert len(epoch_one) == 3
+    assert len(loader) == 3
+
+
+def test_packed_loader_len_matches_yielded_batches_every_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, assembled, pack_root = _synthetic_v31_pack_fixture(tmp_path, monkeypatch)
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    factory, _, _, _ = _build_packed_v3_1_loaders(
+        cfg, assembled, table, token_budget_per_rank=1024, process_index=0, world_size=1
+    )
+    for epoch in range(1, cfg.optim.epochs + 1):
+        epoch_loader = factory(epoch)
+        assert isinstance(epoch_loader, GpuBatchIterable)
+        expected = len(epoch_loader)  # read before iteration, as the training loop does
+        assert expected == sum(1 for _ in epoch_loader)
 
 
 def test_packed_loader_enables_persistent_workers_and_reuses_loader(
