@@ -23,7 +23,6 @@ ROOT = Path("outputs/split20260908")
 CONFIGS = Path("configs/split20260908")
 ARMS = ("kd_logit", "kd_rank", "kd_gram", "kd_rep", "kd_rank_rep")
 BANKS = Path("outputs/distill/split20260908")
-F0 = "outputs/feature_packs/egostitch_e2e_split20260908_ng50/f0_matrix.pt"
 POLL_SECONDS = 60.0
 
 
@@ -111,8 +110,6 @@ def dump_bank(*, contexts: bool, devices: list[str]) -> None:
         str(TEACHER / "best.pt"),
         "--output",
         str(output),
-        "--f0-cache",
-        F0,
     ]
     if contexts:
         command += ["--contexts", "--rw-step", "3", "--hops", "2", "--ns-rate", "3"]

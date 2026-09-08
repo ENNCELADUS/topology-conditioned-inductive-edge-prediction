@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from src.data.features import FeatureStore, build_f0_matrix
+from src.data.features import FeatureStore
 from src.data.pairs import BUCKET_BOUNDARIES, probe_lengths
 from src.data.val_region import Pair, ValRegionSplit
 from src.distill.artifacts import KDContextBank, write_kd_context_targets, write_kd_targets
@@ -223,20 +223,20 @@ def encode_all_nodes(
     *,
     device: torch.device,
     token_budget: int,
-    f0_cache: Path,
 ) -> dict[str, E2ENodeState]:
     """Encode every node in `node_ids` exactly once.
 
     Mirrors `score_universe._score_egostitch_e2e`'s bucketed encode-once
-    node-state cache. `ground` is a dummy zero tensor:
-    `FullOracleGenerator.encode_node` reads only its batch dimension (`del
-    ground`), never its content, so a real grounding pool -- and the
-    `build_grounding_pool` cache it would otherwise require -- is unneeded
-    for this generator.
+    node-state cache. Both content arguments of `encode_node_state` are dummy
+    zero tensors: `FullOracleGenerator.encode_node` reads only the batch
+    dimension of `x` and `ground` (`del ground`), never their content, and
+    its node state is the context-local row identity. So neither a real
+    grounding pool nor an F0 mean-pool matrix -- and no F0 cache, whose
+    node ordering is keyed to some other universe -- is needed here; the
+    classifier's token encoder reads the raw tokens directly.
     """
-    f0_cache.parent.mkdir(parents=True, exist_ok=True)
-    matrix, index = build_f0_matrix(store, node_ids, cache_path=f0_cache)
     n_ground = model.generator_cfg.n_ground
+    row_of = {node_id: i for i, node_id in enumerate(node_ids)}
 
     node_lengths = {
         node_id: length[0]
@@ -262,16 +262,12 @@ def encode_all_nodes(
                     [token.size(0) for token in tokens], dtype=torch.int64, device=device
                 )
                 embeddings = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True).to(device)
-                rows = torch.tensor([index[node_id] for node_id in batch_nodes], dtype=torch.long)
-                ground = torch.zeros(len(batch_nodes), n_ground, model.input_dim, device=device)
-                state = model.encode_node_state(
-                    embeddings,
-                    lengths,
-                    matrix.index_select(0, rows).to(device),
-                    ground,
-                    None,
-                    rows.to(device),
+                rows = torch.tensor(
+                    [row_of[node_id] for node_id in batch_nodes], dtype=torch.long, device=device
                 )
+                content = torch.zeros(len(batch_nodes), model.input_dim, device=device)
+                ground = torch.zeros(len(batch_nodes), n_ground, model.input_dim, device=device)
+                state = model.encode_node_state(embeddings, lengths, content, ground, None, rows)
                 if state.slots is None or state.projected_x is None:
                     raise RuntimeError(
                         "full-ego oracle generator produced no slot state -- this is a "
@@ -716,7 +712,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--token-budget", type=int, default=_DEFAULT_TOKEN_BUDGET)
     parser.add_argument("--batch-pairs", type=int, default=_DEFAULT_BATCH_PAIRS)
-    parser.add_argument("--f0-cache", type=Path, default=None)
     parser.add_argument(
         "--row-shard",
         type=str,
@@ -863,14 +858,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         model.to(device)
         model.eval()
         _install_oracle_context(model, node_ids, truth_graph=truth_graph)
-        f0_cache = args.f0_cache if args.f0_cache is not None else args.output / "f0_cache.pt"
         node_cache = encode_all_nodes(
-            model,
-            assembled.store,
-            node_ids,
-            device=device,
-            token_budget=args.token_budget,
-            f0_cache=f0_cache,
+            model, assembled.store, node_ids, device=device, token_budget=args.token_budget
         )
 
         if context_shard_range is not None:
@@ -965,14 +954,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     model.eval()
     _install_oracle_context(model, node_ids, truth_graph=truth_graph)
 
-    f0_cache = args.f0_cache if args.f0_cache is not None else args.output / "f0_cache.pt"
     node_cache = encode_all_nodes(
-        model,
-        assembled.store,
-        node_ids,
-        device=device,
-        token_budget=args.token_budget,
-        f0_cache=f0_cache,
+        model, assembled.store, node_ids, device=device, token_budget=args.token_budget
     )
 
     if shard_range is not None:

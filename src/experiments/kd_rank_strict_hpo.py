@@ -278,7 +278,7 @@ def dump_missing_banks(args: argparse.Namespace) -> None:
     """
     for name in sorted(BANKS):
         spec = BANKS[name]
-        # A partial dump leaves the directory (shards, f0_cache.pt) without the
+        # A partial dump leaves the directory (shards) without the
         # manifest, which the artifact writer emits last.
         if (Path(spec.path) / "manifest.json").exists():
             continue

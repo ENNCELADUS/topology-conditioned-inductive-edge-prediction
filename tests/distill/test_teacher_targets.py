@@ -346,9 +346,7 @@ def test_score_rows_is_invariant_to_the_batch_pairs_chunk_size(
     model = _tiny_model()
     device = torch.device("cpu")
     _install_oracle_context(model, nodes, truth_graph=truth)
-    node_cache = tt.encode_all_nodes(
-        model, store, nodes, device=device, token_budget=4096, f0_cache=tmp_path / "f0.pt"
-    )
+    node_cache = tt.encode_all_nodes(model, store, nodes, device=device, token_budget=4096)
 
     a_positions = np.array([0, 0, 1, 3], dtype=np.int32)
     b_positions = np.array([1, 2, 2, 3], dtype=np.int32)  # row 3 is a self-pair
@@ -843,3 +841,37 @@ def test_validation_cli_uses_g_val_and_exact_cls_pairs(
     np.testing.assert_array_equal(labels, expected_labels)
     assert n_shards == 2 and args.validation
     wrong_graph.assert_not_called()
+
+
+def test_encode_all_nodes_reads_no_f0_matrix(tmp_path: Path) -> None:
+    """The oracle teacher's node state depends on tokens and row identity only.
+
+    `FullOracleGenerator.encode_node` reads just the batch dimension of its
+    content argument, so the dumper must neither build nor cache an F0
+    matrix: a cache keyed to another node universe (the teacher pack covers
+    the whole substrate, the dump covers the training universe) used to
+    abort every shard with an "ordering does not match" error.
+    """
+    nodes = [f"n{i}" for i in range(4)]
+    node_tokens = {node: torch.randn(2 + i, _NODE_DIM) for i, node in enumerate(nodes)}
+    features_root = tmp_path / "features"
+    _write_feature_store(features_root, node_tokens)
+    store = FeatureStore(features_root)
+    truth = nx.Graph([("n0", "n1"), ("n2", "n3")])
+    truth.add_nodes_from(nodes)
+    model = _tiny_model()
+    _install_oracle_context(model, nodes, truth_graph=truth)
+
+    node_cache = tt.encode_all_nodes(
+        model, store, nodes, device=torch.device("cpu"), token_budget=4096
+    )
+
+    assert sorted(node_cache) == nodes
+    for row, node in enumerate(nodes):
+        state = node_cache[node]
+        assert state.projected_x is not None
+        assert state.projected_x.tolist() == [[row]]
+        assert int(state.length.item()) == node_tokens[node].shape[0]
+    assert [path.relative_to(tmp_path).parts[0] for path in tmp_path.rglob("*.pt")] == [
+        "features"
+    ] * len(nodes)

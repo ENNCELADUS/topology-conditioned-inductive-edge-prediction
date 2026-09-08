@@ -109,3 +109,43 @@ def test_chain_runs_each_test_before_next_arm(
         assert events == [False, True, *queue.ARMS]
     state = json.loads((tmp_path / "queue_status.json").read_text())
     assert state["stage"] == ("failed" if failed_test else "complete")
+
+
+def test_dump_bank_hands_the_dumper_no_f0_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The teacher pack's F0 covers the substrate, the dump the training universe.
+
+    The oracle dumper needs no F0 matrix at all, so the chain must not pass
+    one: the pack file's node ordering can never match the dump's.
+    """
+    monkeypatch.setattr(queue, "ROOT", tmp_path)
+    monkeypatch.setattr(queue, "BANKS", tmp_path / "banks")
+    monkeypatch.setattr(queue, "status", lambda *args, **kwargs: None)
+    (tmp_path / "logs").mkdir()
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            commands.append(command)
+
+        def wait(self) -> int:
+            return 0
+
+        def poll(self) -> int:
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
+
+    def run(command: list[str], log_name: str) -> None:
+        commands.append(command)
+        (tmp_path / "banks" / "rows").mkdir(parents=True)
+        (tmp_path / "banks" / "rows" / "manifest.json").write_text("{}")
+
+    monkeypatch.setattr(queue, "run", run)
+    queue.dump_bank(contexts=False, devices=["0", "1"])
+
+    assert len(commands) == 3
+    for command in commands:
+        assert "--f0-cache" not in command
+        assert "--checkpoint" in command
