@@ -6,9 +6,10 @@ measured on 2026-07-09. This module is intentionally dependency-light: only
 ``networkx``, ``numpy``, and the standard library. It must not import
 ``src/data/features.py`` or ``torch``.
 
-Quarantine (spec §9.3): ``*_ratio5_exclusive.txt`` files draw negatives from the
-global node set and leak test-side node features across the split boundary. No
-loader function in this module may read them — do not add one.
+Quarantine (spec §9.3): the benchmark's ``*_ratio5_exclusive.txt`` files drew
+negatives from the global node set and leaked test-side node features across the
+split boundary. They were deleted from the data package on 2026-09-08; no loader
+function in this module may read them — do not add one.
 """
 
 from __future__ import annotations

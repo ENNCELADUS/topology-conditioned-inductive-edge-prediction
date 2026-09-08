@@ -138,7 +138,8 @@ stay fail-closed. `complete.json` means published, not evaluated: held-out evide
 
 ## Data-contract traps
 
-- `*_ratio5_exclusive.txt` is quarantined: its negatives leak across the node split; no loader reads it.
+- `*_ratio5_exclusive.txt` was deleted from the data package (2026-09-08): its negatives leak across the
+  node split; no loader reads it and none may be added.
 - `train_graph.pkl` (train⁺∪val⁺) is the V_val substrate; `train_edges.txt`/`val_edges.txt` are retired.
 - `exclude_nodes` filters only the pair lists, so featureless nodes survive in every graph and bucket.
 - Self-loops: training structural targets strip them; canonical MMD descriptors and official GS/RD

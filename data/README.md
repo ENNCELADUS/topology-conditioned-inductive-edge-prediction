@@ -36,9 +36,6 @@ Each split-strategy directory contains:
 | `train_edges.txt` | Labeled train pairs. |
 | `val_edges.txt` | Raw material for the derived internal V_val split; retired as a selection artifact. |
 | `test_edges.txt` | Labeled test pairs. |
-| `train_edges_ratio5_exclusive.txt` | **QUARANTINED** (spec §9.3: negatives leak across the split) — never use for training, model selection, or evaluation. |
-| `val_edges_ratio5_exclusive.txt` | **QUARANTINED** — same prohibition as above. |
-| `test_edges_ratio5_exclusive.txt` | **QUARANTINED** — same prohibition as above. |
 | `candidate_test_edges.txt` | Candidate-pair universe for held-out assembled-graph evaluation. |
 | `train_graph.pkl` | Split substrate: `val_region.py` grows the V_val region on its loopless giant component. |
 | `test_graph.pkl` | Held-out reference graph for final assembled-graph evaluation. |
@@ -47,9 +44,10 @@ Each split-strategy directory contains:
 ## Contract
 
 - Treat node IDs as opaque strings.
-- The `*_ratio5_exclusive.txt` files are quarantined under the strict inductive
-  protocol (`docs/05-egostitch-spec.md` §9.3): their negatives leak across the
-  node split. No loader in `src/` reads them; keep it that way.
+- The benchmark's `*_ratio5_exclusive.txt` files were deleted from every strategy
+  directory on 2026-09-08 (strict inductive protocol, `docs/05-egostitch-spec.md`
+  §9.3: their negatives leak across the node split). Do not restore them; no loader
+  in `src/` reads them.
 - Train and test nodes are disjoint under each split strategy.
 - Training, retrieval, and scaffold construction must not access held-out graph
   structure.
