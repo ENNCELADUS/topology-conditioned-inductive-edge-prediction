@@ -1,0 +1,241 @@
+{
+  "schema_version": "test_protocol_v7",
+  "arm": {
+    "arm": "kd_logit",
+    "seed": 0,
+    "model_family": "v3_1",
+    "topo_gen_control": null,
+    "run_kind": null,
+    "checkpoint_id": "0f6fff53f8eaaec2",
+    "checkpoint_sha256": "8e5fd6c13653807280546e6ec399df7d1d03c8980186f3001339f5c58741065e",
+    "selected_epoch": 6
+  },
+  "edge": {
+    "scores_path": "outputs/node_heldout_20260907/kd_logit/scores/test.npz",
+    "checkpoint_id": "0f6fff53f8eaaec2",
+    "model_family": "v3_1",
+    "pairs_source": "test",
+    "strategy": "breadth_first",
+    "num_rows": 64038,
+    "self_rows": 1891,
+    "logit_threshold": -2.0,
+    "threshold": 0.11920292202211755,
+    "ece_bins": 15,
+    "self_loops_included": true,
+    "metrics": {
+      "auroc": 0.7222363831355203,
+      "auprc": 0.7494115942059446,
+      "accuracy": 0.6220212998532122,
+      "sensitivity": 0.8331615603235579,
+      "specificity": 0.4108810393828664,
+      "precision": 0.5857927097057531,
+      "recall": 0.8331615603235579,
+      "f1": 0.6879150066401062,
+      "mcc": 0.2692244548242993,
+      "ece": 0.20030192079344916,
+      "brier": 0.2551810921630963,
+      "threshold": 0.11920292202211755,
+      "n_pos": 32019,
+      "n_neg": 32019
+    },
+    "metrics_self": null,
+    "metrics_non_self": {
+      "auroc": 0.7048027326761326,
+      "auprc": 0.7109390400336363,
+      "accuracy": 0.6105202181923504,
+      "sensitivity": 0.8226898566117897,
+      "specificity": 0.4108810393828664,
+      "precision": 0.5678480606657655,
+      "recall": 0.8226898566117897,
+      "f1": 0.6719167220136356,
+      "mcc": 0.25530435515242816,
+      "ece": 0.20643508638988922,
+      "brier": 0.262945652160691,
+      "threshold": 0.11920292202211755,
+      "n_pos": 30128,
+      "n_neg": 32019
+    },
+    "self_loop_rate": {
+      "self_rows": 1891,
+      "reference_positive": 1891,
+      "predicted_positive": 1891
+    }
+  },
+  "classification_threshold": {
+    "method": "max_f1_selected_on_val_cls",
+    "logit_threshold": -2.0,
+    "probability_threshold": 0.11920292202211755,
+    "val_rows": 21438,
+    "val_f1": 0.7569576490924805,
+    "val_precision": 0.7050962080347798,
+    "val_recall": 0.8170538296482881,
+    "probabilities": "raw_sigmoid"
+  },
+  "graph": {
+    "fixed_threshold": {
+      "validation_selection": {
+        "rule": "sampled_subgraph_density_shape_1se_v3",
+        "threshold_candidates": "every_unique_validation_sample_union_logit_plus_empty",
+        "candidate_threshold_sha256": "d047dbb4b4a412c497dafcc11c6faa1e15d7f77d086f078612aa3cecbc5afec3",
+        "candidate_count": 2758,
+        "sample_count": 500,
+        "sample_count_by_size": {
+          "20": 50,
+          "40": 50,
+          "60": 50,
+          "80": 50,
+          "100": 50,
+          "120": 50,
+          "140": 50,
+          "160": 50,
+          "180": 50,
+          "200": 50
+        },
+        "sampled_bucket_sha256": "8cb24a30eb9eeb97ffbcc88ab738120bebf46acc42804ed3e7eca668eb16bd02",
+        "standard_error": "exact_paired_nonparametric_bootstrap_se_within_size_strata",
+        "resampling_unit": "sampled_ball_paired_within_size; overlapping_balls_not_independent",
+        "density_stage": {
+          "objective": "minimize_macro_mean_abs_log_relative_density",
+          "best_logit_threshold": 0.2314453125,
+          "min_d_rd": 0.2818761660209556,
+          "finite_candidate_count": 2752,
+          "feasible_count": 58,
+          "d_rd_se_at_selected": 0.0001728710106672938,
+          "criterion": "candidate_d_rd_minus_min_lte_paired_1se"
+        },
+        "shape_stage": {
+          "objective": "minimize_mean_log_mmd_ratio",
+          "log_ratio_epsilon": 1e-12,
+          "candidate_count": 58,
+          "selected_d_shape": 1.6487625448788712,
+          "selected_log_mmd_ratio_by_statistic": {
+            "degree": 1.8871017084205588,
+            "clustering": 0.9720079234985737,
+            "spectral": 2.0871780027174807
+          },
+          "selected_mmd_ratio_by_statistic": {
+            "degree": 6.600211595353772,
+            "clustering": 2.6432465713582625,
+            "spectral": 8.062131718213452
+          },
+          "config": {
+            "sigma": 1.0,
+            "reference_epsilon": 1e-12
+          }
+        },
+        "tie_break": "higher_logit_threshold",
+        "selected": {
+          "logit_threshold": 0.2333984375,
+          "probability_threshold": 0.5580861623147292,
+          "union_pair_count": 501872,
+          "union_admitted_pair_count": 21100,
+          "sample_occurrence_admitted_pair_count": 496971,
+          "selected_boundary_tie_group_pair_count": 28,
+          "validation_graph_similarity": 0.44700837977113417,
+          "validation_relative_density": 1.028452599191788,
+          "validation_mmd_ratio": {
+            "degree": 6.600211595355688,
+            "clustering": 2.6432465713589077,
+            "spectral": 8.062131718211726
+          }
+        }
+      },
+      "test": {
+        "matching": "fixed_threshold_selected_on_validation",
+        "selection": "logit_greater_than_or_equal",
+        "logit_threshold": 0.2333984375,
+        "probability_threshold": 0.5580861623147292,
+        "graph_similarity": {
+          "bfs_macro": 0.4255034554022974
+        },
+        "relative_density": {
+          "bfs_macro": 0.6779492059466526
+        },
+        "mmd_ratio": {
+          "degree": 5.777176694104508,
+          "clustering": 5.137096042656762,
+          "spectral": 9.919742456288953
+        },
+        "per_size": {
+          "20": {
+            "graph_similarity": 0.5419185829530043,
+            "relative_density": 0.5626071605364525,
+            "sample_count": 50
+          },
+          "40": {
+            "graph_similarity": 0.493480122400831,
+            "relative_density": 0.5555153853087853,
+            "sample_count": 50
+          },
+          "60": {
+            "graph_similarity": 0.4812501899508613,
+            "relative_density": 0.63757605443649,
+            "sample_count": 50
+          },
+          "80": {
+            "graph_similarity": 0.4392717499861562,
+            "relative_density": 0.6783482021797508,
+            "sample_count": 50
+          },
+          "100": {
+            "graph_similarity": 0.419975876518982,
+            "relative_density": 0.6901112343348988,
+            "sample_count": 50
+          },
+          "120": {
+            "graph_similarity": 0.38915604427290773,
+            "relative_density": 0.7047493145710945,
+            "sample_count": 50
+          },
+          "140": {
+            "graph_similarity": 0.3963769385261393,
+            "relative_density": 0.7444817668636845,
+            "sample_count": 50
+          },
+          "160": {
+            "graph_similarity": 0.38142991363784545,
+            "relative_density": 0.7185481365155294,
+            "sample_count": 50
+          },
+          "180": {
+            "graph_similarity": 0.3756153146267872,
+            "relative_density": 0.7212615457882526,
+            "sample_count": 50
+          },
+          "200": {
+            "graph_similarity": 0.33655982114945926,
+            "relative_density": 0.7662932589315876,
+            "sample_count": 50
+          }
+        },
+        "self_loop_occurrences": {
+          "aggregation": "sum_over_sample_occurrences",
+          "predicted": 55000,
+          "reference": 52754
+        }
+      }
+    }
+  },
+  "provenance": {
+    "val_topology": {
+      "path": "outputs/node_heldout_20260907/kd_logit/scores/val_topology.npz",
+      "sha256": "270502a48c833370b227a92e5ac4b3260c5322e08e3dbabe71049f63e9d7ecfe",
+      "test_access_ledger_record_sha256": null
+    },
+    "val_cls": {
+      "path": "outputs/node_heldout_20260907/kd_logit/scores/val_cls.npz",
+      "sha256": "48e6200d50463950c2983db48bb43ad077430fe7a1efc664a19f9b5817a21496",
+      "test_access_ledger_record_sha256": null
+    },
+    "test": {
+      "path": "outputs/node_heldout_20260907/kd_logit/scores/test.npz",
+      "sha256": "8e3b59c4615afb35d933133880bb46534282608c1f268b131f760e576b9bf914",
+      "test_access_ledger_record_sha256": null
+    },
+    "test_topology": {
+      "path": "outputs/node_heldout_20260907/kd_logit/scores/test_topology.npz",
+      "sha256": "8823137487d7a4f1bcae8158929a6f7c169e2a72fc84900359c5b9dfe04bba6d",
+      "test_access_ledger_record_sha256": null
+    }
+  }
+}

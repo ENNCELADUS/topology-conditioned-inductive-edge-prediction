@@ -255,6 +255,42 @@ mkdir -p outputs/logs && nohup hpc/run.sh train configs/b0_v31_breadth_first.yam
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
 reported experiment; attempt `train.log` is authoritative and the redirect records launcher output.
 
+### 2026-09-08 split campaign: B0, PMA1 teacher, five KD students
+
+Everything under `configs/split20260908/` targets the node-held-out V_val (root
+`node_002696`, split seed 273) with fresh split-keyed directories: outputs under
+`outputs/split20260908/<run>`, the teacher's F0/grounding pack under
+`outputs/feature_packs/egostitch_e2e_split20260908_ng50`, and banks under
+`outputs/distill/split20260908/{rows,contexts_h2ns3}`. The raw token packs
+(`outputs/feature_packs/b0_v31_bf16`, `egostitch_e2e_tokens`) are keyed only to the
+feature source and are reused. Nothing under the old `outputs/b0_v31`,
+`outputs/b1_*`, `outputs/kd_val20pos_20260906`, or `outputs/distill/kd_*` directories
+applies to this split.
+
+Launch order from the checkout (the two containers share the filesystem):
+
+```bash
+mkdir -p outputs/logs
+# 4-GPU container: teacher first (it reads true training structure, so --run-kind diagnostic)
+nohup hpc/run.sh train configs/split20260908/teacher_pma1.yaml \
+  --worker-module src.train_egostitch --run-kind diagnostic \
+  > outputs/logs/split20260908_teacher.log 2>&1 < /dev/null &
+# then the chain: waits for the teacher, dumps both banks, trains/publishes/tests the five students
+nohup .venv/bin/python -u -m src.experiments.queue_split20260908 \
+  > outputs/logs/split20260908_queue.log 2>&1 < /dev/null &
+# 2-GPU container, concurrently: the B0 baseline
+OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 nohup hpc/run.sh train configs/split20260908/b0_v31.yaml \
+  > outputs/logs/split20260908_b0.log 2>&1 < /dev/null &
+```
+
+The chain writes `outputs/split20260908/queue_status.json` and per-stage logs under
+`outputs/split20260908/logs/`. It refuses an existing bank or student directory;
+investigate a failure before arranging a restart. The student configs carry the
+previously selected HPO settings (logit 100; strict rank 0.1 / distribution 10;
+Gram 1; representation 0.1; joint Trial 5 weights), `h2ns3` contexts, margin 0.1,
+dynamic 1:5 negatives, positive weight 5, seed 0, up to 25 epochs. They are prior
+selections, not demonstrated optima on this split.
+
 G_val learning-curve diagnostics use a separate output directory and the same teacher checkpoint:
 
     hpc/run.sh kd-targets --validation --device cuda --config STUDENT_CONFIG --checkpoint TEACHER_CHECKPOINT --output ORACLE_VAL_BANK
