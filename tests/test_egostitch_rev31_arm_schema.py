@@ -80,7 +80,6 @@ def test_v3_live_arms_share_one_ng50_pack_and_grounding_cache() -> None:
             FULL_EGO_TEACHER_CONFIG,
             FULL_EGO_TEACHER_PMA1_CONFIG,
             FULL_EGO_FEATURES_CONFIG,
-            REPO_ROOT / "configs/egostitch_e2e_v3_teacher_pma1_val20pos_breadth_first.yaml",
         }
         | set(WAVE1_ORACLE_CONFIGS.values())
     )

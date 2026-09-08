@@ -39,7 +39,8 @@ class ValRegionParams:
 
     positive_edge_fraction: float = 0.10
     root_neighbors: int = 5
-    split_seed: int = 42
+    # Test-informed density selection; see docs/results/validation_density_selection/README.md.
+    split_seed: int = 273
     bucket_seed: int = 43
     bucket_sizes: tuple[int, ...] = (20, 40, 60, 80, 100, 120, 140, 160, 180, 200)
     buckets_per_size: int = 50

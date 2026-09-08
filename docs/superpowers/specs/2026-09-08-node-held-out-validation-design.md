@@ -4,7 +4,12 @@ Status: implemented on 2026-09-08; replaces the pair-disjoint boundary of the
 [2026-09-06 design](2026-09-06-pring-node-disjoint-validation-design.md). BFS growth,
 inner buckets, and classification negatives are unchanged from that design.
 
-## Decision
+Current root selection was subsequently updated to `node_002696`, seed 273, using
+test-informed density matching. Current counts are 642 validation nodes / 5,354
+positives and 7,430 fit nodes / 38,916 positives. [Decision and evidence](../../results/validation_density_selection/README.md).
+The seed-42 counts below are the historical budget study.
+
+## Initial decision
 
 1. **Boundary.** V_val leaves the training universe. `ValRegionSplit.train_nodes` is the
    substrate minus V_val; `training_positives` and `training_negatives` keep only pairs with

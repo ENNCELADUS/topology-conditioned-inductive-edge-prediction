@@ -139,6 +139,7 @@ def _cfg(tmp_path: Path, *, strategy: str = _STRATEGY, training: bool = True) ->
 # module is deliberately self-contained, so it does not share
 # `test_train_egostitch_e2e.py`'s equivalent constant).
 _TINY_VAL_REGION_PARAMS = ValRegionParams(
+    split_seed=42,
     positive_edge_fraction=0.4,
     root_neighbors=2,
     bucket_sizes=(2, 3),

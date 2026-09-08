@@ -124,7 +124,9 @@ class TestNodeHeldOutSampling:
         # All eligible roots, including n00, participate in the same seeded choice.
         import random
 
-        expected = random.Random(42).choice(sorted(n for n in graph if len(graph[n]) == 2))
+        expected = random.Random(params.split_seed).choice(
+            sorted(n for n in graph if len(graph[n]) == 2)
+        )
         split = derive_val_region_split(graph.nodes, graph.edges, [], frozenset(), params=params)
         assert split.region_seeds == (expected,)
 

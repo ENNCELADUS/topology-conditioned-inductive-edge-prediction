@@ -97,6 +97,7 @@ SHIPPED_B0_KD_CONFIGS = (
 # an odd/even floor split. See `_build_synthetic_benchmark` for the fixture
 # this is derived against.
 _TINY_VAL_REGION_PARAMS = ValRegionParams(
+    split_seed=42,
     root_neighbors=1,
     positive_edge_fraction=0.5,
     bucket_sizes=(2, 3),

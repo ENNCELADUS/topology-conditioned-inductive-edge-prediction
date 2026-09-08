@@ -2321,6 +2321,7 @@ def _write_e2e_feature_root(tmp_path: Path, nodes: list[str], *, input_dim: int 
 # Toy-scale V_val derivation for the 25-node ring fixture: small enough that
 # region growth and bucket sampling both succeed over so few nodes/edges.
 _TOY_VAL_REGION_PARAMS = ValRegionParams(
+    split_seed=42,
     positive_edge_fraction=0.4,
     root_neighbors=2,
     bucket_sizes=(2, 3),
