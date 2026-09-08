@@ -47,7 +47,7 @@ to the exact count in their retained artifacts.
 
 | Item | Fixed value |
 |---|---|
-| SSH | `ssh -p 30838 root@10.15.171.204` |
+| SSH | `ssh -p 30838 root@10.15.171.204` (4 × H20, GitHub access); also `-p 30846` (4 × H20) and `-p 30030` (2 × H20); all share `/2023533015` |
 | Repository | `/2023533015/topology-conditioned-inductive-edge-prediction` |
 | GPU | 1 or more NVIDIA H20/H20-3e |
 | NVIDIA driver | 550.144.03 |
@@ -267,7 +267,7 @@ feature source and are reused. Nothing under the old `outputs/b0_v31`,
 `outputs/b1_*`, `outputs/kd_val20pos_20260906`, or `outputs/distill/kd_*` directories
 applies to this split.
 
-Launch order from the checkout (the two containers share the filesystem):
+Launch order from the checkout (all three containers share the filesystem):
 
 ```bash
 mkdir -p outputs/logs

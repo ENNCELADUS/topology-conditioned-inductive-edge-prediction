@@ -10,12 +10,27 @@ has one HPC launcher, `hpc/run.sh`, and no scheduler or qualification ladder. Ru
 experiments directly; do not add preregistration, contract-identity, hash, eligibility,
 promotion, or qualification preflights.
 
-## Connect to the H20 container
+## Connect to an H20 container
+
+Three containers on the same host share the `/2023533015` filesystem, so one checkout,
+one `data/`, and one `outputs/` tree serve all of them. Pick a container by its SSH port:
+
+| Port | GPUs | Use |
+|---|---|---|
+| 30838 | 4 × H20 | default; has GitHub access, so `git pull` here |
+| 30846 | 4 × H20 | second 4-GPU lane for a concurrent job |
+| 30030 | 2 × H20 | 2-GPU jobs (e.g. a B0 baseline while a 4-GPU job runs elsewhere) |
 
 ```bash
-ssh -p 30838 root@10.15.171.204
+ssh -p 30838 root@10.15.171.204   # or -p 30846 / -p 30030
 cd /2023533015/topology-conditioned-inductive-edge-prediction
 ```
+
+Each container sees only its own GPUs, so jobs on different containers never contend
+for a GPU, but they share the host's 224 CPU cores: export
+`OMP_NUM_THREADS=16 MKL_NUM_THREADS=16` for every concurrent torch job. A `nohup` launch
+inside a single `ssh` command can hang that session; launch, exit, and verify the process
+from a fresh session.
 
 The pinned checkout uses:
 
@@ -23,7 +38,7 @@ The pinned checkout uses:
 - Python: `/2023533015/topology-conditioned-inductive-edge-prediction/.venv/bin/python`
 - uv: `/2023533015/.uv/bin/uv`
 - data: repository-local `data/`
-- hardware: one or more visible `NVIDIA H20` GPUs
+- hardware: the visible `NVIDIA H20` GPUs of the chosen container (4, 4, or 2)
 
 Do not store the SSH password in the repository.
 
