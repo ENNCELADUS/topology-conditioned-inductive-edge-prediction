@@ -291,6 +291,29 @@ Gram 1; representation 0.1; joint Trial 5 weights), `h2ns3` contexts, margin 0.1
 dynamic 1:5 negatives, positive weight 5, seed 0, up to 25 epochs. They are prior
 selections, not demonstrated optima on this split.
 
+Structural arms on the same split (`configs/split20260908/struct_{bce,grand,new}.yaml`, identical
+to the `configs/struct_*_breadth_first.yaml` wave-1 files except `output_dir`; no teacher or bank).
+They need a free lane; the chain below runs `struct_bce` (pipeline with test), then the two 10-trial
+studies in sequence, with the studies' base config and sweep dir pointed at the split-keyed paths:
+
+```bash
+# idle 4-GPU container (30846 while 30838 runs the teacher chain and 30030 runs B0)
+OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 nohup bash -c '
+  hpc/run.sh train configs/split20260908/struct_bce.yaml \
+    > outputs/logs/split20260908_struct_bce.log 2>&1 \
+  && .venv/bin/python -u -m src.experiments.struct_hpo --arm grand \
+    --base-config configs/split20260908/struct_grand.yaml --sweep-dir outputs/split20260908/struct_hpo/grand \
+    > outputs/logs/split20260908_struct_hpo_grand.log 2>&1 \
+  && .venv/bin/python -u -m src.experiments.struct_hpo --arm new \
+    --base-config configs/split20260908/struct_new.yaml --sweep-dir outputs/split20260908/struct_hpo/new \
+    > outputs/logs/split20260908_struct_hpo_new.log 2>&1
+' > outputs/logs/split20260908_struct_chain.log 2>&1 < /dev/null &
+```
+
+Trials land under `outputs/split20260908/struct_hpo/<arm>/trial_NNN` (`--skip-test`); each study
+resumes from its `optuna.db`. The per-arm winner runs `hpc/run.sh test` once on its published
+checkpoint. Compare against `struct_bce` first, then the split's `b0_v31` / KD control.
+
 G_val learning-curve diagnostics use a separate output directory and the same teacher checkpoint:
 
     hpc/run.sh kd-targets --validation --device cuda --config STUDENT_CONFIG --checkpoint TEACHER_CHECKPOINT --output ORACLE_VAL_BANK

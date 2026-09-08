@@ -1,0 +1,83 @@
+# Structural arm `struct_grand` on the 2026-09-08 node-held-out V_val split (root node_002696);
+# identical to configs/struct_grand_breadth_first.yaml except output_dir (raw token pack reused).
+model:
+  family: v3_1
+  config:
+    input_dim: 1536
+    d_model: 512
+    encoder_layers: 3
+    cross_attn_layers: 3
+    n_heads: 8
+    mlp_head:
+      hidden_dims: [512, 256, 128]
+      dropout: 0.2
+      activation: gelu
+      norm: layernorm
+      spectral_norm: false
+    regularization:
+      dropout: 0.1
+      token_dropout: 0.1
+      cross_attention_dropout: 0.1
+      stochastic_depth: 0.1
+    rich_pooling:
+      components: [mean, attn, max, gated]
+    pair_readout:
+      mode: pair_context_gated
+      order_aggregation: abba_max
+      spectral_norm: false
+    mixing:
+      mode: none
+    label_smoothing: 0.0 # hard labels, matching the Full-Ego task loss
+    positive_weight: 5.0 # balances the 1:5 dynamic training stream
+data:
+  root: data
+  strategy: breadth_first
+  negative_ratio: 5 # shared teacher/student dynamic sampler, refreshed each epoch
+  token_budget: 131072
+  batch_pairs: 1024
+  num_workers: 0
+  f0_cache: outputs/f0_cache/f0_matrix.pt
+  expected_missing_features: [node_004764, node_007050]
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  epochs: 25
+  warmup_steps: 500 # unused while a onecycle scheduler is configured
+  grad_clip: 1.0
+  scheduler:
+    type: onecycle
+    max_lr: 1.0e-4
+    pct_start: 0.1
+    div_factor: 25
+    final_div_factor: 10000
+    anneal_strategy: cos
+eval:
+  patience: 10
+  eval_every: 1
+  topology_every: 2 # sweep points score at cadence 2, like configs/autoresearch
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/b0_v31_bf16
+  pack_workers: 16
+  loader_workers_per_rank: 4
+  prefetch_factor: 4
+  token_budget: 524288
+  max_pairs_per_rank: 4096
+  memory_limit_gib: 85.0
+  probe_warmup_steps: 10
+  probe_timed_steps: 30
+seed: 0
+output_dir: outputs/split20260908/struct_grand
+mixed_precision: "bf16" # pinned for the H20 E2 target
+struct:
+  nodes: 40
+  background_nodes: 8
+  mix: {bfs: 0.5, motif: 0.25, bridge: 0.25}
+  subgraphs_per_epoch: null
+  weights: {bce: 1.0, gs: 0.70, rd: 0.90, deg_mmd: 0.0, rank: 0.0, degree: 0.0, motif: 0.0}
+  rank_margin: 0.1
+  rank_temperature: 1.0
+  huber_delta: 1.0
+  mmd_sigma: 1.25
+  mmd_bins: 48
+  val_subgraphs: 32

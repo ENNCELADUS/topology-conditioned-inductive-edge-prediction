@@ -169,7 +169,8 @@ Design: [spec](superpowers/specs/2026-09-07-structural-stream-topology-losses-de
 reduce only over legal pairs (distinct nodes, not both in V_val, feature-bearing). Wave 1 compares
 the `struct_grand` and `struct_new` winners against `struct_bce`, then against the new-split
 `b1_kd_control` once it exists, reporting the pairwise and five topology numbers together and
-checking the selected epoch before crediting a term. Results: pending.
+checking the selected epoch before crediting a term. Runs use `configs/split20260908/struct_*.yaml`
+(outputs under `outputs/split20260908/struct_*` and `struct_hpo/<arm>`). Results: pending.
 
 ## 4. Analysis
 
