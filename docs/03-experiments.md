@@ -157,8 +157,11 @@ runs the held-out protocol once. `struct_bce` is a single run and the first comp
 ### 2.1 Headline split (seed-42 random root), in progress
 
 Root `node_007630`, split seed 42, 869-node V_val (§1.1). Campaign configs live in
-`configs/split_seed42/` (B0 with seeds 0/1/2 for the noise band, PMA1 teacher, five KD
-students, three structural arms); launched 2026-09-09, no held-out results yet.
+`configs/split_seed42/` (B0, PMA1 teacher, five KD students, three structural arms), all
+seed 0. Plan of 2026-09-09: B0 with held-out test; teacher; per-arm KD HPO sweeps on V_val
+(strict-LLP `kd_rank` study first, then the loss-weight grid for `kd_logit`/`kd_gram`/`kd_rep`,
+then the joint `kd_rank_rep` study) and the `struct_grand`/`struct_new` studies, each winner
+tested once. No seed replicates and no `struct_bce` control in this plan. No held-out results yet.
 
 ### 2.2 Test-informed split (2026-09-08), secondary upper bound
 

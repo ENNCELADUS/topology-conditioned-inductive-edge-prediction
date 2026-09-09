@@ -273,15 +273,13 @@ nohup hpc/run.sh train configs/split_seed42/teacher_pma1.yaml \
   > outputs/logs/split_seed42_teacher.log 2>&1 < /dev/null &
 nohup .venv/bin/python -u -m src.experiments.queue_split20260908 --campaign split_seed42 \
   > outputs/logs/split_seed42_queue.log 2>&1 < /dev/null &
-# B0 and its two noise-band seeds (any free lane; sequential)
-nohup bash -c 'for c in b0_v31 b0_v31_seed1 b0_v31_seed2; do
-  hpc/run.sh train configs/split_seed42/$c.yaml > outputs/logs/split_seed42_$c.log 2>&1 || exit 1; done' \
-  > outputs/logs/split_seed42_b0_chain.log 2>&1 < /dev/null &
+# B0 (seed 0 only; the seed-1/2 replicate configs exist but are not part of the 2026-09-09 plan)
+nohup hpc/run.sh train configs/split_seed42/b0_v31.yaml \
+  > outputs/logs/split_seed42_b0_v31.log 2>&1 < /dev/null &
 # structural arms (a free 4-GPU lane): the two 10-trial studies (struct_bce, the sampler-matched
 # control, was dropped from the 2026-09-09 plan; its recipe is one `hpc/run.sh train` line)
 nohup bash -c '
-  hpc/run.sh train configs/split_seed42/struct_bce.yaml > outputs/logs/split_seed42_struct_bce.log 2>&1 \
-  && .venv/bin/python -u -m src.experiments.struct_hpo --arm grand \
+  .venv/bin/python -u -m src.experiments.struct_hpo --arm grand \
     --base-config configs/split_seed42/struct_grand.yaml --sweep-dir outputs/split_seed42/struct_hpo/grand \
     > outputs/logs/split_seed42_struct_hpo_grand.log 2>&1 \
   && .venv/bin/python -u -m src.experiments.struct_hpo --arm new \
