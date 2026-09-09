@@ -9,7 +9,7 @@ test-informed density matching. Current counts are 642 validation nodes / 5,354
 positives and 7,430 fit nodes / 38,916 positives. [Decision and evidence](../../results/validation_density_selection/README.md).
 The seed-42 counts below are the historical budget study.
 
-## Initial decision
+## Current decision
 
 1. **Boundary.** V_val leaves the training universe. `ValRegionSplit.train_nodes` is the
    substrate minus V_val; `training_positives` and `training_negatives` keep only pairs with
@@ -17,9 +17,10 @@ The seed-42 counts below are the historical budget study.
    feature statistics, and the teacher's oracle structure are all built on `train_nodes`.
    Packs and F0 caches still cover the whole substrate so V_val rows can be scored.
 2. **Budget.** `positive_edge_fraction = 0.10`: cap `floor(0.10 * 53,640) = 5,364` positives,
-   FIFO prefix stops at 5,347 (644 self-loops), 869 nodes (10.8% of the substrate).
+   FIFO prefix from root `node_002696`, seed 273, stops at 5,354 positives
+   (528 self-loops), 642 nodes; fit retains 38,916 positives on 7,430 nodes.
 
-## Evidence
+## Historical seed-42 evidence
 
 - The 2026-09-07 diagnostic (branch `codex/node-heldout-diagnostic-20260907`, run in
   `/2023533015/topology-node-heldout-20260907`) trained KD1 with every V_val-touching pair

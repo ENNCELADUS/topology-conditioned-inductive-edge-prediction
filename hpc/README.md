@@ -323,3 +323,15 @@ This optional bank covers exactly val_cls pairs on G_val and only adds per-epoch
 metrics. Training targets remain on G_train; early stopping uses validation task BCE.
 The validation mode supports the same --row-shard / --merge workflow and cannot be combined
 with --contexts. Rebuild banks for new runs; preserve banks used by active jobs.
+
+### First-attempt failures on the current split
+
+The teacher and structural BCE first attempts failed for different runtime reasons,
+not a reported split-boundary violation. Existing fix `3dc2d3b` makes packed loader
+lengths epoch-specific (preventing `invalid KD context step 143 for 143 steps`),
+sets both DDP process-group timeouts to two hours (teacher ranks previously waited
+past the 600-second default during rank-0 validation), and defaults OMP/MKL threads
+to 16. See the [failure evidence and retry audit](../docs/results/split20260908_execution/README.md).
+The structural BCE retry has completed publication/test; the teacher retry is still
+running as of that audit. Retain failed attempt directories as evidence and inspect
+the current attempt and publication/test artifacts separately.

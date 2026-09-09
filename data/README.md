@@ -53,3 +53,14 @@ Each split-strategy directory contains:
   structure.
 - Report edge-level metrics and assembled-graph metrics together.
 - Keep model-facing file and folder names domain-neutral.
+
+## Current internal validation split
+
+`val_region/breadth_first.json` records root `node_002696`, split seed 273:
+642 validation nodes and 5,354 positives (528 loops), under a 5,364-positive cap.
+Fit has 7,430 nodes and 38,916 positives (33,566 non-self); all 9,370 boundary
+positives and every validation-touching negative are excluded from training.
+Validation contains 5,354 fixed negatives and 500 FIFO BFS samples (20–200 nodes,
+50 each; bucket seed 43). Fixed negative counts do not describe the dynamic 1:5
+training stream. Test is unchanged. Root selection used test topology statistics;
+see [selection provenance](../docs/results/validation_density_selection/README.md).

@@ -136,7 +136,7 @@ class TestDeriveVvalNodes:
         params = ValRegionParams(
             positive_edge_fraction=0.4,
             root_neighbors=2,
-                bucket_sizes=(3, 5),
+            bucket_sizes=(3, 5),
             buckets_per_size=3,
         )
 

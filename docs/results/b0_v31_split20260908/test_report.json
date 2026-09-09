@@ -1,0 +1,241 @@
+{
+  "schema_version": "test_protocol_v7",
+  "arm": {
+    "arm": "v3_1",
+    "seed": 47,
+    "model_family": "v3_1",
+    "topo_gen_control": null,
+    "run_kind": null,
+    "checkpoint_id": "7112498fb02d8c85",
+    "checkpoint_sha256": "f4607f3d0f78dfa07076650e32f847b7681f6b097aa71aa3f9c20bc466f2e56d",
+    "selected_epoch": 6
+  },
+  "edge": {
+    "scores_path": "outputs/split20260908/b0_v31/scores/test.npz",
+    "checkpoint_id": "7112498fb02d8c85",
+    "model_family": "v3_1",
+    "pairs_source": "test",
+    "strategy": "breadth_first",
+    "num_rows": 64038,
+    "self_rows": 1891,
+    "logit_threshold": -2.265625,
+    "threshold": 0.09401017961657226,
+    "ece_bins": 15,
+    "self_loops_included": true,
+    "metrics": {
+      "auroc": 0.7080572883093113,
+      "auprc": 0.7413255515636687,
+      "accuracy": 0.6152596895593242,
+      "sensitivity": 0.7966832193385177,
+      "specificity": 0.43383615978013057,
+      "precision": 0.584572724981094,
+      "recall": 0.7966832193385177,
+      "f1": 0.6743417574283599,
+      "mcc": 0.2473785471488514,
+      "ece": 0.2015679824144166,
+      "brier": 0.2619200660671421,
+      "threshold": 0.09401017961657226,
+      "n_pos": 32019,
+      "n_neg": 32019
+    },
+    "metrics_self": null,
+    "metrics_non_self": {
+      "auroc": 0.6897336923532706,
+      "auprc": 0.702905838250317,
+      "accuracy": 0.6035528665905031,
+      "sensitivity": 0.7839219330855018,
+      "specificity": 0.43383615978013057,
+      "precision": 0.5657548028553634,
+      "recall": 0.7839219330855018,
+      "f1": 0.6572056654701283,
+      "mcc": 0.2317555671471674,
+      "ece": 0.2077476857691786,
+      "brier": 0.2698896553532567,
+      "threshold": 0.09401017961657226,
+      "n_pos": 30128,
+      "n_neg": 32019
+    },
+    "self_loop_rate": {
+      "self_rows": 1891,
+      "reference_positive": 1891,
+      "predicted_positive": 1891
+    }
+  },
+  "classification_threshold": {
+    "method": "max_f1_selected_on_val_cls",
+    "logit_threshold": -2.265625,
+    "probability_threshold": 0.09401017961657226,
+    "val_rows": 10708,
+    "val_f1": 0.7836486968939664,
+    "val_precision": 0.7504273504273504,
+    "val_recall": 0.8199477026522226,
+    "probabilities": "raw_sigmoid"
+  },
+  "graph": {
+    "fixed_threshold": {
+      "validation_selection": {
+        "rule": "sampled_subgraph_density_shape_1se_v3",
+        "threshold_candidates": "every_unique_validation_sample_union_logit_plus_empty",
+        "candidate_threshold_sha256": "1a069407a205218f0387495e12124d5710ca573d98c1efa784da302df0249f40",
+        "candidate_count": 2319,
+        "sample_count": 500,
+        "sample_count_by_size": {
+          "20": 50,
+          "40": 50,
+          "60": 50,
+          "80": 50,
+          "100": 50,
+          "120": 50,
+          "140": 50,
+          "160": 50,
+          "180": 50,
+          "200": 50
+        },
+        "sampled_bucket_sha256": "443572074f6c87068c95a546125136984101932205f7665df9c8a519018eadb9",
+        "standard_error": "exact_paired_nonparametric_bootstrap_se_within_size_strata",
+        "resampling_unit": "sampled_ball_paired_within_size; overlapping_balls_not_independent",
+        "density_stage": {
+          "objective": "minimize_macro_mean_abs_log_relative_density",
+          "best_logit_threshold": 1.0703125,
+          "min_d_rd": 0.19836038234286402,
+          "finite_candidate_count": 2313,
+          "feasible_count": 9,
+          "d_rd_se_at_selected": 0.0010997068541685339,
+          "criterion": "candidate_d_rd_minus_min_lte_paired_1se"
+        },
+        "shape_stage": {
+          "objective": "minimize_mean_log_mmd_ratio",
+          "log_ratio_epsilon": 1e-12,
+          "candidate_count": 9,
+          "selected_d_shape": 1.1916995580814163,
+          "selected_log_mmd_ratio_by_statistic": {
+            "degree": 1.1387100328373512,
+            "clustering": 0.8119813283294134,
+            "spectral": 1.6244073130774843
+          },
+          "selected_mmd_ratio_by_statistic": {
+            "degree": 3.1227375370467723,
+            "clustering": 2.2523662456313036,
+            "spectral": 5.0754100164214
+          },
+          "config": {
+            "sigma": 1.0,
+            "reference_epsilon": 1e-12
+          }
+        },
+        "tie_break": "higher_logit_threshold",
+        "selected": {
+          "logit_threshold": 1.125,
+          "probability_threshold": 0.7549149868676283,
+          "union_pair_count": 176722,
+          "union_admitted_pair_count": 9720,
+          "sample_occurrence_admitted_pair_count": 456389,
+          "selected_boundary_tie_group_pair_count": 43,
+          "validation_graph_similarity": 0.4465899771947428,
+          "validation_relative_density": 0.96896642760941,
+          "validation_mmd_ratio": {
+            "degree": 3.1227375370470316,
+            "clustering": 2.2523662456313462,
+            "spectral": 5.07541001642158
+          }
+        }
+      },
+      "test": {
+        "matching": "fixed_threshold_selected_on_validation",
+        "selection": "logit_greater_than_or_equal",
+        "logit_threshold": 1.125,
+        "probability_threshold": 0.7549149868676283,
+        "graph_similarity": {
+          "bfs_macro": 0.436387635093747
+        },
+        "relative_density": {
+          "bfs_macro": 1.2007603583316073
+        },
+        "mmd_ratio": {
+          "degree": 3.9078748197623256,
+          "clustering": 3.98367378244542,
+          "spectral": 5.854457083937693
+        },
+        "per_size": {
+          "20": {
+            "graph_similarity": 0.5712194817284477,
+            "relative_density": 0.7450864470588371,
+            "sample_count": 50
+          },
+          "40": {
+            "graph_similarity": 0.5277553908119106,
+            "relative_density": 0.8530558288915375,
+            "sample_count": 50
+          },
+          "60": {
+            "graph_similarity": 0.5032801445852,
+            "relative_density": 0.9877820280024723,
+            "sample_count": 50
+          },
+          "80": {
+            "graph_similarity": 0.45342552124048124,
+            "relative_density": 1.1395675530593319,
+            "sample_count": 50
+          },
+          "100": {
+            "graph_similarity": 0.44088674466383,
+            "relative_density": 1.2183607747873497,
+            "sample_count": 50
+          },
+          "120": {
+            "graph_similarity": 0.395657573999449,
+            "relative_density": 1.3464459724062339,
+            "sample_count": 50
+          },
+          "140": {
+            "graph_similarity": 0.39597260821468366,
+            "relative_density": 1.4138339036803402,
+            "sample_count": 50
+          },
+          "160": {
+            "graph_similarity": 0.38002513150630723,
+            "relative_density": 1.3937468398056696,
+            "sample_count": 50
+          },
+          "180": {
+            "graph_similarity": 0.37400063118615756,
+            "relative_density": 1.3833376465191387,
+            "sample_count": 50
+          },
+          "200": {
+            "graph_similarity": 0.3216531230010031,
+            "relative_density": 1.52638658910516,
+            "sample_count": 50
+          }
+        },
+        "self_loop_occurrences": {
+          "aggregation": "sum_over_sample_occurrences",
+          "predicted": 55000,
+          "reference": 52754
+        }
+      }
+    }
+  },
+  "provenance": {
+    "val_topology": {
+      "path": "outputs/split20260908/b0_v31/scores/val_topology.npz",
+      "sha256": "d7c8289a8690adff6147c67da5bb75dbeae5b036238a4cd595087ff21363e316",
+      "test_access_ledger_record_sha256": null
+    },
+    "val_cls": {
+      "path": "outputs/split20260908/b0_v31/scores/val_cls.npz",
+      "sha256": "1d2abb5dcbbe41cc6a2198ff4bc32b02e7a3ce3dab1730e85ffaee4f87c73dd9",
+      "test_access_ledger_record_sha256": null
+    },
+    "test": {
+      "path": "outputs/split20260908/b0_v31/scores/test.npz",
+      "sha256": "8b8cbb153d0d200ffe4fc4237d1911280bd2f0dc545ffca9d62191fca73c13b4",
+      "test_access_ledger_record_sha256": null
+    },
+    "test_topology": {
+      "path": "outputs/split20260908/b0_v31/scores/test_topology.npz",
+      "sha256": "7ca7f356ff311c95f5fa1bb7c876762176fd8aa6861b1993578d2abd20c7b134",
+      "test_access_ledger_record_sha256": null
+    }
+  }
+}

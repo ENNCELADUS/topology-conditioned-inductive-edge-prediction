@@ -1,6 +1,6 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-06):** paper-style protocol and evidence record. Section 2 records the Pairwise baseline, Full-Ego Oracle ceiling, and KD1--KD4 results. The joint `kd_rank_rep` sweep completed 12 trials; Trial 5 (checkpoint epoch 20) completed held-out evaluation; its results are included below.
+**Status (2026-09-08):** paper-style protocol and evidence record. §2.2 records the Pairwise baseline, Full-Ego Oracle ceiling, and KD1--KD4 results under the pre-2026-09-06 split (historical, superseded). §2.1 begins the current node-held-out split (2026-09-08): B0 and the structural-stream BCE comparator have held-out results; the teacher is running, KD waits for the teacher, GRAND HPO is running, and NEW HPO is queued (§3.1).
 
 ## 1. Experimental setup
 
@@ -30,7 +30,16 @@ random split or evidence that threshold transfer improved. [Selection rule, comp
 and provenance](results/validation_density_selection/README.md); [frozen manifest](../data/val_region/breadth_first.json).
 
 
-**Result provenance:** all model results below predate this change. Results before 2026-09-06 used the old pair-disjoint V_val (2,553 nodes; 9,528 non-self edges; effective training 38,234 non-self edges with boundary pairs retained); the 2026-09-06 pair-disjoint 20% split (1,250 nodes, 10,719 positives) was never used for a published arm. The node-held-out rule was adopted after the 2026-09-07 KD1 diagnostic (branch `codex/node-heldout-diagnostic-20260907`, 20% budget, 30,594 training positives, teacher not node-held-out): its V_val-selected threshold replayed on held-out test gave AUROC 0.7222, AUPRC 0.7494, F1 0.6879, GS 0.4255, RD 0.6779, degree/clustering/spectral MMD ratios 5.78/5.14/9.92, whereas pair-disjoint selection had not transferred ([raw reports](results/node_heldout_diagnostic_20260907/README.md)). The budget was then cut from 20% to 10% of positives (869 nodes, 10.8% of substrate nodes) to recover training positives (30,594 → 36,857); the boundary loss barely moves above ~800 nodes, so the trade is nearly 1:1 in that range. Finally the root was re-selected by test-informed density matching (node_002696, seed 273: 642 nodes, 38,916 training positives; see the paragraph above). No arm has been retrained under the current split yet. Historical results must not be interpreted as current-protocol evidence.
+**Result provenance:** §2.1 and §3.1 contain current-split results only. §2.2 and
+§4 retain historical results with their original split/checkpoint identities. The
+initial 10% root `node_007630` (869 nodes, 5,347 positives) is superseded by the
+642-node manifest above. The earlier 20%-positive-budget node-held-out diagnostic
+used 1,250 nodes and a teacher that had seen those nodes; it is separate diagnostic
+evidence, not a current-split result ([reports](results/node_heldout_diagnostic_20260907/README.md)).
+Local and H20 manifests were verified byte-identical on 2026-09-08. Completed
+current-split B0 and structural BCE results do not imply completion of the teacher
+or KD campaign. [First-attempt failures and retry status](results/split20260908_execution/README.md).
+
 
 **Dynamic training negatives:** `src/data/training_sampler.py:enumerate_edge_stream`
 is shared by Full-Ego and V3.1. It proposes negatives through a 50:50 mixture of
@@ -100,6 +109,10 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 
 ### 1.4 Compared methods
 
+The KD bank/HPO entries below describe historical method development. Current
+`configs/split20260908/` runs rebuild banks from the node-held-out PMA(1) teacher;
+they reuse selected hyperparameters, not old teacher banks or old-split checkpoints.
+
 | Arm | KD signal | Teacher | Searched hyperparameters | Role |
 |---|---|---|---|---|
 | Pairwise baseline (B0) | none | — | none (frozen) | frozen endpoint-only comparator |
@@ -118,7 +131,7 @@ real-vs-real floor, so ratio 1 is that floor). Descriptors retain self-loops.
 
 ### 1.5 Training, HPO, and reproducibility
 
-The V3.1 student uses d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling (mean/attn/max/gated), pair_context_gated readout with abba_max aggregation, and 0.05 label smoothing.
+The V3.1 student uses d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling (mean/attn/max/gated), pair_context_gated readout with abba_max aggregation, and zero label smoothing in the current split campaign (historical grid runs used 0.05).
 Optimization: AdamW, lr 1e-4, weight decay 0.05, onecycle, 25 epochs, 1,024 pairs per batch, clip 1.0, bf16 DDP.
 
 HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1, kd_gram_w1, kd_rep_w0p1). Strict constrained MO-TPE continues with kd_rank (16 trials: w_rank × w_dist × context bank × margin)
@@ -137,7 +150,33 @@ runs the held-out protocol once. `struct_bce` is a single run and the first comp
 
 ## 2. Main results — edge and assembled topology
 
-Table 2 (pairwise, current selected result per arm) and Table 3 (the five topology numbers at each arm's single frozen V_val-selected threshold) are reported together; KD2 Trial 8 is provisional while its HPO remains unfinished.
+### 2.1 New split (2026-09-08 node-held-out split), in progress
+
+Root `node_002696`, split seed 273, 642-node V_val (§1.1). B0 is reported below;
+the completed structural-stream BCE comparator is reported separately in §3.1.
+As checked on 2026-09-08, the PMA1 teacher retry is running, KD is waiting for that
+teacher, GRAND HPO trial 0 is running, and NEW HPO is queued.
+
+| Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
+|---|---:|---:|---:|---:|---:|
+| Pairwise baseline (B0, seed 47, epoch 6) | 0.7081 | 0.7413 | 0.6153 | 0.6743 | 0.2474 |
+
+| Arm | BFS GS | BFS RD | Degree | Clustering | Spectral |
+|---|---:|---:|---:|---:|---:|
+| Pairwise baseline (B0, seed 47, epoch 6) | 0.4364 | 1.2008 | 3.908 | 3.984 | 5.854 |
+
+Pairwise baseline (B0): [held-out report](results/b0_v31_split20260908/test_report.json),
+checkpoint `7112498f`, `outputs/split20260908/b0_v31/` (H20 30030, attempt
+`444a3f2eb0aa4cb3b85d34f605110cda`). Classification threshold (max-F1 on `val_cls`) is a
+probability of 0.0940 (logit −2.266); the topology threshold is a probability of 0.7549
+(logit 1.125), selected on the V_val density-first cascade (validation GS 0.4466, RD 0.9690,
+MMD degree/clustering/spectral 3.12/2.25/5.08) and replayed unchanged on test.
+
+### 2.2 Old split (pre-2026-09-06), historical — superseded
+
+The following paired edge/topology tables retain historical checkpoints and their
+original V_val-selected thresholds. They are not comparators for current-split runs;
+KD2 Trial 8 was provisional at the time of that report.
 
 | Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
 |---|---:|---:|---:|---:|---:|
@@ -166,11 +205,29 @@ Table 2 (pairwise, current selected result per arm) and Table 3 (the five topolo
 ### 3.1 Structural stream (wave 1, new split)
 
 Design: [spec](superpowers/specs/2026-09-07-structural-stream-topology-losses-design.md). Terms
-reduce only over legal pairs (distinct nodes, not both in V_val, feature-bearing). Wave 1 compares
+reduce only over legal pairs (distinct, feature-bearing fit nodes; neither endpoint in V_val). Wave 1 compares
 the `struct_grand` and `struct_new` winners against `struct_bce`, then against the new-split
 `b1_kd_control` once it exists, reporting the pairwise and five topology numbers together and
 checking the selected epoch before crediting a term. Runs use `configs/split20260908/struct_*.yaml`
-(outputs under `outputs/split20260908/struct_*` and `struct_hpo/<arm>`). Results: pending.
+(outputs under `outputs/split20260908/struct_*` and `struct_hpo/<arm>`).
+
+`struct_bce` retry completed publication and held-out testing: seed 0, epoch 7,
+checkpoint `a6d5c8704f6d7959`, attempt `fb4221f7a4eb4fc59b32bcf89e756e41`.
+Its validation-frozen topology logit threshold is 0.443359375; classification
+probability threshold is 0.1801067. [Report](results/struct_bce_split20260908/test_report.json).
+
+| Arm | AUROC | AUPRC | Accuracy | F1 | MCC |
+|---|---:|---:|---:|---:|---:|
+| struct_bce | 0.7017 | 0.7330 | 0.6154 | 0.6736 | 0.2470 |
+
+| Arm | BFS GS ↑ | BFS RD → 1 | Degree ↓ | Clustering ↓ | Spectral ↓ |
+|---|---:|---:|---:|---:|---:|
+| struct_bce | 0.4382 | 1.1356 | 3.837 | 3.779 | 6.379 |
+
+GRAND HPO trial 0 is running; NEW HPO and both selected winners remain pending.
+B0 uses seed 47 and this comparator uses seed 0, so their difference does not isolate
+an effect of the structural stream. Initial failures and applied fixes are recorded
+in the [execution audit](results/split20260908_execution/README.md).
 
 ## 4. Analysis
 

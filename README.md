@@ -65,7 +65,8 @@ hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
 
 The run trains on every substrate positive that does not touch V_val and samples
 five negatives per positive each epoch from the V_val-free training universe, sharing the Full-Ego sampler
-(single-root FIFO BFS capped at 10% of substrate positive pairs, including loops; node-held-out validation),
+(root `node_002696`, split seed 273; 642 held-out nodes / 5,354 positive pairs,
+within the 10% cap including loops; all boundary pairs excluded),
 validates on fixed PRING-style BFS buckets, and executes `pack → train → publish → test` through the
 shared orchestrator. Quality telemetry (eligibility, liveness, slot collapse, margins)
 is recorded but never blocks completion, publication, scoring, or evaluation.
@@ -340,3 +341,7 @@ interpreting the published throughput evidence: the frozen-s0 Seed-0 run used
 follow `YEAR_venue_short_title.pdf` and are filed by topic; see
 `literature/models/graph_structure_learning/README.md` for the taxonomy. Citations in the
 model proposal are by arXiv ID and were verified against arXiv or local PDFs.
+
+Current-split results and failure/retry status are maintained in
+[Experiments §2.1/§3.1](docs/03-experiments.md) and the
+[2026-09-08 execution audit](docs/results/split20260908_execution/README.md).
