@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Event, Thread
 
 import pytest
+from src.data.val_region import ValRegionParams
 from src.experiments import queue_split20260908 as queue
 
 
@@ -159,5 +160,12 @@ def test_configure_points_every_path_at_the_campaign(monkeypatch: pytest.MonkeyP
     assert str(queue.TEACHER) == "outputs/split_seed42/teacher_pma1"
     assert str(queue.CONFIGS) == "configs/split_seed42"
     assert str(queue.BANKS) == "outputs/distill/split_seed42"
-    queue.configure("split20260908")
-    assert str(queue.ROOT) == "outputs/split20260908"
+
+
+def test_configure_refuses_a_campaign_built_under_another_split() -> None:
+    """The retired test-informed campaign must not run against the seed-42 split."""
+    assert queue.CAMPAIGN_SPLIT_SEED["split_seed42"] == ValRegionParams().split_seed
+    with pytest.raises(ValueError, match="split_seed=273.*pins split_seed=42"):
+        queue.configure("split20260908")
+    with pytest.raises(ValueError, match="unknown campaign"):
+        queue.configure("split_nowhere")

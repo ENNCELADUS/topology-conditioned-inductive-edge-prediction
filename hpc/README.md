@@ -296,8 +296,10 @@ output directory, and never against an existing bank or student directory.
 ### 2026-09-08 split campaign (retired to a secondary upper bound): B0, PMA1 teacher, five KD students
 
 This split's root was selected with test structure; its results are a labeled upper bound
-on threshold transfer, not the headline. The launch recipe is kept for provenance; the chain
-now needs `--campaign split20260908`.
+on threshold transfer, not the headline. The launch recipe is kept for provenance only: the
+split is pinned in code, so on the seed-42 checkout the chain refuses
+`--campaign split20260908` (it would pair the seed-273 teacher with seed-42 targets).
+Reproduce it from its historical checkout (5681955..dbc9884).
 
 
 Everything under `configs/split20260908/` targets the node-held-out V_val (root

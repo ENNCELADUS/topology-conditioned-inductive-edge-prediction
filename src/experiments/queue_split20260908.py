@@ -21,6 +21,12 @@ import subprocess
 import time
 from pathlib import Path
 
+from src.data.val_region import ValRegionParams
+
+# The split is pinned in code (ValRegionParams.split_seed); a campaign's configs
+# only carry paths. Each campaign is therefore bound to the seed its teacher and
+# banks were built under, and the chain refuses to run one against another split.
+CAMPAIGN_SPLIT_SEED = {"split_seed42": 42, "split20260908": 273}
 CAMPAIGN = "split20260908"
 TEACHER = Path(f"outputs/{CAMPAIGN}/teacher_pma1")
 ROOT = Path(f"outputs/{CAMPAIGN}")
@@ -31,8 +37,22 @@ POLL_SECONDS = 60.0
 
 
 def configure(campaign: str) -> None:
-    """Point every campaign path at ``configs/<campaign>`` and its output trees."""
+    """Point every campaign path at ``configs/<campaign>`` and its output trees.
+
+    Raises:
+        ValueError: If the campaign is unknown or was built under a different
+            split seed than the checkout's ``ValRegionParams`` default, which
+            would silently mix a retired split's teacher with new-split targets.
+    """
     global CAMPAIGN, TEACHER, ROOT, CONFIGS, BANKS  # noqa: PLW0603
+    if campaign not in CAMPAIGN_SPLIT_SEED:
+        raise ValueError(f"unknown campaign {campaign!r}; known: {sorted(CAMPAIGN_SPLIT_SEED)}")
+    expected, actual = CAMPAIGN_SPLIT_SEED[campaign], ValRegionParams().split_seed
+    if expected != actual:
+        raise ValueError(
+            f"campaign {campaign!r} was built under split_seed={expected}, but this checkout "
+            f"pins split_seed={actual}; run it only from its historical checkout"
+        )
     CAMPAIGN = campaign
     ROOT = Path(f"outputs/{campaign}")
     TEACHER = ROOT / "teacher_pma1"
