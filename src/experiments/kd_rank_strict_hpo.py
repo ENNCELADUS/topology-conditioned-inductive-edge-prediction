@@ -44,6 +44,26 @@ BANKS: dict[str, BankSpec] = {
     "h3ns3": BankSpec(3, 3, 3, "outputs/distill/kd_ctx_targets_breadth_first_h3ns3"),
 }
 
+
+def configure_banks(bank_root: Path) -> None:
+    """Key every context bank to one campaign: ``<bank_root>/contexts_<name>``.
+
+    Banks are teacher- and split-specific, so a campaign (``outputs/distill/
+    <campaign>``) owns its own set; the queue chain dumps ``contexts_h2ns3``
+    under the same naming.
+    """
+    for name, spec in BANKS.items():
+        BANKS[name] = BankSpec(
+            spec.rw_step, spec.hops, spec.ns_rate, str(bank_root / f"contexts_{name}")
+        )
+
+
+def row_bank_path(base_config: Path) -> Path:
+    """Return the row bank (``distill.targets_path``) the base config trains against."""
+    cfg = yaml.safe_load(base_config.read_text(encoding="utf-8"))
+    return Path(str(cfg["distill"]["targets_path"]))
+
+
 ENQUEUED_PRIORS: tuple[dict[str, object], ...] = (
     {"w_rank": 1.0, "w_dist": 1.0, "bank": "h2ns1", "margin": 0.1},
     {"w_rank": 0.1, "w_dist": 10.0, "bank": "h2ns1", "margin": 0.1},
@@ -248,56 +268,63 @@ def run_commands_parallel(commands: list[tuple[list[str], dict[str, str]]]) -> l
     return [proc.wait() for proc in procs]
 
 
-def _dump_cmd(args: argparse.Namespace, spec: BankSpec) -> list[str]:
-    return [
+def _dump_cmd(args: argparse.Namespace, spec: BankSpec | None, output: Path) -> list[str]:
+    """Build the kd-targets command for one bank: rows when ``spec`` is None."""
+    cmd = [
         "bash",
         "hpc/run.sh",
         "kd-targets",
-        "--contexts",
         "--config",
         str(args.base_config),
         "--checkpoint",
         str(args.teacher_checkpoint),
         "--output",
-        spec.path,
-        "--rw-step",
-        str(spec.rw_step),
-        "--hops",
-        str(spec.hops),
-        "--ns-rate",
-        str(spec.ns_rate),
+        str(output),
     ]
+    if spec is not None:
+        cmd += ["--contexts", "--rw-step", str(spec.rw_step)]
+        cmd += ["--hops", str(spec.hops), "--ns-rate", str(spec.ns_rate)]
+    return cmd
+
+
+def _dump_bank(args: argparse.Namespace, name: str, spec: BankSpec | None, output: Path) -> None:
+    shards = [
+        (
+            _dump_cmd(args, spec, output)
+            + ["--device", "cuda", "--row-shard", f"{index}/{args.dump_shards}"],
+            {"CUDA_VISIBLE_DEVICES": str(index)},
+        )
+        for index in range(args.dump_shards)
+    ]
+    codes = run_commands_parallel(shards)
+    if any(code != 0 for code in codes):
+        raise RuntimeError(f"bank {name}: shard exit codes {codes}")
+    merge_code = run_command(
+        _dump_cmd(args, spec, output) + ["--merge", "--row-shard", f"0/{args.dump_shards}"]
+    )
+    if merge_code != 0:
+        raise RuntimeError(f"bank {name}: merge exited {merge_code}")
 
 
 def dump_missing_banks(args: argparse.Namespace) -> None:
-    """Dump every context bank whose artifact is absent (sharded, then merged).
+    """Dump the row bank and every context bank whose artifact is absent.
+
+    Each dump is sharded over ``--dump-shards`` GPUs and then merged. A
+    partial dump leaves the directory (shards) without the manifest, which
+    the artifact writer emits last, so the manifest is the presence test.
 
     Raises:
         RuntimeError: If any shard or merge exits nonzero (fail-closed
             before any training budget is spent).
     """
+    rows = row_bank_path(args.base_config)
+    if not (rows / "manifest.json").exists():
+        _dump_bank(args, "rows", None, rows)
     for name in sorted(BANKS):
         spec = BANKS[name]
-        # A partial dump leaves the directory (shards) without the
-        # manifest, which the artifact writer emits last.
         if (Path(spec.path) / "manifest.json").exists():
             continue
-        shards = [
-            (
-                _dump_cmd(args, spec)
-                + ["--device", "cuda", "--row-shard", f"{index}/{args.dump_shards}"],
-                {"CUDA_VISIBLE_DEVICES": str(index)},
-            )
-            for index in range(args.dump_shards)
-        ]
-        codes = run_commands_parallel(shards)
-        if any(code != 0 for code in codes):
-            raise RuntimeError(f"bank {name}: shard exit codes {codes}")
-        merge_code = run_command(
-            _dump_cmd(args, spec) + ["--merge", "--row-shard", f"0/{args.dump_shards}"]
-        )
-        if merge_code != 0:
-            raise RuntimeError(f"bank {name}: merge exited {merge_code}")
+        _dump_bank(args, name, spec, Path(spec.path))
 
 
 def _n_complete(study: optuna.Study) -> int:
@@ -317,6 +344,9 @@ KD_RANK_SPEC = SweepSpec(
 
 def run_sweep(args: argparse.Namespace, spec: SweepSpec = KD_RANK_SPEC) -> None:
     """Drive the whole sweep: reconcile, prepare banks, ask/tell until budget."""
+    bank_root = getattr(args, "bank_root", None)
+    if bank_root is not None:
+        configure_banks(Path(bank_root))
     study = build_study(
         args.sweep_dir / "optuna.db",
         study_name=spec.study_name,
@@ -384,6 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-trials", type=int, default=16)
     parser.add_argument("--rd-band", type=float, default=0.05)
     parser.add_argument("--dump-shards", type=int, default=4)
+    parser.add_argument(
+        "--bank-root",
+        type=Path,
+        default=None,
+        help="campaign bank root: context banks live at <root>/contexts_<name>",
+    )
     return parser
 
 

@@ -277,7 +277,8 @@ nohup .venv/bin/python -u -m src.experiments.queue_split20260908 --campaign spli
 nohup bash -c 'for c in b0_v31 b0_v31_seed1 b0_v31_seed2; do
   hpc/run.sh train configs/split_seed42/$c.yaml > outputs/logs/split_seed42_$c.log 2>&1 || exit 1; done' \
   > outputs/logs/split_seed42_b0_chain.log 2>&1 < /dev/null &
-# structural arms (a free 4-GPU lane): struct_bce with test, then the two 10-trial studies
+# structural arms (a free 4-GPU lane): the two 10-trial studies (struct_bce, the sampler-matched
+# control, was dropped from the 2026-09-09 plan; its recipe is one `hpc/run.sh train` line)
 nohup bash -c '
   hpc/run.sh train configs/split_seed42/struct_bce.yaml > outputs/logs/split_seed42_struct_bce.log 2>&1 \
   && .venv/bin/python -u -m src.experiments.struct_hpo --arm grand \
@@ -292,6 +293,34 @@ nohup bash -c '
 The chain writes `outputs/split_seed42/queue_status.json` and per-stage logs under
 `outputs/split_seed42/logs/`. Launch it only after the teacher pipeline has created its
 output directory, and never against an existing bank or student directory.
+
+**KD HPO sweeps (2026-09-09 plan, 30838):** instead of the five prior-selection students, the
+campaign sweeps each arm on V_val only (`--skip-test`), previous best arm first. The chain
+below waits for the teacher's diagnostic completion, then runs the strict-LLP `kd_rank`
+study (it dumps the row bank and the four context banks it needs under
+`outputs/distill/split_seed42/{rows,contexts_*}` first), the 15-point loss-weight grid for
+`kd_logit`/`kd_gram`/`kd_rep` (`configs/split_seed42/sweep/`), and the joint `kd_rank_rep`
+study on the `h2ns3` bank. Per-arm winners are the frozen five-metric undominated pick and
+get one held-out test each.
+
+```bash
+nohup bash -c '
+  until [ -f outputs/split_seed42/teacher_pma1/diagnostic_test_complete.json ] \
+        && [ -f outputs/split_seed42/teacher_pma1/best.pt ]; do
+    [ -f outputs/split_seed42/teacher_pma1/failure.json ] && exit 1; sleep 120; done
+  T=outputs/split_seed42/teacher_pma1/best.pt
+  .venv/bin/python -u -m src.experiments.kd_rank_strict_hpo \
+    --base-config configs/split_seed42/kd_rank.yaml --teacher-checkpoint $T \
+    --sweep-dir outputs/split_seed42/kd_hpo/rank --bank-root outputs/distill/split_seed42 \
+    > outputs/logs/split_seed42_kd_hpo_rank.log 2>&1 || exit 1
+  hpc/sweep_kd_hpo.sh all configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid \
+    > outputs/logs/split_seed42_kd_hpo_grid.log 2>&1 || exit 1
+  .venv/bin/python -u -m src.experiments.kd_rank_rep_hpo \
+    --base-config configs/split_seed42/kd_rank_rep.yaml --sweep-dir outputs/split_seed42/kd_hpo/rank_rep \
+    --bank-root outputs/distill/split_seed42 --bank h2ns3 --margin 0.1 \
+    > outputs/logs/split_seed42_kd_hpo_rank_rep.log 2>&1
+' > outputs/logs/split_seed42_kd_hpo_chain.log 2>&1 < /dev/null &
+```
 
 ### 2026-09-08 split campaign (retired to a secondary upper bound): B0, PMA1 teacher, five KD students
 

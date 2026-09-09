@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Serial driver for the B1 KD loss-weight sweep (configs/sweep/b1_kd_hpo).
 #
-# Usage: hpc/sweep_kd_hpo.sh <lane>       lane all, 0, or 1
+# Usage: hpc/sweep_kd_hpo.sh <lane> [config_dir] [sweep_root]
+#   lane all, 0, or 1; config_dir defaults to configs/sweep/b1_kd_hpo and
+#   sweep_root to outputs/b1_row_kd_hpo (a campaign passes its own, e.g.
+#   configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid).
 #   lane all -> CUDA_VISIBLE_DEVICES=0,1,2,3 and every config (sorted order)
 #   lane 0 -> CUDA_VISIBLE_DEVICES=0,1 and the even-indexed configs (sorted order)
 #   lane 1 -> CUDA_VISIBLE_DEVICES=2,3 and the odd-indexed configs
@@ -19,7 +22,8 @@
 # A config whose output dir already holds complete.json is skipped (resume).
 set -euo pipefail
 
-LANE="${1:?usage: hpc/sweep_kd_hpo.sh <lane all|0|1>}"
+LANE="${1:?usage: hpc/sweep_kd_hpo.sh <lane all|0|1> [config_dir] [sweep_root]}"
+CONFIG_DIR="${2:-configs/sweep/b1_kd_hpo}"
 case "${LANE}" in
   all) export CUDA_VISIBLE_DEVICES=0,1,2,3 ;;
   0) export CUDA_VISIBLE_DEVICES=0,1 ;;
@@ -30,14 +34,14 @@ esac
 # without a thread cap.
 export OMP_NUM_THREADS=16 MKL_NUM_THREADS=16
 
-SWEEP_ROOT="outputs/b1_row_kd_hpo"
+SWEEP_ROOT="${3:-outputs/b1_row_kd_hpo}"
 LOG_DIR="${SWEEP_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
 
 CONFIGS=()
 while IFS= read -r cfg; do
   CONFIGS+=("${cfg}")
-done < <(printf '%s\n' configs/sweep/b1_kd_hpo/*.yaml | sort)
+done < <(printf '%s\n' "${CONFIG_DIR}"/*.yaml | sort)
 [[ -f "${CONFIGS[0]:-}" ]] || { echo "ERROR: no sweep configs found" >&2; exit 1; }
 
 index=0

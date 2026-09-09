@@ -207,6 +207,18 @@ def _fabricate_bank(path: Path) -> Path:
     return path
 
 
+def _base_config_with_rows(tmp_path: Path, *, rows_present: bool = True) -> Path:
+    """Copy the base config so its row bank points into ``tmp_path``."""
+    cfg = yaml.safe_load(BASE_CONFIG.read_text(encoding="utf-8"))
+    rows = tmp_path / "rows"
+    if rows_present:
+        _fabricate_bank(rows)
+    cfg["distill"]["targets_path"] = str(rows)
+    path = tmp_path / "base_config.yaml"
+    path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    return path
+
+
 def _sweep_args(tmp_path: Path, **overrides: object) -> argparse.Namespace:
     argv = [
         "--teacher-checkpoint",
@@ -215,6 +227,8 @@ def _sweep_args(tmp_path: Path, **overrides: object) -> argparse.Namespace:
         str(tmp_path),
         "--n-trials",
         "2",
+        "--base-config",
+        str(_base_config_with_rows(tmp_path)),
     ]
     for key, value in overrides.items():
         argv += [f"--{key.replace('_', '-')}", str(value)]
@@ -348,3 +362,50 @@ def test_dump_missing_banks_raises_on_shard_failure(
     monkeypatch.setattr(hpo, "run_commands_parallel", lambda commands: [0, 1])
     with pytest.raises(RuntimeError):
         hpo.dump_missing_banks(_sweep_args(tmp_path, dump_shards=2))
+
+
+def test_configure_banks_keys_every_context_bank_to_the_campaign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hpo, "BANKS", dict(hpo.BANKS))
+    hpo.configure_banks(Path("outputs/distill/split_seed42"))
+    assert hpo.BANKS["h2ns3"].path == "outputs/distill/split_seed42/contexts_h2ns3"
+    assert hpo.BANKS["h3ns3"].path == "outputs/distill/split_seed42/contexts_h3ns3"
+    assert (hpo.BANKS["h3ns3"].rw_step, hpo.BANKS["h3ns3"].hops, hpo.BANKS["h3ns3"].ns_rate) == (
+        3,
+        3,
+        3,
+    )
+    assert hpo.build_parser().parse_args(["--teacher-checkpoint", "t.pt"]).bank_root is None
+
+
+def test_dump_missing_banks_dumps_the_row_bank_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, spec in list(hpo.BANKS.items()):
+        existing = _fabricate_bank(tmp_path / f"bank_{name}")
+        monkeypatch.setitem(
+            hpo.BANKS, name, hpo.BankSpec(spec.rw_step, spec.hops, spec.ns_rate, str(existing))
+        )
+    args = _sweep_args(tmp_path, dump_shards=2)
+    (tmp_path / "rows" / "manifest.json").unlink()  # row bank absent: must be dumped
+    parallel_calls: list[list[tuple[list[str], dict[str, str]]]] = []
+    merges: list[list[str]] = []
+
+    def fake_parallel(cmds: list[tuple[list[str], dict[str, str]]]) -> list[int]:
+        parallel_calls.append(cmds)
+        return [0] * len(cmds)
+
+    def fake_run(cmd: list[str]) -> int:
+        merges.append(cmd)
+        return 0
+
+    monkeypatch.setattr(hpo, "run_commands_parallel", fake_parallel)
+    monkeypatch.setattr(hpo, "run_command", fake_run)
+    hpo.dump_missing_banks(args)
+    assert len(parallel_calls) == 1 and len(merges) == 1
+    shard_cmd, _ = parallel_calls[0][0]
+    assert shard_cmd[:3] == ["bash", "hpc/run.sh", "kd-targets"]
+    assert "--contexts" not in shard_cmd and "--rw-step" not in shard_cmd
+    assert shard_cmd[shard_cmd.index("--output") + 1] == str(tmp_path / "rows")
+    assert "--merge" in merges[0] and "--contexts" not in merges[0]

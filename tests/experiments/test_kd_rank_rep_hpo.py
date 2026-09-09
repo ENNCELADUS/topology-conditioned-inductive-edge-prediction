@@ -185,3 +185,18 @@ def test_main_runs_priors_first_with_the_frozen_bank_and_margin(
     hpo.main(argv)  # Restart at the completed budget must not enqueue or launch duplicates.
     assert len(launched) == len(study.get_trials(deepcopy=False)) == 12
     assert "number state w_rank w_dist w_rep auprc" in capsys.readouterr().out
+
+
+def test_bank_root_rebinds_the_frozen_bank(tmp_path: Path) -> None:
+    saved = dict(shared.BANKS)  # configure_banks mutates the shared registry in place
+    try:
+        args = _args(tmp_path, bank_root=tmp_path / "banks", bank="h2ns3")
+        shared.configure_banks(args.bank_root)
+        with pytest.raises(RuntimeError, match="h2ns3"):
+            hpo.require_bank(args)
+        bank = tmp_path / "banks" / "contexts_h2ns3"
+        bank.mkdir(parents=True)
+        (bank / "manifest.json").write_text("{}", encoding="utf-8")
+        hpo.require_bank(args)
+    finally:
+        shared.BANKS.update(saved)

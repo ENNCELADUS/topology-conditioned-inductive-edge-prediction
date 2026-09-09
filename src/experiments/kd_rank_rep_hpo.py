@@ -18,7 +18,13 @@ from pathlib import Path
 
 import optuna
 
-from src.experiments.kd_rank_strict_hpo import BANKS, SweepSpec, _write_trial_config, run_sweep
+from src.experiments.kd_rank_strict_hpo import (
+    BANKS,
+    SweepSpec,
+    _write_trial_config,
+    configure_banks,
+    run_sweep,
+)
 
 STUDY_NAME = "kd_rank_rep_strict"
 N_STARTUP_TRIALS = 4
@@ -101,12 +107,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rd-band", type=float, default=0.05)
     parser.add_argument("--bank", choices=sorted(BANKS), default="h2ns3")
     parser.add_argument("--margin", type=float, default=0.1)
+    parser.add_argument(
+        "--bank-root",
+        type=Path,
+        default=None,
+        help="campaign bank root: the frozen bank lives at <root>/contexts_<bank>",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Entry point for the unattended container sweep."""
     args = build_parser().parse_args(argv)
+    if args.bank_root is not None:
+        configure_banks(args.bank_root)
     run_sweep(args, build_spec(args))
 
 
