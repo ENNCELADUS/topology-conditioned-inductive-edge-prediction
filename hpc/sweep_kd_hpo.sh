@@ -3,8 +3,10 @@
 #
 # Usage: hpc/sweep_kd_hpo.sh <lane> [config_dir] [sweep_root]
 #   lane all, 0, or 1; config_dir defaults to configs/sweep/b1_kd_hpo and
-#   sweep_root to outputs/b1_row_kd_hpo (a campaign passes its own, e.g.
-#   configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid).
+#   sweep_root (where the lane logs go) to outputs/b1_row_kd_hpo; a campaign
+#   passes its own, e.g. configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid.
+#   Completion/failure checks read each config's own output_dir, which is
+#   where training writes.
 #   lane all -> CUDA_VISIBLE_DEVICES=0,1,2,3 and every config (sorted order)
 #   lane 0 -> CUDA_VISIBLE_DEVICES=0,1 and the even-indexed configs (sorted order)
 #   lane 1 -> CUDA_VISIBLE_DEVICES=2,3 and the odd-indexed configs
@@ -50,7 +52,8 @@ for cfg in "${CONFIGS[@]}"; do
   index=$(( index + 1 ))
   [[ "${LANE}" == all ]] || (( lane_of_cfg == LANE )) || continue
   stem="$(basename "${cfg}" .yaml)"
-  out_dir="${SWEEP_ROOT}/${stem}"
+  out_dir="$(awk '$1 == "output_dir:" { print $2; exit }' "${cfg}")"
+  [[ -n "${out_dir}" ]] || { echo "ERROR: ${cfg} has no top-level output_dir" >&2; exit 1; }
   if [[ -f "${out_dir}/failure.json" ]]; then
     echo "ERROR: lane ${LANE} aborting at ${stem} (failure.json exists)" >&2
     exit 1
