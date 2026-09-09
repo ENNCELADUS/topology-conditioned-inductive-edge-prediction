@@ -65,8 +65,9 @@ hpc/run.sh train configs/egostitch_e2e_v3_full_breadth_first.yaml \
 
 The run trains on every substrate positive that does not touch V_val and samples
 five negatives per positive each epoch from the V_val-free training universe, sharing the Full-Ego sampler
-(root `node_002696`, split seed 273; 642 held-out nodes / 5,354 positive pairs,
-within the 10% cap including loops; all boundary pairs excluded),
+(root `node_007630`, pre-registered random split seed 42; 869 held-out nodes / 5,347
+positive pairs, within the 10% cap including loops; all boundary pairs excluded; no test
+information enters the split),
 validates on fixed PRING-style BFS buckets, and executes `pack → train → publish → test` through the
 shared orchestrator. Quality telemetry (eligibility, liveness, slot collapse, margins)
 is recorded but never blocks completion, publication, scoring, or evaluation.

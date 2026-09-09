@@ -149,14 +149,17 @@ stay fail-closed. `complete.json` means published, not evaluated: held-out evide
 - Topology and classification share the same train positives (no message/supervision split):
   loopless projection for topology, self-pairs kept for classification, and edge-stream structural
   targets must drop the queried partner and decrement its degree.
-- `V_val` (`val_region.py`): one sorted-neighbor FIFO BFS from root `node_002696` (5-neighbor root,
-  split seed 273) on `train_graph.pkl`, stopped before exceeding 10% of substrate positive pairs
-  (loops counted once): 642 nodes, 5,354 positives. Node-held-out since 2026-09-08: V_val leaves the
-  training universe and every pair touching it is dropped (training = 7,430 nodes, 38,916 positives),
-  mirroring the train/test boundary. The root was chosen by test-informed density matching
-  (`docs/results/validation_density_selection/README.md`); say so wherever the split is described.
-  This is the only split: no config key or CLI flag selects another. Each V_val change invalidated
-  every split-keyed cache, pack, bank, threshold, and result.
+- `V_val` (`val_region.py`): one sorted-neighbor FIFO BFS from root `node_007630` (5-neighbor root
+  drawn uniformly with the pre-registered split seed 42) on `train_graph.pkl`, stopped before
+  exceeding 10% of substrate positive pairs (loops counted once): 869 nodes, 5,347 positives.
+  Node-held-out since 2026-09-08: V_val leaves the training universe and every pair touching it is
+  dropped (training = 7,203 nodes, 36,857 positives; 11,436 boundary positives held out), mirroring
+  the train/test boundary. Headline since 2026-09-09: this split is chosen without any test
+  information. The 2026-09-08 split (root `node_002696`, seed 273; `configs/split20260908/`) was
+  chosen by test-informed density matching (`docs/results/validation_density_selection/README.md`)
+  and is a labeled secondary upper bound, never the headline; say so wherever it is cited. This is
+  the only split: no config key or CLI flag selects another. Each V_val change invalidated every
+  split-keyed cache, pack, bank, threshold, and result.
 - KD banks are keyed to the teacher checkpoint and the split: a re-trained teacher or a moved V_val
   boundary invalidates `outputs/distill/*` wholesale. `src/distill/artifacts.py` loads only the
   `kd_row_targets_v1` / `kd_ctx_targets_v1` formats and raises on row-coverage mismatch.

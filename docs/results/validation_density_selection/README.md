@@ -4,6 +4,12 @@ Selected on 2026-09-08: **node_002696**, reproduced by **split_seed=273**.
 This is an explicitly **test-informed split redesign** authorized by the user.
 It is not an untouched-test result, and actual threshold transfer has not been measured.
 
+**Retired as headline on 2026-09-09.** Selecting the validation region on test label
+statistics tunes the deployable threshold on test, so the headline split reverted to the
+pre-registered random draw (`split_seed=42`, root `node_007630`, `configs/split_seed42/`).
+Results on this split (`configs/split20260908/`, §2.2 of `docs/03-experiments.md`) remain
+as a labeled upper bound on threshold transfer.
+
 ## Decision rule
 
 The goal is to reduce density mismatch relevant to freezing a topology threshold.

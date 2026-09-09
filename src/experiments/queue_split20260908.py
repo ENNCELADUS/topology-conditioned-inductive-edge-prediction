@@ -1,15 +1,18 @@
-"""One-shot H20 chain for the 2026-09-08 split: teacher, banks, five KD students.
+"""One-shot H20 chain for one split campaign: teacher, banks, five KD students.
 
 Launch from the checkout with its ``.venv`` Python and ``nohup`` after the teacher
-pipeline has started (``configs/split20260908/teacher_pma1.yaml``). The chain waits
-for the teacher's pipeline lock, requires its diagnostic completion artifacts, dumps
-the shared row bank and the ``h2ns3`` context bank from ``best.pt``, then trains,
+pipeline has started (``configs/<campaign>/teacher_pma1.yaml``), passing
+``--campaign <name>`` (``split_seed42`` for the random headline split,
+``split20260908`` for the retired test-informed one). The chain waits for the
+teacher's pipeline lock, requires its diagnostic completion artifacts, dumps the
+shared row bank and the ``h2ns3`` context bank from ``best.pt``, then trains,
 publishes and tests ``kd_logit``, ``kd_rank``, ``kd_gram``, ``kd_rep`` and
 ``kd_rank_rep`` in sequence on every visible GPU. Any failed dependency stops it.
 """
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import logging
@@ -18,12 +21,23 @@ import subprocess
 import time
 from pathlib import Path
 
-TEACHER = Path("outputs/split20260908/teacher_pma1")
-ROOT = Path("outputs/split20260908")
-CONFIGS = Path("configs/split20260908")
+CAMPAIGN = "split20260908"
+TEACHER = Path(f"outputs/{CAMPAIGN}/teacher_pma1")
+ROOT = Path(f"outputs/{CAMPAIGN}")
+CONFIGS = Path(f"configs/{CAMPAIGN}")
 ARMS = ("kd_logit", "kd_rank", "kd_gram", "kd_rep", "kd_rank_rep")
-BANKS = Path("outputs/distill/split20260908")
+BANKS = Path(f"outputs/distill/{CAMPAIGN}")
 POLL_SECONDS = 60.0
+
+
+def configure(campaign: str) -> None:
+    """Point every campaign path at ``configs/<campaign>`` and its output trees."""
+    global CAMPAIGN, TEACHER, ROOT, CONFIGS, BANKS  # noqa: PLW0603
+    CAMPAIGN = campaign
+    ROOT = Path(f"outputs/{campaign}")
+    TEACHER = ROOT / "teacher_pma1"
+    CONFIGS = Path(f"configs/{campaign}")
+    BANKS = Path(f"outputs/distill/{campaign}")
 
 
 def status(stage: str, **extra: object) -> None:
@@ -142,9 +156,11 @@ def dump_bank(*, contexts: bool, devices: list[str]) -> None:
         raise RuntimeError(f"Missing bank manifest: {output}")
 
 
-def main() -> None:
+def main(campaign: str | None = None) -> None:
     """Execute this one-shot dependency chain under an exclusive queue lock."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    if campaign is not None:
+        configure(campaign)
     ROOT.mkdir(parents=True, exist_ok=True)
     (ROOT / "logs").mkdir(exist_ok=True)
     os.environ.update(OMP_NUM_THREADS="16", MKL_NUM_THREADS="16")
@@ -174,4 +190,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--campaign", required=True, help="configs/<campaign> directory name")
+    main(parser.parse_args().campaign)

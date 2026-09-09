@@ -1,6 +1,6 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-08):** paper-style protocol and evidence record. §2.2 records the Pairwise baseline, Full-Ego Oracle ceiling, and KD1--KD4 results under the pre-2026-09-06 split (historical, superseded). §2.1 begins the current node-held-out split (2026-09-08): B0 and the structural-stream BCE comparator have held-out results; the teacher is running, KD waits for the teacher, GRAND HPO is running, and NEW HPO is queued (§3.1).
+**Status (2026-09-09):** paper-style protocol and evidence record. The headline split is the seed-42 random node-held-out V_val (§1.1); its campaign (§2.1) is launched and has no results yet. §2.2 holds the 2026-09-08 test-informed split, retired to a labeled secondary upper bound: B0, all five KD students, and the structural-stream BCE comparator have held-out results there, GRAND HPO is complete and NEW HPO is running (§3.1). §2.3 records the pre-2026-09-06 split (historical, superseded).
 
 ## 1. Experimental setup
 
@@ -10,30 +10,34 @@
 |---|---:|---:|---|
 | Full reference graph | 10,090 | 122,092 | positive graph truth only |
 | Train-side substrate (`train_graph.pkl`) | 8,072 | 47,762 | original train⁺∪val⁺ graph and pair pool, before the internal split |
-| ↳ Effective training (node-held-out protocol) | 7,430 | 33,566 | every pair touching V_val excluded |
-| ↳ `V_val` region (node-held-out protocol) | 642 | 4,826 | node-held-out validation |
-| ↳ Dropped boundary | — | 9,370 | cross-boundary positives, held out from training |
+| ↳ Effective training (node-held-out protocol) | 7,203 | 31,623 | every pair touching V_val excluded |
+| ↳ `V_val` region (node-held-out protocol) | 869 | 4,703 | node-held-out validation |
+| ↳ Dropped boundary | — | 11,436 | cross-boundary positives, held out from training |
 | Test graph | disjoint 2,018 | 30,128 | held out until final evaluation |
 | Loopless test candidate universe | same 2,018 | — | all 2,035,153 unordered distinct-node pairs |
 
 The primary strategy is `breadth_first`. V_val uses a sorted-neighbor FIFO BFS from
-root `node_002696` (five neighbors, split seed 273), capped at 10% of substrate
-positive pairs including loops. The prefix has 5,354 positives (528 self-loops),
-below the 5,364 cap. All 642 V_val nodes and every pair touching them are held out;
-fit has 7,430 nodes and 38,916 positives (33,566 loopless). Inner BFS buckets retain
-seed 43 and 50 uniform-root draws per size 20–200. Classification validation has
-5,354 positives and 5,354 endpoint-frequency negatives, seed 0.
+root `node_007630`, a uniform draw over five-neighbor roots with the pre-registered
+split seed 42 (the project's original default), capped at 10% of substrate positive
+pairs including loops. The prefix has 5,347 positives (644 self-loops), below the
+5,364 cap. All 869 V_val nodes and every pair touching them are held out; fit has
+7,203 nodes and 36,857 positives (31,623 loopless). Inner BFS buckets retain seed 43
+and 50 uniform-root draws per size 20–200. Classification validation has 5,347
+positives and 5,347 endpoint-frequency negatives, seed 0.
 
-**Test-informed design:** this root was explicitly selected using true test bucket
-edge-count distributions to reduce density mismatch. This is not a test-independent
-random split or evidence that threshold transfer improved. [Selection rule, comparison
-and provenance](results/validation_density_selection/README.md); [frozen manifest](../data/val_region/breadth_first.json).
+**Headline split rule (2026-09-09):** no test information enters the split. The root
+is a single seeded draw, not a choice among candidates, so V_val density is whatever
+the draw gives and the fixed topology threshold transfers to test unaided. The
+2026-09-08 split (root `node_002696`, seed 273, 642 nodes) selected its root by
+matching true test bucket edge-count distributions; its results (§2.2, §3.1) are a
+labeled test-informed upper bound on threshold transfer, never the headline.
+[Selection rule, comparison and provenance](results/validation_density_selection/README.md);
+[frozen manifest](../data/val_region/breadth_first.json).
 
 
-**Result provenance:** §2.1 and §3.1 contain current-split results only. §2.2 and
-§4 retain historical results with their original split/checkpoint identities. The
-initial 10% root `node_007630` (869 nodes, 5,347 positives) is superseded by the
-642-node manifest above. The earlier 20%-positive-budget node-held-out diagnostic
+**Result provenance:** §2.1 will hold headline (seed-42) results only. §2.2 and §3.1
+hold 2026-09-08 test-informed-split results; §2.3 and §4 retain historical results
+with their original split/checkpoint identities. The 20%-positive-budget node-held-out diagnostic
 used 1,250 nodes and a teacher that had seen those nodes; it is separate diagnostic
 evidence, not a current-split result ([reports](results/node_heldout_diagnostic_20260907/README.md)).
 Local and H20 manifests were verified byte-identical on 2026-09-08. Completed
@@ -150,9 +154,17 @@ runs the held-out protocol once. `struct_bce` is a single run and the first comp
 
 ## 2. Main results — edge and assembled topology
 
-### 2.1 New split (2026-09-08 node-held-out split), in progress
+### 2.1 Headline split (seed-42 random root), in progress
 
-Root `node_002696`, split seed 273, 642-node V_val (§1.1). B0 is reported below;
+Root `node_007630`, split seed 42, 869-node V_val (§1.1). Campaign configs live in
+`configs/split_seed42/` (B0 with seeds 0/1/2 for the noise band, PMA1 teacher, five KD
+students, three structural arms); launched 2026-09-09, no held-out results yet.
+
+### 2.2 Test-informed split (2026-09-08), secondary upper bound
+
+Root `node_002696`, split seed 273, 642-node V_val, selected by matching test bucket
+edge-count distributions (§1.1). These numbers are an upper bound on threshold
+transfer, not held-out evidence; compare arms within this table only. B0 is reported below;
 the completed structural-stream BCE comparator is reported separately in §3.1.
 As checked on 2026-09-08, the PMA1 teacher retry is running, KD is waiting for that
 teacher, GRAND HPO trial 0 is running, and NEW HPO is queued.
@@ -172,7 +184,7 @@ probability of 0.0940 (logit −2.266); the topology threshold is a probability 
 (logit 1.125), selected on the V_val density-first cascade (validation GS 0.4466, RD 0.9690,
 MMD degree/clustering/spectral 3.12/2.25/5.08) and replayed unchanged on test.
 
-### 2.2 Old split (pre-2026-09-06), historical — superseded
+### 2.3 Old split (pre-2026-09-06), historical — superseded
 
 The following paired edge/topology tables retain historical checkpoints and their
 original V_val-selected thresholds. They are not comparators for current-split runs;
@@ -202,7 +214,7 @@ KD2 Trial 8 was provisional at the time of that report.
 
 ## 3. Ablations and sensitivity
 
-### 3.1 Structural stream (wave 1, new split)
+### 3.1 Structural stream (wave 1, 2026-09-08 test-informed split)
 
 Design: [spec](superpowers/specs/2026-09-07-structural-stream-topology-losses-design.md). Terms
 reduce only over legal pairs (distinct, feature-bearing fit nodes; neither endpoint in V_val). Wave 1 compares

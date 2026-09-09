@@ -56,11 +56,13 @@ Each split-strategy directory contains:
 
 ## Current internal validation split
 
-`val_region/breadth_first.json` records root `node_002696`, split seed 273:
-642 validation nodes and 5,354 positives (528 loops), under a 5,364-positive cap.
-Fit has 7,430 nodes and 38,916 positives (33,566 non-self); all 9,370 boundary
-positives and every validation-touching negative are excluded from training.
-Validation contains 5,354 fixed negatives and 500 FIFO BFS samples (20–200 nodes,
-50 each; bucket seed 43). Fixed negative counts do not describe the dynamic 1:5
-training stream. Test is unchanged. Root selection used test topology statistics;
-see [selection provenance](../docs/results/validation_density_selection/README.md).
+`val_region/breadth_first.json` records root `node_007630`, split seed 42 (a uniform
+draw over five-neighbour roots, pre-registered, no test information): 869 validation
+nodes and 5,347 positives (644 loops), under a 5,364-positive cap. Fit has 7,203
+nodes and 36,857 positives (31,623 non-self); all 11,436 boundary positives and every
+validation-touching negative are excluded from training. Validation contains 5,347
+fixed negatives and 500 FIFO BFS samples (20–200 nodes, 50 each; bucket seed 43).
+Fixed negative counts do not describe the dynamic 1:5 training stream. Test is
+unchanged. The retired 2026-09-08 split (root `node_002696`, seed 273) selected its
+root with test topology statistics and is a labeled secondary upper bound only; see
+[selection provenance](../docs/results/validation_density_selection/README.md).

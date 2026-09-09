@@ -149,3 +149,15 @@ def test_dump_bank_hands_the_dumper_no_f0_cache(
     for command in commands:
         assert "--f0-cache" not in command
         assert "--checkpoint" in command
+
+
+def test_configure_points_every_path_at_the_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(queue, "CAMPAIGN", "split20260908")
+    queue.configure("split_seed42")
+    assert queue.CAMPAIGN == "split_seed42"
+    assert str(queue.ROOT) == "outputs/split_seed42"
+    assert str(queue.TEACHER) == "outputs/split_seed42/teacher_pma1"
+    assert str(queue.CONFIGS) == "configs/split_seed42"
+    assert str(queue.BANKS) == "outputs/distill/split_seed42"
+    queue.configure("split20260908")
+    assert str(queue.ROOT) == "outputs/split20260908"

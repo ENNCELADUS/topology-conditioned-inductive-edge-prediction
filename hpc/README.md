@@ -255,7 +255,50 @@ mkdir -p outputs/logs && nohup hpc/run.sh train configs/b0_v31_breadth_first.yam
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
 reported experiment; attempt `train.log` is authoritative and the redirect records launcher output.
 
-### 2026-09-08 split campaign: B0, PMA1 teacher, five KD students
+### Headline seed-42 split campaign (2026-09-09): B0, PMA1 teacher, five KD students, structural arms
+
+Everything under `configs/split_seed42/` targets the headline node-held-out V_val (root
+`node_007630`, pre-registered split seed 42, no test information) with fresh split-keyed
+directories: outputs under `outputs/split_seed42/<run>`, the teacher's F0/grounding pack
+under `outputs/feature_packs/egostitch_e2e_split_seed42_ng50`, and banks under
+`outputs/distill/split_seed42/{rows,contexts_h2ns3}`. The configs are the
+`configs/split20260908/` files with only the split-keyed paths changed; the raw token
+packs are reused. The KD chain is the same module with `--campaign split_seed42`.
+
+```bash
+mkdir -p outputs/logs
+# 4-GPU container: teacher, then the chain (waits for the teacher, dumps banks, runs five students)
+nohup hpc/run.sh train configs/split_seed42/teacher_pma1.yaml \
+  --worker-module src.train_egostitch --run-kind diagnostic \
+  > outputs/logs/split_seed42_teacher.log 2>&1 < /dev/null &
+nohup .venv/bin/python -u -m src.experiments.queue_split20260908 --campaign split_seed42 \
+  > outputs/logs/split_seed42_queue.log 2>&1 < /dev/null &
+# B0 and its two noise-band seeds (any free lane; sequential)
+nohup bash -c 'for c in b0_v31 b0_v31_seed1 b0_v31_seed2; do
+  hpc/run.sh train configs/split_seed42/$c.yaml > outputs/logs/split_seed42_$c.log 2>&1 || exit 1; done' \
+  > outputs/logs/split_seed42_b0_chain.log 2>&1 < /dev/null &
+# structural arms (a free 4-GPU lane): struct_bce with test, then the two 10-trial studies
+nohup bash -c '
+  hpc/run.sh train configs/split_seed42/struct_bce.yaml > outputs/logs/split_seed42_struct_bce.log 2>&1 \
+  && .venv/bin/python -u -m src.experiments.struct_hpo --arm grand \
+    --base-config configs/split_seed42/struct_grand.yaml --sweep-dir outputs/split_seed42/struct_hpo/grand \
+    > outputs/logs/split_seed42_struct_hpo_grand.log 2>&1 \
+  && .venv/bin/python -u -m src.experiments.struct_hpo --arm new \
+    --base-config configs/split_seed42/struct_new.yaml --sweep-dir outputs/split_seed42/struct_hpo/new \
+    > outputs/logs/split_seed42_struct_hpo_new.log 2>&1
+' > outputs/logs/split_seed42_struct_chain.log 2>&1 < /dev/null &
+```
+
+The chain writes `outputs/split_seed42/queue_status.json` and per-stage logs under
+`outputs/split_seed42/logs/`. Launch it only after the teacher pipeline has created its
+output directory, and never against an existing bank or student directory.
+
+### 2026-09-08 split campaign (retired to a secondary upper bound): B0, PMA1 teacher, five KD students
+
+This split's root was selected with test structure; its results are a labeled upper bound
+on threshold transfer, not the headline. The launch recipe is kept for provenance; the chain
+now needs `--campaign split20260908`.
+
 
 Everything under `configs/split20260908/` targets the node-held-out V_val (root
 `node_002696`, split seed 273) with fresh split-keyed directories: outputs under
@@ -276,7 +319,7 @@ nohup hpc/run.sh train configs/split20260908/teacher_pma1.yaml \
   --worker-module src.train_egostitch --run-kind diagnostic \
   > outputs/logs/split20260908_teacher.log 2>&1 < /dev/null &
 # then the chain: waits for the teacher, dumps both banks, trains/publishes/tests the five students
-nohup .venv/bin/python -u -m src.experiments.queue_split20260908 \
+nohup .venv/bin/python -u -m src.experiments.queue_split20260908 --campaign split20260908 \
   > outputs/logs/split20260908_queue.log 2>&1 < /dev/null &
 # 2-GPU container, concurrently: the B0 baseline
 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 nohup hpc/run.sh train configs/split20260908/b0_v31.yaml \
