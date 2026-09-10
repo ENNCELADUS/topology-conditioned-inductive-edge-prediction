@@ -40,7 +40,7 @@ def test_arm_table_matches_spec() -> None:
     assert bce.priors == ()
 
 
-@pytest.mark.parametrize("arm", ["grand", "new", "prefix_static", "prefix_pair"])
+@pytest.mark.parametrize("arm", ["grand", "new", "prefix_static", "prefix_pair", "prefix_pair_bce"])
 def test_suggest_stays_inside_the_boxes(arm: str) -> None:
     spec = struct_hpo.ARMS[arm]
     study = optuna.create_study(
@@ -55,10 +55,15 @@ def test_suggest_stays_inside_the_boxes(arm: str) -> None:
             assert low <= float(value) <= high  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("arm", ["grand", "new", "prefix_static", "prefix_pair"])
+@pytest.mark.parametrize("arm", ["grand", "new", "prefix_static", "prefix_pair", "prefix_pair_bce"])
 def test_materialize_overrides_only_struct_weights_and_output_dir(arm: str, tmp_path: Path) -> None:
     spec = struct_hpo.ARMS[arm]
-    params = dict(spec.priors[0])
+    params = dict(spec.priors[0]) if spec.priors else {"lr": 2.5e-3}
+    if "lr" in spec.param_names:
+        # A prior's lr (1e-3) equals the base config's optim.lr, which would leave the lr-write
+        # assertions below satisfied even if materialize_trial_config never touched optim. Use a
+        # value that appears in no base file so the lr routing is actually exercised.
+        params["lr"] = 2.5e-3
     path = struct_hpo.materialize_trial_config(spec.base_config, params, 7, tmp_path / "sweep")
     trial = yaml.safe_load(path.read_text())
     base = yaml.safe_load(spec.base_config.read_text())
@@ -74,6 +79,8 @@ def test_materialize_overrides_only_struct_weights_and_output_dir(arm: str, tmp_
     for key, value in trial["struct"]["weights"].items():
         if key not in params and key != "bce":
             assert value == 0.0
+    if "lr" in spec.param_names:
+        assert trial["optim"]["lr"] != base["optim"]["lr"]
     trial["output_dir"] = base["output_dir"]
     trial["struct"]["weights"] = base["struct"]["weights"]
     trial["optim"] = base["optim"]

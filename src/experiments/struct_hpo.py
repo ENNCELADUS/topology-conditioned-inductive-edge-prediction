@@ -7,8 +7,9 @@ learning rate. ``prefix_static`` and ``prefix_pair`` search ``rank``/``degree``/
 and ``optim.scheduler.max_lr``, never into ``struct.weights``. ``prefix_pair_bce`` is the BCE-only
 control for the ``prefix_pair`` conditioning: it searches only ``lr``, and its three priors are
 derived from ``--lr-center X`` (the ``prefix_pair`` winner's lr) as ``(X/3, X, 3X)``. Launch it
-with ``--arm prefix_pair_bce --n-trials 3 --lr-center <prefix_pair winner lr>``: since
-``N_STARTUP_TRIALS`` is 3, all three trials are the enqueued priors and no sampled trial runs.
+with ``--arm prefix_pair_bce --n-trials 3 --lr-center <prefix_pair winner lr>``: Optuna's
+``Study.ask()`` drains the three enqueued (WAITING) priors before it ever consults the sampler, so
+with ``--n-trials 3`` all three trials are exactly those priors.
 """
 
 from __future__ import annotations
@@ -185,7 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "prefix_pair_bce only: the prefix_pair winner's lr; the three priors are "
-            "(X/3, X, 3X) and, with --n-trials 3, are the arm's only trials."
+            "(X/3, X, 3X), and with --n-trials 3 Study.ask() drains them as WAITING "
+            "trials before sampling, so they are the arm's only trials."
         ),
     )
     return parser
