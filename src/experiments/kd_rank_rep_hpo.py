@@ -1,12 +1,6 @@
-"""Unattended Optuna sweep for the ``kd_rank_rep`` double-KD arm.
+"""Joint rank/representation KD HPO using the shared three-objective search.
 
-Same ask-and-tell constrained MO-TPE loop, objectives (GS max, geometric-mean
-MMD ratio min), and ``|log RD|`` soft constraint as the strict-LLP kd_rank
-sweep (`src.experiments.kd_rank_strict_hpo`); this study searches only the
-three loss weights and inherits the kd_rank winner's context bank and margin
-through ``--bank``/``--margin``. Winner selection stays the frozen
-five-metric undominated verdict plus the human pick.
-Spec: ``docs/superpowers/specs/2026-09-04-kd-rank-rep-double-kd-design.md``.
+Search AUPRC, GS and geo-MMD; select the final trial by five-metric mean rank.
 """
 
 from __future__ import annotations
@@ -104,7 +98,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sweep-dir", type=Path, default=Path("outputs/b1_kd_rank_rep_hpo"))
     parser.add_argument("--n-trials", type=int, default=12)
-    parser.add_argument("--rd-band", type=float, default=0.05)
     parser.add_argument("--bank", choices=sorted(BANKS), default="h2ns3")
     parser.add_argument("--margin", type=float, default=0.1)
     parser.add_argument(

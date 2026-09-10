@@ -85,7 +85,7 @@ def test_build_spec_binds_the_arm_and_fills_defaults() -> None:
 def test_parser_defaults() -> None:
     args = struct_hpo.build_parser().parse_args(["--arm", "grand"])
     assert args.n_trials == 10
-    assert args.rd_band == 0.05
+    assert not hasattr(args, "rd_band")
     assert args.base_config is None and args.sweep_dir is None
     with pytest.raises(SystemExit):
         struct_hpo.build_parser().parse_args([])

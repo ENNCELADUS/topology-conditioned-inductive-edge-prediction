@@ -1,6 +1,10 @@
 # Experiments: Topology-Conditioned Inductive Edge Prediction
 
-**Status (2026-09-09):** paper-style protocol and evidence record. The headline split is the seed-42 random node-held-out V_val (§1.1); its campaign (§2.1) is launched and has no results yet. §2.2 holds the 2026-09-08 test-informed split, retired to a labeled secondary upper bound: B0, all five KD students, and the structural-stream BCE comparator have held-out results there, GRAND HPO is complete and NEW HPO is running (§3.1). §2.3 records the pre-2026-09-06 split (historical, superseded).
+**Protocol update (2026-09-10):** closest-geometric-RD threshold selection,
+five-metric checkpoint ranking, and three-objective Optuna (§1.2/§1.5). The
+headline split remains the seed-42 random node-held-out V_val. Result sections
+retain their recorded campaign/split provenance; changing selection rules does
+not update historical results or restart running experiments.
 
 ## 1. Experimental setup
 
@@ -78,15 +82,48 @@ a pair universe, predictions are assembled into $\widehat G_\tau$ only for evalu
 
 **Evidence classes.** A *comparator* is a frozen model or score artifact evaluated without changing its checkpoint or opening new test-dependent choices; a *formal result* follows this fixed pre-test protocol.
 
-**Model selection.** Training early-stops on the validation task BCE alone (`val_task_loss`,
-patience 10); KD and structural validation terms are logged as diagnostics and never enter the
-monitor. The published checkpoint is chosen
-independently, by mean rank over V_val AUPRC plus the five bucket-topology metrics (§1.3).
+**Selection protocol (2026-09-10, `geometric_rd_five_rank_v1`).** Threshold
+selection and checkpoint selection are separate ordered steps. All arms use the
+same frozen V_val sampled-set pair union and 500 subgraphs, retaining self-loops.
+Historical results retain their recorded selection protocol.
 
-**Topology threshold.** Selected on the `V_val` 20--200-node sampled-set pair union. Define `D_RD(t)` as the size-bucket
-macro-average of mean `|log RD|`; among finite atomic candidates, let `t_min=argmin_t D_RD(t)` and retain exactly those with
-`D_RD(t) <= D_RD(t_min) + SE_t`, where `SE_t` is the size-stratified paired-bootstrap SE of the difference. Among survivors minimize
-`D_shape=(1/3) sum_s log(max(r_s(t), epsilon))`, `epsilon=1e-12`, then break ties toward the larger threshold; empty-prediction candidates have `D_RD=+inf`. Freeze before test.
+**Step 1 — threshold for each checkpoint.** Enumerate every distinct validation
+logit boundary with atomic score ties and `logit >= threshold`. Define
+`L(t) = mean_size(mean_subgraph(log RD_i(t)))` and `RD_geo(t) = exp(L(t))`.
+Sizes have equal weight; subgraphs within a size have equal weight. Choose the
+threshold minimizing `abs(L(t))`, not `mean(abs(log RD_i(t)))` and not the distance
+of arithmetic macro RD from 1. Exact density-error ties prefer higher macro GS,
+then lower geometric mean of the degree/clustering/spectral MMD ratios, then the
+larger threshold. Comparisons use unrounded values.
+
+A candidate emptying any positive-reference subgraph has infinite density error;
+no epsilon replaces a zero RD. Since all reference subgraphs have positive edges,
+the lowest threshold predicts all pairs and always supplies a finite candidate.
+There is no RD band, checkpoint eligibility gate, or quality-based refusal to
+publish: coarse score ties may leave a nonzero residual density error, which is
+reported honestly.
+
+**Step 2 — checkpoint selection.** At each checkpoint's own step-1 threshold,
+rank five metrics: AUPRC and GS descending, degree/clustering/spectral MMD ratios
+ascending. AUPRC uses raw logits and is independent of the threshold. Exact metric
+ties receive average ranks. Select the smallest equal-weight mean of the five
+ranks; mean-rank ties prefer higher GS, lower geo-MMD, then the earlier epoch.
+RD is reported but never ranked. Early stopping remains validation task BCE with
+configured patience. Rank checkpoints with completed topology measurements.
+
+**Density reporting.** Report arithmetic macro RD, geometric RD, mean per-subgraph
+absolute log RD, and per-size density summaries alongside GS and all three MMD
+ratios. Geometric RD near 1 balances multiplicative over/under-density but does not
+ensure each subgraph is accurate; arithmetic RD can exceed 1. For fixed-threshold
+test replay, a zero RD is reported as geometric RD 0; infinite mean absolute log
+RD is encoded as JSON null with an explicit zero-RD subgraph count, never hidden
+by an arbitrary epsilon.
+
+**Frozen replay.** Publish the selected checkpoint with its own topology threshold
+embedded in `best.pt`. Validation rescoring may report drift but never silently
+reselects the threshold. Test replays it unchanged. The teacher's true-G_val
+oracle remains a separate diagnostic threshold surface, using the same geometric
+RD rule. Neither the threshold nor the split is adjusted using test information.
 
 **Classification threshold.** Selected separately as the max-F1 logit threshold on the balanced
 `V_val` classification rows (`val_cls`) and frozen before test. It serves only Accuracy/F1/MCC;
@@ -138,9 +175,32 @@ they reuse selected hyperparameters, not old teacher banks or old-split checkpoi
 The V3.1 student uses d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling (mean/attn/max/gated), pair_context_gated readout with abba_max aggregation, and zero label smoothing in the current split campaign (historical grid runs used 0.05).
 Optimization: AdamW, lr 1e-4, weight decay 0.05, onecycle, 25 epochs, 1,024 pairs per batch, clip 1.0, bf16 DDP.
 
-HPO: a Phase-0 grid (24 runs) fixed per-arm incumbents (kd_logit_w100, kd_rank_wr0p1_wd1, kd_gram_w1, kd_rep_w0p1). Strict constrained MO-TPE continues with kd_rank (16 trials: w_rank × w_dist × context bank × margin)
-and kd_rank_rep (12 trials: w_rank × w_dist × w_rep, bank/margin inherited). Both maximize GS and minimize geometric-mean MMD with soft constraint `|log RD| <= 0.05`; the study front is advisory to the five-metric undominated verdict plus human pick.
-The best configuration per arm runs the held-out test protocol exactly once; provenance and HPC completion are rules 5--6 (§5).
+**Current Optuna selection.** TPE uses three fixed objectives: maximize AUPRC,
+maximize GS, minimize geo-MMD. There is no RD constraint. Each trial reports its
+actually published checkpoint at that checkpoint's threshold, without reselection
+at a different cadence. Across completed trials, choose the winner using the same
+five-metric equal mean rank as step 2; the final cross-trial tie-break is earlier
+trial number. Write the winner, selected epoch, threshold and metric surface to
+`best_trial.json`. Search objectives and final selection criteria are intentionally
+different; rank itself is not an objective because adding trials changes ranks.
+Numerical/data/I/O failures remain FAIL; RD deviation alone is not a failure or
+reason to prune a completed run.
+
+**Existing sweeps and offline replay.** Changing this rule does not require
+retraining saved checkpoints or stopping current sweeps. Re-score every saved
+epoch on V_val, apply steps 1 and 2, and save reselected checkpoint/threshold and
+reports separately from the original artifacts. This cannot recreate an old TPE
+trajectory or epochs never trained after early stopping. A new-objective Optuna
+study requires a separate directory; old objective values must not be mixed in.
+Re-evaluated observations can inform a new study with their provenance retained.
+Use measured full replay throughput to schedule this work; scoring-only timings
+exclude model loading, I/O and topology evaluation. Local code changes do not
+modify already-running remote workers.
+
+**Historical HPO.** The earlier Phase-0 grid and rank/rank+rep campaigns optimized
+GS and geometric-mean MMD under a soft RD constraint. Their archived results below
+retain that provenance. The best configuration selected without test feedback is
+evaluated on held-out test once.
 
 The `kd_rank_rep` study completed all 12 trials (four priors plus eight guided trials), with context bank `h2ns3` and margin 0.1 fixed. Trial 5 was selected for held-out evaluation; its published checkpoint is epoch 20. Its weights and V_val selection metrics are recorded in §4.6.
 
@@ -148,9 +208,9 @@ The structural arms are not KD: each optimizer step adds one sampled 40-node tra
 (32 locally expanded nodes from a BFS, wedge/triangle, or two-ball bridge seed at a 50/25/25 mix,
 plus 8 uniform background nodes) whose legal pairs are forwarded and scored as a logit matrix.
 `struct_grand` and `struct_new` each run a 10-trial constrained MO-TPE study
-(`src/experiments/struct_hpo.py`, 2 enqueued priors, 3 startup trials, same objectives and RD
-band as the KD sweeps); the winner per arm is the five-metric undominated verdict plus human pick and
-runs the held-out protocol once. `struct_bce` is a single run and the first comparator for both.
+(`src/experiments/struct_hpo.py`, 2 enqueued priors, 3 startup trials) uses the same
+three objectives and final five-metric mean-rank winner as the KD driver.
+The selected winner runs the held-out protocol once. `struct_bce` is a single run and the first comparator for both.
 
 ## 2. Main results — edge and assembled topology
 

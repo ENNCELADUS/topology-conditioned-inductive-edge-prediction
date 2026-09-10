@@ -101,6 +101,7 @@ from src.distill.struct_targets import structural_row_targets
 from src.distill.validation import OracleValidationBank
 from src.e2_pipeline import ProbeResult
 from src.eval.checkpoint_selection import (
+    SELECTION_RULE,
     CheckpointCandidate,
     TopologyValidationMetrics,
     select_checkpoint,
@@ -1548,9 +1549,10 @@ def write_outputs(
 ) -> None:
     """Write the pinned run artifacts into ``cfg.output_dir``.
 
-    Finalizes ``best.pt`` / ``last.pt`` (payload keys exactly ``model_state``,
+    Finalizes ``best.pt`` / ``last.pt`` (payload keys include ``model_state``,
     ``model_family``, ``model_config``, ``epoch``, ``val_metrics``, ``seed``,
-    ``config``) and ``run_metadata.json`` (config hash, checkpoint id = first
+    ``config``; best also embeds its selected topology threshold and rule) and
+    ``run_metadata.json`` (config hash, checkpoint id = first
     16 hex of the sha256 over the best
     checkpoint's model_state tensor bytes, torch version, timestamp, dropped-pair
     counts, positives mode, and — when ``result.val_threshold_transfer`` is set —
@@ -1567,17 +1569,18 @@ def write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     config_dict = config_to_dict(cfg)
 
-    _torch_save_atomic(
-        _checkpoint_payload(
-            result.best_state_dict,
-            cfg,
-            model_kwargs,
-            result.best_epoch,
-            result.best_val_metrics,
-            config_dict,
-        ),
-        output_dir / "best.pt",
+    best_payload = _checkpoint_payload(
+        result.best_state_dict,
+        cfg,
+        model_kwargs,
+        result.best_epoch,
+        result.best_val_metrics,
+        config_dict,
     )
+    if result.val_threshold_transfer is not None:
+        best_payload["val_threshold_transfer"] = asdict(result.val_threshold_transfer)
+        best_payload["selection_rule"] = SELECTION_RULE
+    _torch_save_atomic(best_payload, output_dir / "best.pt")
     _torch_save_atomic(
         _checkpoint_payload(
             result.last_state_dict,
@@ -1605,8 +1608,8 @@ def write_outputs(
         "selected_epoch": result.best_epoch,
     }
     if result.val_threshold_transfer is not None:
-        # Lets a future test-time operating point be derived by degree-density
-        # transfer without re-scoring V_val.
+        # Freeze the selected checkpoint and its own validation threshold together.
+        run_metadata["selection_rule"] = SELECTION_RULE
         run_metadata["val_threshold_transfer"] = asdict(result.val_threshold_transfer)
     _write_json_atomic(output_dir / "run_metadata.json", run_metadata)
     logger.info(
@@ -2626,6 +2629,8 @@ def _evaluate_val_universe(
     return ValTopologyResult(
         metrics=TopologyValidationMetrics(**metrics_payload),
         threshold=cast(float, result_payload["threshold"]),
+        geometric_rd=cast(float | None, result_payload.get("geometric_rd")),
+        mean_abs_log_rd=cast(float | None, result_payload.get("mean_abs_log_rd")),
     )
 
 
@@ -2686,6 +2691,8 @@ def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | No
             spectral_mmd=float(cast(float, row["val_spectral_mmd_ratio"])),
         ),
         threshold=float(cast(float, row["val_threshold"])),
+        geometric_rd=cast(float | None, row.get("val_rd_geometric")),
+        mean_abs_log_rd=cast(float | None, row.get("val_rd_mean_abs_log")),
     )
 
 
@@ -3774,7 +3781,7 @@ def train_ddp_loop(
     Trains up to ``cfg.optim.epochs`` epochs with a validation after every epoch
     (the V_val topology pass on the ``eval.topology_every`` cadence). Patience
     counts on the validation task loss and really stops the run;
-    checkpoint selection stays independent -- the six-criterion mean rank, or
+    checkpoint selection stays independent -- the five-criterion mean rank, or
     validation AUPRC alone when ``eval.classification_only`` skips the topology
     pass. Tail batches are loss-scaled with
     :func:`scale_ddp_mean_loss`; a non-finite loss on any rank aborts all ranks;
@@ -4000,6 +4007,10 @@ def train_ddp_loop(
                     raise RuntimeError(f"resume candidate epoch mismatch at epoch {epoch}")
                 if candidate.get("selection_metrics") != entry:
                     raise RuntimeError(f"resume metric/candidate mismatch at epoch {epoch}")
+                if not isinstance(entry, dict) or entry.get("selection_rule") != SELECTION_RULE:
+                    raise RuntimeError(
+                        "cannot resume across threshold protocols; start a fresh run"
+                    )
                 return candidate
 
             candidate = _run_rank_symmetric(
@@ -4395,6 +4406,10 @@ def train_ddp_loop(
                     "val_threshold": outcome.topology.threshold,
                 }
             )
+        if outcome.topology is not None and outcome.topology.geometric_rd is not None:
+            entry["val_rd_geometric"] = outcome.topology.geometric_rd
+            entry["val_rd_mean_abs_log"] = outcome.topology.mean_abs_log_rd
+        entry["selection_rule"] = SELECTION_RULE
         history.append(entry)
         metrics_by_epoch[epoch] = metrics
         topology_by_epoch[epoch] = outcome.topology
@@ -4622,7 +4637,7 @@ def train_ddp_loop(
         "per_epoch": per_epoch_profiles,
     }
 
-    # Selection over the whole run: mean rank on AUPRC plus all five topology
+    # Selection over the whole run: mean rank on AUPRC, GS and three MMD
     # metrics over the epochs whose due V_val pass ran (production; the
     # eval.topology_every cadence skips the rest), best AUPRC otherwise
     # (unit tests inject evaluate_fn stubs without a topology context).

@@ -50,7 +50,7 @@ def read_metric_rows(metrics_path: Path) -> list[dict[str, Any]]:
 
 
 def read_run(run_dir: Path, topology_every: int | None = None) -> RunMetrics:
-    """Load the six-metric surface at the selected epoch of ``run_dir``.
+    """Load the five-metric ranking surface at the selected epoch of ``run_dir``.
 
     ``topology_every`` reselects the epoch with the frozen checkpoint selector
     restricted to that cadence's due epochs (divisible by it, plus the final
@@ -134,7 +134,7 @@ def _reselect(run_dir: Path, topology_every: int) -> tuple[int, dict[str, Any]]:
         if epoch % topology_every == 0 or epoch == final
     ]
     selected = select_checkpoint(candidates)
-    assert selected is not None  # the final epoch is always due, so never empty
+    assert selected is not None  # The final epoch is always a candidate.
     return selected.epoch, rows_by_epoch[selected.epoch]
 
 

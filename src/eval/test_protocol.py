@@ -2,7 +2,7 @@
 
 Owns the whole post-train sequence for one arm and nothing else::
 
-    score val_topology -> select the topology threshold (density-first cascade)
+    score val_topology -> replay the checkpoint-frozen topology threshold
     score val_cls       -> select the classification threshold (max F1)
     score test          -> AUROC/AUPRC on raw logits; Accuracy/F1/MCC at the
                            frozen max-F1 threshold; ECE/Brier on raw sigmoid
@@ -37,8 +37,13 @@ from typing import Protocol, cast
 import numpy as np
 from scipy.special import expit
 
+from src.eval.checkpoint_selection import SELECTION_RULE
 from src.eval.edge_metrics import select_max_f1_threshold
-from src.eval.fixed_threshold import evaluate_fixed_threshold, select_fixed_threshold
+from src.eval.fixed_threshold import (
+    FixedThresholdSelection,
+    evaluate_fixed_threshold,
+    select_fixed_threshold,
+)
 from src.eval.graph_metrics import MMDConfig
 from src.eval.report_edge_metrics import report_edge_metrics
 from src.experiments.g1_hardened_e2 import (
@@ -59,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ScoreRunner", "TestProtocolResult", "build_parser", "main", "run_test_protocol"]
 
-_SCHEMA_VERSION = "test_protocol_v7"
+_SCHEMA_VERSION = "test_protocol_v8"
 #: The filename `src.e2_pipeline` (and `src.train_egostitch`/`src.train_b0`)
 #: publish training provenance into: checkpoint identity, publication status,
 #: and access-audit fields no scoring call may destroy. This module never
@@ -540,13 +545,47 @@ def run_test_protocol(
     )
     validation_split = _load_val_region_split(data_root, strategy)
     config = MMDConfig()
-    fixed_selection = select_fixed_threshold(
-        pairs=list(validation_artifact.pairs()),
-        logits=validation_artifact.logit.astype(np.float64),
-        g_ref=validation_split.build_g_val(),
-        buckets=validation_split.buckets,
-        config=config,
-    )
+    if is_egostitch_e2e_family:
+        # The true-structure oracle has a separate diagnostic validation surface.
+        fixed_selection = select_fixed_threshold(
+            pairs=list(validation_artifact.pairs()),
+            logits=validation_artifact.logit.astype(np.float64),
+            g_ref=validation_split.build_g_val(),
+            buckets=validation_split.buckets,
+            config=config,
+        )
+    else:
+        import torch
+
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        if payload.get("selection_rule") != SELECTION_RULE:
+            raise ValueError("checkpoint lacks the current frozen threshold; reselect on V_val")
+        frozen_threshold = float(payload["val_threshold_transfer"]["threshold"])
+        if not np.isfinite(frozen_threshold):
+            raise ValueError("non-finite frozen topology threshold")
+        replay_metrics, replay_report = evaluate_fixed_threshold(
+            pairs=list(validation_artifact.pairs()),
+            logits=validation_artifact.logit.astype(np.float64),
+            g_ref=validation_split.build_g_val(),
+            buckets=validation_split.buckets,
+            threshold=frozen_threshold,
+            config=config,
+        )
+        fixed_selection = FixedThresholdSelection(
+            frozen_threshold,
+            replay_metrics,
+            {
+                "rule": SELECTION_RULE,
+                "source": "checkpoint_frozen_threshold",
+                "validation_replay": replay_report,
+                "selected": {
+                    "logit_threshold": frozen_threshold,
+                    "validation_graph_similarity": replay_metrics.graph_similarity,
+                    "validation_relative_density": replay_metrics.relative_density,
+                    "validation_mmd_ratio": dict(replay_metrics.mmd_ratio),
+                },
+            },
+        )
 
     val_cls_path = _score(
         "val_cls",

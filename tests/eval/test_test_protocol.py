@@ -18,6 +18,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import networkx as nx
 import numpy as np
@@ -203,7 +204,16 @@ def _write_checkpoint(tmp_path: Path, *, model_family: str = "v3_1") -> Path:
     longer a valid fixture checkpoint.
     """
     checkpoint = tmp_path / "checkpoint.pt"
-    torch.save({"model_family": model_family}, checkpoint)
+    torch.save(
+        {
+            "model_family": model_family,
+            "selection_rule": "geometric_rd_five_rank_v1",
+            "val_threshold_transfer": {
+                "threshold": float(np.float32(_logit_for_prob(0.9)) + np.float32(1.0))
+            },
+        },
+        checkpoint,
+    )
     return checkpoint
 
 
@@ -323,7 +333,7 @@ class TestRunTestProtocol:
             "graph",
             "provenance",
         ]
-        assert report["schema_version"] == "test_protocol_v7"
+        assert report["schema_version"] == "test_protocol_v8"
 
         arm_block = report["arm"]
         assert isinstance(arm_block, dict)
@@ -371,7 +381,7 @@ class TestRunTestProtocol:
         assert isinstance(graph, dict)
         assert set(graph.keys()) == {"fixed_threshold"}
         fixed = graph["fixed_threshold"]
-        assert fixed["validation_selection"]["rule"] == "sampled_subgraph_density_shape_1se_v3"
+        assert fixed["validation_selection"]["rule"] == "geometric_rd_five_rank_v1"
         assert fixed["test"]["matching"] == "fixed_threshold_selected_on_validation"
         selected_threshold = fixed["validation_selection"]["selected"]["logit_threshold"]
         assert fixed["test"]["logit_threshold"] == pytest.approx(selected_threshold)
@@ -1320,3 +1330,30 @@ class TestOracleAndCaziForwarding:
                 model_family="cazi_mbn",
             )
         assert runner.calls == []
+
+
+def test_v31_replays_embedded_threshold_without_reselection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    checkpoint = _write_checkpoint(tmp_path)
+    monkeypatch.setattr(
+        test_protocol,
+        "select_fixed_threshold",
+        lambda **kwargs: pytest.fail("must replay, never reselect"),
+    )
+    result = run_test_protocol(
+        checkpoint=checkpoint,
+        output_dir=tmp_path / "out",
+        data_root=fixture.data_root,
+        strategy=_STRATEGY,
+        arm="full",
+        seed=0,
+        score_runner=_FakeScoreRunner(fixture.artifacts),
+    )
+    payload = torch.load(checkpoint, weights_only=True)
+    graph = cast(dict[str, Any], result.report["graph"])
+    assert (
+        graph["fixed_threshold"]["test"]["logit_threshold"]
+        == payload["val_threshold_transfer"]["threshold"]
+    )

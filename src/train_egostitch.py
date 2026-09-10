@@ -1534,13 +1534,11 @@ def select_e2e_checkpoint(
     records: Sequence[E2ECheckpointRecord],
     arm: E2EArmName,
 ) -> E2ECheckpointRecord | None:
-    """Select by mean rank over AUPRC and all five topology metrics.
+    """Select by mean rank over AUPRC, GS and the three MMD ratios.
 
     Delegates to :func:`src.eval.checkpoint_selection.select_checkpoint`
-    (AUPRC↑, GS↑, RD→1, degree/clustering/spectral MMD↓, ties on higher
-    AUPRC then later epoch). There is still no eligibility predicate:
-    whether the selected checkpoint is scientifically usable remains an
-    owner-side judgement made from ``metrics.jsonl``. ``arm`` is accepted
+    (AUPRC↑, GS↑, degree/clustering/spectral MMD↓, ties on higher
+    GS, geo-MMD, then earlier epoch). RD is reported but not ranked. ``arm`` is accepted
     only to keep one call signature across arms.
     """
     del arm
@@ -4120,6 +4118,7 @@ def _validate_epoch(
     }
     endpoint_degree = _e2e_validation_endpoint_degrees(data)
     val_threshold = 0.0
+    density_fidelity: dict[str, float] = {}
     if reference is not None and ball_union is not None and universe_logits is not None:
         topology_result = val_region_topology_metrics(
             u_idx=ball_union.u_idx,
@@ -4129,6 +4128,10 @@ def _validate_epoch(
         )
         validation_topology = topology_result.metrics
         val_threshold = topology_result.threshold
+        if topology_result.geometric_rd is not None:
+            density_fidelity["rd_geometric"] = topology_result.geometric_rd
+        if topology_result.mean_abs_log_rd is not None:
+            density_fidelity["rd_mean_abs_log"] = topology_result.mean_abs_log_rd
     else:
         validation_topology = TopologyValidationMetrics(
             gs=0.0, rd=0.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
@@ -4142,6 +4145,7 @@ def _validate_epoch(
         "selection_tiebreak": 0.0,
         "gs_bfs": validation_topology.gs,
         "rd_bfs": validation_topology.rd,
+        **density_fidelity,
         "degree_mmd_ratio": validation_topology.degree_mmd,
         "clustering_mmd_ratio": validation_topology.clustering_mmd,
         "spectral_mmd_ratio": validation_topology.spectral_mmd,
@@ -5754,7 +5758,7 @@ def _train_e2e_stability_loop(
         # is a pure function of the epoch, identical on every rank): only those
         # epochs produce `E2ECheckpointRecord`s, and stopping on a cascade epoch
         # would drop selection into the `telemetry_miss_last_epoch` fallback
-        # instead of the six-criterion mean rank.
+        # instead of the five-criterion mean rank.
         stop_now = accelerator.reduce(
             torch.tensor(
                 int(
@@ -5805,15 +5809,9 @@ def _train_e2e_stability_loop(
         reduction="sum",
     )
     selected_epoch = int(selected_epoch_tensor.item())
-    selection_status = "selected"
-    diagnostic_epoch: int | None = None
     if selected_epoch <= 0:
-        selection_status = "telemetry_miss_last_epoch"
-        diagnostic_epoch = completed_epochs
-        if accelerator.is_main_process:
-            best_state = last_state
-            best_metrics = last_metrics
-    result_epoch = selected_epoch if selected_epoch > 0 else cast(int, diagnostic_epoch)
+        raise RuntimeError("training produced no measured checkpoint candidates")
+    result_epoch = selected_epoch
 
     if not profile_only and arm == "full":
         precision_error = None
@@ -5988,8 +5986,8 @@ def _train_e2e_stability_loop(
         "quality_guard_events": quality_guard_events,
         "quality_guards_passed": quality_guards_passed,
         "selected_epoch": selected_epoch if selected_epoch > 0 else None,
-        "selection_status": selection_status,
-        "diagnostic_epoch": diagnostic_epoch,
+        "selection_status": "selected",
+        "diagnostic_epoch": None,
         "profile_only": profile_only,
     }
     if accelerator.is_main_process and data.access_audit is not None:

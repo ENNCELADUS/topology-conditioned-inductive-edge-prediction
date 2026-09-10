@@ -421,3 +421,39 @@ to 16. See the [failure evidence and retry audit](../docs/results/split20260908_
 The structural BCE retry has completed publication/test; the teacher retry is still
 running as of that audit. Retain failed attempt directories as evidence and inspect
 the current attempt and publication/test artifacts separately.
+
+## Selection protocol: geometric RD, then five-metric checkpoint ranking
+
+New runs use `geometric_rd_five_rank_v1` (Experiments §1.2/§1.5). Each epoch first
+minimizes the absolute size-macro mean log RD. Exact ties use GS, geo-MMD, then
+the larger threshold. Empty predicted subgraphs give infinite density error; the
+all-pairs threshold is always finite. There is no density band or quality gate.
+Rank epochs equally on AUPRC, GS and three MMD ratios; report arithmetic/geometric
+RD and log-density distortion separately. The selected threshold travels with
+`best.pt` and replays unchanged on test.
+
+Optuna uses AUPRC, GS and geo-MMD as three objectives and writes a final five-metric
+mean-rank `best_trial.json`. RD deviation does not prune a trial. Use a separate
+study directory for changed objectives. Existing saved epochs can be re-scored on
+V_val and reselected offline without retraining; retain original results and write
+replay outputs separately. Old TPE trajectories and untrained epochs cannot be
+recovered. Do not stop active sweeps merely to apply an offline selection rule.
+
+The seed-42 migration driver owns disjoint `rank`, `rank_rep`, and `struct` lanes:
+
+```bash
+OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 .venv/bin/python -m src.experiments.reselect_campaign \
+  --source-root outputs/split_seed42 --output-root outputs/split_seed42_geometric_20260910 \
+  --lane rank  # rank_rep on the second container; struct on the third
+```
+
+It scores the V_val topology/classification pair union once per saved V3.1 epoch
+through `hpc/run.sh score`, evaluates the new rule on CPU, and writes separate
+replay artifacts. It preserves source trial numbers and imports re-evaluated
+objectives into the new Optuna study, then continues its remaining trial budget.
+Interrupted runs with a training snapshot resume from a copied, re-evaluated
+prefix; an interrupted run with no saved epoch starts from its original config.
+The teacher checkpoint and target banks remain the original frozen sources.
+After rank/rank_rep HPO, the driver runs their assigned rep/logit/gram grids;
+all stages remain validation-only (`--skip-test`). `lane_<name>.json` records
+running/complete/failed; publication is not evidence of held-out evaluation.

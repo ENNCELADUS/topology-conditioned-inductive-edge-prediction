@@ -17,11 +17,10 @@ from src.eval.fixed_threshold import (
     _incremental_mmd_ratio_curve,
     _initialize_mmd_state,
     _local_samples,
-    _macro_abs_log_rd_curve,
+    _macro_log_rd_gs_curves,
     _mmd_ratio_for_statistic,
     _normalized_descriptor,
     _precompute_reference_descriptors,
-    _stratified_paired_se_curve,
     _update_mmd_state,
     evaluate_fixed_threshold,
     select_fixed_threshold,
@@ -71,142 +70,60 @@ def test_atomic_logit_candidates_keep_sparse_optima_and_saturated_order() -> Non
 
 
 def test_macro_curve_averages_buckets_not_samples() -> None:
-    """D_RD weighs each size bucket equally, whatever its sample count."""
-    nodes = ["a", "b", "c"]
-    pairs = list(combinations_with_replacement(nodes, 2))
-    graph = nx.Graph([("a", "b"), ("b", "c")])
-    by_pair = {("a", "a"): 1.0, ("a", "b"): 1.0}
-    logits = np.array([by_pair.get(pair, -3.0) for pair in pairs])
-    # Size 2: RD 2 per sample (|log RD| = log 2); size 3: RD 1 (0), four samples.
-    buckets = {2: [{"a", "b"}, {"a", "b"}], 3: [set(nodes)] * 4}
+    pairs, _, graph, _ = _fixture()
+    logits = np.array([1.0 if pair in [("a", "a"), ("a", "b")] else -3.0 for pair in pairs])
+    buckets = {2: [{"a", "b"}] * 2, 3: [{"a", "b", "c"}] * 4}
     samples = _local_samples(pairs=pairs, logits=logits, g_ref=graph, buckets=buckets)
-
-    curve = _macro_abs_log_rd_curve(samples, np.array([1.0]))
-
-    assert curve[0] == pytest.approx(np.log(2.0) / 2.0)  # macro, not 2*log(2)/6
-
-
-def test_paired_se_weights_unequal_buckets_equally() -> None:
-    """The paired SE estimates the equal-bucket macro D_RD objective."""
-
-    def sample(size: int, logits: list[float]) -> fixed_threshold._LocalSample:
-        return fixed_threshold._LocalSample(
-            size=size,
-            nodes=set(),
-            pairs=(("a", "a"), ("a", "b")),
-            logits=np.array(logits),
-            truth=np.array([True, False]),
-        )
-
-    variable_bucket = [sample(2, [2.0, 0.5]), sample(2, [2.0, 1.5])]
-    constant_bucket = [sample(3, [2.0, 1.5]) for _ in range(4)]
-
-    se = _stratified_paired_se_curve(
-        tuple(variable_bucket + constant_bucket),
-        np.array([1.0]),
-        reference_threshold=0.0,
-    )
-
-    assert se[0] == pytest.approx(np.log(2.0) / np.sqrt(32.0))
+    rd, gs = _macro_log_rd_gs_curves(samples, np.array([1.0]))
+    assert rd[0] == pytest.approx(np.log(2 / 3) / 2)
+    assert gs[0] == pytest.approx((1 + 4 / 5) / 2)
 
 
-def test_density_stage_beats_gs_optimum() -> None:
-    """RD=1 at 2.0 wins although 1.0 has strictly higher mean GS."""
+def test_geometric_density_optimum_precedes_gs() -> None:
     pairs, logits, graph, buckets = _graded_fixture()
     selection = select_fixed_threshold(
-        pairs=pairs,
-        logits=logits,
-        g_ref=graph,
-        buckets=buckets,
-        config=MMDConfig(),
+        pairs=pairs, logits=logits, g_ref=graph, buckets=buckets, config=MMDConfig()
     )
-
-    assert selection.logit_threshold == pytest.approx(2.0)
-    assert selection.report["rule"] == "sampled_subgraph_density_shape_1se_v3"
-    density_stage = cast(dict[str, object], selection.report["density_stage"])
-    assert density_stage["best_logit_threshold"] == pytest.approx(2.0)
-    assert density_stage["min_d_rd"] == pytest.approx(0.0)
-    # Identical samples give zero SE: only the density optimum stays feasible.
-    assert density_stage["feasible_count"] == 1
+    assert selection.logit_threshold == 2.0
+    assert cast(dict[str, object], selection.report["density_stage"])["density_tie_count"] == 1
 
 
-def test_empty_graph_candidate_is_masked_not_fail_closed() -> None:
-    pairs, logits, graph, buckets = _fixture()
+def test_coarse_ties_still_select_a_finite_threshold() -> None:
+    pairs, _, graph, buckets = _fixture()
     selection = select_fixed_threshold(
-        pairs=pairs,
-        logits=logits,
-        g_ref=graph,
-        buckets=buckets,
-        config=MMDConfig(),
+        pairs=pairs, logits=np.ones(len(pairs)), g_ref=graph, buckets=buckets, config=MMDConfig()
     )
-
-    report = selection.report
-    density_stage = cast(dict[str, int], report["density_stage"])
-    # The empty-graph boundary candidate has D_RD = +inf and never selects.
-    assert density_stage["finite_candidate_count"] == cast(int, report["candidate_count"]) - 1
-    assert selection.logit_threshold <= float(np.max(logits))
+    assert cast(dict[str, object], selection.report["density_stage"])["finite_candidate_count"] == 1
+    assert selection.metrics.relative_density == 2.0
 
 
-def test_one_se_feasibility_admits_near_optimal_then_shape_argmin_decides(
+@pytest.mark.parametrize(
+    "gs,ratios,expected",
+    [
+        ([0, 0.4, 0.5, 0.4, 0], [[0.1, 0.1, 0.1]], 2.0),
+        ([0, 0.5, 0.5, 0.4, 0], [[2, 2, 2], [1, 1, 1]], 2.0),
+        ([0, 0.5, 0.5, 0.4, 0], [[1, 1, 1], [1, 1, 1]], 3.0),
+    ],
+)
+def test_density_ties_use_gs_then_mmd_then_larger_threshold(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pairs, logits, graph, buckets = _graded_fixture()
-    # Finite candidates descend [3.0, 2.0, 1.0, -2.0] with D_RD
-    # [log(3/2), 0, log(4/3), log 2]; this SE admits exactly {2.0, 1.0}.
-    monkeypatch.setattr(
-        fixed_threshold,
-        "_stratified_paired_se_curve",
-        lambda *args: np.array([0.0, 0.0, 0.3, 0.0]),
-    )
-    monkeypatch.setattr(
-        fixed_threshold,
-        "_incremental_mmd_ratio_curve",
-        lambda *args: np.array([[1.0] * 3, [0.1] * 3]),
-    )
-
-    selection = select_fixed_threshold(
-        pairs=pairs,
-        logits=logits,
-        g_ref=graph,
-        buckets=buckets,
-        config=MMDConfig(),
-    )
-
-    assert selection.logit_threshold == pytest.approx(1.0)
-    density_stage = cast(dict[str, object], selection.report["density_stage"])
-    shape_stage = cast(dict[str, object], selection.report["shape_stage"])
-    assert density_stage["feasible_count"] == 2
-    assert shape_stage["candidate_count"] == 2
-    assert shape_stage["selected_d_shape"] == pytest.approx(np.log(0.1))
-
-
-def test_complete_shape_tie_prefers_higher_logit_threshold(
-    monkeypatch: pytest.MonkeyPatch,
+    gs: list[float],
+    ratios: list[list[float]],
+    expected: float,
 ) -> None:
     pairs, logits, graph, buckets = _graded_fixture()
     monkeypatch.setattr(
         fixed_threshold,
-        "_stratified_paired_se_curve",
-        lambda *args: np.full(4, np.inf),
+        "_macro_log_rd_gs_curves",
+        lambda *args: (np.array([-np.inf, 0.0, 0.0, 0.1, 1.0]), np.array(gs)),
     )
     monkeypatch.setattr(
-        fixed_threshold,
-        "_incremental_mmd_ratio_curve",
-        lambda *args: np.ones((len(args[2]), 3)),
+        fixed_threshold, "_incremental_mmd_ratio_curve", lambda *args: np.array(ratios)
     )
-
     selection = select_fixed_threshold(
-        pairs=pairs,
-        logits=logits,
-        g_ref=graph,
-        buckets=buckets,
-        config=MMDConfig(),
+        pairs=pairs, logits=logits, g_ref=graph, buckets=buckets, config=MMDConfig()
     )
-
-    # Every finite candidate ties on shape: the largest logit wins, never the
-    # (infinite-D_RD) empty-graph boundary above it.
-    assert selection.logit_threshold == pytest.approx(float(np.max(logits)))
-    assert selection.report["tie_break"] == "higher_logit_threshold"
+    assert selection.logit_threshold == expected
 
 
 def test_selects_perfect_validation_boundary_and_replays_it_unchanged() -> None:
@@ -504,3 +421,33 @@ def test_missing_pair_and_nonfinite_logit_fail_closed() -> None:
             buckets=buckets,
             config=MMDConfig(),
         )
+
+
+def test_geometric_balance_differs_from_mean_absolute_log_error() -> None:
+    nodes = ["a", "b", "c", "d"]
+    pairs = list(combinations_with_replacement(nodes, 2))
+    graph = nx.Graph([("a", "a"), ("a", "b"), ("c", "c")])
+    graph.add_nodes_from(nodes)
+    scores = {("a", "a"): 2.0, ("c", "c"): 2.0, ("c", "d"): 2.0, ("a", "b"): 1.0}
+    logits = np.array([scores.get(pair, -1.0) for pair in pairs])
+    selection = select_fixed_threshold(
+        pairs=pairs,
+        logits=logits,
+        g_ref=graph,
+        buckets={2: [{"a", "b"}, {"c", "d"}]},
+        config=MMDConfig(),
+    )
+    # RD=[0.5,2] has geometric center 1; RD=[1,2] at threshold 1 has lower
+    # mean absolute log error but a worse geometric center.
+    assert selection.logit_threshold == 2.0
+    assert selection.metrics.relative_density == 1.25
+    diagnostics = cast(dict[str, object], selection.report["density_diagnostics"])
+    assert diagnostics["geometric_mean"] == pytest.approx(1.0)
+    assert diagnostics["mean_abs_log"] == pytest.approx(np.log(2))
+
+
+def test_zero_density_reporting_uses_zero_and_null_without_epsilon() -> None:
+    diagnostics = fixed_threshold.density_diagnostics({20: [0.0, 2.0], 40: [1.0, 1.0]})
+    assert diagnostics["geometric_mean"] == 0.0
+    assert diagnostics["mean_abs_log"] is None
+    assert diagnostics["zero_rd_samples"] == 1

@@ -1,20 +1,4 @@
-"""Checkpoint selection over pairwise AUPRC plus all five topology metrics.
-
-Protocol rule (docs/03-experiment-protocol.md §7): pairwise and the five
-topology numbers are reported together and never substituted by a single
-favorable criterion. Selection follows the same discipline: every candidate
-epoch is ranked jointly on AUPRC↑, GS↑, |log RD|↓, and the degree / clustering /
-spectral MMD ratios↓, and the best mean rank wins. A lexicographic rule with an
-absolute tolerance (the pre-2026-08-14 `select_e2e_checkpoint`) collapses to
-one criterion whenever an arm's AUPRC spread is smaller than the tolerance —
-which is exactly how kd_d2 published its untrained epoch-1 snapshot.
-
-The five numbers come from the V_val bucket evaluation
-(`src.eval.val_topology.val_region_topology_metrics`): the same sampled-only
-fixed-threshold selector used by the held-out protocol over the pinned 500-ball
-bucket bank — BFS-macro GS, BFS-macro RD, and the three
-odd/even-floor-normalized MMD ratios.
-"""
+"""Checkpoint selection by equal mean rank over five V_val quality metrics."""
 
 from __future__ import annotations
 
@@ -23,6 +7,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.stats import rankdata
+
+SELECTION_RULE = "geometric_rd_five_rank_v1"
 
 
 @dataclass(frozen=True)
@@ -56,22 +42,11 @@ class CheckpointCandidate:
 def select_checkpoint(
     candidates: Sequence[CheckpointCandidate],
 ) -> CheckpointCandidate | None:
-    """Select the checkpoint with the best mean rank over all six criteria.
+    """Rank AUPRC, GS and three MMD ratios equally; RD is reporting-only.
 
-    Criteria (all ranked with average ranks, then averaged): AUPRC higher,
-    GS higher, |log RD| lower (RD 0 ranks worst as a derived ``+inf``), and
-    each of the degree / clustering / spectral MMDs lower. Ties break on
-    higher AUPRC, then the later epoch (an untrained early snapshot never
-    wins a full tie).
-
-    Args:
-        candidates: One entry per eligible epoch; empty selects nothing.
-
-    Returns:
-        The winning candidate, or `None` for an empty sequence.
-
-    Raises:
-        ValueError: If any candidate carries a non-finite metric or negative RD.
+    Exact metric ties receive average ranks. Mean-rank ties prefer higher GS,
+    lower geo-MMD, then earlier epoch. Only an empty input returns None;
+    invalid numerical inputs still fail closed.
     """
     if not candidates:
         return None
@@ -91,13 +66,11 @@ def select_checkpoint(
     )
     if not np.all(np.isfinite(raw)):
         raise ValueError("non-finite checkpoint-selection metric")
+    if np.any(raw[:, 3:] < 0):
+        raise ValueError("checkpoint-selection MMD ratios must be non-negative")
     if np.any(raw[:, 2] < 0):
         raise ValueError("checkpoint-selection RD must be non-negative")
-    with np.errstate(divide="ignore"):
-        rd_criterion = np.abs(np.log(raw[:, 2]))
-    columns = np.column_stack(
-        [-raw[:, 0], -raw[:, 1], rd_criterion, raw[:, 3], raw[:, 4], raw[:, 5]]
-    )
+    columns = np.column_stack([-raw[:, 0], -raw[:, 1], raw[:, 3], raw[:, 4], raw[:, 5]])
     ranks = np.stack(
         [rankdata(columns[:, criterion], method="average") for criterion in range(columns.shape[1])]
     )
@@ -106,8 +79,9 @@ def select_checkpoint(
         range(len(candidates)),
         key=lambda index: (
             float(mean_rank[index]),
-            -candidates[index].auprc,
-            -candidates[index].epoch,
+            -candidates[index].topology.gs,
+            float(np.prod(raw[index, 3:]) ** (1.0 / 3.0)),
+            candidates[index].epoch,
         ),
     )
     return candidates[best]

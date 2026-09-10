@@ -31,14 +31,6 @@ from src.model.egostitch.generator.oracle import OracleStructGenerator
 pytestmark = pytest.mark.unit
 
 
-def test_quality_miss_uses_completed_final_epoch_instead_of_aborting() -> None:
-    source = inspect.getsource(te._train_e2e_stability_loop)
-    assert 'selection_status = "telemetry_miss_last_epoch"' in source
-    assert "best_state = last_state" in source
-    assert "produced no eligible checkpoint" not in source
-    assert "enforce_quality = False" in source
-
-
 def _record(
     epoch: int, *, auprc: float, gs: float, rd: float, mmd: float
 ) -> te.E2ECheckpointRecord:
@@ -59,21 +51,21 @@ def _record(
     )
 
 
-def test_selection_returns_the_best_record_with_no_eligibility_predicate() -> None:
-    """A degenerate record is still selected: eligibility is an owner judgement.
-
-    There is deliberately no `e2e_checkpoint_eligible` anywhere in the tree —
-    nothing in code decides whether a checkpoint is scientifically usable.
-    """
-    assert not hasattr(te, "e2e_checkpoint_eligible")
-    record = _record(30, auprc=0.0, gs=0.0, rd=0.0, mmd=1.0)
+def test_quality_telemetry_does_not_exclude_an_rd_feasible_record() -> None:
+    record = _record(30, auprc=0.0, gs=0.0, rd=1.0, mmd=1.0)
     assert te.select_e2e_checkpoint([record], "full") == record
 
 
-def test_selection_ranks_auprc_and_all_five_topology_metrics_jointly() -> None:
+def test_selection_does_not_gate_on_rd() -> None:
+    record = _record(30, auprc=0.99, gs=0.99, rd=1.8, mmd=0.01)
+    assert te.select_e2e_checkpoint([record], "full") == record
+
+
+def test_selection_ranks_auprc_gs_and_three_mmds_jointly() -> None:
     """The single-MMD trap: an untrained epoch winning one MMD must not be selected."""
-    untrained = _record(1, auprc=0.0084, gs=0.05, rd=0.0, mmd=0.14)
-    trained = _record(25, auprc=0.0213, gs=0.30, rd=0.9, mmd=0.19)
+    untrained = replace(_record(1, auprc=0.0084, gs=0.05, rd=0.0, mmd=0.14),
+                        degree_mmd=.3, spectral_mmd=.3)
+    trained = _record(25, auprc=0.0213, gs=0.30, rd=1.0, mmd=0.19)
     assert te.select_e2e_checkpoint([untrained, trained], "full") == trained
 
 

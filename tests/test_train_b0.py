@@ -3046,3 +3046,36 @@ def test_student_weighted_bce_matches_teacher_objective() -> None:
     actual_gradient = torch.autograd.grad(output["loss"], output["logits"], retain_graph=True)[0]
     expected_gradient = torch.autograd.grad(expected, output["logits"])[0]
     torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_ddp_loop_selects_measured_checkpoint_without_density_gate(tmp_path: Path) -> None:
+    config_path = tmp_path / "cfg.yaml"
+    _write_yaml_config(config_path, {"optim.epochs": 2, "eval.patience": 8})
+    cfg = load_config(config_path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+
+    def evaluate_infeasible(
+        model: nn.Module, loader: Iterable[dict[str, torch.Tensor]], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        return ValidationOutcome(
+            _constant_metrics(),
+            ValTopologyResult(TopologyValidationMetrics(0.5, 1.8, 0.1, 0.1, 0.1), 0.3),
+            0.5,
+        )
+
+    attempt = tmp_path / "attempt"
+    result = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=attempt,
+        evaluate_fn=evaluate_infeasible,
+        require_topology=True,
+    )
+    assert (attempt / "checkpoints" / "epoch-0002.pt").exists()
+    assert len((attempt / "metrics.jsonl").read_text().splitlines()) == 2
+    assert result.best_epoch == 1
+    assert not (attempt / "best.pt").exists()

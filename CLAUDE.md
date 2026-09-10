@@ -128,7 +128,7 @@ stay fail-closed. `complete.json` means published, not evaluated: held-out evide
 - Report edge-level and assembled-graph metrics together — never one family alone.
 - Each topology operating point reports five numbers together: BFS-macro GS/RD and degree /
   clustering / spectral MMD ratios (GS↑, RD→1, ratios↓). The primary deployable result is the ONE
-  V_val-selected fixed threshold (density-first cascade) on every test subgraph; Accuracy/F1/MCC use
+  V_val-selected fixed threshold (closest geometric RD) on every test subgraph; Accuracy/F1/MCC use
   a separate max-F1 threshold frozen on `val_cls`; ECE/Brier use raw probabilities. GS is edge-set Dice/F1.
 - Compare KD arms against `b1_kd_control` and check the selected epoch before crediting a KD term:
   matched-epoch control runs (epochs 10/11) erased the earlier `kd_struct`/`kd_white` gains. The
@@ -169,8 +169,8 @@ stay fail-closed. `complete.json` means published, not evaluated: held-out evide
 - `load_scores` does no precision validation, so a bf16-contaminated artifact analyses cleanly. Call
   `validate_artifact_precision(artifact, label=…)`; `validate_score_precision` on an `egostitch_e2e`
   artifact spuriously raises "missing arrays".
-- Checkpoint selection (`src/eval/checkpoint_selection.py`) mean-ranks AUPRC plus the five V_val
-  topology metrics and can still return a weak checkpoint. There is no eligibility predicate and none
+- Checkpoint selection (`src/eval/checkpoint_selection.py`) mean-ranks AUPRC, GS and the three V_val
+  MMD ratios and can still return a weak checkpoint. There is no eligibility predicate and none
   should be added — judge usability from `metrics.jsonl`.
 - The fp32 islands in `generator/assemble.py` must promote inputs *before* cost and marginal products
   are formed; casting afterwards keeps the bf16 ulp grid and silently quantizes logits.

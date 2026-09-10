@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 
 import optuna
@@ -72,7 +71,7 @@ def _publish_run(run_dir: Path, rows: list[dict[str, object]], *, failure: bool 
     )
     (run_dir / "run_metadata.json").write_text(
         json.dumps(
-            {"selected_epoch": 2, "arm": "kd_rank", "config_hash": "d", "checkpoint_id": "c"}
+            {"selected_epoch": 4, "arm": "kd_rank", "config_hash": "d", "checkpoint_id": "c"}
         ),
         encoding="utf-8",
     )
@@ -85,42 +84,41 @@ def _publish_run(run_dir: Path, rows: list[dict[str, object]], *, failure: bool 
     return run_dir
 
 
-def test_trial_outcome_reads_cadence2_surface(tmp_path: Path) -> None:
+def test_trial_outcome_reads_published_surface(tmp_path: Path) -> None:
     run_dir = _publish_run(tmp_path / "trial_000", make_cadence_rows())
-    outcome = hpo.trial_outcome(run_dir, rd_band=0.05)
+    outcome = hpo.trial_outcome(run_dir)
     # make_cadence_rows: epoch 4 dominates the cadence-2 due set (gs .80, rd 1.02, mmds .60).
     assert outcome.gs == pytest.approx(0.80)
     assert outcome.geo_mmd == pytest.approx(0.60)
-    assert outcome.constraint == pytest.approx(abs(math.log(1.02)) - 0.05)
-    assert outcome.constraint < 0.0
+    assert outcome.values == pytest.approx([0.90, 0.80, 0.60])
     assert outcome.surface["selected_epoch"] == 4.0
 
 
-def test_trial_outcome_flags_rd_outside_band(tmp_path: Path) -> None:
+def test_trial_outcome_does_not_gate_on_rd(tmp_path: Path) -> None:
     rows = make_cadence_rows()
     rows[3]["val_rd_bfs"] = 1.20
     run_dir = _publish_run(tmp_path / "trial_001", rows)
-    assert hpo.trial_outcome(run_dir, rd_band=0.05).constraint > 0.0
+    assert hpo.trial_outcome(run_dir).surface["rd"] == 1.20
 
 
 def test_trial_outcome_propagates_run_failure(tmp_path: Path) -> None:
     run_dir = _publish_run(tmp_path / "trial_002", make_cadence_rows(), failure=True)
     with pytest.raises(RunFailure):
-        hpo.trial_outcome(run_dir, rd_band=0.05)
+        hpo.trial_outcome(run_dir)
 
 
 def test_trial_outcome_rejects_nonpositive_mmd_ratio(tmp_path: Path) -> None:
     rows = make_cadence_rows()
-    rows[3]["val_degree_mmd_ratio"] = 0.0
+    rows[3]["val_degree_mmd_ratio"] = -1.0
     run_dir = _publish_run(tmp_path / "trial_003", rows)
     with pytest.raises(ValueError):
-        hpo.trial_outcome(run_dir, rd_band=0.05)
+        hpo.trial_outcome(run_dir)
 
 
 def test_build_study_directions_and_priors(tmp_path: Path) -> None:
     study = hpo.build_study(tmp_path / "optuna.db")
     assert study.study_name == "kd_rank_strict_llp"
-    assert [d.name.lower() for d in study.directions] == ["maximize", "minimize"]
+    assert [d.name.lower() for d in study.directions] == hpo.OBJECTIVE_DIRECTIONS
     hpo.enqueue_priors(study)
     assert len(study.get_trials(deepcopy=False)) == 6
 
@@ -153,14 +151,6 @@ def test_suggest_params_consumes_priors_in_order(tmp_path: Path) -> None:
     assert second == hpo.ENQUEUED_PRIORS[1]
 
 
-def test_constraints_default_to_infeasible() -> None:
-    study = optuna.create_study(directions=["maximize", "minimize"])
-    study.add_trial(
-        optuna.trial.create_trial(params={}, distributions={}, values=[0.5, 1.0], user_attrs={})
-    )
-    assert hpo._constraints(study.get_trials(deepcopy=False)[0]) == (float("inf"),)
-
-
 def _ask_running_trial(study: optuna.Study) -> optuna.Trial:
     trial = study.ask()
     hpo.suggest_params(trial)
@@ -172,14 +162,15 @@ def test_reconcile_completed_run_is_retold_with_values(tmp_path: Path) -> None:
     hpo.enqueue_priors(study)
     trial = _ask_running_trial(study)
     _publish_run(tmp_path / f"trial_{trial.number:03d}", make_cadence_rows())
-    hpo.reconcile_running(study, tmp_path, rd_band=0.05)
+    hpo.reconcile_running(study, tmp_path)
     trials = study.get_trials(deepcopy=False)
-    assert [t.state for t in trials if t.number == trial.number] == [TrialState.FAIL]
+    assert [t.state for t in trials if t.number == trial.number] == [TrialState.COMPLETE]
     twins = [t for t in trials if t.state == TrialState.COMPLETE]
     assert len(twins) == 1
     assert twins[0].params == dict(hpo.ENQUEUED_PRIORS[0])
-    assert twins[0].values == pytest.approx([0.80, 0.60])
-    assert twins[0].user_attrs["constraint"][0] < 0.0
+    assert twins[0].values == pytest.approx(
+        hpo.trial_outcome(tmp_path / f"trial_{trial.number:03d}").values
+    )
     assert twins[0].user_attrs["surface"]["selected_epoch"] == 4.0
     assert [t.number for t in study.best_trials] == [twins[0].number]
 
@@ -189,7 +180,7 @@ def test_reconcile_failed_and_vanished_runs_are_failed(tmp_path: Path) -> None:
     failed = _ask_running_trial(study)
     _publish_run(tmp_path / f"trial_{failed.number:03d}", make_cadence_rows(), failure=True)
     vanished = _ask_running_trial(study)
-    hpo.reconcile_running(study, tmp_path, rd_band=0.05)
+    hpo.reconcile_running(study, tmp_path)
     states = {t.number: t.state for t in study.get_trials(deepcopy=False)}
     assert states[failed.number] == TrialState.FAIL
     assert states[vanished.number] == TrialState.FAIL
@@ -261,6 +252,9 @@ def test_run_sweep_completes_n_trials(tmp_path: Path, monkeypatch: pytest.Monkey
     assert [t.params for t in complete] == [dict(p) for p in hpo.ENQUEUED_PRIORS[:2]]
     assert all(t.user_attrs["surface"]["gs"] == pytest.approx(0.80) for t in complete)
     assert len(launched) == 2
+    winner = json.loads((tmp_path / "best_trial.json").read_text())
+    assert winner["trial_number"] == 0
+    assert winner["surface"]["threshold"] == 2.5
 
 
 def test_run_sweep_marks_failed_run_and_continues(
@@ -409,3 +403,40 @@ def test_dump_missing_banks_dumps_the_row_bank_first(
     assert "--contexts" not in shard_cmd and "--rw-step" not in shard_cmd
     assert shard_cmd[shard_cmd.index("--output") + 1] == str(tmp_path / "rows")
     assert "--merge" in merges[0] and "--contexts" not in merges[0]
+
+
+def test_old_two_objective_study_requires_fresh_directory(tmp_path: Path) -> None:
+    optuna.create_study(
+        study_name=hpo.STUDY_NAME,
+        storage=f"sqlite:///{tmp_path / 'optuna.db'}",
+        directions=["maximize", "minimize"],
+    )
+    with pytest.raises(ValueError, match="fresh sweep directory"):
+        hpo.build_study(tmp_path / "optuna.db")
+
+
+def test_trial_outcome_does_not_reselect_a_better_epoch(tmp_path: Path) -> None:
+    rows = make_cadence_rows()
+    # Epoch 3 is better, but epoch 4 is the actually published checkpoint.
+    run_dir = _publish_run(tmp_path / "trial_000", rows)
+    assert hpo.trial_outcome(run_dir).surface["selected_epoch"] == 4
+
+
+def test_five_metric_trial_winner_is_not_simply_highest_gs(tmp_path: Path) -> None:
+    study = hpo.build_study(tmp_path / "optuna.db")
+    for auprc, gs, rd, mmd in [(0.7, 0.5, 1.04, 3.0), (0.8, 0.4, 1.0, 2.0)]:
+        trial = study.ask()
+        surface = {
+            "auprc": auprc,
+            "gs": gs,
+            "rd": rd,
+            "degree_mmd": mmd,
+            "clustering_mmd": mmd,
+            "spectral_mmd": mmd,
+            "selected_epoch": 4.0,
+        }
+        outcome = hpo.TrialOutcome(gs, mmd, surface)
+        trial.set_user_attr("surface", surface)
+        study.tell(trial, outcome.values)
+    winner = hpo.select_trial(study)
+    assert winner is not None and winner.number == 1

@@ -135,11 +135,14 @@ def mmd_squared(
         raise ValueError("mmd_squared requires two non-empty sample sets")
     normalized1 = [sample / (float(np.sum(sample)) + 1e-6) for sample in samples1]
     normalized2 = [sample / (float(np.sum(sample)) + 1e-6) for sample in samples2]
-    return float(
+    raw = (
         _mean_kernel(normalized1, normalized1, sigma=config.sigma)
         + _mean_kernel(normalized2, normalized2, sigma=config.sigma)
         - 2.0 * _mean_kernel(normalized1, normalized2, sigma=config.sigma)
     )
+    # Biased kernel MMD2 is non-negative; cancellation at zero can round negative.
+    return float(np.maximum(raw, 0.0))
+
 
 
 @dataclass(frozen=True)
@@ -420,10 +423,10 @@ def evaluate_assembled_graph_with_reference(
         for stat in STATISTICS
     }
     graph_similarity = float(
-        np.mean([value for values in per_size_graph_similarity.values() for value in values])
+        np.mean([np.mean(values) for values in per_size_graph_similarity.values()])
     )
     relative_density = float(
-        np.mean([value for values in per_size_relative_density.values() for value in values])
+        np.mean([np.mean(values) for values in per_size_relative_density.values()])
     )
     return BucketedMMDReport(
         per_size_graph_similarity=per_size_graph_similarity,

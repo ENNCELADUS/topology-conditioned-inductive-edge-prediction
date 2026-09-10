@@ -1,14 +1,4 @@
-"""Unattended Optuna sweeps for the structural-stream arms (``grand`` and ``new``).
-
-Reuses the strict-LLP kd_rank loop (`src.experiments.kd_rank_strict_hpo`):
-ask-and-tell constrained MO-TPE with objectives (GS max, geometric-mean MMD
-ratio min) and the ``|log RD|`` soft constraint, one ``hpc/run.sh train
---skip-test`` per trial, scored at the cadence-2 selected epoch. Each arm is
-its own 10-trial study; only ``struct.weights`` and ``output_dir`` differ
-between trial configs. Winner selection stays the frozen five-metric
-undominated verdict plus the human pick.
-Spec: ``docs/superpowers/specs/2026-09-07-structural-stream-topology-losses-design.md`` section 8.
-"""
+"""Structural-arm HPO using the shared three-objective search and five-metric rank protocol."""
 
 from __future__ import annotations
 
@@ -127,7 +117,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-config", type=Path, default=None)
     parser.add_argument("--sweep-dir", type=Path, default=None)
     parser.add_argument("--n-trials", type=int, default=DEFAULT_TRIALS)
-    parser.add_argument("--rd-band", type=float, default=0.05)
     return parser
 
 

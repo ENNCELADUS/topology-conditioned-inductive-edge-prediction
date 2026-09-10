@@ -2252,9 +2252,8 @@ def test_phase_a_end_and_epoch_end_are_distinct_validation_events(
         _assert_training_inputs_are_not_inference_tensors,
     )
     cfg, _, _, result = helper._run(tmp_path)
-
-    events = result.runtime_profile["val_region_validation_events"]
-    assert result.runtime_profile["val_region_validation_event_count"] == cfg.optim.epochs + 2
+    events = cast(list[dict[str, object]], result.runtime_profile["val_region_validation_events"])
+    assert len(events) == cfg.optim.epochs + 2
     assert [row["kind"] for row in events] == [
         "step_0",
         "phase_a_end",

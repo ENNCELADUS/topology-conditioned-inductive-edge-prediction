@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import networkx as nx
 import numpy as np
@@ -10,7 +11,7 @@ from numpy.typing import NDArray
 
 from src.data.val_region import ValRegionSplit
 from src.eval.checkpoint_selection import TopologyValidationMetrics
-from src.eval.fixed_threshold import select_fixed_threshold
+from src.eval.fixed_threshold import density_diagnostics, select_fixed_threshold
 from src.eval.graph_metrics import MMDConfig
 
 
@@ -38,6 +39,8 @@ class ValTopologyResult:
 
     metrics: TopologyValidationMetrics
     threshold: float
+    geometric_rd: float | None = None
+    mean_abs_log_rd: float | None = None
 
 
 def val_region_topology_metrics(
@@ -78,6 +81,7 @@ def val_region_topology_metrics(
         config=MMDConfig(),
     )
     report = selection.metrics
+    density = density_diagnostics(report.per_size_relative_density)
     return ValTopologyResult(
         metrics=TopologyValidationMetrics(
             gs=report.graph_similarity,
@@ -87,6 +91,8 @@ def val_region_topology_metrics(
             spectral_mmd=report.mmd_ratio["spectral"],
         ),
         threshold=selection.logit_threshold,
+        geometric_rd=float(cast(float, density["geometric_mean"])),
+        mean_abs_log_rd=float(cast(float, density["mean_abs_log"])),
     )
 
 

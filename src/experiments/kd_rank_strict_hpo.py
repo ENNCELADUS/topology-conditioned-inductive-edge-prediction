@@ -1,17 +1,14 @@
-"""Unattended Optuna sweep for the strict-LLP ``kd_rank`` arm.
+"""Optuna HPO using three fixed V_val objectives and five-metric mean-rank selection.
 
-Runs on the H20 container: an ask-and-tell TPE loop proposes
-``(w_rank, w_dist, context bank, margin)``, launches one grid-protocol
-training per trial through ``hpc/run.sh train --skip-test``, and scores the
-cadence-2 V_val surface as (GS max, geometric-mean MMD ratio min) with an
-``|log RD|`` soft constraint. The feasible Pareto front is advisory: the
-recorded winner comes from the frozen five-metric undominated verdict.
-Spec: ``docs/superpowers/specs/2026-09-01-kd-rank-strict-llp-optuna-hpo-design.md``.
+Each trial reports its published checkpoint at that checkpoint's own selected
+threshold. TPE models AUPRC, GS and geo-MMD; final trial selection uses five equal
+mean ranks. Rank itself is not an objective: it changes when new trials arrive.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -25,6 +22,14 @@ from optuna.trial import TrialState
 
 from src.autoresearch.metrics_io import RunFailure, RunMetrics, read_run
 from src.distill.config import DistillConfig
+from src.eval.checkpoint_selection import (
+    SELECTION_RULE,
+    CheckpointCandidate,
+    TopologyValidationMetrics,
+    select_checkpoint,
+)
+
+OBJECTIVE_DIRECTIONS = ["maximize", "maximize", "minimize"]
 
 
 @dataclass(frozen=True)
@@ -113,12 +118,16 @@ def materialize_trial_config(
 
 @dataclass(frozen=True)
 class TrialOutcome:
-    """Objectives, constraint, and telemetry surface of one completed trial."""
+    """Objectives and telemetry surface of one completed trial."""
 
     gs: float
     geo_mmd: float
-    constraint: float
     surface: dict[str, float]
+
+    @property
+    def values(self) -> list[float]:
+        """Three fixed search objectives, independent of final rank aggregation."""
+        return [self.surface["auprc"], self.gs, self.geo_mmd]
 
 
 @dataclass(frozen=True)
@@ -134,19 +143,19 @@ class SweepSpec:
     prepare: Callable[[argparse.Namespace], None]
 
 
-def trial_outcome(run_dir: Path, rd_band: float) -> TrialOutcome:
-    """Score one run at its cadence-2 selected epoch.
+def trial_outcome(run_dir: Path) -> TrialOutcome:
+    """Read one run at its published checkpoint and frozen threshold.
 
     Raises:
         RunFailure: If the run wrote ``failure.json``.
-        ValueError: On missing/non-finite metrics or a non-positive MMD ratio.
+        ValueError: On missing/non-finite metrics or a negative MMD ratio.
     """
-    run: RunMetrics = read_run(run_dir, topology_every=2)
+    run: RunMetrics = read_run(run_dir)
     topo = run.topology
     ratios = (topo.degree_mmd, topo.clustering_mmd, topo.spectral_mmd)
-    if any(ratio <= 0.0 for ratio in ratios):
-        raise ValueError(f"{run_dir}: MMD ratios must be positive, got {ratios}")
-    geo_mmd = math.exp(sum(math.log(ratio) for ratio in ratios) / 3.0)
+    if any(ratio < 0.0 for ratio in ratios):
+        raise ValueError(f"{run_dir}: MMD ratios must be non-negative, got {ratios}")
+    geo_mmd = math.prod(ratios) ** (1.0 / 3.0)
     surface = {
         "auprc": run.auprc,
         "gs": topo.gs,
@@ -155,20 +164,14 @@ def trial_outcome(run_dir: Path, rd_band: float) -> TrialOutcome:
         "clustering_mmd": topo.clustering_mmd,
         "spectral_mmd": topo.spectral_mmd,
         "selected_epoch": float(run.selected_epoch),
+        "threshold": run.threshold,
     }
-    return TrialOutcome(topo.gs, geo_mmd, abs(math.log(topo.rd)) - rd_band, surface)
+    return TrialOutcome(topo.gs, geo_mmd, surface)
 
 
 STUDY_NAME = "kd_rank_strict_llp"
 N_STARTUP_TRIALS = 6
 MAX_CONSECUTIVE_FAILURES = 3
-
-
-def _constraints(trial: optuna.trial.FrozenTrial) -> Sequence[float]:
-    constraint = trial.user_attrs.get("constraint")
-    if not isinstance(constraint, list) or len(constraint) != 1:
-        return (float("inf"),)
-    return (float(constraint[0]),)
 
 
 def build_study(
@@ -180,15 +183,20 @@ def build_study(
         seed=0,
         multivariate=True,
         n_startup_trials=n_startup_trials,
-        constraints_func=_constraints,
     )
-    return optuna.create_study(
+    study = optuna.create_study(
         study_name=study_name,
         storage=f"sqlite:///{db_path}",
-        directions=["maximize", "minimize"],
+        directions=OBJECTIVE_DIRECTIONS,
         sampler=sampler,
         load_if_exists=True,
     )
+    if [direction.name.lower() for direction in study.directions] != OBJECTIVE_DIRECTIONS:
+        raise ValueError("incompatible Optuna objectives; use a fresh sweep directory")
+    if study.trials and study.user_attrs.get("selection_rule") != SELECTION_RULE:
+        raise ValueError("old threshold protocol; use a fresh sweep directory")
+    study.set_user_attr("selection_rule", SELECTION_RULE)
+    return study
 
 
 def enqueue_priors(
@@ -220,35 +228,23 @@ def suggest_params(trial: optuna.Trial) -> dict[str, object]:
     }
 
 
-def reconcile_running(study: optuna.Study, sweep_dir: Path, rd_band: float) -> None:
-    """Resolve trials left RUNNING by an interrupted driver.
-
-    The stale trial is always failed; a run that actually completed is
-    re-added as a COMPLETE twin with its real objectives and constraint.
-    """
+def reconcile_running(study: optuna.Study, sweep_dir: Path) -> None:
+    """Recover terminal outcomes without duplicating or renumbering trials."""
     for stale in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)):
         run_dir = sweep_dir / f"trial_{stale.number:03d}"
-        twin: optuna.trial.FrozenTrial | None = None
-        if (run_dir / "complete.json").exists():
+        if (run_dir / "failure.json").exists():
+            study.tell(stale.number, state=TrialState.FAIL)
+        elif (run_dir / "complete.json").exists():
             try:
-                outcome = trial_outcome(run_dir, rd_band)
+                outcome = trial_outcome(run_dir)
             except RunFailure:
-                outcome = None
-            if outcome is not None:
-                twin = optuna.trial.create_trial(
-                    params=dict(stale.params),
-                    distributions=dict(stale.distributions),
-                    values=[outcome.gs, outcome.geo_mmd],
-                    user_attrs={"constraint": [outcome.constraint], "surface": outcome.surface},
-                    # "constraints" is where samplers materialize constraints_func
-                    # results; add_trial bypasses after_trial, so without it the
-                    # constrained TPE and best_trials would treat the twin as
-                    # infeasible.
-                    system_attrs={"constraints": [outcome.constraint]},
-                )
-        study.tell(stale.number, state=TrialState.FAIL)
-        if twin is not None:
-            study.add_trial(twin)
+                study.tell(stale.number, state=TrialState.FAIL)
+                continue
+            trial = optuna.Trial(study, stale._trial_id)
+            trial.set_user_attr("surface", outcome.surface)
+            study.tell(trial, values=outcome.values)
+        else:
+            study.tell(stale.number, state=TrialState.FAIL)
 
 
 _THREAD_CAPS = {"OMP_NUM_THREADS": "16", "MKL_NUM_THREADS": "16"}
@@ -352,7 +348,7 @@ def run_sweep(args: argparse.Namespace, spec: SweepSpec = KD_RANK_SPEC) -> None:
         study_name=spec.study_name,
         n_startup_trials=spec.n_startup_trials,
     )
-    reconcile_running(study, args.sweep_dir, args.rd_band)
+    reconcile_running(study, args.sweep_dir)
     enqueue_priors(study, spec.priors)
     spec.prepare(args)
     failures = 0
@@ -363,7 +359,7 @@ def run_sweep(args: argparse.Namespace, spec: SweepSpec = KD_RANK_SPEC) -> None:
         run_command(["bash", "hpc/run.sh", "train", str(config_path), "--skip-test"])
         run_dir = args.sweep_dir / f"trial_{trial.number:03d}"
         try:
-            outcome = trial_outcome(run_dir, args.rd_band)
+            outcome = trial_outcome(run_dir)
         except RunFailure:
             study.tell(trial, state=TrialState.FAIL)
             failures += 1
@@ -374,16 +370,53 @@ def run_sweep(args: argparse.Namespace, spec: SweepSpec = KD_RANK_SPEC) -> None:
                 ) from None
             continue
         failures = 0
-        trial.set_user_attr("constraint", [outcome.constraint])
         trial.set_user_attr("surface", outcome.surface)
-        study.tell(trial, values=[outcome.gs, outcome.geo_mmd])
+        study.tell(trial, values=outcome.values)
+    winner = select_trial(study)
+    (args.sweep_dir / "best_trial.json").write_text(
+        json.dumps(
+            {
+                "selection_rule": SELECTION_RULE,
+                "status": "selected" if winner is not None else "no_completed_trials",
+                "trial_number": winner.number if winner is not None else None,
+                "surface": winner.user_attrs["surface"] if winner is not None else None,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     print_report(study, spec.param_names)
+
+
+def select_trial(study: optuna.Study) -> optuna.trial.FrozenTrial | None:
+    """Apply the checkpoint five-metric mean-rank rule across completed trials."""
+    trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+    candidates = []
+    for trial in trials:
+        surface = trial.user_attrs["surface"]
+        candidates.append(
+            CheckpointCandidate(
+                epoch=trial.number + 1,
+                auprc=surface["auprc"],
+                topology=TopologyValidationMetrics(
+                    surface["gs"],
+                    surface["rd"],
+                    surface["degree_mmd"],
+                    surface["clustering_mmd"],
+                    surface["spectral_mmd"],
+                ),
+            )
+        )
+    selected = select_checkpoint(candidates)
+    return next(
+        (t for t in trials if selected is not None and t.number == selected.epoch - 1), None
+    )
 
 
 def print_report(
     study: optuna.Study, param_names: Sequence[str] = ("w_rank", "w_dist", "bank", "margin")
 ) -> None:
-    """Print the full trial table, then the feasible Pareto front."""
+    """Print the five-metric table and the mean-rank winner."""
     columns = [
         "auprc",
         "gs",
@@ -392,6 +425,7 @@ def print_report(
         "clustering_mmd",
         "spectral_mmd",
         "selected_epoch",
+        "threshold",
     ]
     print("number state " + " ".join(param_names) + " " + " ".join(columns))  # noqa: T201 -- CLI report goes to stdout
     for t in study.get_trials(deepcopy=False):
@@ -399,8 +433,8 @@ def print_report(
         params = " ".join(str(t.params.get(name, "-")) for name in param_names)
         values = " ".join(f"{surface[c]:.4f}" if c in surface else "-" for c in columns)
         print(f"{t.number} {t.state.name} {params} {values}")  # noqa: T201 -- CLI report goes to stdout
-    front = ", ".join(str(t.number) for t in study.best_trials)
-    print(f"feasible Pareto front (advisory): trials [{front}]")  # noqa: T201 -- CLI report goes to stdout
+    winner = select_trial(study)
+    print(f"five-metric mean-rank winner: {winner.number if winner is not None else None}")  # noqa: T201 -- CLI report goes to stdout
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -412,7 +446,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-checkpoint", type=Path, required=True)
     parser.add_argument("--sweep-dir", type=Path, default=Path("outputs/b1_kd_rank_strict_hpo"))
     parser.add_argument("--n-trials", type=int, default=16)
-    parser.add_argument("--rd-band", type=float, default=0.05)
     parser.add_argument("--dump-shards", type=int, default=4)
     parser.add_argument(
         "--bank-root",
