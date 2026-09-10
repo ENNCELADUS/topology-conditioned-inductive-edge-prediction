@@ -19,10 +19,17 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from src.model.egostitch.classifier.layers import CrossAttentionLayer, inner_token_mask, masked_mean
+from src.model.egostitch.classifier.b0_v31 import V3_1, unpack_pair_batch, weighted_pair_bce
+from src.model.egostitch.classifier.layers import (
+    CrossAttentionLayer,
+    _build_padding_mask,
+    inner_token_mask,
+    masked_mean,
+)
 
 CONDITIONING_MODES = ("static", "pair")
 SITES = 3  # A<-B, B<-A, CLS
+INTERVENTIONS = ("none", "gates_off", "shuffle", "mean")
 
 
 @dataclass(frozen=True)
@@ -353,3 +360,176 @@ class PrefixCrossAttentionLayer(nn.Module):
         cls_token = cls_token + layer.drop_cls_attn(attn_cls) + branch
         cls_token = cls_token + layer.drop_cls_ffn(layer.ff_cls(layer.norm_cls_ffn(cls_token)))
         return h_a, h_b, cls_token
+
+
+class V3_1Prefix(nn.Module):
+    """A frozen `V3_1` (bidirectional-cross trunk) plus a trainable gated prefix.
+
+    Registration order matters: ``generator`` is registered before ``base`` so
+    ``next(model.parameters())`` is a trainable parameter (the structural stream
+    builds its zero-loss anchor from it).
+    """
+
+    name: str = "v3_1_prefix"
+
+    def __init__(self, *, base: Mapping[str, object], prefix: Mapping[str, object]) -> None:
+        """Build the frozen base from its config and the prefix on top.
+
+        Args:
+            base: The base `V3_1` constructor kwargs (a checkpoint's ``model_config``).
+            prefix: The ``model.config.prefix`` block.
+
+        Raises:
+            ValueError: If the base trunk has no bidirectional cross-attention layers.
+        """
+        super().__init__()
+        self.prefix_cfg = PrefixConfig.from_mapping(prefix)
+        self.base_config: dict[str, object] = dict(base)
+        base_model = V3_1(**self.base_config)
+        trunk = base_model.cross_attention
+        if trunk.mixing_mode != "bidirectional_cross" or len(trunk.layers) == 0:
+            raise ValueError(
+                "v3_1_prefix needs a base with model.config.mixing.mode == 'bidirectional_cross'"
+            )
+        self.d_model = int(base_model.d_model)
+        self.input_dim = int(base_model.input_dim)
+        self.kd_rep_head = None
+        self.kd_struct_head = None
+        self.topo_gen = None
+        self.generator = PrefixGenerator(
+            self.d_model, len(trunk.layers), int(base_model.n_heads), self.prefix_cfg
+        )
+        self.base = base_model
+        for param in self.base.parameters():
+            param.requires_grad_(False)
+        self.base.eval()
+        self.prefix_layers = nn.ModuleList(
+            PrefixCrossAttentionLayer(cast(CrossAttentionLayer, layer), index, self.generator)
+            for index, layer in enumerate(trunk.layers)
+        )
+        self.intervention: str = "none"
+        self.intervention_seed: int = 0
+
+    def train(self, mode: bool = True) -> V3_1Prefix:
+        """Switch the wrapper's mode while keeping the frozen base in eval mode.
+
+        Args:
+            mode: Training mode for the prefix parameters.
+
+        Returns:
+            ``self``.
+        """
+        super().train(mode)
+        self.base.eval()
+        return self
+
+    def prefix_parameters(self) -> list[nn.Parameter]:
+        """The only trainable parameters: everything in `PrefixGenerator`."""
+        return list(self.generator.parameters())
+
+    @torch.no_grad()
+    def init_static_prefix(self, batch: Mapping[str, torch.Tensor], seed: int) -> None:
+        """Initialise ``p0`` from the frozen encoder's inner-token states of ``batch``.
+
+        Args:
+            batch: A task batch with ``emb_a``/``emb_b`` (and optional lengths).
+            seed: Draw seed.
+        """
+        emb_a, emb_b, len_a, len_b = unpack_pair_batch(batch, self.input_dim)
+        rows: list[torch.Tensor] = []
+        for emb, lengths in ((emb_a, len_a), (emb_b, len_b)):
+            encoded = self.base.encoder(emb, lengths)
+            keep = inner_token_mask(
+                x=encoded, padding_mask=_build_padding_mask(lengths, encoded.size(1))
+            )
+            rows.append(encoded[keep])
+        tokens = torch.cat(rows, dim=0).to(self.generator.p0[0].device)
+        self.generator.init_static_from_tokens(tokens, seed)
+
+    def _apply_intervention(self, z: torch.Tensor | None) -> tuple[torch.Tensor | None, float]:
+        """Return the (possibly substituted) condition and the gate scale.
+
+        Raises:
+            ValueError: On an unknown intervention name.
+        """
+        if self.intervention not in INTERVENTIONS:
+            raise ValueError(f"unknown prefix intervention {self.intervention!r}")
+        if self.intervention == "gates_off":
+            return z, 0.0
+        if z is None or self.intervention == "none":
+            return z, 1.0
+        if self.intervention == "mean":
+            return self.generator.z_mean.to(z.dtype).unsqueeze(0).expand_as(z), 1.0
+        gen = torch.Generator(device="cpu").manual_seed(self.intervention_seed)
+        perm = torch.randperm(z.size(0), generator=gen).to(z.device)
+        return z[perm], 1.0
+
+    def _trunk(
+        self,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+        z: torch.Tensor | None,
+        gate_scale: float,
+    ) -> torch.Tensor:
+        trunk = self.base.cross_attention
+        mask_a = _build_padding_mask(lengths_a, h_a.size(1))
+        mask_b = _build_padding_mask(lengths_b, h_b.size(1))
+        cls_token = trunk.cls_token.repeat(h_a.size(0), 1, 1)
+        for layer in self.prefix_layers:
+            h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b, z, gate_scale)
+        cls_vec = cls_token.squeeze(1)
+        if trunk.pair_readout_mode == "pair_context_gated":
+            return cast(torch.Tensor, trunk.pair_context_readout(h_a, h_b, cls_vec, mask_a, mask_b))
+        base_repr = trunk._rich_pooling_readout(h_a, h_b, cls_vec, mask_a, mask_b)
+        if trunk.pair_readout_mode == "grid_sketch_fusion":
+            return cast(
+                torch.Tensor, trunk.grid_sketch_readout(base_repr, h_a, h_b, mask_a, mask_b)
+            )
+        return base_repr
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor] | None = None,
+        **kwargs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Score pairs with the frozen base read through the prefix.
+
+        Args:
+            batch: Optional batch dictionary.
+            **kwargs: Additional batch tensors merged into ``batch``.
+
+        Returns:
+            ``logits``, ``pair_repr``, and, with ``label``, the weighted BCE ``loss``
+            and ``loss_weight_sum`` exactly as `V3_1` computes them.
+        """
+        merged: dict[str, torch.Tensor] = {}
+        if batch is not None:
+            merged.update(batch)
+        merged.update(kwargs)
+        emb_a, emb_b, lengths_a, lengths_b = unpack_pair_batch(merged, self.input_dim)
+        with torch.no_grad():
+            encoded_a = self.base.encoder(emb_a, lengths_a)
+            encoded_b = self.base.encoder(emb_b, lengths_b)
+        mask_a = _build_padding_mask(lengths_a, encoded_a.size(1))
+        mask_b = _build_padding_mask(lengths_b, encoded_b.size(1))
+        z, gate_scale = self._apply_intervention(
+            self.generator.condition(encoded_a, encoded_b, mask_a, mask_b)
+        )
+        feature_ab = self._trunk(encoded_a, encoded_b, lengths_a, lengths_b, z, gate_scale)
+        if self.base.order_aggregation == "single":
+            pair_repr = feature_ab
+        else:
+            feature_ba = self._trunk(encoded_b, encoded_a, lengths_b, lengths_a, z, gate_scale)
+            pair_repr = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
+        logits = self.base.output_head(pair_repr)
+        output: dict[str, torch.Tensor] = {"pair_repr": pair_repr, "logits": logits}
+        if "label" in merged:
+            output["loss"], output["loss_weight_sum"] = weighted_pair_bce(
+                logits,
+                merged["label"],
+                label_smoothing=float(self.base.label_smoothing),
+                positive_weight=float(self.base.positive_weight),
+            )
+        return output

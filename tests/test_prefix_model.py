@@ -3,13 +3,59 @@
 from __future__ import annotations
 
 import torch
+from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.layers import CrossAttentionLayer
 from src.model.egostitch.classifier.prefix import (
     PrefixConfig,
     PrefixCrossAttentionLayer,
     PrefixGenerator,
+    V3_1Prefix,
     prefix_branch,
 )
+
+
+def _tiny_base_config(mixing: str = "bidirectional_cross") -> dict[str, object]:
+    """A 4-dim, 8-wide V3_1 with two cross-attention layers and every dropout on."""
+    return {
+        "input_dim": 4,
+        "d_model": 8,
+        "encoder_layers": 1,
+        "cross_attn_layers": 2,
+        "n_heads": 2,
+        "mlp_head": {
+            "hidden_dims": [8],
+            "dropout": 0.2,
+            "activation": "gelu",
+            "norm": "layernorm",
+            "spectral_norm": False,
+        },
+        "regularization": {
+            "dropout": 0.1,
+            "token_dropout": 0.1,
+            "cross_attention_dropout": 0.1,
+            "stochastic_depth": 0.1,
+        },
+        "rich_pooling": {"components": ["mean", "attn", "max", "gated"]},
+        "pair_readout": {
+            "mode": "pair_context_gated",
+            "order_aggregation": "abba_max",
+            "spectral_norm": False,
+        },
+        "mixing": {"mode": mixing},
+        "label_smoothing": 0.0,
+        "positive_weight": 5.0,
+    }
+
+
+def _pair_batch(n: int = 6, seed: int = 0) -> dict[str, torch.Tensor]:
+    """Random (B, L, 4) token pairs with ragged lengths and binary labels."""
+    gen = torch.Generator().manual_seed(seed)
+    emb_a = torch.randn(n, 7, 4, generator=gen)
+    emb_b = torch.randn(n, 5, 4, generator=gen)
+    len_a = torch.tensor([7, 6, 5, 7, 4, 7][:n])
+    len_b = torch.tensor([5, 5, 3, 4, 5, 3][:n])
+    label = torch.tensor([1, 0, 0, 1, 0, 1][:n])
+    return {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b, "label": label}
 
 
 def test_static_generator_has_no_condition_and_shares_one_prefix() -> None:
@@ -137,3 +183,146 @@ def test_prefix_layer_changes_output_once_a_gate_opens_and_grads_stay_on_prefix(
     out_a.sum().backward()
     assert all(p.grad is None for p in layer.parameters())
     assert gen.p0[0].grad is not None and gen.gates.grad is not None
+
+
+def _trained_base(seed: int = 1) -> V3_1:
+    torch.manual_seed(seed)
+    base = V3_1(**_tiny_base_config())
+    with torch.no_grad():  # perturb so the frozen function is not the init
+        for param in base.parameters():
+            param.add_(torch.randn_like(param) * 0.1)
+    return base
+
+
+def _wrapped(conditioning: str = "pair", seed: int = 1) -> tuple[V3_1, V3_1Prefix]:
+    base = _trained_base(seed)
+    model = V3_1Prefix(
+        base=_tiny_base_config(),
+        prefix={"tokens": 3, "rank": 2, "conditioning": conditioning, "bottleneck": 6},
+    )
+    model.base.load_state_dict(base.state_dict())
+    return base, model
+
+
+def test_wrapper_rejects_a_base_without_cross_attention_layers() -> None:
+    try:
+        V3_1Prefix(base=_tiny_base_config(mixing="none"), prefix={"tokens": 2})
+    except ValueError as err:
+        assert "bidirectional_cross" in str(err)
+    else:
+        raise AssertionError("mixing none must be rejected")
+
+
+def test_null_identity_against_the_frozen_base_in_both_modes() -> None:
+    for conditioning in ("static", "pair"):
+        base, model = _wrapped(conditioning)
+        base.eval()
+        batch = _pair_batch()
+        with torch.no_grad():
+            want = base(batch)["logits"]
+            model.train()
+            got_train = model(batch)["logits"]
+            model.eval()
+            got_eval = model(batch)["logits"]
+        assert torch.equal(got_train, want), conditioning
+        assert torch.equal(got_eval, want), conditioning
+
+
+def test_base_stays_in_eval_mode_and_frozen_after_wrapper_train() -> None:
+    _, model = _wrapped()
+    model.train()
+    assert model.training
+    assert not model.base.training
+    assert all(not m.training for m in model.base.modules())
+    assert all(not p.requires_grad for p in model.base.parameters())
+    trainable = {name for name, param in model.named_parameters() if param.requires_grad}
+    assert trainable and all(name.startswith("generator.") for name in trainable)
+    assert {id(p) for p in model.prefix_parameters()} == {
+        id(p) for p in model.generator.parameters()
+    }
+
+
+def test_loss_backward_reaches_only_prefix_parameters() -> None:
+    _, model = _wrapped()
+    model.train()
+    with torch.no_grad():
+        model.generator.gates.fill_(0.3)
+    out = model(_pair_batch())
+    assert "loss" in out and "loss_weight_sum" in out
+    out["loss"].backward()
+    assert all(p.grad is None for p in model.base.parameters())
+    assert all(p.grad is not None for p in model.generator.parameters())
+
+
+def test_pair_symmetry_holds_with_open_gates() -> None:
+    _, model = _wrapped()
+    model.eval()
+    with torch.no_grad():
+        model.generator.gates.fill_(0.4)
+    batch = _pair_batch()
+    swapped = {
+        "emb_a": batch["emb_b"],
+        "emb_b": batch["emb_a"],
+        "len_a": batch["len_b"],
+        "len_b": batch["len_a"],
+    }
+    with torch.no_grad():
+        assert torch.allclose(model(batch)["logits"], model(swapped)["logits"], atol=1e-5)
+
+
+def test_interventions() -> None:
+    base, model = _wrapped()
+    base.eval()
+    model.eval()
+    with torch.no_grad():
+        model.generator.gates.fill_(0.4)
+        model.generator.z_sum.copy_(torch.randn(6))
+        model.generator.z_count.fill_(10.0)
+    batch = _pair_batch()
+    with torch.no_grad():
+        live = model(batch)["logits"]
+        model.intervention = "gates_off"
+        assert torch.equal(model(batch)["logits"], base(batch)["logits"])
+        model.intervention = "mean"
+        mean_logits = model(batch)["logits"]
+        assert not torch.equal(mean_logits, live)
+        model.intervention = "shuffle"
+        model.intervention_seed = 5
+        shuffled_1 = model(batch)["logits"]
+        model.intervention_seed = 5
+        shuffled_2 = model(batch)["logits"]
+        assert torch.equal(shuffled_1, shuffled_2)
+        assert not torch.equal(shuffled_1, live)
+        # the same permutation is applied to AB and BA (abba_max stays symmetric)
+        swapped = {
+            "emb_a": batch["emb_b"],
+            "emb_b": batch["emb_a"],
+            "len_a": batch["len_b"],
+            "len_b": batch["len_a"],
+        }
+        model.intervention_seed = 5
+        assert torch.allclose(model(swapped)["logits"], shuffled_1, atol=1e-5)
+    model.intervention = "bogus"
+    try:
+        with torch.no_grad():
+            model(batch)
+    except ValueError as err:
+        assert "intervention" in str(err)
+    else:
+        raise AssertionError("unknown intervention must raise")
+
+
+def test_init_static_prefix_from_a_batch_and_state_dict_round_trip() -> None:
+    _, model = _wrapped()
+    before = model.generator.p0[0].clone()
+    model.init_static_prefix(_pair_batch(), seed=0)
+    assert not torch.equal(before, model.generator.p0[0])
+    rebuilt = V3_1Prefix(
+        base=_tiny_base_config(),
+        prefix={"tokens": 3, "rank": 2, "conditioning": "pair", "bottleneck": 6},
+    )
+    rebuilt.load_state_dict(model.state_dict())
+    rebuilt.eval()
+    model.eval()
+    with torch.no_grad():
+        assert torch.equal(rebuilt(_pair_batch())["logits"], model(_pair_batch())["logits"])

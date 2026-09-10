@@ -947,6 +947,78 @@ def _to_bool(value: object, field_name: str) -> bool:
 # --------------------------------------------------------------------------- V3_1 top-level model
 
 
+def unpack_pair_batch(
+    merged: Mapping[str, torch.Tensor], input_dim: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Validate a pair batch and return ``(emb_a, emb_b, lengths_a, lengths_b)``.
+
+    Args:
+        merged: Batch tensors; must hold ``emb_a``/``emb_b`` and may hold ``len_a``/``len_b``.
+        input_dim: Expected trailing embedding width.
+
+    Returns:
+        The two token tensors and their per-row lengths (``long``, on the batch's device).
+
+    Raises:
+        KeyError: If ``emb_a`` or ``emb_b`` is missing.
+        ValueError: On a shape, width, or batch-size mismatch.
+    """
+    if "emb_a" not in merged or "emb_b" not in merged:
+        raise KeyError("Batch must contain 'emb_a' and 'emb_b' tensors")
+    emb_a = merged["emb_a"]
+    emb_b = merged["emb_b"]
+    if emb_a.dim() != 3 or emb_b.dim() != 3:
+        raise ValueError("Input embeddings must be shaped (batch, seq_len, embedding_dim)")
+    if emb_a.size(2) != input_dim or emb_b.size(2) != input_dim:
+        raise ValueError("Input embedding dimension must match model input_dim")
+    if emb_a.size(0) != emb_b.size(0):
+        raise ValueError("Item pair batches must have matching batch dimension")
+    device = emb_a.device
+    lengths_a = merged.get("len_a")
+    lengths_b = merged.get("len_b")
+    if lengths_a is None:
+        lengths_a = torch.full((emb_a.size(0),), emb_a.size(1), device=device, dtype=torch.long)
+    else:
+        lengths_a = lengths_a.to(device=device, dtype=torch.long)
+    if lengths_b is None:
+        lengths_b = torch.full((emb_b.size(0),), emb_b.size(1), device=device, dtype=torch.long)
+    else:
+        lengths_b = lengths_b.to(device=device, dtype=torch.long)
+    return emb_a, emb_b, lengths_a, lengths_b
+
+
+def weighted_pair_bce(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    label_smoothing: float,
+    positive_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Positive-weighted BCE with optional symmetric label smoothing.
+
+    Args:
+        logits: Raw pair logits, ``(B,)`` or ``(B, 1)``.
+        labels: Binary labels, ``(B,)`` or ``(B, 1)``, any dtype.
+        label_smoothing: ``1 -> 1 - eps/2``, ``0 -> eps/2`` when positive.
+        positive_weight: Row weight for positives (negatives weigh 1).
+
+    Returns:
+        ``(loss, weight_sum)``: the weighted mean and the detached weight total.
+    """
+    labels = labels.float()
+    logits_for_loss = logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
+    labels_for_loss = labels.squeeze(-1) if labels.dim() > 1 and labels.size(-1) == 1 else labels
+    if label_smoothing > 0.0:
+        # Symmetric binary smoothing: 1 -> 1 - eps/2, 0 -> eps/2.
+        labels_for_loss = labels_for_loss * (1.0 - label_smoothing) + 0.5 * label_smoothing
+    per_row = nn.functional.binary_cross_entropy_with_logits(
+        logits_for_loss.float(), labels_for_loss.float(), reduction="none"
+    )
+    weights = 1.0 + (positive_weight - 1.0) * labels.reshape_as(per_row)
+    denominator = weights.sum().detach()
+    return (weights * per_row).sum() / denominator, denominator
+
+
 class V3_1(nn.Module):
     """V3.1 model — V3 with rich per-item pooling (CLS+mean+attn+max+gate).
 
@@ -1209,29 +1281,7 @@ class V3_1(nn.Module):
             merged.update(batch)
         merged.update(kwargs)
 
-        if "emb_a" not in merged or "emb_b" not in merged:
-            raise KeyError("Batch must contain 'emb_a' and 'emb_b' tensors")
-
-        emb_a = merged["emb_a"]
-        emb_b = merged["emb_b"]
-        if emb_a.dim() != 3 or emb_b.dim() != 3:
-            raise ValueError("Input embeddings must be shaped (batch, seq_len, embedding_dim)")
-        if emb_a.size(2) != self.input_dim or emb_b.size(2) != self.input_dim:
-            raise ValueError("Input embedding dimension must match model input_dim")
-        if emb_a.size(0) != emb_b.size(0):
-            raise ValueError("Item pair batches must have matching batch dimension")
-
-        device = emb_a.device
-        lengths_a = merged.get("len_a")
-        lengths_b = merged.get("len_b")
-        if lengths_a is None:
-            lengths_a = torch.full((emb_a.size(0),), emb_a.size(1), device=device, dtype=torch.long)
-        else:
-            lengths_a = lengths_a.to(device=device, dtype=torch.long)
-        if lengths_b is None:
-            lengths_b = torch.full((emb_b.size(0),), emb_b.size(1), device=device, dtype=torch.long)
-        else:
-            lengths_b = lengths_b.to(device=device, dtype=torch.long)
+        emb_a, emb_b, lengths_a, lengths_b = unpack_pair_batch(merged, self.input_dim)
 
         encoded_a = self.encoder(emb_a, lengths_a)
         encoded_b = self.encoder(emb_b, lengths_b)
@@ -1260,25 +1310,12 @@ class V3_1(nn.Module):
                     output[f"gen_{key}"] = value
         output["logits"] = logits
         if "label" in merged:
-            labels = merged["label"].float()
-            logits_for_loss = (
-                logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
+            output["loss"], output["loss_weight_sum"] = weighted_pair_bce(
+                logits,
+                merged["label"],
+                label_smoothing=self.label_smoothing,
+                positive_weight=self.positive_weight,
             )
-            labels_for_loss = (
-                labels.squeeze(-1) if labels.dim() > 1 and labels.size(-1) == 1 else labels
-            )
-            if self.label_smoothing > 0.0:
-                # Symmetric binary smoothing: 1 -> 1 - eps/2, 0 -> eps/2.
-                labels_for_loss = (
-                    labels_for_loss * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
-                )
-            per_row = nn.functional.binary_cross_entropy_with_logits(
-                logits_for_loss.float(), labels_for_loss.float(), reduction="none"
-            )
-            weights = 1.0 + (self.positive_weight - 1.0) * labels.reshape_as(per_row)
-            denominator = weights.sum().detach()
-            output["loss"] = (weights * per_row).sum() / denominator
-            output["loss_weight_sum"] = denominator
 
         return output
 
