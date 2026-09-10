@@ -231,6 +231,20 @@ def _copy_with_topo_gen_control(source: Path, destination: Path, control: str | 
     )
 
 
+def _copy_with_prefix_intervention(source: Path, destination: Path, intervention: str) -> None:
+    artifact = load_scores(source)
+    save_scores(
+        destination,
+        node_ids=artifact.node_ids,
+        u_idx=artifact.u_idx,
+        v_idx=artifact.v_idx,
+        logit=artifact.logit,
+        label=artifact.label,
+        row_start=0,
+        meta={**artifact.meta, "prefix_intervention": intervention},
+    )
+
+
 # --------------------------------------------------------------------------- tests
 
 
@@ -286,6 +300,59 @@ class TestRunTestProtocol:
         arm_block = result.report["arm"]
         assert isinstance(arm_block, dict)
         assert arm_block["topo_gen_control"] == control
+
+    @pytest.mark.parametrize("intervention", ["gates_off", "shuffle", "mean"])
+    def test_parser_accepts_prefix_intervention(self, intervention: str) -> None:
+        args = test_protocol.build_parser().parse_args(
+            [
+                "--checkpoint",
+                "checkpoint.pt",
+                "--output-dir",
+                "outputs/control",
+                "--data-root",
+                "data",
+                "--strategy",
+                _STRATEGY,
+                "--arm",
+                "prefix_arm",
+                "--seed",
+                "0",
+                "--prefix-intervention",
+                intervention,
+            ]
+        )
+
+        assert args.prefix_intervention == intervention
+
+    @pytest.mark.parametrize("intervention", ["gates_off", "shuffle", "mean"])
+    def test_forwards_prefix_intervention_to_every_score_pass(
+        self, tmp_path: Path, intervention: str
+    ) -> None:
+        fixture = _build_fixture(tmp_path)
+        controlled_artifacts: dict[str, Path] = {}
+        for pairs_source, source in fixture.artifacts.items():
+            destination = tmp_path / "controlled_scores" / f"{pairs_source}.npz"
+            _copy_with_prefix_intervention(source, destination, intervention)
+            controlled_artifacts[pairs_source] = destination
+        runner = _FakeScoreRunner(controlled_artifacts)
+
+        result = run_test_protocol(
+            checkpoint=_write_checkpoint(tmp_path),
+            output_dir=tmp_path / "outputs" / intervention,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm=f"prefix_{intervention}",
+            seed=0,
+            score_runner=runner,
+            prefix_intervention=intervention,
+        )
+
+        for pairs_source in ("val_topology", "val_cls", "test", "test_topology"):
+            call = runner.call_for(pairs_source)
+            assert _arg_value(call, "--prefix-intervention") == intervention
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["prefix_intervention"] == intervention
 
     def test_full_report_shape_ordering_and_leakage_guarantee(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
@@ -510,6 +577,7 @@ class TestRunTestProtocol:
             assert "--pack-dir" not in call
             assert "--scaffold-control" not in call
             assert "--topo-gen-control" not in call
+            assert "--prefix-intervention" not in call
             assert "--rescore-reason" not in call
             assert "--scoring-run-id" not in call
             assert "--allow-oracle-diagnostic" not in call
@@ -742,6 +810,88 @@ class TestReuseExistingScores:
         arm_block = result.report["arm"]
         assert isinstance(arm_block, dict)
         assert arm_block["topo_gen_control"] is None
+
+    @pytest.mark.parametrize(
+        "mismatched_source", ["val_topology", "val_cls", "test", "test_topology"]
+    )
+    def test_rejects_reused_prefix_intervention_mismatch(
+        self, tmp_path: Path, mismatched_source: str
+    ) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / f"prefix_mismatch_{mismatched_source}"
+        scores_dir = output_dir / "scores"
+        for pairs_source, source in fixture.artifacts.items():
+            intervention = "gates_off" if pairs_source == mismatched_source else "shuffle"
+            _copy_with_prefix_intervention(source, scores_dir / f"{pairs_source}.npz", intervention)
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        with pytest.raises(ValueError, match="prefix_intervention.*does not match"):
+            run_test_protocol(
+                checkpoint=_write_checkpoint(tmp_path),
+                output_dir=output_dir,
+                data_root=fixture.data_root,
+                strategy=_STRATEGY,
+                arm="prefix_shuffle",
+                seed=0,
+                score_runner=runner,
+                prefix_intervention="shuffle",
+                reuse_existing_scores=True,
+            )
+
+        assert runner.calls == []
+        assert not (output_dir / "test_report.json").exists()
+
+    def test_accepts_matching_reused_prefix_intervention(self, tmp_path: Path) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / "matching_prefix_shuffle"
+        scores_dir = output_dir / "scores"
+        for pairs_source, source in fixture.artifacts.items():
+            _copy_with_prefix_intervention(source, scores_dir / f"{pairs_source}.npz", "shuffle")
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        result = run_test_protocol(
+            checkpoint=_write_checkpoint(tmp_path),
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="prefix_shuffle",
+            seed=0,
+            score_runner=runner,
+            prefix_intervention="shuffle",
+            reuse_existing_scores=True,
+        )
+
+        assert runner.calls == []
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["prefix_intervention"] == "shuffle"
+
+    def test_accepts_missing_prefix_intervention_for_default_live_reuse(
+        self, tmp_path: Path
+    ) -> None:
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / "matching_prefix_live"
+        scores_dir = output_dir / "scores"
+        scores_dir.mkdir(parents=True)
+        for pairs_source, source in fixture.artifacts.items():
+            (scores_dir / f"{pairs_source}.npz").write_bytes(source.read_bytes())
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        result = run_test_protocol(
+            checkpoint=_write_checkpoint(tmp_path),
+            output_dir=output_dir,
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="full",
+            seed=0,
+            score_runner=runner,
+            reuse_existing_scores=True,
+        )
+
+        assert runner.calls == []
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["prefix_intervention"] is None
 
     def test_reuses_written_artifacts_and_only_scores_what_is_missing(self, tmp_path: Path) -> None:
         """Mimics the real failure: test finished, test_topology did not."""

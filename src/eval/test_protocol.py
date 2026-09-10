@@ -168,6 +168,7 @@ def _require_scoring_identity(
     checkpoint_id: str | None,
     strategy: str,
     topo_gen_control: str | None,
+    prefix_intervention: str = "none",
     label: str,
 ) -> None:
     """Bind a scored or reused artifact to this invocation's checkpoint and split."""
@@ -184,6 +185,12 @@ def _require_scoring_identity(
         raise ValueError(
             f"{label}: topo_gen_control {artifact.meta.get('topo_gen_control')!r} "
             f"does not match {topo_gen_control!r}"
+        )
+    if artifact.meta.get("prefix_intervention", "none") != prefix_intervention:
+        raise ValueError(
+            f"{label}: prefix_intervention "
+            f"{artifact.meta.get('prefix_intervention', 'none')!r} "
+            f"does not match {prefix_intervention!r}"
         )
 
 
@@ -316,6 +323,7 @@ def _build_score_args(
     pack_dir: Path | None,
     scaffold_control: str | None,
     topo_gen_control: str | None,
+    prefix_intervention: str = "none",
     rescore_reason: str | None,
     scoring_run_id: str | None,
     allow_oracle_diagnostic: bool,
@@ -356,6 +364,8 @@ def _build_score_args(
         args += ["--scaffold-control", scaffold_control]
     if topo_gen_control is not None:
         args += ["--topo-gen-control", topo_gen_control]
+    if prefix_intervention != "none":
+        args += ["--prefix-intervention", prefix_intervention]
     if rescore_reason is not None:
         args += ["--rescore-reason", rescore_reason]
     if scoring_run_id is not None:
@@ -383,6 +393,7 @@ def run_test_protocol(
     pack_dir: Path | None = None,
     scaffold_control: str | None = None,
     topo_gen_control: str | None = None,
+    prefix_intervention: str = "none",
     rescore_reason: str | None = None,
     model_family: str | None = None,
     model_config: Path | None = None,
@@ -405,6 +416,9 @@ def run_test_protocol(
         pack_dir: Optional GPU-resident packed BF16 feature directory.
         scaffold_control: Optional scoring-time structure control.
         topo_gen_control: Optional topology-generator scoring-time control.
+        prefix_intervention: ``v3_1_prefix`` scoring-time intervention
+            (``"none"``/``"gates_off"``/``"shuffle"``/``"mean"``); forwarded
+            to every pass and cross-checked against each artifact's meta.
         rescore_reason: Required by the test-access ledger when this
             ``(arm, seed)`` has already opened held-out data.
         model_family: Explicit model family for a bare legacy checkpoint (only
@@ -515,6 +529,7 @@ def run_test_protocol(
             pack_dir=pack_dir,
             scaffold_control=scaffold_control,
             topo_gen_control=topo_gen_control,
+            prefix_intervention=prefix_intervention,
             rescore_reason=rescore_reason if allow_rescore_reason else None,
             scoring_run_id=scoring_run_id if include_scoring_run_id else None,
             allow_oracle_diagnostic=allow_oracle_diagnostic,
@@ -541,6 +556,7 @@ def run_test_protocol(
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
         topo_gen_control=topo_gen_control,
+        prefix_intervention=prefix_intervention,
         label=str(validation_path),
     )
     validation_split = _load_val_region_split(data_root, strategy)
@@ -602,6 +618,7 @@ def run_test_protocol(
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
         topo_gen_control=topo_gen_control,
+        prefix_intervention=prefix_intervention,
         label=str(val_cls_path),
     )
     f1_selection = select_max_f1_threshold(
@@ -626,6 +643,7 @@ def run_test_protocol(
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
         topo_gen_control=topo_gen_control,
+        prefix_intervention=prefix_intervention,
         label=str(test_path),
     )
 
@@ -644,6 +662,7 @@ def run_test_protocol(
         checkpoint_id=expected_checkpoint_id,
         strategy=strategy,
         topo_gen_control=topo_gen_control,
+        prefix_intervention=prefix_intervention,
         label=str(topology_path),
     )
 
@@ -696,6 +715,7 @@ def run_test_protocol(
         "seed": seed,
         "model_family": meta.get("model_family"),
         "topo_gen_control": meta.get("topo_gen_control"),
+        "prefix_intervention": meta.get("prefix_intervention"),
         # `score_universe` never writes `run_kind` into score metadata, so the
         # artifact's own value is always absent. The published training
         # metadata is the only place a run's formal/diagnostic classification
@@ -796,6 +816,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="v3_1 topology-generator scoring-time control",
     )
     parser.add_argument(
+        "--prefix-intervention",
+        choices=["none", "gates_off", "shuffle", "mean"],
+        default="none",
+        help="v3_1_prefix scoring-time intervention",
+    )
+    parser.add_argument(
         "--rescore-reason",
         default=None,
         help="required reason for a repeated egostitch_e2e held-out scoring epoch",
@@ -883,6 +909,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         pack_dir=args.pack_dir,
         scaffold_control=args.scaffold_control,
         topo_gen_control=args.topo_gen_control,
+        prefix_intervention=args.prefix_intervention,
         rescore_reason=args.rescore_reason,
         model_family=args.model_family,
         model_config=args.model_config,

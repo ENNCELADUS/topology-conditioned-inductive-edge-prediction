@@ -31,9 +31,12 @@ from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.data.val_region import ValRegionParams
 from src.model.egostitch.classifier.b0_v31 import V3_1, B0V31PairClassifier, GatedCrossAttention
+from src.model.egostitch.classifier.prefix import V3_1Prefix
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import E2EConfig, GeneratorConfig
 from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
+
+from tests.test_prefix_model import _pair_batch, _tiny_base_config
 
 INPUT_DIM = 4
 
@@ -1041,8 +1044,21 @@ def _write_fake_shard(
     num_rows: int,
     checkpoint_id: str = "abc123abc123abcd",
     topo_gen_control: str | None = None,
+    prefix_intervention: str | None = None,
 ) -> None:
     node_ids = ["node_a", "node_b"]
+    meta: dict[str, object] = {
+        "checkpoint_id": checkpoint_id,
+        "model_family": "v3_1",
+        "pairs_source": "candidate",
+        "strategy": "breadth_first",
+        "num_rows": num_rows,
+        "created_utc": "2026-07-09T00:00:00+00:00",
+        "torch_version": torch.__version__,
+        "topo_gen_control": topo_gen_control,
+    }
+    if prefix_intervention is not None:
+        meta["prefix_intervention"] = prefix_intervention
     score_universe.save_scores(
         path,
         node_ids=node_ids,
@@ -1051,16 +1067,7 @@ def _write_fake_shard(
         logit=np.zeros(n_rows, dtype=np.float32),
         label=np.full(n_rows, -1, dtype=np.int8),
         row_start=row_start,
-        meta={
-            "checkpoint_id": checkpoint_id,
-            "model_family": "v3_1",
-            "pairs_source": "candidate",
-            "strategy": "breadth_first",
-            "num_rows": num_rows,
-            "created_utc": "2026-07-09T00:00:00+00:00",
-            "torch_version": torch.__version__,
-            "topo_gen_control": topo_gen_control,
-        },
+        meta=meta,
     )
 
 
@@ -1116,6 +1123,27 @@ def test_merge_mismatched_topo_gen_control_raises_clear_error(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="topo_gen_control"):
         score_universe.merge_scores([shard0, shard1])
+
+
+def test_merge_mismatched_prefix_intervention_raises_clear_error(tmp_path: Path) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20, prefix_intervention="none")
+    _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention="mean")
+
+    with pytest.raises(ValueError, match="prefix_intervention"):
+        score_universe.merge_scores([shard0, shard1])
+
+
+def test_merge_missing_prefix_intervention_defaults_to_none_and_merges(tmp_path: Path) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20)
+    _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention="none")
+
+    merged = score_universe.merge_scores([shard0, shard1])
+
+    assert len(merged.logit) == 20
 
 
 def test_merge_missing_topo_gen_control_rejects_explicit_null(tmp_path: Path) -> None:
@@ -3122,3 +3150,67 @@ def test_oracle_val_topology_truth_diagnostic_still_writes_no_ledger_record(
     assert oracle_diagnostic["truth_source"] == "val_topology_g_val"
     assert artifact.meta["heldout"] is False
     assert not list(tmp_path.rglob("test_access_ledger.jsonl"))
+
+
+def test_prefix_family_round_trips_through_build_model(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = V3_1Prefix(
+        base=_tiny_base_config(),
+        prefix={"tokens": 3, "rank": 2, "conditioning": "pair", "bottleneck": 6},
+    )
+    with torch.no_grad():
+        model.generator.gates.fill_(0.3)
+    payload: dict[str, object] = {
+        "model_state": model.state_dict(),
+        "model_family": "v3_1_prefix",
+        "model_config": {"base": _tiny_base_config(), "prefix": model.prefix_cfg.to_dict()},
+    }
+    rebuilt = score_universe.build_model(
+        cast(str, payload["model_family"]),
+        cast("dict[str, object]", payload["model_config"]),
+    )
+    rebuilt.load_state_dict(cast("dict[str, torch.Tensor]", payload["model_state"]))
+    rebuilt.eval()
+    model.eval()
+    batch = _pair_batch()
+    with torch.no_grad():
+        assert torch.equal(rebuilt(batch)["logits"], model(batch)["logits"])
+
+
+def test_prefix_intervention_flag_is_parsed_and_defaults_to_none() -> None:
+    parser = score_universe.build_parser()
+    args = parser.parse_args(
+        [
+            "score",
+            "--checkpoint",
+            "x.pt",
+            "--pairs",
+            "candidate",
+            "--output",
+            "y.npz",
+            "--prefix-intervention",
+            "shuffle",
+            "--prefix-intervention-seed",
+            "7",
+        ]
+    )
+    assert args.prefix_intervention == "shuffle" and args.prefix_intervention_seed == 7
+    default = parser.parse_args(
+        ["score", "--checkpoint", "x.pt", "--pairs", "candidate", "--output", "y.npz"]
+    )
+    assert default.prefix_intervention == "none"
+
+
+def test_require_shufflable_batches_raises_on_a_single_row_batch() -> None:
+    with pytest.raises(SystemExit, match=r"batch 1 has 1"):
+        score_universe._require_shufflable_batches([[0, 1], [2]], "shuffle")
+
+
+def test_require_shufflable_batches_passes_when_every_batch_has_at_least_two_rows() -> None:
+    score_universe._require_shufflable_batches([[0, 1], [2, 3]], "shuffle")
+
+
+def test_require_shufflable_batches_is_a_no_op_for_other_interventions() -> None:
+    score_universe._require_shufflable_batches([[0, 1], [2]], "none")
+    score_universe._require_shufflable_batches([[0, 1], [2]], "mean")
+    score_universe._require_shufflable_batches([[0, 1], [2]], "gates_off")

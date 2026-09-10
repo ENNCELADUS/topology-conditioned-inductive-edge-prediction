@@ -1007,6 +1007,16 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
             f"{[shard.meta['topo_gen_control'] for shard in shards]} "
             f"(files: {[str(shard.path) for shard in shards]})"
         )
+    # Unlike `topo_gen_control`, a missing key is not an error here: it means
+    # the shard was scored before this flag existed, and defaults to "none"
+    # (the flag's own default) so pre-existing artifacts still merge.
+    prefix_interventions = {str(shard.meta.get("prefix_intervention", "none")) for shard in shards}
+    if len(prefix_interventions) > 1:
+        raise ValueError(
+            "merge inputs disagree on meta 'prefix_intervention': "
+            f"{sorted(prefix_interventions)} "
+            f"(files: {[str(shard.path) for shard in shards]})"
+        )
     for key in (
         "checkpoint_id",
         "model_family",
@@ -1158,6 +1168,13 @@ def _build_v3_1(model_config: dict[str, object]) -> nn.Module:
     return V3_1(**model_config)
 
 
+def _build_v3_1_prefix(model_config: dict[str, object]) -> nn.Module:
+    """Build a `V3_1Prefix` from its checkpointed config (frozen base state is checkpointed)."""
+    from src.model.egostitch.classifier.prefix import V3_1Prefix
+
+    return V3_1Prefix(**cast(dict[str, Any], model_config))
+
+
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchModel` from its checkpointed config (design rev 3).
 
@@ -1245,6 +1262,7 @@ def _build_cazi_mbn(model_config: dict[str, object]) -> nn.Module:
 
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
+    "v3_1_prefix": _build_v3_1_prefix,
     "egostitch_e2e": _build_egostitch_e2e,
     "cazi_mbn": _build_cazi_mbn,
 }
@@ -1865,6 +1883,32 @@ def _log_progress(processed: int, total: int, batch_rows: int) -> None:
         logger.info("scored %d/%d rows", processed, total)
 
 
+def _require_shufflable_batches(sampler: Iterable[Sequence[int]], intervention: str) -> None:
+    """Fail closed, before scoring, if ``--prefix-intervention shuffle`` cannot run.
+
+    `V3_1Prefix`'s ``shuffle`` intervention raises deep inside the model on a
+    batch of exactly one row (nothing to permute against). Iterating the
+    length-bucketed sampler here, before any GPU work starts, turns that
+    mid-run crash into a clear, immediate one.
+
+    Args:
+        sampler: The v3_1 length-bucketed batch sampler about to be used.
+        intervention: The scoring-time ``--prefix-intervention`` value.
+
+    Raises:
+        SystemExit: If `intervention` is ``"shuffle"`` and any batch has a
+            single row.
+    """
+    if intervention != "shuffle":
+        return
+    for index, batch in enumerate(sampler):
+        if len(batch) < 2:
+            raise SystemExit(
+                "--prefix-intervention shuffle needs every batch to hold >= 2 pairs; "
+                f"batch {index} has {len(batch)} — change --token-budget"
+            )
+
+
 def _score_v3_1(
     model: nn.Module,
     pairs: Sequence[tuple[str, str]],
@@ -1873,6 +1917,7 @@ def _score_v3_1(
     device: torch.device,
     amp: str,
     token_budget: int,
+    prefix_intervention: str = "none",
 ) -> NDArray[np.float32]:
     """Score pairs with a `V3_1` model via the length-bucketed batching machinery.
 
@@ -1887,6 +1932,9 @@ def _score_v3_1(
         device: Compute device.
         amp: ``off`` or ``bf16``.
         token_budget: Approximate per-batch token budget for the bucketed sampler.
+        prefix_intervention: The scoring-time ``--prefix-intervention`` value
+            (``v3_1_prefix`` only); fails closed here when it is ``"shuffle"``
+            and some batch would have too few rows to shuffle.
 
     Returns:
         Shape ``(len(pairs),)`` float32 logits in input row order.
@@ -1894,6 +1942,7 @@ def _score_v3_1(
     lengths = probe_lengths(store, pairs)
     dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
+    _require_shufflable_batches(sampler, prefix_intervention)
 
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
@@ -1919,6 +1968,7 @@ def _score_v3_1_packed(
     amp: str,
     pair_amp: str | None = None,
     token_budget: int,
+    prefix_intervention: str = "none",
 ) -> NDArray[np.float32]:
     """Score V3.1 pairs with packed features and cached per-node encodings."""
     if not isinstance(model, V3_1):
@@ -1938,6 +1988,7 @@ def _score_v3_1_packed(
     lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
     lengths = [(lengths_by_node[u], lengths_by_node[v]) for u, v in pairs]
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
+    _require_shufflable_batches(sampler, prefix_intervention)
     node_a = torch.tensor([node_index[u] for u, _ in pairs], dtype=torch.int64)
     node_b = torch.tensor([node_index[v] for _, v in pairs], dtype=torch.int64)
 
@@ -3094,6 +3145,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="v3_1 topology-generator scoring-time control",
     )
+    score.add_argument(
+        "--prefix-intervention",
+        choices=["none", "gates_off", "shuffle", "mean"],
+        default="none",
+        help="v3_1_prefix scoring-time intervention (spec §7)",
+    )
+    score.add_argument("--prefix-intervention-seed", type=int, default=0)
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
     score.add_argument("--num-shards", type=int, default=None, help="total shard count N")
     score.add_argument(
@@ -3220,6 +3278,15 @@ def _run_score(args: argparse.Namespace) -> None:
         if topo_gen is None:
             raise SystemExit("--topo-gen-control requires a checkpoint with model.config.topo_gen")
         cast(TopoGenBase, topo_gen).control = args.topo_gen_control
+
+    if args.prefix_intervention != "none":
+        if model_family != "v3_1_prefix":
+            raise SystemExit("--prefix-intervention requires a v3_1_prefix checkpoint")
+        from src.model.egostitch.classifier.prefix import V3_1Prefix
+
+        prefix_model = cast(V3_1Prefix, model)
+        prefix_model.intervention = args.prefix_intervention
+        prefix_model.intervention_seed = int(args.prefix_intervention_seed)
 
     cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None
 
@@ -3370,6 +3437,7 @@ def _run_score(args: argparse.Namespace) -> None:
             "logit_storage_dtype": "float32",
         },
         "topo_gen_control": args.topo_gen_control,
+        "prefix_intervention": args.prefix_intervention,
     }
     f_logit: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
@@ -3377,7 +3445,7 @@ def _run_score(args: argparse.Namespace) -> None:
     if full_oracle_telemetry is not None and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     score_started = perf_counter()
-    if model_family == "v3_1":
+    if model_family in ("v3_1", "v3_1_prefix"):
         if args.pack_dir is None:
             logits = _score_v3_1(
                 model,
@@ -3386,6 +3454,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 device=device,
                 amp=args.amp,
                 token_budget=args.token_budget,
+                prefix_intervention=args.prefix_intervention,
             )
         else:
             logits = _score_v3_1_packed(
@@ -3396,6 +3465,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 amp=args.amp,
                 pair_amp=args.pair_amp or args.amp,
                 token_budget=args.token_budget,
+                prefix_intervention=args.prefix_intervention,
             )
     elif model_family == "f0_mlp":
         logits = _score_f0_mlp(
@@ -3462,6 +3532,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 "logit_storage_dtype": "float32",
             },
             "topo_gen_control": args.topo_gen_control,
+            "prefix_intervention": args.prefix_intervention,
             "scaffold_control": {
                 "mode": args.scaffold_control,
                 "seed": _SCAFFOLD_CONTROL_SEED,
