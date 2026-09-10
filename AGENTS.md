@@ -25,6 +25,15 @@ selected method. Every piece of writing must explain how its context helps decid
   (sampler-matched baseline), `struct_grand` (ported soft-GS + RD), `struct_new` (neighbour rank +
   node-wise degree + open/closed motif). One sampled training subgraph per step supervises the
   output adjacency; the inference interface is unchanged.
+- Prefix arms (`model.family: v3_1_prefix`, `model.config.prefix` + `struct:` block): `prefix_static`,
+  `prefix_pair`, `prefix_pair_bce`. They load and freeze `prefix_base` (`configs/split_seed42/prefix_base.yaml`,
+  the headline B0 with `mixing.mode: bidirectional_cross`) and train only a zero-init gated KV prefix
+  in its three cross-attention layers; `prefix_pair_bce` zeroes the structural weights as the
+  topology-supervision control. Studies: `src.experiments.struct_hpo --arm prefix_{static,pair}` and
+  `--arm prefix_pair_bce --n-trials 3 --lr-center <winner lr>`. Scoring-time interventions:
+  `score_universe --prefix-intervention {gates_off,shuffle,mean}`. `shuffle`/`mean` require a
+  pair-conditioned checkpoint and `shuffle` needs every scoring batch to hold at least two pairs;
+  both fail closed.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

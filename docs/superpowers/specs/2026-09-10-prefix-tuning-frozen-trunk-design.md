@@ -194,6 +194,14 @@ $$
   tokens), and the CLS attention (partner = concatenated A and B tokens); all three, in all three
   layers. FFN sub-layers are untouched. The prefix path has no dropout; the base runs in eval mode.
 
+*Bit-exactness caveat (2026-09-10, verified on torch 2.10.0).* Null identity is bit-exact against the
+frozen base as deployed inside the arm: parameters with `requires_grad=False`, eval mode. PyTorch's
+attention kernel path depends on the parameters' `requires_grad` state, so a scoring pass of the same
+weights with `requires_grad=True` (an ordinary `score_universe` run of `prefix_base`) differs from the
+`gates_off` intervention by about 1e-7 in float32. The `gates_off` check in §7 therefore compares
+logits to `prefix_base`'s artifact within 1e-6, and metrics at the frozen threshold can differ only at
+exact ties.
+
 ### 5.3 Compute
 
 Freezing removes parameter gradients and optimizer state, and the Siamese encoder runs under
@@ -259,7 +267,7 @@ each row's own frozen threshold, with AUPRC alongside:
 applied at the **unordered-pair level** so the AB and BA evaluations of one pair see the same
 substituted $z_{uv}$ and `abba_max` symmetry is preserved:
 
-1. *Gates off* — all $g\leftarrow 0$; must reproduce `prefix_base` exactly (a correctness check, reported).
+1. *Gates off* — all $g\leftarrow 0$; must reproduce `prefix_base`'s logits within 1e-6 (a correctness check, reported; see §5.2).
 2. *Shuffle* — $z_{uv}$ permuted across unordered pairs within each scored universe.
 3. *Mean* — $z_{uv}$ replaced by its training-set mean (a `z_mean` buffer computed at publish time).
 
