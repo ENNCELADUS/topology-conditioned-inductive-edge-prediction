@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add the `v3_1_prefix` model family (a frozen `b0_cross` V3.1 trunk plus a trainable zero-init gated KV prefix), its three arms (`prefix_static`, `prefix_pair`, `prefix_pair_bce`), the `b0_cross` base config, scoring-time interventions, and the struct_hpo studies, so the H20 campaign can run the attribution experiment in the spec.
+**Goal:** Add the `v3_1_prefix` model family (a frozen `prefix_base` V3.1 trunk plus a trainable zero-init gated KV prefix), its three arms (`prefix_static`, `prefix_pair`, `prefix_pair_bce`), the `prefix_base` base config, scoring-time interventions, and the struct_hpo studies, so the H20 campaign can run the attribution experiment in the spec.
 
 **Architecture:** A new classifier module wraps a trained `V3_1` whose pair trunk has `mixing.mode: bidirectional_cross`. Each frozen `CrossAttentionLayer` is re-driven by a `PrefixCrossAttentionLayer` that calls the layer's own `nn.MultiheadAttention` modules unchanged and adds a separately-softmaxed, tanh-gated prefix branch at the three attention sites. The prefix is a static per-layer token matrix, optionally plus a slot-specific low-rank pair shift generated from the frozen encoder's masked-mean vectors. Training reuses `train_b0` with the structural stream; only prefix parameters enter the optimizer; the published checkpoint embeds the frozen base state so `score_universe` rebuilds it alone.
 
@@ -30,7 +30,7 @@
 
 | Path | Responsibility |
 |---|---|
-| `configs/split_seed42/b0_cross.yaml` | Create. Headline B0 with `mixing.mode: bidirectional_cross`. |
+| `configs/split_seed42/prefix_base.yaml` | Create. Headline B0 with `mixing.mode: bidirectional_cross`. |
 | `src/model/egostitch/classifier/prefix.py` | Create. `PrefixConfig`, `PrefixGenerator`, `prefix_branch`, `PrefixCrossAttentionLayer`, `V3_1Prefix`. |
 | `src/model/egostitch/classifier/__init__.py` | Modify. Export the new names if the package re-exports classifiers. |
 | `src/train_b0.py` | Modify. `MODEL_FAMILIES`, `is_v3_1_family`, `resolve_model_kwargs`, `build_model`, `_build_optimizer`, four family gates, static-prefix init before `prepare`. |
@@ -92,25 +92,25 @@ def _pair_batch(n: int = 6, seed: int = 0) -> dict[str, torch.Tensor]:
 
 ---
 
-### Task 1: `b0_cross` config and local smoke of the bidirectional path
+### Task 1: `prefix_base` config and local smoke of the bidirectional path
 
 **Files:**
-- Create: `configs/split_seed42/b0_cross.yaml`
+- Create: `configs/split_seed42/prefix_base.yaml`
 - Test: `tests/test_sweep_configs.py` (add one test)
 
 **Interfaces:**
-- Produces: `configs/split_seed42/b0_cross.yaml`, identical to `configs/split_seed42/b0_v31.yaml` except `mixing.mode`, `output_dir`, and the header comment. Later tasks reference `outputs/split_seed42/b0_cross/best.pt` as `prefix.base_checkpoint`.
+- Produces: `configs/split_seed42/prefix_base.yaml`, identical to `configs/split_seed42/b0_v31.yaml` except `mixing.mode`, `output_dir`, and the header comment. Later tasks reference `outputs/split_seed42/prefix_base/best.pt` as `prefix.base_checkpoint`.
 
 - [ ] **Step 1: Write the failing config test**
 
 Append to `tests/test_sweep_configs.py`:
 
 ```python
-def test_b0_cross_differs_from_headline_b0_only_in_mixing_and_output_dir() -> None:
+def test_prefix_base_differs_from_headline_b0_only_in_mixing_and_output_dir() -> None:
     base = yaml.safe_load(Path("configs/split_seed42/b0_v31.yaml").read_text(encoding="utf-8"))
-    cross = yaml.safe_load(Path("configs/split_seed42/b0_cross.yaml").read_text(encoding="utf-8"))
+    cross = yaml.safe_load(Path("configs/split_seed42/prefix_base.yaml").read_text(encoding="utf-8"))
     assert cross["model"]["config"]["mixing"] == {"mode": "bidirectional_cross"}
-    assert cross["output_dir"] == "outputs/split_seed42/b0_cross"
+    assert cross["output_dir"] == "outputs/split_seed42/prefix_base"
     cross["model"]["config"]["mixing"] = base["model"]["config"]["mixing"]
     cross["output_dir"] = base["output_dir"]
     assert cross == base
@@ -120,23 +120,23 @@ If the file does not already import `yaml` and `Path`, add `import yaml` and `fr
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/test_sweep_configs.py -n0 -k b0_cross -v`
-Expected: FAIL with `FileNotFoundError` for `configs/split_seed42/b0_cross.yaml`.
+Run: `.venv/bin/python -m pytest tests/test_sweep_configs.py -n0 -k prefix_base -v`
+Expected: FAIL with `FileNotFoundError` for `configs/split_seed42/prefix_base.yaml`.
 
 - [ ] **Step 3: Create the config**
 
 ```bash
-sed -e 's|^# B0 baseline on the seed-42.*|# b0_cross: the headline B0 recipe with bidirectional cross-attention in the pair trunk.\n# The exact frozen base of the prefix arms (spec 2026-09-10-prefix-tuning-frozen-trunk-design §4);\n# identical to b0_v31.yaml except mixing.mode and output_dir.|' \
+sed -e 's|^# B0 baseline on the seed-42.*|# prefix_base: the headline B0 recipe with bidirectional cross-attention in the pair trunk.\n# The exact frozen base of the prefix arms (spec 2026-09-10-prefix-tuning-frozen-trunk-design §4);\n# identical to b0_v31.yaml except mixing.mode and output_dir.|' \
     -e 's|      mode: none|      mode: bidirectional_cross|' \
-    -e 's|^output_dir: outputs/split_seed42/b0_v31$|output_dir: outputs/split_seed42/b0_cross|' \
-    configs/split_seed42/b0_v31.yaml > configs/split_seed42/b0_cross.yaml
+    -e 's|^output_dir: outputs/split_seed42/b0_v31$|output_dir: outputs/split_seed42/prefix_base|' \
+    configs/split_seed42/b0_v31.yaml > configs/split_seed42/prefix_base.yaml
 ```
 
-Open the file and confirm exactly three differences against `b0_v31.yaml` (`diff configs/split_seed42/b0_v31.yaml configs/split_seed42/b0_cross.yaml`): the header, `mode: bidirectional_cross`, and `output_dir`.
+Open the file and confirm exactly three differences against `b0_v31.yaml` (`diff configs/split_seed42/b0_v31.yaml configs/split_seed42/prefix_base.yaml`): the header, `mode: bidirectional_cross`, and `output_dir`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `.venv/bin/python -m pytest tests/test_sweep_configs.py -n0 -k b0_cross -v`
+Run: `.venv/bin/python -m pytest tests/test_sweep_configs.py -n0 -k prefix_base -v`
 Expected: PASS
 
 - [ ] **Step 5: Smoke the bidirectional path end-to-end on CPU**
@@ -145,10 +145,10 @@ Write a scratch config that shrinks the batch and adds the structural stream, th
 
 ```bash
 S=/private/tmp/claude-501/-Users-richardwang-Documents-topology-conditioned-inductive-edge-prediction/810cd6bb-d08e-4e35-a289-7b1f59c6536f/scratchpad
-mkdir -p $S/b0_cross_smoke
+mkdir -p $S/prefix_base_smoke
 .venv/bin/python - <<'EOF'
 import yaml, pathlib
-p = pathlib.Path("configs/split_seed42/b0_cross.yaml")
+p = pathlib.Path("configs/split_seed42/prefix_base.yaml")
 cfg = yaml.safe_load(p.read_text())
 cfg["data"]["batch_pairs"] = 8
 cfg["data"]["token_budget"] = 8192
@@ -157,19 +157,19 @@ cfg["mixed_precision"] = "no"
 cfg["struct"] = yaml.safe_load(pathlib.Path("configs/split_seed42/struct_new.yaml").read_text())["struct"]
 cfg["struct"]["nodes"] = 12
 cfg["struct"]["background_nodes"] = 4
-out = pathlib.Path("/private/tmp/claude-501/-Users-richardwang-Documents-topology-conditioned-inductive-edge-prediction/810cd6bb-d08e-4e35-a289-7b1f59c6536f/scratchpad/b0_cross_smoke/cfg.yaml")
+out = pathlib.Path("/private/tmp/claude-501/-Users-richardwang-Documents-topology-conditioned-inductive-edge-prediction/810cd6bb-d08e-4e35-a289-7b1f59c6536f/scratchpad/prefix_base_smoke/cfg.yaml")
 out.write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
-.venv/bin/python -m src.train_b0 --config $S/b0_cross_smoke/cfg.yaml --output-dir $S/b0_cross_smoke/out --max-steps 2 2>&1 | tail -20
+.venv/bin/python -m src.train_b0 --config $S/prefix_base_smoke/cfg.yaml --output-dir $S/prefix_base_smoke/out --max-steps 2 2>&1 | tail -20
 ```
 
-Expected: the run reaches "step 2" and exits without a traceback; `$S/b0_cross_smoke/out/metrics.jsonl` exists. If the direct path cannot find local data (`TCIEP_DATA_ROOT` unset and `data/` absent), record that the smoke is deferred to the H20 `--max-steps` debug launch in Task 10 and continue.
+Expected: the run reaches "step 2" and exits without a traceback; `$S/prefix_base_smoke/out/metrics.jsonl` exists. If the direct path cannot find local data (`TCIEP_DATA_ROOT` unset and `data/` absent), record that the smoke is deferred to the H20 `--max-steps` debug launch in Task 10 and continue.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add configs/split_seed42/b0_cross.yaml tests/test_sweep_configs.py
-git commit -m "feat(split): b0_cross, the headline B0 with bidirectional cross-attention"
+git add configs/split_seed42/prefix_base.yaml tests/test_sweep_configs.py
+git commit -m "feat(split): prefix_base, the headline B0 with bidirectional cross-attention"
 ```
 
 ---
@@ -1687,7 +1687,7 @@ def test_prefix_arm_configs_share_the_struct_new_recipe(arm: str) -> None:
         "family": "v3_1_prefix",
         "config": {
             "prefix": {
-                "base_checkpoint": "outputs/split_seed42/b0_cross/best.pt",
+                "base_checkpoint": "outputs/split_seed42/prefix_base/best.pt",
                 "tokens": 16,
                 "rank": 8,
                 "conditioning": "static" if arm == "prefix_static" else "pair",
@@ -1731,7 +1731,7 @@ for arm, conditioning, weights in (
 ):
     cfg = yaml.safe_load(yaml.safe_dump(base))
     cfg["model"] = {"family": "v3_1_prefix", "config": {"prefix": {
-        "base_checkpoint": "outputs/split_seed42/b0_cross/best.pt",
+        "base_checkpoint": "outputs/split_seed42/prefix_base/best.pt",
         "tokens": 16, "rank": 8, "conditioning": conditioning, "bottleneck": 128}}}
     cfg["optim"]["lr"] = 1e-3
     cfg["optim"]["scheduler"]["max_lr"] = 1e-3
@@ -1739,7 +1739,7 @@ for arm, conditioning, weights in (
     cfg["output_dir"] = f"outputs/split_seed42/{arm}"
     cfg["struct"]["weights"] = {"bce": 1.0, "gs": 0.0, "rd": 0.0, "deg_mmd": 0.0, **weights}
     header = (
-        f"# {arm}: frozen b0_cross trunk + trainable gated KV prefix (model.family v3_1_prefix),\n"
+        f"# {arm}: frozen prefix_base trunk + trainable gated KV prefix (model.family v3_1_prefix),\n"
         "# supervised by the struct_new structural stream. Spec:\n"
         "# docs/superpowers/specs/2026-09-10-prefix-tuning-frozen-trunk-design.md. Base config of\n"
         f"# src.experiments.struct_hpo --arm {arm}; the study rewrites struct.weights, optim.lr,\n"
@@ -1778,13 +1778,13 @@ git commit -m "feat(split): prefix_static, prefix_pair, prefix_pair_bce configs 
 In the §1.4 "Compared methods" table, after the `struct_new` row, add:
 
 ```markdown
-| b0_cross | none | — | none | the headline B0 recipe with `mixing.mode: bidirectional_cross`; frozen base of the prefix arms |
+| prefix_base | none | — | none | the headline B0 recipe with `mixing.mode: bidirectional_cross`; frozen base of the prefix arms |
 | prefix_static | none (structural stream through a frozen trunk) | — | `rank`, `degree`, `motif` as struct_new; `lr` log-uniform [1e-4, 1e-2] | shared-prompt control (spec 2026-09-10) |
 | prefix_pair | none (structural stream through a frozen trunk) | — | as prefix_static | primary prefix arm: pair-conditioned slot-specific prefix |
 | prefix_pair_bce | none (subgraph BCE only) | — | `lr` at {c/3, c, 3c} around the prefix_pair winner | topology-supervision control |
 ```
 
-In §1.5, replace "The V3.1 student uses d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling (mean/attn/max/gated), pair_context_gated readout with abba_max aggregation" with "The V3.1 student uses d_model 512, 3 encoder layers, 8 heads, `mixing.mode: none` (the configured `cross_attn_layers: 3` build no pair cross-attention layers under that mode; `b0_cross` is the arm that instantiates them), pair_context_gated readout with abba_max aggregation". Add one sentence after it: "The prefix arms freeze `b0_cross` and train only a gated KV prefix (spec `docs/superpowers/specs/2026-09-10-prefix-tuning-frozen-trunk-design.md`); their interventions are scoring-time flags of `score_universe` (`--prefix-intervention`)."
+In §1.5, replace "The V3.1 student uses d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling (mean/attn/max/gated), pair_context_gated readout with abba_max aggregation" with "The V3.1 student uses d_model 512, 3 encoder layers, 8 heads, `mixing.mode: none` (the configured `cross_attn_layers: 3` build no pair cross-attention layers under that mode; `prefix_base` is the arm that instantiates them), pair_context_gated readout with abba_max aggregation". Add one sentence after it: "The prefix arms freeze `prefix_base` and train only a gated KV prefix (spec `docs/superpowers/specs/2026-09-10-prefix-tuning-frozen-trunk-design.md`); their interventions are scoring-time flags of `score_universe` (`--prefix-intervention`)."
 
 - [ ] **Step 2: `CLAUDE.md` and `AGENTS.md`**
 
@@ -1792,7 +1792,7 @@ In both files' "Active method set" list, after the structural-arms bullet, add:
 
 ```markdown
 - Prefix arms (`model.family: v3_1_prefix`, `model.config.prefix` + `struct:` block): `prefix_static`,
-  `prefix_pair`, `prefix_pair_bce`. They load and freeze `b0_cross` (`configs/split_seed42/b0_cross.yaml`,
+  `prefix_pair`, `prefix_pair_bce`. They load and freeze `prefix_base` (`configs/split_seed42/prefix_base.yaml`,
   the headline B0 with `mixing.mode: bidirectional_cross`) and train only a zero-init gated KV prefix
   in its three cross-attention layers; `prefix_pair_bce` zeroes the structural weights as the
   topology-supervision control. Studies: `src.experiments.struct_hpo --arm prefix_{static,pair}` and
@@ -1805,7 +1805,7 @@ In both files' "Active method set" list, after the structural-arms bullet, add:
 Near the existing `struct_hpo` launch examples add:
 
 ```bash
-hpc/run.sh train configs/split_seed42/b0_cross.yaml                          # frozen base of the prefix arms
+hpc/run.sh train configs/split_seed42/prefix_base.yaml                          # frozen base of the prefix arms
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_static           # 10 trials
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair             # 10 trials
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair_bce --n-trials 3 --lr-center <prefix_pair winner lr>
@@ -1820,7 +1820,7 @@ Run: `.venv/bin/python -m pytest tests/test_struct_hpo.py -n0 -q` (the driver te
 
 ```bash
 git add docs/03-experiments.md CLAUDE.md AGENTS.md hpc/README.md src/experiments/struct_hpo.py
-git commit -m "docs: prefix arms, b0_cross, and the corrected student trunk description"
+git commit -m "docs: prefix arms, prefix_base, and the corrected student trunk description"
 ```
 
 ---
@@ -1842,7 +1842,7 @@ Expected: all clean and green. Fix anything the suite surfaces, commit as `fix(p
 
 - [ ] **Step 2: Codex review of the wave**
 
-`BASE` is the commit before Task 1 (`git log --oneline | grep -n "b0_cross, the headline" ` and take its parent).
+`BASE` is the commit before Task 1 (`git log --oneline | grep -n "prefix_base, the headline" ` and take its parent).
 
 ```bash
 S=/private/tmp/claude-501/-Users-richardwang-Documents-topology-conditioned-inductive-edge-prediction/810cd6bb-d08e-4e35-a289-7b1f59c6536f/scratchpad
@@ -1866,7 +1866,7 @@ Report the exact commands, in this order, to be run on the H20 checkout after `g
 
 ```bash
 # 1. frozen base (train + publish + held-out test)
-hpc/run.sh train configs/split_seed42/b0_cross.yaml
+hpc/run.sh train configs/split_seed42/prefix_base.yaml
 # 2. the two weight studies (parallel on two containers is fine)
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_static
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair
@@ -1884,13 +1884,13 @@ for iv in gates_off shuffle mean; do
 done
 ```
 
-Note in the hand-off that `gates_off` must reproduce `outputs/split_seed42/b0_cross/test_report.json` at the same thresholds, and that a mismatch is a bug in the wrapper, not a result.
+Note in the hand-off that `gates_off` must reproduce `outputs/split_seed42/prefix_base/test_report.json` at the same thresholds, and that a mismatch is a bug in the wrapper, not a result.
 
 ---
 
 ## Self-review against the spec
 
-- §4 `b0_cross` config, one-key difference, smoke: Task 1. Readout stays: no code touches it (Task 4 calls the frozen readout).
+- §4 `prefix_base` config, one-key difference, smoke: Task 1. Readout stays: no code touches it (Task 4 calls the frozen readout).
 - §4 loading/freezing, `train()` override, embedded state, provenance without verification: Tasks 4, 5.
 - §5.1 static prefix, real-activation init, slot-specific low-rank shift, gates as the only zero factor, symmetric `z`: Tasks 2, 4 (init from loader in Task 5).
 - §5.2 base MHA called unchanged, separate softmax, `out_proj` without bias, three sites, all layers, no prefix dropout: Task 3.

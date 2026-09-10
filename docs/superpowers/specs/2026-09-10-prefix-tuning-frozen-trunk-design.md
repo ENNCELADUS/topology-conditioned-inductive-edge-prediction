@@ -4,7 +4,7 @@
 **Date:** 2026-09-10, revision 2 after owner review
 **Status:** design approved in brainstorming; revision 2 addresses the two architectural blockers
 and the experimental corrections of the owner's review; implementation plan pending
-**Arms:** `b0_cross` (frozen base), `prefix_static`, `prefix_pair`, `prefix_pair_bce`
+**Arms:** `prefix_base` (frozen base), `prefix_static`, `prefix_pair`, `prefix_pair_bce`
 (model family `v3_1_prefix` for the three prefix arms)
 
 ## 1. Decision summary
@@ -27,7 +27,7 @@ Decisions, in the order they were made:
 | 3 | How the frozen trunk reads the prefix | Zero-init gated prefix attention in all three cross-attention layers |
 | 4 | Static or pair-conditioned | Both: `prefix_static` (shared-prompt control) and `prefix_pair` (primary) |
 | 5 | Loss weights | One 10-trial constrained study per trained-weight arm through `struct_hpo` |
-| 6 | Which frozen trunk (rev 2) | A matched `b0_cross`: the headline B0 recipe with `mixing.mode: bidirectional_cross`, because the headline B0 has no cross-attention layers (§4) |
+| 6 | Which frozen trunk (rev 2) | A matched `prefix_base`: the headline B0 recipe with `mixing.mode: bidirectional_cross`, because the headline B0 has no cross-attention layers (§4) |
 | 7 | Pair shift (rev 2) | Slot-specific low-rank $\Delta P_{uv}\in\mathbb R^{m\times d}$; a shared shift cancels in the prefix softmax (§5.1) |
 | 8 | Topology attribution (rev 2) | `prefix_pair_bce`: same prefix, same stream, structural weights zero (§7) |
 
@@ -74,7 +74,7 @@ two sequences. No observed edge, neighbour, degree, retrieval result, or test st
 training or inference. Training topology supervises the prefix through the structural stream;
 graph assembly remains an evaluation operation (`docs/02-methodology.md` §1).
 
-## 4. The frozen base: `b0_cross`
+## 4. The frozen base: `prefix_base`
 
 **Why not the headline B0.** The headline student (`configs/split_seed42/b0_v31.yaml`) sets
 `mixing.mode: none`. In `PairCrossAttention` that mode builds an empty layer list regardless of
@@ -83,12 +83,12 @@ independent Siamese encoding, with AB/BA evaluation and `abba_max`. There is no 
 a prefix can be read. Attaching the prefix to the Siamese encoder's self-attention or to the readout
 would be a different design and could not be described as prefix tuning of the pair trunk.
 
-**`b0_cross`.** The headline B0 recipe with exactly one change, `mixing.mode: bidirectional_cross`,
+**`prefix_base`.** The headline B0 recipe with exactly one change, `mixing.mode: bidirectional_cross`,
 which instantiates three `CrossAttentionLayer`s (shared-weight bidirectional cross-attention with
 FFN and a CLS attention over both streams) ahead of the same `pair_context_gated` readout. Same
 split (root `node_007630`, split seed 42), seed 0, optimizer, schedule, sampler, token budget,
-patience, and held-out protocol. Config `configs/split_seed42/b0_cross.yaml`, output
-`outputs/split_seed42/b0_cross`, published checkpoint `best.pt`, tested once.
+patience, and held-out protocol. Config `configs/split_seed42/prefix_base.yaml`, output
+`outputs/split_seed42/prefix_base`, published checkpoint `best.pt`, tested once.
 
 - **The readout stays.** `PairCrossAttention.forward` runs the layers and then hands the
   cross-attended token streams *and* the updated CLS token to `PairContextGatedReadout`, which
@@ -96,10 +96,10 @@ patience, and held-out protocol. Config `configs/split_seed42/b0_cross.yaml`, ou
   concatenates the CLS vector before its final projection. The readout is therefore the
   integration step over the cross-attention output, not a competitor to it. Under the headline B0
   the CLS input to that readout is the learned constant parameter (no layers touch it); under
-  `b0_cross` it becomes pair-dependent through each layer's CLS attention, so the CLS prefix site
+  `prefix_base` it becomes pair-dependent through each layer's CLS attention, so the CLS prefix site
   in §5.2 is live. Replacing the readout with a CLS-only head would be a second change from the
   headline recipe and would discard the pooling branches with no evidence against them.
-- `b0_cross` is the **exact base** for every prefix arm and the row every prefix comparison is
+- `prefix_base` is the **exact base** for every prefix arm and the row every prefix comparison is
   made against. The headline B0 remains the paper's endpoint-only comparator and is reported next
   to it; it is not the base of anything here.
 - The bidirectional path is exercised by `tests/test_b0_attention.py` at the layer level but has
@@ -230,7 +230,7 @@ weight gradients saved. No per-node activation cache is built.
   learning rates, the `prefix_pair` winner's `lr` and that value divided and multiplied by 3, and
   the same five-metric rule picks one, so the control is not under-tuned relative to the arm it
   must be compared with.
-- **Held-out.** `b0_cross` and each prefix winner run the held-out protocol once, at their own
+- **Held-out.** `prefix_base` and each prefix winner run the held-out protocol once, at their own
   V_val-frozen thresholds.
 
 ## 7. Controls, interventions, and how the result is read
@@ -240,7 +240,7 @@ weight gradients saved. No per-node activation cache is built.
 | Row | Trainable | Structural terms | Role |
 |---|---|---|---|
 | Headline B0 | all, `mixing: none` | none | the paper's endpoint-only comparator; context only |
-| `b0_cross` | all, `mixing: bidirectional_cross` | none | the exact frozen base; every prefix row is read against it |
+| `prefix_base` | all, `mixing: bidirectional_cross` | none | the exact frozen base; every prefix row is read against it |
 | `struct_new` winner | all, `mixing: none` | rank + degree + motif | the same supervision with every parameter trainable (different base recipe; context) |
 | `prefix_static` winner | $P_0$, gates | rank + degree + motif | shared-prompt control |
 | `prefix_pair_bce` | $P_0$, generator, gates | subgraph BCE only | topology-supervision control |
@@ -249,7 +249,7 @@ weight gradients saved. No per-node activation cache is built.
 **Attribution chain.** Three inequalities carry the claim, each on the five topology numbers at
 each row's own frozen threshold, with AUPRC alongside:
 
-1. `prefix_pair` > `b0_cross`: the prompt moved the assembled graph.
+1. `prefix_pair` > `prefix_base`: the prompt moved the assembled graph.
 2. `prefix_pair` > `prefix_pair_bce`: the graph-level terms, not extra supervised pair learning
    through new parameters on the extra subgraph BCE rows, caused it.
 3. `prefix_pair` > `prefix_static`: explicit pair-conditioned prompt generation adds something
@@ -259,7 +259,7 @@ each row's own frozen threshold, with AUPRC alongside:
 applied at the **unordered-pair level** so the AB and BA evaluations of one pair see the same
 substituted $z_{uv}$ and `abba_max` symmetry is preserved:
 
-1. *Gates off* — all $g\leftarrow 0$; must reproduce `b0_cross` exactly (a correctness check, reported).
+1. *Gates off* — all $g\leftarrow 0$; must reproduce `prefix_base` exactly (a correctness check, reported).
 2. *Shuffle* — $z_{uv}$ permuted across unordered pairs within each scored universe.
 3. *Mean* — $z_{uv}$ replaced by its training-set mean (a `z_mean` buffer computed at publish time).
 
@@ -279,7 +279,7 @@ $\tanh(g)$ per site and epoch.
   a large ranking change is representation adaptation.
 - *Pair ≈ pair\_bce* means the structural terms contributed nothing beyond the extra supervised rows;
   the "topology-supervised" label is then not earned.
-- *All ≈ `b0_cross`* means the frozen trunk bounds what any prompt can move under this supervision;
+- *All ≈ `prefix_base`* means the frozen trunk bounds what any prompt can move under this supervision;
   the bound is the result and is reported.
 - **Significance.** Differences in GS, RD, and the MMD ratios between two rows are judged by the
   test protocol's paired nonparametric bootstrap over the sampled test subgraphs within size strata
@@ -296,8 +296,8 @@ teacher-KD or descriptor-bottleneck prefix.
 
 ## 8. Implementation surfaces
 
-- **`b0_cross`.** `configs/split_seed42/b0_cross.yaml` (the B0 config with
-  `mixing.mode: bidirectional_cross`, `output_dir: outputs/split_seed42/b0_cross`). No code
+- **`prefix_base`.** `configs/split_seed42/prefix_base.yaml` (the B0 config with
+  `mixing.mode: bidirectional_cross`, `output_dir: outputs/split_seed42/prefix_base`). No code
   change; one local CPU smoke of the bidirectional path through `train_b0` with a `struct:` block
   before launch.
 - **New module** `src/model/egostitch/classifier/prefix.py`: `PrefixGenerator` ($P_0$, $g_\phi$,
@@ -329,11 +329,11 @@ teacher-KD or descriptor-bottleneck prefix.
   checkpoint round trip through `score_universe.build_model`.
 - **Docs in the same change:** arm table in `docs/03-experiments.md` §1.4; correct §1.5 there,
   which describes the current student as having three cross-attention layers (under
-  `mixing.mode: none` it has none; `b0_cross` is the arm that does); the active method set in
+  `mixing.mode: none` it has none; `prefix_base` is the arm that does); the active method set in
   `CLAUDE.md`/`AGENTS.md`; and the `struct_hpo` docstring. A result note under
   `docs/results/prefix_split_seed42/` follows the runs.
-- **Execution order.** Local: `b0_cross` config + smoke, module, tests, configs, docs, Codex review,
-  commit, push. H20: `b0_cross` train + test; then the two studies
+- **Execution order.** Local: `prefix_base` config + smoke, module, tests, configs, docs, Codex review,
+  commit, push. H20: `prefix_base` train + test; then the two studies
   (`.venv/bin/python -m src.experiments.struct_hpo --arm prefix_static` / `--arm prefix_pair`);
   then `prefix_pair_bce` at its three learning rates; then each winner's held-out run and the three
   interventions.
@@ -342,7 +342,7 @@ teacher-KD or descriptor-bottleneck prefix.
 
 | Risk | Answer |
 |---|---|
-| `b0_cross` differs from the headline B0 in quality | Both are reported; `b0_cross` is the base for attribution, the headline B0 the paper's comparator |
+| `prefix_base` differs from the headline B0 in quality | Both are reported; `prefix_base` is the base for attribution, the headline B0 the paper's comparator |
 | The bidirectional path has not run end-to-end since July | Local smoke with the structural stream before launch |
 | The prefix cannot move topology under a frozen trunk | Reported as a bound; the `struct_new` row shows what full training moves |
 | Static and pair prefixes tie | Reported as "no benefit beyond a shared prompt"; the calibration fit separates recalibration from representation change |
