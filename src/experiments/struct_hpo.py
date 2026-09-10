@@ -1,6 +1,6 @@
 """Structural-arm HPO using the shared three-objective search and five-metric rank protocol.
 
-Six arms: the frozen-trunk structural baselines ``grand`` and ``new``, and three prefix-tuning
+Five arms: the frozen-trunk structural baselines ``grand`` and ``new``, and three prefix-tuning
 arms (frozen ``prefix_base`` trunk, trainable gated KV prefix) that additionally search a
 learning rate. ``prefix_static`` and ``prefix_pair`` search ``rank``/``degree``/``motif`` (the
 ``struct_new`` weights) together with ``lr``; a searched ``lr`` is written to both ``optim.lr``

@@ -254,7 +254,12 @@ hpc/run.sh train configs/split_seed42/prefix_base.yaml                          
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_static           # 10 trials
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair             # 10 trials
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair_bce --n-trials 3 --lr-center <prefix_pair winner lr>
-hpc/run.sh test --checkpoint outputs/struct_hpo/prefix_pair/trial_<k>/best.pt --prefix-intervention shuffle --report-filename test_report_shuffle.json
+hpc/run.sh test \
+  --checkpoint outputs/struct_hpo/prefix_pair/trial_<k>/best.pt \
+  --output-dir outputs/struct_hpo/prefix_pair/trial_<k>/prefix_shuffle \
+  --data-root data --strategy breadth_first \
+  --arm prefix_pair_shuffle --seed 0 \
+  --prefix-intervention shuffle --report-filename test_report_shuffle.json
 ```
 
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
