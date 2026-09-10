@@ -163,11 +163,13 @@ class ModelConfig:
     """The ``model:`` config section.
 
     Attributes:
-        family: Scorer family, one of ``v3_1`` or ``f0_mlp``. ``f0_mlp`` (the B0-alt
-            baseline) has no buildable model: :func:`build_model` raises for it.
+        family: Scorer family, one of ``v3_1``, ``v3_1_prefix``, or ``f0_mlp``. ``f0_mlp``
+            (the B0-alt baseline) has no buildable model: :func:`build_model` raises for it.
         config: Model constructor kwargs. Empty for ``v3_1`` means
             :data:`~src.model.egostitch.classifier.b0_v31.BEST_V3_1_CONFIG`; for
-            ``f0_mlp`` this is stored but never consumed (see above).
+            ``v3_1_prefix`` this holds the ``prefix`` block (see
+            :func:`_resolve_prefix_kwargs`); for ``f0_mlp`` this is stored but never
+            consumed (see above).
     """
 
     family: str
@@ -1030,7 +1032,9 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
         return dict(model_cfg.config) if model_cfg.config else dict(BEST_V3_1_CONFIG)
     if model_cfg.family == "f0_mlp":
         return dict(model_cfg.config)
-    raise ValueError(f"unknown model family '{model_cfg.family}' (expected v3_1 or f0_mlp)")
+    raise ValueError(
+        f"unknown model family '{model_cfg.family}' (expected v3_1, v3_1_prefix, or f0_mlp)"
+    )
 
 
 def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
@@ -1048,9 +1052,9 @@ def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
         ``base_checkpoint`` and ``base_checkpoint_sha256`` embedded in ``prefix``.
 
     Raises:
-        ValueError: If ``model.config.prefix.base_checkpoint`` is missing, the
-            base checkpoint is not a ``v3_1`` checkpoint, or ``model.config``
-            carries keys other than ``prefix``.
+        ValueError: If ``model.config.prefix.base_checkpoint`` is missing, the base
+            checkpoint payload is not a mapping or is not a ``v3_1`` checkpoint, or
+            ``model.config`` carries keys other than ``prefix``.
     """
     raw_prefix = model_cfg.config.get("prefix")
     if not isinstance(raw_prefix, Mapping) or "base_checkpoint" not in raw_prefix:
@@ -1060,11 +1064,14 @@ def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
         raise ValueError(f"v3_1_prefix accepts only model.config.prefix, got {extra}")
     path = Path(str(raw_prefix["base_checkpoint"]))
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{path}: prefix base must be a v3_1 checkpoint payload")
     if payload.get("model_family") != "v3_1":
         raise ValueError(f"{path}: prefix base must be a v3_1 checkpoint")
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    prefix = PrefixConfig.from_mapping({**dict(raw_prefix), "base_checkpoint": str(path)})
-    prefix = PrefixConfig.from_mapping({**prefix.to_dict(), "base_checkpoint_sha256": digest})
+    prefix = PrefixConfig.from_mapping(
+        {**dict(raw_prefix), "base_checkpoint": str(path), "base_checkpoint_sha256": digest}
+    )
     base_config = dict(cast(Mapping[str, object], payload["model_config"]))
     return {"base": base_config, "prefix": prefix.to_dict()}
 
@@ -1092,6 +1099,7 @@ def build_model(cfg: Config) -> nn.Module:
         base_path = Path(str(cast(Mapping[str, object], kwargs["prefix"])["base_checkpoint"]))
         payload = torch.load(base_path, map_location="cpu", weights_only=False)
         prefix_model.base.load_state_dict(payload["model_state"])
+        _validate_topo_gen_distill_contract(prefix_model, cfg.distill)
         return prefix_model
     if cfg.model.family == "v3_1":
         v3_1_model = V3_1(**kwargs)
@@ -1115,8 +1123,14 @@ def _init_prefix_from_loader(
         model: The prefix-wrapped model whose static prefix to initialise.
         loader: The validation loader; only its first batch is used.
         seed: Draw seed passed through to `V3_1Prefix.init_static_prefix`.
+
+    Raises:
+        ValueError: If ``loader`` yields no batches.
     """
-    batch = next(iter(loader))
+    try:
+        batch = next(iter(loader))
+    except StopIteration as error:
+        raise ValueError("prefix init needs a non-empty validation loader") from error
     model.init_static_prefix({k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}, seed)
 
 
@@ -5147,6 +5161,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         world_size=accelerator.num_processes,
     )
     model = build_model(cfg)
+    model.to(accelerator.device)
     if isinstance(model, V3_1Prefix):
         _init_prefix_from_loader(model, val_loader, cfg.seed)
 

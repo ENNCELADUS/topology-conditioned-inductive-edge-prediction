@@ -5,19 +5,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import torch
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.prefix import V3_1Prefix
 from src.train_b0 import (
     MODEL_FAMILIES,
     _build_optimizer,
+    _init_prefix_from_loader,
     build_model,
     is_v3_1_family,
     load_config,
     resolve_model_kwargs,
 )
 
-from tests.test_prefix_model import _tiny_base_config
+from tests.test_prefix_model import _pair_batch, _tiny_base_config
 from tests.test_train_b0 import _write_yaml_config
 
 
@@ -102,3 +104,88 @@ def test_missing_base_checkpoint_key_raises(tmp_path: Path) -> None:
         assert "base_checkpoint" in str(err)
     else:
         raise AssertionError("prefix.base_checkpoint is required")
+
+
+def test_extra_model_config_keys_raise(tmp_path: Path) -> None:
+    config_path = tmp_path / "bad_extra.yaml"
+    _write_yaml_config(
+        config_path,
+        {
+            "model": {
+                "family": "v3_1_prefix",
+                "config": {
+                    "prefix": {
+                        "tokens": 3,
+                        "rank": 2,
+                        "conditioning": "pair",
+                        "bottleneck": 6,
+                        "base_checkpoint": str(_base_checkpoint(tmp_path)),
+                    },
+                    "extra_key": 1,
+                },
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="prefix"):
+        resolve_model_kwargs(load_config(config_path).model)
+
+
+def test_non_v3_1_base_checkpoint_raises(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    base = V3_1(**_tiny_base_config())
+    payload = {
+        "model_state": base.state_dict(),
+        "model_family": "egostitch_e2e",
+        "model_config": _tiny_base_config(),
+        "epoch": 1,
+        "val_metrics": {},
+        "seed": 0,
+        "config": {},
+    }
+    path = tmp_path / "teacher.pt"
+    torch.save(payload, path)
+    config_path = tmp_path / "bad_family.yaml"
+    _write_yaml_config(
+        config_path,
+        {
+            "model": {
+                "family": "v3_1_prefix",
+                "config": {
+                    "prefix": {
+                        "tokens": 3,
+                        "rank": 2,
+                        "conditioning": "pair",
+                        "bottleneck": 6,
+                        "base_checkpoint": str(path),
+                    }
+                },
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="v3_1"):
+        resolve_model_kwargs(load_config(config_path).model)
+
+
+def _tiny_prefix_model() -> V3_1Prefix:
+    return V3_1Prefix(
+        base=_tiny_base_config(),
+        prefix={"tokens": 3, "rank": 2, "conditioning": "pair", "bottleneck": 6},
+    )
+
+
+def test_init_prefix_from_loader_casts_a_bfloat16_batch() -> None:
+    model = _tiny_prefix_model()
+    before = model.generator.p0[0].clone()
+    batch = _pair_batch()
+    batch["emb_a"] = batch["emb_a"].to(torch.bfloat16)
+    batch["emb_b"] = batch["emb_b"].to(torch.bfloat16)
+    _init_prefix_from_loader(model, [batch], seed=0)
+    after = model.generator.p0[0]
+    assert not torch.equal(before, after)
+    assert torch.isfinite(after).all()
+
+
+def test_init_prefix_from_loader_raises_on_an_empty_loader() -> None:
+    model = _tiny_prefix_model()
+    with pytest.raises(ValueError, match="non-empty"):
+        _init_prefix_from_loader(model, [], seed=0)

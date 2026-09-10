@@ -451,10 +451,16 @@ class V3_1Prefix(nn.Module):
         """Initialise ``p0`` from the frozen encoder's inner-token states of ``batch``.
 
         Args:
-            batch: A task batch with ``emb_a``/``emb_b`` (and optional lengths).
+            batch: A task batch with ``emb_a``/``emb_b`` (and optional lengths), on any
+                device/dtype -- cast to the frozen encoder's device/dtype before use.
             seed: Draw seed.
         """
         emb_a, emb_b, len_a, len_b = unpack_pair_batch(batch, self.input_dim)
+        param = next(self.base.encoder.parameters())
+        emb_a = emb_a.to(device=param.device, dtype=param.dtype)
+        emb_b = emb_b.to(device=param.device, dtype=param.dtype)
+        len_a = len_a.to(device=param.device)
+        len_b = len_b.to(device=param.device)
         rows: list[torch.Tensor] = []
         for emb, lengths in ((emb_a, len_a), (emb_b, len_b)):
             encoded = self.base.encoder(emb, lengths)
