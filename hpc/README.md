@@ -317,18 +317,20 @@ nohup bash -c '
     > outputs/logs/split_seed42_kd_hpo_grid_logit.log 2>&1
 ' > outputs/logs/split_seed42_chainA_30838.log 2>&1 < /dev/null &
 
-# container B (30030): struct_new study -> kd_rank_rep study -> kd_gram grid
-# (struct_grand finished its 10 trials on 30846; its chain was cut before it could start struct_new there)
+# container B (30030): kd_rank_rep study -> kd_gram grid -> struct_new study
+# (struct_grand finished its 10 trials on 30846, whose chain then starts struct_new itself;
+# struct_new is last here so this driver either joins that study as a second Optuna worker
+# or exits at once when it is already complete)
 nohup bash -c '
-  OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 .venv/bin/python -u -m src.experiments.struct_hpo --arm new \
-    --base-config configs/split_seed42/struct_new.yaml --sweep-dir outputs/split_seed42/struct_hpo/new \
-    > outputs/logs/split_seed42_struct_hpo_new.log 2>&1 || exit 1
   .venv/bin/python -u -m src.experiments.kd_rank_rep_hpo \
     --base-config configs/split_seed42/kd_rank_rep.yaml --sweep-dir outputs/split_seed42/kd_hpo/rank_rep \
     --bank-root outputs/distill/split_seed42 --bank h2ns3 --margin 0.1 \
     > outputs/logs/split_seed42_kd_hpo_rank_rep.log 2>&1 || exit 1
   hpc/sweep_kd_hpo.sh all configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid "kd_gram_*" \
-    > outputs/logs/split_seed42_kd_hpo_grid_gram.log 2>&1
+    > outputs/logs/split_seed42_kd_hpo_grid_gram.log 2>&1 || exit 1
+  OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 .venv/bin/python -u -m src.experiments.struct_hpo --arm new \
+    --base-config configs/split_seed42/struct_new.yaml --sweep-dir outputs/split_seed42/struct_hpo/new \
+    >> outputs/logs/split_seed42_struct_hpo_new.log 2>&1
 ' > outputs/logs/split_seed42_chainB_30030.log 2>&1 < /dev/null &
 ```
 
