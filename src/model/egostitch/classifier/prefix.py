@@ -279,6 +279,9 @@ class PrefixCrossAttentionLayer(nn.Module):
     dropout so that at zero gate the sum is the base value exactly.
     """
 
+    layer: CrossAttentionLayer
+    generator: PrefixGenerator
+
     def __init__(
         self, layer: CrossAttentionLayer, layer_index: int, generator: PrefixGenerator
     ) -> None:
@@ -290,9 +293,17 @@ class PrefixCrossAttentionLayer(nn.Module):
             generator: The shared prefix parameters.
         """
         super().__init__()
-        self.layer = layer
+        # `layer` is already registered under `base.cross_attention.layers`, and
+        # `generator` under `V3_1Prefix.generator`; registering them again here
+        # (plain `self.x = x` on an `nn.Module` attribute) would duplicate every
+        # one of their state_dict keys under `prefix_layers.<i>.*`. Bypassing
+        # `nn.Module.__setattr__` keeps them as plain references -- `V3_1Prefix`'s
+        # own `train()` override (`self.base.eval()`) still reaches `layer` via
+        # its `base` registration, and `generator`'s mode/parameters are already
+        # tracked via its own top-level registration.
+        object.__setattr__(self, "layer", layer)
+        object.__setattr__(self, "generator", generator)
         self.layer_index = layer_index
-        self.generator = generator
 
     def _attend(
         self,
@@ -396,7 +407,8 @@ class V3_1Prefix(nn.Module):
         trunk = base_model.cross_attention
         if trunk.mixing_mode != "bidirectional_cross" or len(trunk.layers) == 0:
             raise ValueError(
-                "v3_1_prefix needs a base with model.config.mixing.mode == 'bidirectional_cross'"
+                "v3_1_prefix needs a base with model.config.mixing.mode == 'bidirectional_cross' "
+                "and at least one cross-attention layer"
             )
         self.d_model = int(base_model.d_model)
         self.input_dim = int(base_model.input_dim)
@@ -456,20 +468,40 @@ class V3_1Prefix(nn.Module):
     def _apply_intervention(self, z: torch.Tensor | None) -> tuple[torch.Tensor | None, float]:
         """Return the (possibly substituted) condition and the gate scale.
 
+        Fails closed rather than silently no-opping: ``shuffle``/``mean`` need
+        a pair condition (``z`` is only ``None`` under ``conditioning="static"``),
+        and ``shuffle`` needs at least 2 rows to actually permute anything.
+        ``shuffle`` draws a seeded cyclic offset in ``[1, B-1]`` and rotates
+        every row by it (``perm = (arange(B) + offset) % B``), so no row ever
+        keeps its own condition -- unlike an unconstrained random permutation,
+        which can (with nonzero probability) leave a row fixed.
+
         Raises:
-            ValueError: On an unknown intervention name.
+            ValueError: On an unknown intervention name, ``shuffle``/``mean``
+                with a static prefix (``z is None``), or ``shuffle`` on a
+                batch of fewer than 2 pairs.
         """
         if self.intervention not in INTERVENTIONS:
             raise ValueError(f"unknown prefix intervention {self.intervention!r}")
         if self.intervention == "gates_off":
             return z, 0.0
-        if z is None or self.intervention == "none":
+        if self.intervention == "none":
             return z, 1.0
+        if z is None:
+            raise ValueError(
+                f"prefix intervention {self.intervention!r} requires conditioning='pair'"
+            )
         if self.intervention == "mean":
             return self.generator.z_mean.to(z.dtype).unsqueeze(0).expand_as(z), 1.0
+        batch_size = z.size(0)
+        if batch_size < 2:
+            raise ValueError(
+                f"prefix intervention 'shuffle' needs a batch of at least 2 pairs, got {batch_size}"
+            )
         gen = torch.Generator(device="cpu").manual_seed(self.intervention_seed)
-        perm = torch.randperm(z.size(0), generator=gen).to(z.device)
-        return z[perm], 1.0
+        offset = int(torch.randint(1, batch_size, (1,), generator=gen).item())
+        perm = (torch.arange(batch_size) + offset) % batch_size
+        return z[perm.to(z.device)], 1.0
 
     def _trunk(
         self,
@@ -510,6 +542,15 @@ class V3_1Prefix(nn.Module):
         Returns:
             ``logits``, ``pair_repr``, and, with ``label``, the weighted BCE ``loss``
             and ``loss_weight_sum`` exactly as `V3_1` computes them.
+
+        Raises:
+            ValueError: If a non-``"none"`` `intervention` is set while
+                `self.training` (interventions are scoring-time only; calling
+                `self.generator.condition` in that state would also fold the
+                live pair condition into its running `z_sum`/`z_count`), or
+                (via `_apply_intervention`) on an unknown intervention name,
+                ``shuffle``/``mean`` with a static prefix, or ``shuffle`` on a
+                batch of fewer than 2 pairs.
         """
         merged: dict[str, torch.Tensor] = {}
         if batch is not None:
@@ -521,6 +562,8 @@ class V3_1Prefix(nn.Module):
             encoded_b = self.base.encoder(emb_b, lengths_b)
         mask_a = _build_padding_mask(lengths_a, encoded_a.size(1))
         mask_b = _build_padding_mask(lengths_b, encoded_b.size(1))
+        if self.intervention != "none" and self.training:
+            raise ValueError("prefix interventions are scoring-time only; call eval() first")
         z, gate_scale = self._apply_intervention(
             self.generator.condition(encoded_a, encoded_b, mask_a, mask_b)
         )

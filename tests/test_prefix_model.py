@@ -333,3 +333,50 @@ def test_init_static_prefix_from_a_batch_and_state_dict_round_trip() -> None:
     model.eval()
     with torch.no_grad():
         assert torch.equal(rebuilt(_pair_batch())["logits"], model(_pair_batch())["logits"])
+
+
+def test_shuffle_and_mean_interventions_fail_closed_on_a_static_prefix() -> None:
+    _, model = _wrapped("static")
+    model.eval()
+    batch = _pair_batch()
+    for intervention in ("shuffle", "mean"):
+        model.intervention = intervention
+        try:
+            with torch.no_grad():
+                model(batch)
+        except ValueError as err:
+            assert "pair" in str(err), intervention
+        else:
+            raise AssertionError(f"{intervention} on a static prefix must raise")
+
+
+def test_shuffle_intervention_fails_closed_on_a_batch_of_one() -> None:
+    _, model = _wrapped("pair")
+    model.eval()
+    model.intervention = "shuffle"
+    try:
+        with torch.no_grad():
+            model(_pair_batch(n=1))
+    except ValueError as err:
+        assert "2" in str(err)
+    else:
+        raise AssertionError("shuffle on a batch of 1 must raise")
+
+
+def test_intervention_in_train_mode_raises() -> None:
+    _, model = _wrapped("pair")
+    model.train()
+    model.intervention = "gates_off"
+    try:
+        model(_pair_batch())
+    except ValueError as err:
+        assert "eval" in str(err)
+    else:
+        raise AssertionError("an intervention set during training must raise")
+
+
+def test_prefix_layers_do_not_duplicate_state_dict_keys() -> None:
+    _, model = _wrapped()
+    keys = set(model.state_dict())
+    assert not any(key.startswith("prefix_layers.") for key in keys)
+    assert all(key.startswith("generator.") or key.startswith("base.") for key in keys)
