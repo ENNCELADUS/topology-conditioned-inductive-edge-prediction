@@ -96,3 +96,50 @@ def test_prefix_base_differs_from_headline_b0_only_in_mixing_and_output_dir() ->
     cross["model"]["config"]["mixing"] = base["model"]["config"]["mixing"]
     cross["output_dir"] = base["output_dir"]
     assert cross == base
+
+
+@pytest.mark.parametrize("arm", ["prefix_static", "prefix_pair", "prefix_pair_bce"])
+def test_prefix_arm_configs_share_the_struct_new_recipe(arm: str) -> None:
+    base = yaml.safe_load(Path("configs/split_seed42/struct_new.yaml").read_text(encoding="utf-8"))
+    cfg = yaml.safe_load(Path(f"configs/split_seed42/{arm}.yaml").read_text(encoding="utf-8"))
+    assert cfg["model"] == {
+        "family": "v3_1_prefix",
+        "config": {
+            "prefix": {
+                "base_checkpoint": "outputs/split_seed42/prefix_base/best.pt",
+                "tokens": 16,
+                "rank": 8,
+                "conditioning": "static" if arm == "prefix_static" else "pair",
+                "bottleneck": 128,
+            }
+        },
+    }
+    assert cfg["output_dir"] == f"outputs/split_seed42/{arm}"
+    assert cfg["optim"]["lr"] == 1e-3 and cfg["optim"]["scheduler"]["max_lr"] == 1e-3
+    assert cfg["eval"] == {"patience": 5, "eval_every": 1, "topology_every": 2}
+    if arm == "prefix_pair_bce":
+        expected_weights = {
+            "bce": 1.0,
+            "gs": 0.0,
+            "rd": 0.0,
+            "deg_mmd": 0.0,
+            "rank": 0.0,
+            "degree": 0.0,
+            "motif": 0.0,
+        }
+    else:
+        expected_weights = {
+            "bce": 1.0,
+            "gs": 0.0,
+            "rd": 0.0,
+            "deg_mmd": 0.0,
+            "rank": 1.0,
+            "degree": 0.1,
+            "motif": 0.1,
+        }
+    assert cfg["struct"]["weights"] == expected_weights
+    for key in ("data", "runtime", "seed", "mixed_precision"):
+        assert cfg[key] == base[key]
+    assert {k: v for k, v in cfg["struct"].items() if k != "weights"} == {
+        k: v for k, v in base["struct"].items() if k != "weights"
+    }
