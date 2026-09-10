@@ -1196,6 +1196,7 @@ def _write_fake_shard(
     checkpoint_id: str = "abc123abc123abcd",
     topo_gen_control: str | None = None,
     prefix_intervention: str | None = None,
+    prefix_intervention_seed: int | None = None,
 ) -> None:
     node_ids = ["node_a", "node_b"]
     meta: dict[str, object] = {
@@ -1210,6 +1211,8 @@ def _write_fake_shard(
     }
     if prefix_intervention is not None:
         meta["prefix_intervention"] = prefix_intervention
+    if prefix_intervention_seed is not None:
+        meta["prefix_intervention_seed"] = prefix_intervention_seed
     score_universe.save_scores(
         path,
         node_ids=node_ids,
@@ -1291,6 +1294,48 @@ def test_merge_missing_prefix_intervention_defaults_to_none_and_merges(tmp_path:
     shard1 = tmp_path / "s1.npz"
     _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20)
     _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention="none")
+
+
+def test_merge_mismatched_prefix_intervention_seed_raises_clear_error(tmp_path: Path) -> None:
+    """A rerun with a different shuffle seed must not merge with an earlier shard.
+
+    Review round 1 P2: the seed used to go unchecked at merge time, so a
+    partially completed rerun could silently combine shards scored under
+    different shuffle permutations.
+    """
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(
+        shard0,
+        row_start=0,
+        n_rows=10,
+        num_rows=20,
+        prefix_intervention="shuffle",
+        prefix_intervention_seed=3,
+    )
+    _write_fake_shard(
+        shard1,
+        row_start=10,
+        n_rows=10,
+        num_rows=20,
+        prefix_intervention="shuffle",
+        prefix_intervention_seed=7,
+    )
+
+    with pytest.raises(ValueError, match="prefix_intervention_seed"):
+        score_universe.merge_scores([shard0, shard1])
+
+
+def test_merge_missing_prefix_intervention_seed_defaults_to_zero_and_merges(
+    tmp_path: Path,
+) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20)
+    _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention_seed=0)
+
+    merged = score_universe.merge_scores([shard0, shard1])
+    assert merged.meta.get("prefix_intervention_seed", 0) == 0
 
     merged = score_universe.merge_scores([shard0, shard1])
 

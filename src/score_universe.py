@@ -1017,6 +1017,21 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
             f"{sorted(prefix_interventions)} "
             f"(files: {[str(shard.path) for shard in shards]})"
         )
+    # Only "shuffle" is seed-sensitive (a different seed draws a different
+    # permutation), but the seed is checked whenever it is recorded so a
+    # partially completed rerun with a new --prefix-intervention-seed cannot
+    # silently combine shards scored under different permutations.
+    prefix_intervention_seeds = {
+        int(cast(int, shard.meta["prefix_intervention_seed"]))
+        for shard in shards
+        if "prefix_intervention_seed" in shard.meta
+    }
+    if len(prefix_intervention_seeds) > 1:
+        raise ValueError(
+            "merge inputs disagree on meta 'prefix_intervention_seed': "
+            f"{sorted(prefix_intervention_seeds)} "
+            f"(files: {[str(shard.path) for shard in shards]})"
+        )
     for key in (
         "checkpoint_id",
         "model_family",

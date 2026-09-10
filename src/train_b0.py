@@ -1037,6 +1037,27 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     )
 
 
+def _base_loss_kwargs(model_cfg: ModelConfig) -> Mapping[str, object]:
+    """Return the frozen base's flat loss-setting kwargs (``positive_weight``, ``label_smoothing``).
+
+    For ``v3_1_prefix``, :func:`resolve_model_kwargs` nests the frozen base's
+    ``model_config`` under ``"base"``, so a plain ``.get("positive_weight", ...)``
+    on its return value always misses and silently falls back to the default.
+    This unwraps that nesting so struct/val loss settings still read the frozen
+    base's configured values for prefix arms.
+
+    Args:
+        model_cfg: The ``model:`` config section.
+
+    Returns:
+        The flat kwargs mapping to read ``positive_weight`` / ``label_smoothing`` from.
+    """
+    kwargs = resolve_model_kwargs(model_cfg)
+    if model_cfg.family == "v3_1_prefix":
+        return cast(Mapping[str, object], kwargs["base"])
+    return kwargs
+
+
 def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     """Embed the frozen base's ``model_config`` and record the base file's SHA-256.
 
@@ -1114,14 +1135,17 @@ def build_model(cfg: Config) -> nn.Module:
 def _init_prefix_from_loader(
     model: V3_1Prefix, loader: Iterable[dict[str, torch.Tensor]], seed: int
 ) -> None:
-    """Draw ``p0`` from the frozen encoder's token states of the first validation batch.
+    """Draw ``p0`` from the frozen encoder's token states of the first training batch.
 
     Runs before ``accelerator.prepare``; DDP's construction-time broadcast then
-    makes rank 0's draw authoritative on every rank.
+    makes rank 0's draw authoritative on every rank. ``loader`` must be a
+    training-epoch loader (e.g. ``factory(1)``, epoch 1 being the first real
+    training epoch): V_val pairs may never be read during training, so the
+    validation loader must not be passed here.
 
     Args:
         model: The prefix-wrapped model whose static prefix to initialise.
-        loader: The validation loader; only its first batch is used.
+        loader: The epoch-1 training loader; only its first batch is used.
         seed: Draw seed passed through to `V3_1Prefix.init_static_prefix`.
 
     Raises:
@@ -1130,7 +1154,7 @@ def _init_prefix_from_loader(
     try:
         batch = next(iter(loader))
     except StopIteration as error:
-        raise ValueError("prefix init needs a non-empty validation loader") from error
+        raise ValueError("prefix init needs a non-empty training loader") from error
     model.init_static_prefix({k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}, seed)
 
 
@@ -1478,7 +1502,7 @@ def train_loop(
     )
 
     val_label_smoothing = float(
-        cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
+        cast(float, _base_loss_kwargs(cfg.model).get("label_smoothing", 0.0))
     )
     history: list[dict[str, object]] = []
     best_state: dict[str, torch.Tensor] | None = None
@@ -5163,7 +5187,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     model = build_model(cfg)
     model.to(accelerator.device)
     if isinstance(model, V3_1Prefix):
-        _init_prefix_from_loader(model, val_loader, cfg.seed)
+        _init_prefix_from_loader(model, factory(1), cfg.seed)
 
     if args.ddp_mode == "probe":
         _run_probe_mode(
@@ -5224,7 +5248,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
 
     struct_stream: StructStream | None = None
     if cfg.struct is not None:
-        struct_model_kwargs = resolve_model_kwargs(cfg.model)
+        struct_model_kwargs = _base_loss_kwargs(cfg.model)
         struct_sampler = StructSampler(
             val_split.build_training_graph(),
             nodes=cfg.struct.nodes,
@@ -5264,7 +5288,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             )
 
     val_label_smoothing = float(
-        cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
+        cast(float, _base_loss_kwargs(cfg.model).get("label_smoothing", 0.0))
     )
     if accelerator.is_main_process:
         logger.info(
@@ -5495,7 +5519,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if is_v3_1_family(cfg.model.family):
         factory, val_loader = _build_v3_1_loaders(cfg, assembled)
         if isinstance(model, V3_1Prefix):
-            _init_prefix_from_loader(model, val_loader, cfg.seed)
+            _init_prefix_from_loader(model, factory(1), cfg.seed)
     else:
         factory, val_loader = _build_f0_loaders(cfg, assembled)
 

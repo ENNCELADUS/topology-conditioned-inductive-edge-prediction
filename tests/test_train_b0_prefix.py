@@ -11,6 +11,7 @@ from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.prefix import V3_1Prefix
 from src.train_b0 import (
     MODEL_FAMILIES,
+    _base_loss_kwargs,
     _build_optimizer,
     _init_prefix_from_loader,
     build_model,
@@ -78,6 +79,20 @@ def test_resolve_embeds_base_config_and_provenance(tmp_path: Path) -> None:
     sha256 = prefix["base_checkpoint_sha256"]
     assert isinstance(sha256, str) and len(sha256) == 64
     json.dumps(kwargs)  # checkpoint-embeddable
+
+
+def test_base_loss_kwargs_unwraps_the_nested_base_for_prefix(tmp_path: Path) -> None:
+    """Verify the base config, not the top-level wrapper, is unwrapped.
+
+    `_base_loss_kwargs` must read the frozen base's config, not the
+    ``{"base": ..., "prefix": ...}`` wrapper `resolve_model_kwargs` returns for
+    ``v3_1_prefix`` -- a plain ``.get("positive_weight", 1.0)`` on the wrapper
+    always misses and silently falls back to the default (review round 1 P2).
+    """
+    cfg = load_config(_prefix_yaml(tmp_path))
+    loss_kwargs = _base_loss_kwargs(cfg.model)
+    assert loss_kwargs["positive_weight"] == _tiny_base_config()["positive_weight"] == 5.0
+    assert loss_kwargs["label_smoothing"] == _tiny_base_config()["label_smoothing"]
 
 
 def test_build_model_loads_and_freezes_the_base(tmp_path: Path) -> None:

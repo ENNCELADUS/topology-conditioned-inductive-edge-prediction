@@ -169,6 +169,7 @@ def _require_scoring_identity(
     strategy: str,
     topo_gen_control: str | None,
     prefix_intervention: str = "none",
+    prefix_intervention_seed: int = 0,
     label: str,
 ) -> None:
     """Bind a scored or reused artifact to this invocation's checkpoint and split."""
@@ -191,6 +192,14 @@ def _require_scoring_identity(
             f"{label}: prefix_intervention "
             f"{artifact.meta.get('prefix_intervention', 'none')!r} "
             f"does not match {prefix_intervention!r}"
+        )
+    # A missing key predates --prefix-intervention-seed and defaults to 0 (the
+    # flag's own default), matching the prefix_intervention fallback above.
+    if int(cast(int, artifact.meta.get("prefix_intervention_seed", 0))) != prefix_intervention_seed:
+        raise ValueError(
+            f"{label}: prefix_intervention_seed "
+            f"{artifact.meta.get('prefix_intervention_seed', 0)!r} "
+            f"does not match {prefix_intervention_seed!r}"
         )
 
 
@@ -564,6 +573,7 @@ def run_test_protocol(
         strategy=strategy,
         topo_gen_control=topo_gen_control,
         prefix_intervention=prefix_intervention,
+        prefix_intervention_seed=prefix_intervention_seed,
         label=str(validation_path),
     )
     validation_split = _load_val_region_split(data_root, strategy)
@@ -626,6 +636,7 @@ def run_test_protocol(
         strategy=strategy,
         topo_gen_control=topo_gen_control,
         prefix_intervention=prefix_intervention,
+        prefix_intervention_seed=prefix_intervention_seed,
         label=str(val_cls_path),
     )
     f1_selection = select_max_f1_threshold(
@@ -651,6 +662,7 @@ def run_test_protocol(
         strategy=strategy,
         topo_gen_control=topo_gen_control,
         prefix_intervention=prefix_intervention,
+        prefix_intervention_seed=prefix_intervention_seed,
         label=str(test_path),
     )
 
@@ -670,6 +682,7 @@ def run_test_protocol(
         strategy=strategy,
         topo_gen_control=topo_gen_control,
         prefix_intervention=prefix_intervention,
+        prefix_intervention_seed=prefix_intervention_seed,
         label=str(topology_path),
     )
 

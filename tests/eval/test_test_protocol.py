@@ -231,7 +231,9 @@ def _copy_with_topo_gen_control(source: Path, destination: Path, control: str | 
     )
 
 
-def _copy_with_prefix_intervention(source: Path, destination: Path, intervention: str) -> None:
+def _copy_with_prefix_intervention(
+    source: Path, destination: Path, intervention: str, *, seed: int = 0
+) -> None:
     artifact = load_scores(source)
     save_scores(
         destination,
@@ -241,7 +243,11 @@ def _copy_with_prefix_intervention(source: Path, destination: Path, intervention
         logit=artifact.logit,
         label=artifact.label,
         row_start=0,
-        meta={**artifact.meta, "prefix_intervention": intervention},
+        meta={
+            **artifact.meta,
+            "prefix_intervention": intervention,
+            "prefix_intervention_seed": seed,
+        },
     )
 
 
@@ -398,7 +404,7 @@ class TestRunTestProtocol:
         controlled_artifacts: dict[str, Path] = {}
         for pairs_source, source in fixture.artifacts.items():
             destination = tmp_path / "controlled_scores" / f"{pairs_source}.npz"
-            _copy_with_prefix_intervention(source, destination, "shuffle")
+            _copy_with_prefix_intervention(source, destination, "shuffle", seed=7)
             controlled_artifacts[pairs_source] = destination
         runner = _FakeScoreRunner(controlled_artifacts)
 
@@ -900,6 +906,46 @@ class TestReuseExistingScores:
                 seed=0,
                 score_runner=runner,
                 prefix_intervention="shuffle",
+                reuse_existing_scores=True,
+            )
+
+        assert runner.calls == []
+        assert not (output_dir / "test_report.json").exists()
+
+    @pytest.mark.parametrize(
+        "mismatched_source", ["val_topology", "val_cls", "test", "test_topology"]
+    )
+    def test_rejects_reused_prefix_intervention_seed_mismatch(
+        self, tmp_path: Path, mismatched_source: str
+    ) -> None:
+        """Verify a differently-seeded rerun cannot reuse a stale shuffle permutation.
+
+        A rerun with a different --prefix-intervention-seed must not reuse
+        artifacts scored under a different shuffle permutation (review round 1 P2:
+        the seed used to go unchecked, so a partially completed run could combine
+        scores from different permutations).
+        """
+        fixture = _build_fixture(tmp_path)
+        output_dir = tmp_path / "outputs" / f"prefix_seed_mismatch_{mismatched_source}"
+        scores_dir = output_dir / "scores"
+        for pairs_source, source in fixture.artifacts.items():
+            seed = 3 if pairs_source == mismatched_source else 7
+            _copy_with_prefix_intervention(
+                source, scores_dir / f"{pairs_source}.npz", "shuffle", seed=seed
+            )
+
+        runner = _FakeScoreRunner(fixture.artifacts)
+        with pytest.raises(ValueError, match="prefix_intervention_seed.*does not match"):
+            run_test_protocol(
+                checkpoint=_write_checkpoint(tmp_path),
+                output_dir=output_dir,
+                data_root=fixture.data_root,
+                strategy=_STRATEGY,
+                arm="prefix_shuffle",
+                seed=0,
+                score_runner=runner,
+                prefix_intervention="shuffle",
+                prefix_intervention_seed=7,
                 reuse_existing_scores=True,
             )
 
