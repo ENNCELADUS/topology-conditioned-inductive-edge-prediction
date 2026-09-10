@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Serial driver for the B1 KD loss-weight sweep (configs/sweep/b1_kd_hpo).
 #
-# Usage: hpc/sweep_kd_hpo.sh <lane> [config_dir] [sweep_root]
+# Usage: hpc/sweep_kd_hpo.sh <lane> [config_dir] [sweep_root] [config_glob]
 #   lane all, 0, or 1; config_dir defaults to configs/sweep/b1_kd_hpo and
 #   sweep_root (where the lane logs go) to outputs/b1_row_kd_hpo; a campaign
 #   passes its own, e.g. configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid.
 #   Completion/failure checks read each config's own output_dir, which is
-#   where training writes.
+#   where training writes. config_glob (default "*") restricts the run to one arm,
+#   e.g. "kd_rep_*", so two containers can split the grid by arm.
 #   lane all -> CUDA_VISIBLE_DEVICES=0,1,2,3 and every config (sorted order)
 #   lane 0 -> CUDA_VISIBLE_DEVICES=0,1 and the even-indexed configs (sorted order)
 #   lane 1 -> CUDA_VISIBLE_DEVICES=2,3 and the odd-indexed configs
@@ -24,7 +25,7 @@
 # A config whose output dir already holds complete.json is skipped (resume).
 set -euo pipefail
 
-LANE="${1:?usage: hpc/sweep_kd_hpo.sh <lane all|0|1> [config_dir] [sweep_root]}"
+LANE="${1:?usage: hpc/sweep_kd_hpo.sh <lane all|0|1> [config_dir] [sweep_root] [config_glob]}"
 CONFIG_DIR="${2:-configs/sweep/b1_kd_hpo}"
 case "${LANE}" in
   all) export CUDA_VISIBLE_DEVICES=0,1,2,3 ;;
@@ -37,13 +38,15 @@ esac
 export OMP_NUM_THREADS=16 MKL_NUM_THREADS=16
 
 SWEEP_ROOT="${3:-outputs/b1_row_kd_hpo}"
+# Optional basename glob (e.g. "kd_rep_*") so one container runs a single arm of the grid.
+CONFIG_GLOB="${4:-*}"
 LOG_DIR="${SWEEP_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
 
 CONFIGS=()
 while IFS= read -r cfg; do
   CONFIGS+=("${cfg}")
-done < <(printf '%s\n' "${CONFIG_DIR}"/*.yaml | sort)
+done < <(printf '%s\n' "${CONFIG_DIR}"/${CONFIG_GLOB}.yaml | sort)
 [[ -f "${CONFIGS[0]:-}" ]] || { echo "ERROR: no sweep configs found" >&2; exit 1; }
 
 index=0

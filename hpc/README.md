@@ -292,32 +292,44 @@ The chain writes `outputs/split_seed42/queue_status.json` and per-stage logs und
 `outputs/split_seed42/logs/`. Launch it only after the teacher pipeline has created its
 output directory, and never against an existing bank or student directory.
 
-**KD HPO sweeps (2026-09-09 plan, 30838):** instead of the five prior-selection students, the
-campaign sweeps each arm on V_val only (`--skip-test`), previous best arm first. The chain
-below waits for the teacher's diagnostic completion, then runs the strict-LLP `kd_rank`
-study (it dumps the row bank and the four context banks it needs under
-`outputs/distill/split_seed42/{rows,contexts_*}` first), the 15-point loss-weight grid for
-`kd_logit`/`kd_gram`/`kd_rep` (`configs/split_seed42/sweep/`), and the joint `kd_rank_rep`
-study on the `h2ns3` bank. Per-arm winners are the frozen five-metric undominated pick and
-get one held-out test each.
+**KD HPO sweeps (2026-09-10 relaunch, two containers):** instead of the five prior-selection
+students, the campaign sweeps each arm on V_val only (`--skip-test`). The first launch
+(2026-09-09) chained everything on 30838 behind the teacher; it was stopped after two
+`kd_rank` trials and relaunched on 2026-09-10 across two containers with `eval.patience: 5`
+and `eval.topology_every: 2` in every sweep config (`kd_rank` trials 0-1 and the whole
+`struct_grand` study ran with patience 10). The `kd_rank` driver resumes its study
+(`optuna.db`), fails the interrupted trial, re-enqueues its prior, and counts only COMPLETE
+trials toward `--n-trials`; the grid runner skips any point whose `complete.json` exists.
+Banks already exist under `outputs/distill/split_seed42/{rows,contexts_*}`, so no dump runs.
+Per-arm winners are the frozen five-metric undominated pick and get one held-out test each.
 
 ```bash
+# container A (30838): kd_rank study (14 trials left) -> kd_rep grid -> kd_logit grid
 nohup bash -c '
-  until [ -f outputs/split_seed42/teacher_pma1/diagnostic_test_complete.json ] \
-        && [ -f outputs/split_seed42/teacher_pma1/best.pt ]; do
-    [ -f outputs/split_seed42/teacher_pma1/failure.json ] && exit 1; sleep 120; done
   T=outputs/split_seed42/teacher_pma1/best.pt
   .venv/bin/python -u -m src.experiments.kd_rank_strict_hpo \
     --base-config configs/split_seed42/kd_rank.yaml --teacher-checkpoint $T \
     --sweep-dir outputs/split_seed42/kd_hpo/rank --bank-root outputs/distill/split_seed42 \
     > outputs/logs/split_seed42_kd_hpo_rank.log 2>&1 || exit 1
-  hpc/sweep_kd_hpo.sh all configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid \
-    > outputs/logs/split_seed42_kd_hpo_grid.log 2>&1 || exit 1
+  hpc/sweep_kd_hpo.sh all configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid "kd_rep_*" \
+    > outputs/logs/split_seed42_kd_hpo_grid_rep.log 2>&1 || exit 1
+  hpc/sweep_kd_hpo.sh all configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid "kd_logit_*" \
+    > outputs/logs/split_seed42_kd_hpo_grid_logit.log 2>&1
+' > outputs/logs/split_seed42_chainA_30838.log 2>&1 < /dev/null &
+
+# container B (30030): struct_new study -> kd_rank_rep study -> kd_gram grid
+# (struct_grand finished its 10 trials on 30846; its chain was cut before it could start struct_new there)
+nohup bash -c '
+  OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 .venv/bin/python -u -m src.experiments.struct_hpo --arm new \
+    --base-config configs/split_seed42/struct_new.yaml --sweep-dir outputs/split_seed42/struct_hpo/new \
+    > outputs/logs/split_seed42_struct_hpo_new.log 2>&1 || exit 1
   .venv/bin/python -u -m src.experiments.kd_rank_rep_hpo \
     --base-config configs/split_seed42/kd_rank_rep.yaml --sweep-dir outputs/split_seed42/kd_hpo/rank_rep \
     --bank-root outputs/distill/split_seed42 --bank h2ns3 --margin 0.1 \
-    > outputs/logs/split_seed42_kd_hpo_rank_rep.log 2>&1
-' > outputs/logs/split_seed42_kd_hpo_chain.log 2>&1 < /dev/null &
+    > outputs/logs/split_seed42_kd_hpo_rank_rep.log 2>&1 || exit 1
+  hpc/sweep_kd_hpo.sh all configs/split_seed42/sweep outputs/split_seed42/kd_hpo/grid "kd_gram_*" \
+    > outputs/logs/split_seed42_kd_hpo_grid_gram.log 2>&1
+' > outputs/logs/split_seed42_chainB_30030.log 2>&1 < /dev/null &
 ```
 
 ### 2026-09-08 split campaign (retired to a secondary upper bound): B0, PMA1 teacher, five KD students

@@ -60,7 +60,7 @@ optim:
     final_div_factor: 10000
     anneal_strategy: cos
 eval:
-  patience: 10
+  patience: 5
   eval_every: 1
   topology_every: 2
 runtime:
