@@ -10,6 +10,7 @@ cross-attention layers.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import cast
@@ -18,7 +19,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from src.model.egostitch.classifier.layers import inner_token_mask, masked_mean
+from src.model.egostitch.classifier.layers import CrossAttentionLayer, inner_token_mask, masked_mean
 
 CONDITIONING_MODES = ("static", "pair")
 SITES = 3  # A<-B, B<-A, CLS
@@ -216,3 +217,139 @@ class PrefixGenerator(nn.Module):
         for layer_index in range(self.n_layers):
             idx = torch.randperm(tokens.size(0), generator=gen)[: self.cfg.tokens]
             self.p0[layer_index].copy_(tokens[idx].to(self.p0[layer_index].dtype))
+
+
+def prefix_branch(
+    mha: nn.MultiheadAttention,
+    query_norm: torch.Tensor,
+    prefix: torch.Tensor,
+    gate: torch.Tensor,
+    gate_scale: float,
+) -> torch.Tensor:
+    """Separately-softmaxed, tanh-gated attention of ``query_norm`` over ``prefix``.
+
+    Uses the frozen ``mha``'s packed ``in_proj_weight``/``in_proj_bias`` slices
+    for Q/K/V and ``out_proj.weight`` **without** its bias (the base call already
+    added that bias), so the branch is an exact zero tensor whenever the gate is
+    zero and the caller's ``base + branch`` reproduces the base bit for bit.
+
+    Args:
+        mha: The frozen attention module of the site (``batch_first=True``).
+        query_norm: The site's normalised queries ``(B, T_q, E)``.
+        prefix: Prefix tokens ``(B, m, E)``.
+        gate: Raw per-head gate ``(H,)``; applied as ``tanh(gate)``.
+        gate_scale: Multiplier on the gate (``0.0`` realises the gates-off intervention).
+
+    Returns:
+        The gated branch output ``(B, T_q, E)``.
+    """
+    embed = int(mha.embed_dim)
+    heads = int(mha.num_heads)
+    head_dim = embed // heads
+    weight = cast(torch.Tensor, mha.in_proj_weight)
+    bias = cast(torch.Tensor | None, mha.in_proj_bias)
+    q = F.linear(query_norm, weight[:embed], None if bias is None else bias[:embed])
+    k = F.linear(
+        prefix, weight[embed : 2 * embed], None if bias is None else bias[embed : 2 * embed]
+    )
+    v = F.linear(prefix, weight[2 * embed :], None if bias is None else bias[2 * embed :])
+    batch, t_q, _ = q.shape
+    q = q.view(batch, t_q, heads, head_dim).transpose(1, 2)
+    k = k.view(batch, -1, heads, head_dim).transpose(1, 2)
+    v = v.view(batch, -1, heads, head_dim).transpose(1, 2)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
+    out = torch.softmax(scores.float(), dim=-1).to(v.dtype) @ v
+    out = out * (torch.tanh(gate) * gate_scale).to(out.dtype).view(1, heads, 1, 1)
+    out = out.transpose(1, 2).reshape(batch, t_q, embed)
+    return F.linear(out, mha.out_proj.weight)
+
+
+class PrefixCrossAttentionLayer(nn.Module):
+    """Re-drive one frozen `CrossAttentionLayer` with a gated prefix at each site.
+
+    The frozen layer's own sub-modules are called unchanged (its attention,
+    dropouts, norms, and FFNs); the prefix branch is added *outside* the
+    dropout so that at zero gate the sum is the base value exactly.
+    """
+
+    def __init__(
+        self, layer: CrossAttentionLayer, layer_index: int, generator: PrefixGenerator
+    ) -> None:
+        """Wrap a frozen layer.
+
+        Args:
+            layer: The frozen `CrossAttentionLayer` (eval mode, no grad).
+            layer_index: Its index in the trunk.
+            generator: The shared prefix parameters.
+        """
+        super().__init__()
+        self.layer = layer
+        self.layer_index = layer_index
+        self.generator = generator
+
+    def _attend(
+        self,
+        site: int,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        key_padding_mask: torch.Tensor | None,
+        prefix: torch.Tensor,
+        gate_scale: float,
+    ) -> torch.Tensor:
+        layer = self.layer
+        query_norm = layer.norm_attn(query)
+        attn_out, _ = layer.attn(
+            query_norm, key_value, key_value, key_padding_mask=key_padding_mask, need_weights=False
+        )
+        branch = prefix_branch(
+            layer.attn, query_norm, prefix, self.generator.gate(self.layer_index, site), gate_scale
+        )
+        return query + cast(torch.Tensor, layer.drop_attn(attn_out)) + branch
+
+    def forward(
+        self,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        cls_token: torch.Tensor,
+        mask_a: torch.Tensor | None,
+        mask_b: torch.Tensor | None,
+        z: torch.Tensor | None,
+        gate_scale: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One bidirectional block plus the prefix branch at all three sites.
+
+        Args:
+            h_a: Item A hidden states.
+            h_b: Item B hidden states.
+            cls_token: CLS state ``(B, 1, d_model)``.
+            mask_a: Padding mask for A (True = PAD) or ``None``.
+            mask_b: Padding mask for B (True = PAD) or ``None``.
+            z: Pair condition or ``None`` (static).
+            gate_scale: ``0.0`` realises the gates-off intervention.
+
+        Returns:
+            Updated ``(h_a, h_b, cls_token)``.
+        """
+        layer = self.layer
+        prefix = self.generator.prefix(self.layer_index, z, h_a.size(0))
+        h_a = self._attend(0, h_a, h_b, mask_b, prefix, gate_scale)
+        h_a = layer._ffn(h_a)  # noqa: SLF001
+        h_b = self._attend(1, h_b, h_a, mask_a, prefix, gate_scale)
+        h_b = layer._ffn(h_b)  # noqa: SLF001
+
+        combined = torch.cat([h_a, h_b], dim=1)
+        combined_mask = (
+            torch.cat([mask_a, mask_b], dim=1)
+            if mask_a is not None and mask_b is not None
+            else None
+        )
+        cls_norm = layer.norm_cls_attn(cls_token)
+        attn_cls, _ = layer.attn_cls(
+            cls_norm, combined, combined, key_padding_mask=combined_mask, need_weights=False
+        )
+        branch = prefix_branch(
+            layer.attn_cls, cls_norm, prefix, self.generator.gate(self.layer_index, 2), gate_scale
+        )
+        cls_token = cls_token + layer.drop_cls_attn(attn_cls) + branch
+        cls_token = cls_token + layer.drop_cls_ffn(layer.ff_cls(layer.norm_cls_ffn(cls_token)))
+        return h_a, h_b, cls_token
