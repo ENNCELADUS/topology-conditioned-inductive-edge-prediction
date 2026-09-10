@@ -90,6 +90,15 @@ split (root `node_007630`, split seed 42), seed 0, optimizer, schedule, sampler,
 patience, and held-out protocol. Config `configs/split_seed42/b0_cross.yaml`, output
 `outputs/split_seed42/b0_cross`, published checkpoint `best.pt`, tested once.
 
+- **The readout stays.** `PairCrossAttention.forward` runs the layers and then hands the
+  cross-attended token streams *and* the updated CLS token to `PairContextGatedReadout`, which
+  pools the tokens by mean, max, and pair-conditioned attention, gates the three branches, and
+  concatenates the CLS vector before its final projection. The readout is therefore the
+  integration step over the cross-attention output, not a competitor to it. Under the headline B0
+  the CLS input to that readout is the learned constant parameter (no layers touch it); under
+  `b0_cross` it becomes pair-dependent through each layer's CLS attention, so the CLS prefix site
+  in §5.2 is live. Replacing the readout with a CLS-only head would be a second change from the
+  headline recipe and would discard the pooling branches with no evidence against them.
 - `b0_cross` is the **exact base** for every prefix arm and the row every prefix comparison is
   made against. The headline B0 remains the paper's endpoint-only comparator and is reported next
   to it; it is not the base of anything here.
@@ -318,8 +327,10 @@ teacher-KD or descriptor-bottleneck prefix.
   weights (a shared-shift control must not); shuffle and mean interventions change logits only
   through $z_{uv}$ and give identical AB/BA substitutions; config parsing and family dispatch;
   checkpoint round trip through `score_universe.build_model`.
-- **Docs in the same change:** arm table in `docs/03-experiments.md` §1.4, the active method set in
-  `CLAUDE.md`/`AGENTS.md`, and the `struct_hpo` docstring. A result note under
+- **Docs in the same change:** arm table in `docs/03-experiments.md` §1.4; correct §1.5 there,
+  which describes the current student as having three cross-attention layers (under
+  `mixing.mode: none` it has none; `b0_cross` is the arm that does); the active method set in
+  `CLAUDE.md`/`AGENTS.md`; and the `struct_hpo` docstring. A result note under
   `docs/results/prefix_split_seed42/` follows the runs.
 - **Execution order.** Local: `b0_cross` config + smoke, module, tests, configs, docs, Codex review,
   commit, push. H20: `b0_cross` train + test; then the two studies
