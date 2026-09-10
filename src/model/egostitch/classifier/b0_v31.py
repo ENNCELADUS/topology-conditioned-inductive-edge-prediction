@@ -1262,6 +1262,36 @@ class V3_1(nn.Module):
         feature_ba = self.cross_attention(encoded_b, encoded_a, lengths_b, lengths_a)
         return torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
 
+    def logits_from_encoded(
+        self,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute logits from already-encoded per-node token states.
+
+        The shared post-encoder path: `forward` and packed scoring
+        (`src.score_universe._score_v3_1_packed`, which caches `encoder`
+        output across pairs) both reduce to this once the tokens are encoded.
+
+        Args:
+            encoded_a: Frozen encoder output for item A ``(B, L_a, d_model)``.
+            encoded_b: Frozen encoder output for item B ``(B, L_b, d_model)``.
+            lengths_a: True sequence lengths for A.
+            lengths_b: True sequence lengths for B.
+
+        Returns:
+            The pair logits, exactly as `output_head` (or, with a topology
+            generator, `topo_gen.marginal_forward`) produces them.
+        """
+        pair_repr = self._pair_representation(encoded_a, encoded_b, lengths_a, lengths_b)
+        if self.topo_gen is None:
+            return cast(torch.Tensor, self.output_head(pair_repr))
+        return self.topo_gen.marginal_forward(
+            encoded_a, encoded_b, lengths_a, lengths_b, pair_repr, self.output_head
+        )["logits"]
+
     def forward(
         self,
         batch: dict[str, torch.Tensor] | None = None,

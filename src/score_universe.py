@@ -1971,8 +1971,12 @@ def _score_v3_1_packed(
     prefix_intervention: str = "none",
 ) -> NDArray[np.float32]:
     """Score V3.1 pairs with packed features and cached per-node encodings."""
-    if not isinstance(model, V3_1):
-        raise TypeError(f"packed V3.1 scoring requires V3_1, got {type(model).__name__}")
+    from src.model.egostitch.classifier.prefix import V3_1Prefix
+
+    if not isinstance(model, (V3_1, V3_1Prefix)):
+        raise TypeError(
+            f"packed V3.1 scoring requires V3_1 or V3_1Prefix, got {type(model).__name__}"
+        )
     load_started = perf_counter()
     table = PackedFeatureTable.from_pack(pack_dir, device)
     logger.info(
@@ -2004,6 +2008,10 @@ def _score_v3_1_packed(
     )
     # V3.1's final encoder normalization returns FP32 even under BF16 autocast.
     # Preserve that dtype: narrowing this cache changes frozen-B0 logits.
+    # For a V3_1Prefix wrapper, `next(model.parameters())` is the generator's
+    # own first parameter (registered before `base`, per its own docstring) --
+    # a freshly-initialized fp32 tensor, which matches the frozen base's own
+    # dtype, so this still selects the right cache dtype.
     cache_dtype = next(model.parameters()).dtype
     encoded = torch.zeros(
         (len(table.manifest.nodes), max_boundary, model.d_model),
@@ -2058,18 +2066,7 @@ def _score_v3_1_packed(
         with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
             encoded_a = encoded.index_select(0, pair_a)[:, :boundary]
             encoded_b = encoded.index_select(0, pair_b)[:, :boundary]
-            pair_repr = model._pair_representation(
-                encoded_a,
-                encoded_b,
-                len_a,
-                len_b,
-            )
-            if model.topo_gen is None:
-                logits = model.output_head(pair_repr)
-            else:
-                logits = model.topo_gen.marginal_forward(
-                    encoded_a, encoded_b, len_a, len_b, pair_repr, model.output_head
-                )["logits"]
+            logits = model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b)
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )
@@ -3438,6 +3435,7 @@ def _run_score(args: argparse.Namespace) -> None:
         },
         "topo_gen_control": args.topo_gen_control,
         "prefix_intervention": args.prefix_intervention,
+        "prefix_intervention_seed": int(args.prefix_intervention_seed),
     }
     f_logit: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
@@ -3533,6 +3531,7 @@ def _run_score(args: argparse.Namespace) -> None:
             },
             "topo_gen_control": args.topo_gen_control,
             "prefix_intervention": args.prefix_intervention,
+            "prefix_intervention_seed": int(args.prefix_intervention_seed),
             "scaffold_control": {
                 "mode": args.scaffold_control,
                 "seed": _SCAFFOLD_CONTROL_SEED,

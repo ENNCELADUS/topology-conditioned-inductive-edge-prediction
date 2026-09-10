@@ -324,6 +324,7 @@ def _build_score_args(
     scaffold_control: str | None,
     topo_gen_control: str | None,
     prefix_intervention: str = "none",
+    prefix_intervention_seed: int = 0,
     rescore_reason: str | None,
     scoring_run_id: str | None,
     allow_oracle_diagnostic: bool,
@@ -366,6 +367,8 @@ def _build_score_args(
         args += ["--topo-gen-control", topo_gen_control]
     if prefix_intervention != "none":
         args += ["--prefix-intervention", prefix_intervention]
+    if prefix_intervention_seed != 0:
+        args += ["--prefix-intervention-seed", str(prefix_intervention_seed)]
     if rescore_reason is not None:
         args += ["--rescore-reason", rescore_reason]
     if scoring_run_id is not None:
@@ -394,6 +397,7 @@ def run_test_protocol(
     scaffold_control: str | None = None,
     topo_gen_control: str | None = None,
     prefix_intervention: str = "none",
+    prefix_intervention_seed: int = 0,
     rescore_reason: str | None = None,
     model_family: str | None = None,
     model_config: Path | None = None,
@@ -419,6 +423,8 @@ def run_test_protocol(
         prefix_intervention: ``v3_1_prefix`` scoring-time intervention
             (``"none"``/``"gates_off"``/``"shuffle"``/``"mean"``); forwarded
             to every pass and cross-checked against each artifact's meta.
+        prefix_intervention_seed: Draw seed for the ``"shuffle"`` intervention;
+            forwarded to every pass the same way as `prefix_intervention`.
         rescore_reason: Required by the test-access ledger when this
             ``(arm, seed)`` has already opened held-out data.
         model_family: Explicit model family for a bare legacy checkpoint (only
@@ -530,6 +536,7 @@ def run_test_protocol(
             scaffold_control=scaffold_control,
             topo_gen_control=topo_gen_control,
             prefix_intervention=prefix_intervention,
+            prefix_intervention_seed=prefix_intervention_seed,
             rescore_reason=rescore_reason if allow_rescore_reason else None,
             scoring_run_id=scoring_run_id if include_scoring_run_id else None,
             allow_oracle_diagnostic=allow_oracle_diagnostic,
@@ -715,7 +722,7 @@ def run_test_protocol(
         "seed": seed,
         "model_family": meta.get("model_family"),
         "topo_gen_control": meta.get("topo_gen_control"),
-        "prefix_intervention": meta.get("prefix_intervention"),
+        "prefix_intervention": meta.get("prefix_intervention", "none"),
         # `score_universe` never writes `run_kind` into score metadata, so the
         # artifact's own value is always absent. The published training
         # metadata is the only place a run's formal/diagnostic classification
@@ -822,6 +829,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="v3_1_prefix scoring-time intervention",
     )
     parser.add_argument(
+        "--prefix-intervention-seed",
+        type=int,
+        default=0,
+        help="draw seed for the v3_1_prefix 'shuffle' intervention",
+    )
+    parser.add_argument(
         "--rescore-reason",
         default=None,
         help="required reason for a repeated egostitch_e2e held-out scoring epoch",
@@ -910,6 +923,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         scaffold_control=args.scaffold_control,
         topo_gen_control=args.topo_gen_control,
         prefix_intervention=args.prefix_intervention,
+        prefix_intervention_seed=args.prefix_intervention_seed,
         rescore_reason=args.rescore_reason,
         model_family=args.model_family,
         model_config=args.model_config,

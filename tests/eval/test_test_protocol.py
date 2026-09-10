@@ -354,6 +354,70 @@ class TestRunTestProtocol:
         assert isinstance(arm_block, dict)
         assert arm_block["prefix_intervention"] == intervention
 
+    def test_parser_accepts_prefix_intervention_seed(self) -> None:
+        args = test_protocol.build_parser().parse_args(
+            [
+                "--checkpoint",
+                "checkpoint.pt",
+                "--output-dir",
+                "outputs/control",
+                "--data-root",
+                "data",
+                "--strategy",
+                _STRATEGY,
+                "--arm",
+                "prefix_arm",
+                "--seed",
+                "0",
+                "--prefix-intervention-seed",
+                "7",
+            ]
+        )
+
+        assert args.prefix_intervention_seed == 7
+        default = test_protocol.build_parser().parse_args(
+            [
+                "--checkpoint",
+                "checkpoint.pt",
+                "--output-dir",
+                "outputs/control",
+                "--data-root",
+                "data",
+                "--strategy",
+                _STRATEGY,
+                "--arm",
+                "prefix_arm",
+                "--seed",
+                "0",
+            ]
+        )
+        assert default.prefix_intervention_seed == 0
+
+    def test_forwards_prefix_intervention_seed_to_every_score_pass(self, tmp_path: Path) -> None:
+        fixture = _build_fixture(tmp_path)
+        controlled_artifacts: dict[str, Path] = {}
+        for pairs_source, source in fixture.artifacts.items():
+            destination = tmp_path / "controlled_scores" / f"{pairs_source}.npz"
+            _copy_with_prefix_intervention(source, destination, "shuffle")
+            controlled_artifacts[pairs_source] = destination
+        runner = _FakeScoreRunner(controlled_artifacts)
+
+        run_test_protocol(
+            checkpoint=_write_checkpoint(tmp_path),
+            output_dir=tmp_path / "outputs" / "prefix_shuffle_seed",
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm="prefix_shuffle_seed",
+            seed=0,
+            score_runner=runner,
+            prefix_intervention="shuffle",
+            prefix_intervention_seed=7,
+        )
+
+        for pairs_source in ("val_topology", "val_cls", "test", "test_topology"):
+            call = runner.call_for(pairs_source)
+            assert _arg_value(call, "--prefix-intervention-seed") == "7"
+
     def test_full_report_shape_ordering_and_leakage_guarantee(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         checkpoint = _write_checkpoint(tmp_path)
@@ -578,6 +642,7 @@ class TestRunTestProtocol:
             assert "--scaffold-control" not in call
             assert "--topo-gen-control" not in call
             assert "--prefix-intervention" not in call
+            assert "--prefix-intervention-seed" not in call
             assert "--rescore-reason" not in call
             assert "--scoring-run-id" not in call
             assert "--allow-oracle-diagnostic" not in call
@@ -891,7 +956,7 @@ class TestReuseExistingScores:
         assert runner.calls == []
         arm_block = result.report["arm"]
         assert isinstance(arm_block, dict)
-        assert arm_block["prefix_intervention"] is None
+        assert arm_block["prefix_intervention"] == "none"
 
     def test_reuses_written_artifacts_and_only_scores_what_is_missing(self, tmp_path: Path) -> None:
         """Mimics the real failure: test finished, test_topology did not."""

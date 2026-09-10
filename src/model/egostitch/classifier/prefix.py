@@ -429,6 +429,11 @@ class V3_1Prefix(nn.Module):
         self.intervention: str = "none"
         self.intervention_seed: int = 0
 
+    @property
+    def encoder(self) -> nn.Module:
+        """The frozen base's per-node encoder (read-only; packed scoring caches its output)."""
+        return self.base.encoder
+
     def train(self, mode: bool = True) -> V3_1Prefix:
         """Switch the wrapper's mode while keeping the frozen base in eval mode.
 
@@ -534,6 +539,55 @@ class V3_1Prefix(nn.Module):
             )
         return base_repr
 
+    def logits_from_encoded(
+        self,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute logits from already-encoded per-node token states.
+
+        Everything `forward` does after the frozen encoder: the pair
+        condition, the intervention substitution (one permutation draw per
+        call, via `_apply_intervention`), the AB/BA-aggregated prefix trunk,
+        and the frozen output head. Shared by `forward` and packed scoring
+        (`src.score_universe._score_v3_1_packed`, which caches `encoder`
+        output across pairs) so the logic exists once.
+
+        Args:
+            encoded_a: Frozen encoder output for item A ``(B, L_a, d_model)``.
+            encoded_b: Frozen encoder output for item B ``(B, L_b, d_model)``.
+            lengths_a: True sequence lengths for A.
+            lengths_b: True sequence lengths for B.
+
+        Returns:
+            The pair logits, exactly as `forward` computes them post-encoder.
+
+        Raises:
+            ValueError: If a non-``"none"`` `intervention` is set while
+                `self.training` (interventions are scoring-time only; calling
+                `self.generator.condition` in that state would also fold the
+                live pair condition into its running `z_sum`/`z_count`), or
+                (via `_apply_intervention`) on an unknown intervention name,
+                ``shuffle``/``mean`` with a static prefix, or ``shuffle`` on a
+                batch of fewer than 2 pairs.
+        """
+        if self.intervention != "none" and self.training:
+            raise ValueError("prefix interventions are scoring-time only; call eval() first")
+        mask_a = _build_padding_mask(lengths_a, encoded_a.size(1))
+        mask_b = _build_padding_mask(lengths_b, encoded_b.size(1))
+        z, gate_scale = self._apply_intervention(
+            self.generator.condition(encoded_a, encoded_b, mask_a, mask_b)
+        )
+        feature_ab = self._trunk(encoded_a, encoded_b, lengths_a, lengths_b, z, gate_scale)
+        if self.base.order_aggregation == "single":
+            pair_repr = feature_ab
+        else:
+            feature_ba = self._trunk(encoded_b, encoded_a, lengths_b, lengths_a, z, gate_scale)
+            pair_repr = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
+        return cast(torch.Tensor, self.base.output_head(pair_repr))
+
     def forward(
         self,
         batch: dict[str, torch.Tensor] | None = None,
@@ -546,8 +600,8 @@ class V3_1Prefix(nn.Module):
             **kwargs: Additional batch tensors merged into ``batch``.
 
         Returns:
-            ``logits``, ``pair_repr``, and, with ``label``, the weighted BCE ``loss``
-            and ``loss_weight_sum`` exactly as `V3_1` computes them.
+            ``logits`` and, with ``label``, the weighted BCE ``loss`` and
+            ``loss_weight_sum`` exactly as `V3_1` computes them.
 
         Raises:
             ValueError: If a non-``"none"`` `intervention` is set while
@@ -566,21 +620,10 @@ class V3_1Prefix(nn.Module):
         with torch.no_grad():
             encoded_a = self.base.encoder(emb_a, lengths_a)
             encoded_b = self.base.encoder(emb_b, lengths_b)
-        mask_a = _build_padding_mask(lengths_a, encoded_a.size(1))
-        mask_b = _build_padding_mask(lengths_b, encoded_b.size(1))
         if self.intervention != "none" and self.training:
             raise ValueError("prefix interventions are scoring-time only; call eval() first")
-        z, gate_scale = self._apply_intervention(
-            self.generator.condition(encoded_a, encoded_b, mask_a, mask_b)
-        )
-        feature_ab = self._trunk(encoded_a, encoded_b, lengths_a, lengths_b, z, gate_scale)
-        if self.base.order_aggregation == "single":
-            pair_repr = feature_ab
-        else:
-            feature_ba = self._trunk(encoded_b, encoded_a, lengths_b, lengths_a, z, gate_scale)
-            pair_repr = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
-        logits = self.base.output_head(pair_repr)
-        output: dict[str, torch.Tensor] = {"pair_repr": pair_repr, "logits": logits}
+        logits = self.logits_from_encoded(encoded_a, encoded_b, lengths_a, lengths_b)
+        output: dict[str, torch.Tensor] = {"logits": logits}
         if "label" in merged:
             output["loss"], output["loss_weight_sum"] = weighted_pair_bce(
                 logits,

@@ -272,6 +272,111 @@ def test_packed_path_matches_forward_for_live_topo_gen(
     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=0.0)
 
 
+def _tiny_v3_1_prefix(*, gates: float = 0.4, conditioning: str = "pair") -> V3_1Prefix:
+    """A tiny pair-conditioned `V3_1Prefix` with open gates, in eval mode."""
+    torch.manual_seed(0)
+    model = V3_1Prefix(
+        base=_tiny_base_config(),
+        prefix={"tokens": 3, "rank": 2, "conditioning": conditioning, "bottleneck": 6},
+    )
+    with torch.no_grad():
+        model.generator.gates.fill_(gates)
+    model.eval()
+    return model
+
+
+def _build_prefix_packed_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[tuple[str, str]]]:
+    """Build a tiny packed-feature pack (matching `_tiny_base_config`'s `input_dim`)."""
+    feature_root = tmp_path / "features"
+    nodes = {
+        "node_00": torch.randn(3, INPUT_DIM),
+        "node_01": torch.randn(4, INPUT_DIM),
+        "node_02": torch.randn(5, INPUT_DIM),
+    }
+    _write_feature_store(feature_root, nodes)
+    pack_root = tmp_path / "pack"
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+    build_packed_features(feature_root, pack_root, workers=1)
+    pairs = [("node_00", "node_01"), ("node_02", "node_00")]
+    return pack_root, pairs
+
+
+def test_packed_scoring_matches_forward_for_v3_1_prefix_with_open_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _tiny_v3_1_prefix()
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch)
+
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    node_index = table.manifest.node_index()
+    compact = CompactPairBatch(
+        row_ids=torch.tensor([0, 1]),
+        node_a=torch.tensor([node_index[u] for u, _ in pairs]),
+        node_b=torch.tensor([node_index[v] for _, v in pairs]),
+        labels=torch.zeros(2),
+        bucket_boundary=128,
+        global_pair_count=2,
+    )
+    reference_batch = table.assemble(compact)
+    reference_batch["emb_a"] = reference_batch["emb_a"].float()
+    reference_batch["emb_b"] = reference_batch["emb_b"].float()
+    with torch.inference_mode():
+        reference = model(reference_batch)["logits"].numpy().reshape(-1)
+
+    actual = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=512,
+    )
+
+    # The packed path pads every batch to its bucket boundary rather than the
+    # natural per-pair lengths `model(reference_batch)` uses, so this is a
+    # close match rather than a bit-exact one (unlike the `V3_1` guards above).
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-6)
+
+
+def test_packed_scoring_shuffle_intervention_differs_and_is_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _tiny_v3_1_prefix()
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch)
+    device = torch.device("cpu")
+
+    model.intervention = "none"
+    baseline = score_universe._score_v3_1_packed(
+        model, pairs, pack_root, device=device, amp="off", token_budget=512
+    )
+
+    model.intervention = "shuffle"
+    model.intervention_seed = 0
+    shuffled_first = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=device,
+        amp="off",
+        token_budget=512,
+        prefix_intervention="shuffle",
+    )
+    shuffled_second = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=device,
+        amp="off",
+        token_budget=512,
+        prefix_intervention="shuffle",
+    )
+
+    assert not np.allclose(baseline, shuffled_first)
+    np.testing.assert_array_equal(shuffled_first, shuffled_second)
+
+
 @pytest.mark.parametrize("control", ["branch_zero", "shuffle"])
 def test_parser_accepts_topo_gen_control(control: str) -> None:
     args = score_universe.build_parser().parse_args(
@@ -418,6 +523,52 @@ def test_score_metadata_records_topo_gen_control(tmp_path: Path, control: str | 
     meta = score_universe.load_scores(output).meta
     assert "topo_gen_control" in meta
     assert meta["topo_gen_control"] == control
+
+
+def test_score_metadata_records_prefix_intervention_and_seed(tmp_path: Path) -> None:
+    nodes = {
+        "node_00": torch.randn(3, INPUT_DIM),
+        "node_01": torch.randn(4, INPUT_DIM),
+    }
+    data_root = _data_root_with_features(tmp_path, nodes)
+    pairs_path = tmp_path / "pairs.tsv"
+    _write_tsv(pairs_path, [("node_00", "node_01", None)])
+    checkpoint = tmp_path / "prefix.pt"
+    model_config: dict[str, object] = {
+        "base": _tiny_base_config(),
+        "prefix": {"tokens": 3, "rank": 2, "conditioning": "static", "bottleneck": 6},
+    }
+    _write_checkpoint(
+        checkpoint,
+        model=score_universe.build_model("v3_1_prefix", model_config),
+        model_family="v3_1_prefix",
+        model_config=model_config,
+    )
+    output = tmp_path / "scores.npz"
+
+    score_universe.main(
+        [
+            "score",
+            "--checkpoint",
+            str(checkpoint),
+            "--pairs",
+            f"file:{pairs_path}",
+            "--data-root",
+            str(data_root),
+            "--output",
+            str(output),
+            "--device",
+            "cpu",
+            "--prefix-intervention",
+            "gates_off",
+            "--prefix-intervention-seed",
+            "5",
+        ]
+    )
+
+    meta = score_universe.load_scores(output).meta
+    assert meta["prefix_intervention"] == "gates_off"
+    assert meta["prefix_intervention_seed"] == 5
 
 
 def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path) -> None:
