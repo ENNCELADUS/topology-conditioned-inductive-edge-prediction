@@ -85,3 +85,14 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
     assert distill.arm == arm
     assert distill == expected_distill
     assert sweep["output_dir"] == f"outputs/b1_row_kd_hpo/{stem}"
+
+
+def test_prefix_base_differs_from_headline_b0_only_in_mixing_and_output_dir() -> None:
+    base = yaml.safe_load(Path("configs/split_seed42/b0_v31.yaml").read_text(encoding="utf-8"))
+    cross_path = Path("configs/split_seed42/prefix_base.yaml")
+    cross = yaml.safe_load(cross_path.read_text(encoding="utf-8"))
+    assert cross["model"]["config"]["mixing"] == {"mode": "bidirectional_cross"}
+    assert cross["output_dir"] == "outputs/split_seed42/prefix_base"
+    cross["model"]["config"]["mixing"] = base["model"]["config"]["mixing"]
+    cross["output_dir"] = base["output_dir"]
+    assert cross == base
