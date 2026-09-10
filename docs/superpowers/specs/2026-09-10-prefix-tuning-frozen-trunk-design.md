@@ -263,17 +263,25 @@ each row's own frozen threshold, with AUPRC alongside:
 3. `prefix_pair` > `prefix_static`: explicit pair-conditioned prompt generation adds something
    beyond a globally shared learned prompt.
 
-**Interventions** (scoring-only, on the selected `prefix_pair` checkpoint, thresholds frozen),
-applied at the **unordered-pair level** so the AB and BA evaluations of one pair see the same
-substituted $z_{uv}$ and `abba_max` symmetry is preserved:
+**Interventions** (scoring-only, on the selected `prefix_pair` checkpoint), applied at the
+**unordered-pair level** so the AB and BA evaluations of one pair see the same substituted
+$z_{uv}$ and `abba_max` symmetry is preserved:
 
 1. *Gates off* — all $g\leftarrow 0$; must reproduce `prefix_base`'s logits within 1e-6 (a correctness check, reported; see §5.2).
-2. *Shuffle* — $z_{uv}$ permuted across unordered pairs within each scored universe.
+2. *Shuffle* — $z_{uv}$ permuted across **all pairs the scoring process scores** (per shard under
+   fan-out), never within a scoring batch: pairs arrive lexicographically sorted and the
+   length-bucketed sampler cuts contiguous chunks, so a batch-local permutation would mostly
+   substitute the condition of a pair sharing an endpoint. The scorer therefore makes two passes
+   over the same batches — collect every row's $z_{uv}$, permute once with
+   `--prefix-intervention-seed`, then score — and the permutation is not a model-level mode.
 3. *Mean* — $z_{uv}$ replaced by its training-set mean (a `z_mean` buffer computed at publish time).
 
-Each reports AUPRC with the five topology numbers (BFS-macro GS, geometric RD, degree /
-clustering / spectral MMD ratios) at the frozen threshold, alongside the gate telemetry
-$\tanh(g)$ per site and epoch.
+Each intervention run **re-selects its own thresholds on its intervened V_val scores, exactly as a
+normal arm does** (the fixed topology threshold and the `val_cls` max-F1 classification threshold
+alike): it is read as the deployable arm that intervention defines, not as `prefix_pair` evaluated
+at a borrowed operating point. Each reports AUPRC with the five topology numbers (BFS-macro GS,
+geometric RD, degree / clustering / spectral MMD ratios) at its own selected threshold, alongside
+the gate telemetry $\tanh(g)$ per site and epoch.
 
 **Reading.** Edge-level and assembled-graph families are always reported together
 (`CLAUDE.md` claim rules).
@@ -315,14 +323,17 @@ teacher-KD or descriptor-bottleneck prefix.
   freezes the base `V3_1`, overrides `train()` to keep the base in eval mode, wraps
   `cross_attention.layers`, exposes `prefix_parameters()`, and forwards with the same
   `PairInputs`/loss interface as `V3_1`, including the structural-stream logit-matrix path and an
-  `intervention` attribute honoured at the unordered-pair level).
+  `intervention` attribute honoured at the unordered-pair level, plus `condition_from_encoded`
+  and a `z` override on `logits_from_encoded` for the scorer's universe-level shuffle).
 - **Family dispatch.** `train_b0.MODEL_FAMILIES` and `build_model` accept `v3_1_prefix`;
   `_build_optimizer` builds its single param group from `prefix_parameters()`;
   `score_universe.MODEL_BUILDERS` rebuilds the family from the checkpoint's embedded config (the
   frozen base state is inside the checkpoint, so no base file is needed at scoring time).
-- **Interventions.** A `--prefix-intervention {none,gates_off,shuffle,mean}` scoring option; the
-  shuffle permutation is drawn once per scored universe over canonical unordered pairs with a
-  recorded seed.
+- **Interventions.** A `--prefix-intervention {none,gates_off,shuffle,mean}` scoring option.
+  `gates_off` and `mean` are `V3_1Prefix.intervention` modes; `shuffle` lives in the scorer, which
+  collects every scored row's $z_{uv}$, permutes them once with `--prefix-intervention-seed`
+  (recorded in the artifact meta and cross-checked at merge), and feeds them back through
+  `V3_1Prefix.logits_from_encoded(..., z=...)`.
 - **Configs.** `configs/split_seed42/prefix_static.yaml`, `prefix_pair.yaml`,
   `prefix_pair_bce.yaml`: the `struct_new` config with `model.family: v3_1_prefix`,
   `model.config.prefix: {base_checkpoint, tokens: 16, rank: 8, conditioning: static|pair,
@@ -332,8 +343,8 @@ teacher-KD or descriptor-bottleneck prefix.
 - **Tests** (`tests/test_prefix_model.py`): bitwise null identity against the frozen base at zero
   gates; AB/BA symmetry of $P_{uv}$; no gradient on any base parameter after a backward; base
   stays in eval mode after `wrapper.train()`; the slot-specific shift changes prefix attention
-  weights (a shared-shift control must not); shuffle and mean interventions change logits only
-  through $z_{uv}$ and give identical AB/BA substitutions; config parsing and family dispatch;
+  weights (a shared-shift control must not); the mean intervention and an explicit `z` change
+  logits only through $z_{uv}$ and give identical AB/BA substitutions; config parsing and family dispatch;
   checkpoint round trip through `score_universe.build_model`.
 - **Docs in the same change:** arm table in `docs/03-experiments.md` §1.4; correct §1.5 there,
   which describes the current student as having three cross-attention layers (under

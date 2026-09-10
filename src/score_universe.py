@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     # modules) so merely importing `score_universe` never pays that cost. This
     # import is erased at runtime (`from __future__ import annotations` makes
     # every annotation a string), so it exists for mypy only.
+    from src.model.egostitch.classifier.prefix import V3_1Prefix
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
     from src.model.egostitch.generator.full_oracle import FullEgoGraph
     from src.train_cazi_mbn import CAZIConfig
@@ -1898,30 +1899,67 @@ def _log_progress(processed: int, total: int, batch_rows: int) -> None:
         logger.info("scored %d/%d rows", processed, total)
 
 
-def _require_shufflable_batches(sampler: Iterable[Sequence[int]], intervention: str) -> None:
-    """Fail closed, before scoring, if ``--prefix-intervention shuffle`` cannot run.
+def _shuffled_prefix_conditions(
+    model: V3_1Prefix,
+    batches: Sequence[Sequence[int]],
+    condition_batch: Callable[[Sequence[int]], torch.Tensor | None],
+    *,
+    num_rows: int,
+    seed: int,
+) -> torch.Tensor:
+    """Build the ``--prefix-intervention shuffle`` conditions for a whole scoring run.
 
-    `V3_1Prefix`'s ``shuffle`` intervention raises deep inside the model on a
-    batch of exactly one row (nothing to permute against). Iterating the
-    length-bucketed sampler here, before any GPU work starts, turns that
-    mid-run crash into a clear, immediate one.
+    Pass 1 of the two-pass shuffle: `condition_batch` is called once per batch,
+    in `batches` order, and each batch's raw `V3_1Prefix.condition_from_encoded`
+    output is scattered back to its input row positions; the resulting
+    ``(num_rows, bottleneck)`` fp32 CPU bank is then permuted by a single seeded
+    `torch.randperm` over **every row this process scores**. The caller's pass 2
+    re-walks the same batches and feeds ``z_perm[batch_rows]`` to
+    `V3_1Prefix.logits_from_encoded`.
+
+    The permutation must span the run, not a batch: scored pairs arrive
+    lexicographically sorted and the length-bucketed sampler cuts contiguous
+    chunks out of that order, so a batch-local permutation would usually
+    substitute the condition of a pair sharing an endpoint with the row it
+    replaces -- not the intended null. Under `src.score_fanout` sharding each
+    shard runs this over its own contiguous row range, so the permutation is
+    within-shard; the shards of one universe are therefore not a single global
+    permutation of it (recorded, not verified -- merge only cross-checks the
+    seed).
 
     Args:
-        sampler: The v3_1 length-bucketed batch sampler about to be used.
-        intervention: The scoring-time ``--prefix-intervention`` value.
+        model: The `V3_1Prefix` being scored, in ``eval()`` mode.
+        batches: The materialised batch row-index lists, in scoring order.
+        condition_batch: Encodes one batch and returns its raw ``z``.
+        num_rows: Total rows this process scores.
+        seed: ``--prefix-intervention-seed``.
+
+    Returns:
+        The permuted ``(num_rows, bottleneck)`` fp32 CPU condition bank.
 
     Raises:
-        SystemExit: If `intervention` is ``"shuffle"`` and any batch has a
-            single row.
+        SystemExit: If the checkpoint has a static prefix (no condition to
+            permute) or fewer than 2 rows are being scored.
     """
-    if intervention != "shuffle":
-        return
-    for index, batch in enumerate(sampler):
-        if len(batch) < 2:
-            raise SystemExit(
-                "--prefix-intervention shuffle needs every batch to hold >= 2 pairs; "
-                f"batch {index} has {len(batch)} — change --token-budget"
-            )
+    if model.prefix_cfg.conditioning != "pair":
+        raise SystemExit(
+            "--prefix-intervention shuffle requires a pair-conditioned checkpoint "
+            f"(model.config.prefix.conditioning is {model.prefix_cfg.conditioning!r})"
+        )
+    if num_rows < 2:
+        raise SystemExit(
+            f"--prefix-intervention shuffle needs at least 2 scored rows, got {num_rows}"
+        )
+    z_all = torch.zeros((num_rows, model.prefix_cfg.bottleneck), dtype=torch.float32)
+    for batch_indices in batches:
+        z_batch = condition_batch(batch_indices)
+        if z_batch is None:
+            raise SystemExit("--prefix-intervention shuffle requires a pair-conditioned checkpoint")
+        z_all[torch.as_tensor(list(batch_indices), dtype=torch.int64)] = (
+            z_batch.detach().to(torch.float32).cpu()
+        )
+    perm = torch.randperm(num_rows, generator=torch.Generator().manual_seed(seed))
+    return z_all[perm]
 
 
 def _score_v3_1(
@@ -1933,6 +1971,7 @@ def _score_v3_1(
     amp: str,
     token_budget: int,
     prefix_intervention: str = "none",
+    prefix_intervention_seed: int = 0,
 ) -> NDArray[np.float32]:
     """Score pairs with a `V3_1` model via the length-bucketed batching machinery.
 
@@ -1948,8 +1987,11 @@ def _score_v3_1(
         amp: ``off`` or ``bf16``.
         token_budget: Approximate per-batch token budget for the bucketed sampler.
         prefix_intervention: The scoring-time ``--prefix-intervention`` value
-            (``v3_1_prefix`` only); fails closed here when it is ``"shuffle"``
-            and some batch would have too few rows to shuffle.
+            (``v3_1_prefix`` only). ``"shuffle"`` is realised here, not in the
+            model: two passes over the same batches, the first collecting every
+            row's condition (`_shuffled_prefix_conditions`), the second scoring
+            against the permuted bank.
+        prefix_intervention_seed: Permutation seed for ``"shuffle"``.
 
     Returns:
         Shape ``(len(pairs),)`` float32 logits in input row order.
@@ -1957,15 +1999,58 @@ def _score_v3_1(
     lengths = probe_lengths(store, pairs)
     dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
-    _require_shufflable_batches(sampler, prefix_intervention)
+    batches = [list(batch) for batch in sampler]
 
-    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
-    processed = 0
-    for batch_indices in sampler:
+    prefix_model: V3_1Prefix | None = None
+
+    def _encode(
+        batch_indices: Sequence[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the frozen encoder over one batch (shuffle path only)."""
+        assert prefix_model is not None
         batch = collate_token_pairs([dataset[i] for i in batch_indices])
         batch = {key: tensor.to(device) for key, tensor in batch.items()}
         with torch.inference_mode(), _autocast_context(device, amp):
-            logits = cast(torch.Tensor, model(batch)["logits"])
+            encoded_a = prefix_model.encoder(batch["emb_a"], batch["len_a"])
+            encoded_b = prefix_model.encoder(batch["emb_b"], batch["len_b"])
+        return encoded_a, encoded_b, batch["len_a"], batch["len_b"]
+
+    def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
+        """Pass 1: this batch's raw pair conditions (shuffle path only)."""
+        assert prefix_model is not None
+        encoded_a, encoded_b, len_a, len_b = _encode(batch_indices)
+        with torch.inference_mode(), _autocast_context(device, amp):
+            return prefix_model.condition_from_encoded(encoded_a, encoded_b, len_a, len_b)
+
+    z_perm: torch.Tensor | None = None
+    if prefix_intervention == "shuffle":
+        from src.model.egostitch.classifier.prefix import V3_1Prefix as _V3_1Prefix
+
+        if not isinstance(model, _V3_1Prefix):
+            raise SystemExit("--prefix-intervention requires a v3_1_prefix checkpoint")
+        prefix_model = model
+        z_perm = _shuffled_prefix_conditions(
+            prefix_model, batches, _condition, num_rows=len(pairs), seed=prefix_intervention_seed
+        )
+
+    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
+    processed = 0
+    for batch_indices in batches:
+        if z_perm is None:
+            batch = collate_token_pairs([dataset[i] for i in batch_indices])
+            batch = {key: tensor.to(device) for key, tensor in batch.items()}
+            with torch.inference_mode(), _autocast_context(device, amp):
+                logits = cast(torch.Tensor, model(batch)["logits"])
+        else:
+            assert prefix_model is not None
+            encoded_a, encoded_b, len_a, len_b = _encode(batch_indices)
+            z_rows = z_perm[torch.as_tensor(batch_indices, dtype=torch.int64)].to(
+                device=encoded_a.device, dtype=encoded_a.dtype
+            )
+            with torch.inference_mode(), _autocast_context(device, amp):
+                logits = prefix_model.logits_from_encoded(
+                    encoded_a, encoded_b, len_a, len_b, z=z_rows
+                )
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )
@@ -1984,8 +2069,14 @@ def _score_v3_1_packed(
     pair_amp: str | None = None,
     token_budget: int,
     prefix_intervention: str = "none",
+    prefix_intervention_seed: int = 0,
 ) -> NDArray[np.float32]:
-    """Score V3.1 pairs with packed features and cached per-node encodings."""
+    """Score V3.1 pairs with packed features and cached per-node encodings.
+
+    ``prefix_intervention == "shuffle"`` runs the same two-pass, universe-level
+    substitution as `_score_v3_1` (`_shuffled_prefix_conditions`), reading both
+    passes out of the per-node encoding cache built here.
+    """
     from src.model.egostitch.classifier.prefix import V3_1Prefix
 
     if not isinstance(model, (V3_1, V3_1Prefix)):
@@ -2007,7 +2098,7 @@ def _score_v3_1_packed(
     lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
     lengths = [(lengths_by_node[u], lengths_by_node[v]) for u, v in pairs]
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
-    _require_shufflable_batches(sampler, prefix_intervention)
+    batches = [list(batch) for batch in sampler]
     node_a = torch.tensor([node_index[u] for u, _ in pairs], dtype=torch.int64)
     node_b = torch.tensor([node_index[v] for _, v in pairs], dtype=torch.int64)
 
@@ -2066,22 +2157,57 @@ def _score_v3_1_packed(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
-    processed = 0
-    batch_count = 0
-    score_started = perf_counter()
-    for batch_indices in sampler:
-        row_ids = torch.tensor(batch_indices, dtype=torch.int64)
+    def _gather(
+        batch_indices: Sequence[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Slice one batch's cached per-node encodings and true lengths."""
+        row_ids = torch.tensor(list(batch_indices), dtype=torch.int64)
         max_length = max(max(lengths[index]) for index in batch_indices)
         boundary = next(value for value in BUCKET_BOUNDARIES if value >= max_length)
         pair_a = node_a.index_select(0, row_ids).to(device)
         pair_b = node_b.index_select(0, row_ids).to(device)
-        len_a = packed_lengths.index_select(0, pair_a)
-        len_b = packed_lengths.index_select(0, pair_b)
+        return (
+            encoded.index_select(0, pair_a)[:, :boundary],
+            encoded.index_select(0, pair_b)[:, :boundary],
+            packed_lengths.index_select(0, pair_a),
+            packed_lengths.index_select(0, pair_b),
+        )
+
+    z_perm: torch.Tensor | None = None
+    if prefix_intervention == "shuffle":
+        if not isinstance(model, V3_1Prefix):
+            raise SystemExit("--prefix-intervention requires a v3_1_prefix checkpoint")
+        prefix_model = model
+
+        def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
+            """Pass 1: this batch's raw pair conditions."""
+            with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
+                return prefix_model.condition_from_encoded(*_gather(batch_indices))
+
+        z_perm = _shuffled_prefix_conditions(
+            prefix_model, batches, _condition, num_rows=len(pairs), seed=prefix_intervention_seed
+        )
+
+    out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
+    processed = 0
+    batch_count = 0
+    score_started = perf_counter()
+    for batch_indices in batches:
+        encoded_a, encoded_b, len_a, len_b = _gather(batch_indices)
+        z_rows = (
+            None
+            if z_perm is None
+            else z_perm[torch.as_tensor(batch_indices, dtype=torch.int64)].to(
+                device=encoded_a.device, dtype=encoded_a.dtype
+            )
+        )
         with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
-            encoded_a = encoded.index_select(0, pair_a)[:, :boundary]
-            encoded_b = encoded.index_select(0, pair_b)[:, :boundary]
-            logits = model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b)
+            if z_rows is None:
+                logits = model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b)
+            else:
+                logits = cast(V3_1Prefix, model).logits_from_encoded(
+                    encoded_a, encoded_b, len_a, len_b, z=z_rows
+                )
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )
@@ -3296,9 +3422,12 @@ def _run_score(args: argparse.Namespace) -> None:
             raise SystemExit("--prefix-intervention requires a v3_1_prefix checkpoint")
         from src.model.egostitch.classifier.prefix import V3_1Prefix
 
-        prefix_model = cast(V3_1Prefix, model)
-        prefix_model.intervention = args.prefix_intervention
-        prefix_model.intervention_seed = int(args.prefix_intervention_seed)
+        # `shuffle` is not a model-level mode: it permutes conditions across
+        # every row this process scores, which only the scoring loop can see
+        # (`_shuffled_prefix_conditions`). The model stays on `"none"`; the
+        # artifact meta below still records the requested intervention.
+        if args.prefix_intervention != "shuffle":
+            cast(V3_1Prefix, model).intervention = args.prefix_intervention
 
     cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None
 
@@ -3468,6 +3597,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 amp=args.amp,
                 token_budget=args.token_budget,
                 prefix_intervention=args.prefix_intervention,
+                prefix_intervention_seed=int(args.prefix_intervention_seed),
             )
         else:
             logits = _score_v3_1_packed(
@@ -3479,6 +3609,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 pair_amp=args.pair_amp or args.amp,
                 token_budget=args.token_budget,
                 prefix_intervention=args.prefix_intervention,
+                prefix_intervention_seed=int(args.prefix_intervention_seed),
             )
     elif model_family == "f0_mlp":
         logits = _score_f0_mlp(

@@ -293,22 +293,6 @@ def test_interventions() -> None:
         model.intervention = "mean"
         mean_logits = model(batch)["logits"]
         assert not torch.equal(mean_logits, live)
-        model.intervention = "shuffle"
-        model.intervention_seed = 5
-        shuffled_1 = model(batch)["logits"]
-        model.intervention_seed = 5
-        shuffled_2 = model(batch)["logits"]
-        assert torch.equal(shuffled_1, shuffled_2)
-        assert not torch.equal(shuffled_1, live)
-        # the same permutation is applied to AB and BA (abba_max stays symmetric)
-        swapped = {
-            "emb_a": batch["emb_b"],
-            "emb_b": batch["emb_a"],
-            "len_a": batch["len_b"],
-            "len_b": batch["len_a"],
-        }
-        model.intervention_seed = 5
-        assert torch.allclose(model(swapped)["logits"], shuffled_1, atol=1e-5)
     model.intervention = "bogus"
     try:
         with torch.no_grad():
@@ -335,32 +319,137 @@ def test_init_static_prefix_from_a_batch_and_state_dict_round_trip() -> None:
         assert torch.equal(rebuilt(_pair_batch())["logits"], model(_pair_batch())["logits"])
 
 
-def test_shuffle_and_mean_interventions_fail_closed_on_a_static_prefix() -> None:
+def test_mean_intervention_fails_closed_on_a_static_prefix() -> None:
     _, model = _wrapped("static")
     model.eval()
-    batch = _pair_batch()
-    for intervention in ("shuffle", "mean"):
-        model.intervention = intervention
-        try:
-            with torch.no_grad():
-                model(batch)
-        except ValueError as err:
-            assert "pair" in str(err), intervention
-        else:
-            raise AssertionError(f"{intervention} on a static prefix must raise")
+    model.generator.z_count.fill_(10.0)
+    model.intervention = "mean"
+    try:
+        with torch.no_grad():
+            model(_pair_batch())
+    except ValueError as err:
+        assert "pair" in str(err)
+    else:
+        raise AssertionError("mean on a static prefix must raise")
 
 
-def test_shuffle_intervention_fails_closed_on_a_batch_of_one() -> None:
+def test_mean_intervention_fails_closed_before_any_training_forward() -> None:
+    """An untrained ``z_mean`` is an all-zero vector, not the training-set mean of anything."""
+    _, model = _wrapped("pair")
+    model.eval()
+    assert float(model.generator.z_count) == 0.0
+    model.intervention = "mean"
+    try:
+        with torch.no_grad():
+            model(_pair_batch())
+    except ValueError as err:
+        assert "z_count" in str(err)
+    else:
+        raise AssertionError("mean without an accumulated z_mean must raise")
+
+
+def test_shuffle_is_not_a_model_level_intervention() -> None:
+    """`shuffle` moved to the scorer (universe-level); the model must reject the name."""
     _, model = _wrapped("pair")
     model.eval()
     model.intervention = "shuffle"
+    assert not hasattr(model, "intervention_seed")
     try:
         with torch.no_grad():
-            model(_pair_batch(n=1))
+            model(_pair_batch())
     except ValueError as err:
-        assert "2" in str(err)
+        assert "unknown prefix intervention" in str(err)
     else:
-        raise AssertionError("shuffle on a batch of 1 must raise")
+        raise AssertionError("shuffle is no longer a model-level intervention")
+
+
+def _encoded_pair(
+    model: V3_1Prefix, batch: dict[str, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the frozen encoder over one batch, as the scorer's pass 1 does."""
+    with torch.no_grad():
+        return (
+            model.base.encoder(batch["emb_a"], batch["len_a"]),
+            model.base.encoder(batch["emb_b"], batch["len_b"]),
+            batch["len_a"],
+            batch["len_b"],
+        )
+
+
+def test_condition_from_encoded_is_symmetric_and_matches_the_forward_condition() -> None:
+    _, model = _wrapped("pair")
+    model.eval()
+    batch = _pair_batch()
+    encoded_a, encoded_b, len_a, len_b = _encoded_pair(model, batch)
+    with torch.no_grad():
+        z = model.condition_from_encoded(encoded_a, encoded_b, len_a, len_b)
+        z_swapped = model.condition_from_encoded(encoded_b, encoded_a, len_b, len_a)
+    assert z is not None and z_swapped is not None
+    assert z.shape == (6, 6)
+    assert torch.allclose(z, z_swapped)
+    # No side effects: a scoring-time condition must not feed the running mean.
+    assert float(model.generator.z_count) == 0.0
+    # It is exactly the condition `forward` uses: replaying it explicitly is a no-op.
+    with torch.no_grad():
+        assert torch.equal(
+            model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b, z=z),
+            model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b),
+        )
+
+
+def test_explicit_permuted_condition_changes_logits_and_is_deterministic() -> None:
+    _, model = _wrapped("pair")
+    model.eval()
+    with torch.no_grad():
+        model.generator.gates.fill_(0.4)
+    batch = _pair_batch()
+    encoded_a, encoded_b, len_a, len_b = _encoded_pair(model, batch)
+    with torch.no_grad():
+        z = model.condition_from_encoded(encoded_a, encoded_b, len_a, len_b)
+        assert z is not None
+        live = model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b)
+        z_perm = z[torch.tensor([3, 4, 5, 0, 1, 2])]
+        first = model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b, z=z_perm)
+        second = model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b, z=z_perm)
+    assert not torch.equal(first, live)
+    assert torch.equal(first, second)
+    # `gates_off` composes with a substituted condition: the branch is still zeroed.
+    model.intervention = "gates_off"
+    with torch.no_grad():
+        assert torch.equal(
+            model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b, z=z_perm),
+            model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b),
+        )
+
+
+def test_mean_intervention_rejects_an_explicit_condition() -> None:
+    _, model = _wrapped("pair")
+    model.eval()
+    model.generator.z_count.fill_(10.0)
+    model.intervention = "mean"
+    batch = _pair_batch()
+    encoded_a, encoded_b, len_a, len_b = _encoded_pair(model, batch)
+    try:
+        with torch.no_grad():
+            model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b, z=torch.zeros(6, 6))
+    except ValueError as err:
+        assert "mean" in str(err)
+    else:
+        raise AssertionError("mean plus an explicit z must raise")
+
+
+def test_explicit_condition_is_rejected_by_a_static_prefix() -> None:
+    _, model = _wrapped("static")
+    model.eval()
+    batch = _pair_batch()
+    encoded_a, encoded_b, len_a, len_b = _encoded_pair(model, batch)
+    try:
+        with torch.no_grad():
+            model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b, z=torch.zeros(6, 6))
+    except ValueError as err:
+        assert "pair" in str(err)
+    else:
+        raise AssertionError("an explicit z on a static prefix must raise")
 
 
 def test_intervention_in_train_mode_raises() -> None:

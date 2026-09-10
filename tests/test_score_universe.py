@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from numpy.typing import NDArray
 from src import score_universe
 from src.data import packed_features
 from src.data.artifacts import canonical_pair
@@ -286,20 +287,21 @@ def _tiny_v3_1_prefix(*, gates: float = 0.4, conditioning: str = "pair") -> V3_1
 
 
 def _build_prefix_packed_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, node_count: int = 3
 ) -> tuple[Path, list[tuple[str, str]]]:
-    """Build a tiny packed-feature pack (matching `_tiny_base_config`'s `input_dim`)."""
+    """Build a tiny packed-feature pack (matching `_tiny_base_config`'s `input_dim`).
+
+    Returns the pack root and every unordered pair over its nodes, in the
+    lexicographic order the real scorer sees.
+    """
     feature_root = tmp_path / "features"
-    nodes = {
-        "node_00": torch.randn(3, INPUT_DIM),
-        "node_01": torch.randn(4, INPUT_DIM),
-        "node_02": torch.randn(5, INPUT_DIM),
-    }
+    nodes = {f"node_{i:02d}": torch.randn(3 + i, INPUT_DIM) for i in range(node_count)}
     _write_feature_store(feature_root, nodes)
     pack_root = tmp_path / "pack"
     monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
     build_packed_features(feature_root, pack_root, workers=1)
-    pairs = [("node_00", "node_01"), ("node_02", "node_00")]
+    names = sorted(nodes)
+    pairs = [(u, v) for index, u in enumerate(names) for v in names[index + 1 :]]
     return pack_root, pairs
 
 
@@ -312,12 +314,12 @@ def test_packed_scoring_matches_forward_for_v3_1_prefix_with_open_gates(
     table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
     node_index = table.manifest.node_index()
     compact = CompactPairBatch(
-        row_ids=torch.tensor([0, 1]),
+        row_ids=torch.arange(len(pairs)),
         node_a=torch.tensor([node_index[u] for u, _ in pairs]),
         node_b=torch.tensor([node_index[v] for _, v in pairs]),
-        labels=torch.zeros(2),
+        labels=torch.zeros(len(pairs)),
         bucket_boundary=128,
-        global_pair_count=2,
+        global_pair_count=len(pairs),
     )
     reference_batch = table.assemble(compact)
     reference_batch["emb_a"] = reference_batch["emb_a"].float()
@@ -340,41 +342,95 @@ def test_packed_scoring_matches_forward_for_v3_1_prefix_with_open_gates(
     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-6)
 
 
-def test_packed_scoring_shuffle_intervention_differs_and_is_deterministic(
+def test_packed_scoring_shuffle_is_universe_level_seeded_and_batch_invariant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Review P0: ``shuffle`` permutes over every scored row, not within a batch.
+
+    All unordered pairs over 5 nodes is 10 rows; ``token_budget=512`` caps a
+    128-bucket batch at 2 rows (5 batches) and ``token_budget=8192`` at 32 (one
+    batch). A batch-local shuffle gives different logits under the two budgets;
+    a universe-level permutation gives the same ones.
+    """
     model = _tiny_v3_1_prefix()
-    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch)
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
     device = torch.device("cpu")
+    assert len(pairs) == 10
 
-    model.intervention = "none"
-    baseline = score_universe._score_v3_1_packed(
-        model, pairs, pack_root, device=device, amp="off", token_budget=512
-    )
+    def _score(*, budget: int, intervention: str, seed: int = 0) -> NDArray[np.float32]:
+        return score_universe._score_v3_1_packed(
+            model,
+            pairs,
+            pack_root,
+            device=device,
+            amp="off",
+            token_budget=budget,
+            prefix_intervention=intervention,
+            prefix_intervention_seed=seed,
+        )
 
-    model.intervention = "shuffle"
-    model.intervention_seed = 0
-    shuffled_first = score_universe._score_v3_1_packed(
-        model,
-        pairs,
-        pack_root,
-        device=device,
-        amp="off",
-        token_budget=512,
-        prefix_intervention="shuffle",
-    )
-    shuffled_second = score_universe._score_v3_1_packed(
-        model,
-        pairs,
-        pack_root,
-        device=device,
-        amp="off",
-        token_budget=512,
-        prefix_intervention="shuffle",
-    )
+    baseline = _score(budget=512, intervention="none")
+    shuffled_first = _score(budget=512, intervention="shuffle")
+    shuffled_second = _score(budget=512, intervention="shuffle")
+    other_seed = _score(budget=512, intervention="shuffle", seed=7)
+    one_batch = _score(budget=8192, intervention="shuffle")
 
     assert not np.allclose(baseline, shuffled_first)
     np.testing.assert_array_equal(shuffled_first, shuffled_second)
+    assert not np.allclose(shuffled_first, other_seed)
+    np.testing.assert_allclose(shuffled_first, one_batch, rtol=0.0, atol=1e-6)
+    # The model itself never enters an intervention mode for `shuffle`.
+    assert model.intervention == "none"
+
+
+def test_unpacked_scoring_shuffle_is_universe_level_and_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same two-pass shuffle on the non-packed path (`_score_v3_1`)."""
+    model = _tiny_v3_1_prefix()
+    _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
+    store = FeatureStore(tmp_path / "features")
+    pairs = [(f"node_{i:02d}", f"node_{j:02d}") for i in range(5) for j in range(i + 1, 5)]
+    device = torch.device("cpu")
+
+    def _score(*, budget: int, intervention: str, seed: int = 0) -> NDArray[np.float32]:
+        return score_universe._score_v3_1(
+            model,
+            pairs,
+            store,
+            device=device,
+            amp="off",
+            token_budget=budget,
+            prefix_intervention=intervention,
+            prefix_intervention_seed=seed,
+        )
+
+    baseline = _score(budget=512, intervention="none")
+    shuffled = _score(budget=512, intervention="shuffle")
+    one_batch = _score(budget=8192, intervention="shuffle")
+
+    assert not np.allclose(baseline, shuffled)
+    np.testing.assert_array_equal(shuffled, _score(budget=512, intervention="shuffle"))
+    assert not np.allclose(shuffled, _score(budget=512, intervention="shuffle", seed=7))
+    np.testing.assert_allclose(shuffled, one_batch, rtol=0.0, atol=1e-6)
+
+
+def test_packed_scoring_shuffle_rejects_a_static_prefix_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _tiny_v3_1_prefix(conditioning="static")
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(SystemExit, match="pair-conditioned"):
+        score_universe._score_v3_1_packed(
+            model,
+            pairs,
+            pack_root,
+            device=torch.device("cpu"),
+            amp="off",
+            token_budget=512,
+            prefix_intervention="shuffle",
+        )
 
 
 @pytest.mark.parametrize("control", ["branch_zero", "shuffle"])
@@ -1295,6 +1351,11 @@ def test_merge_missing_prefix_intervention_defaults_to_none_and_merges(tmp_path:
     _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20)
     _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention="none")
 
+    merged = score_universe.merge_scores([shard0, shard1])
+
+    assert merged.meta.get("prefix_intervention", "none") == "none"
+    assert len(merged.logit) == 20
+
 
 def test_merge_mismatched_prefix_intervention_seed_raises_clear_error(tmp_path: Path) -> None:
     """A rerun with a different shuffle seed must not merge with an earlier shard.
@@ -1335,10 +1396,8 @@ def test_merge_missing_prefix_intervention_seed_defaults_to_zero_and_merges(
     _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention_seed=0)
 
     merged = score_universe.merge_scores([shard0, shard1])
+
     assert merged.meta.get("prefix_intervention_seed", 0) == 0
-
-    merged = score_universe.merge_scores([shard0, shard1])
-
     assert len(merged.logit) == 20
 
 
@@ -3395,18 +3454,3 @@ def test_prefix_intervention_flag_is_parsed_and_defaults_to_none() -> None:
         ["score", "--checkpoint", "x.pt", "--pairs", "candidate", "--output", "y.npz"]
     )
     assert default.prefix_intervention == "none"
-
-
-def test_require_shufflable_batches_raises_on_a_single_row_batch() -> None:
-    with pytest.raises(SystemExit, match=r"batch 1 has 1"):
-        score_universe._require_shufflable_batches([[0, 1], [2]], "shuffle")
-
-
-def test_require_shufflable_batches_passes_when_every_batch_has_at_least_two_rows() -> None:
-    score_universe._require_shufflable_batches([[0, 1], [2, 3]], "shuffle")
-
-
-def test_require_shufflable_batches_is_a_no_op_for_other_interventions() -> None:
-    score_universe._require_shufflable_batches([[0, 1], [2]], "none")
-    score_universe._require_shufflable_batches([[0, 1], [2]], "mean")
-    score_universe._require_shufflable_batches([[0, 1], [2]], "gates_off")

@@ -29,7 +29,7 @@ from src.model.egostitch.classifier.layers import (
 
 CONDITIONING_MODES = ("static", "pair")
 SITES = 3  # A<-B, B<-A, CLS
-INTERVENTIONS = ("none", "gates_off", "shuffle", "mean")
+INTERVENTIONS = ("none", "gates_off", "mean")
 
 
 @dataclass(frozen=True)
@@ -427,7 +427,6 @@ class V3_1Prefix(nn.Module):
             for index, layer in enumerate(trunk.layers)
         )
         self.intervention: str = "none"
-        self.intervention_seed: int = 0
 
     @property
     def encoder(self) -> nn.Module:
@@ -479,18 +478,20 @@ class V3_1Prefix(nn.Module):
     def _apply_intervention(self, z: torch.Tensor | None) -> tuple[torch.Tensor | None, float]:
         """Return the (possibly substituted) condition and the gate scale.
 
-        Fails closed rather than silently no-opping: ``shuffle``/``mean`` need
-        a pair condition (``z`` is only ``None`` under ``conditioning="static"``),
-        and ``shuffle`` needs at least 2 rows to actually permute anything.
-        ``shuffle`` draws a seeded cyclic offset in ``[1, B-1]`` and rotates
-        every row by it (``perm = (arange(B) + offset) % B``), so no row ever
-        keeps its own condition -- unlike an unconstrained random permutation,
-        which can (with nonzero probability) leave a row fixed.
+        Fails closed rather than silently no-opping: ``mean`` needs a pair
+        condition (``z`` is only ``None`` under ``conditioning="static"``) and
+        an accumulated training mean (``z_count > 0``); an untrained
+        `PrefixGenerator`'s ``z_mean`` is an all-zero vector that is not the
+        training-set mean of anything. The ``shuffle`` intervention is not a
+        model-level mode at all -- it permutes conditions across every row the
+        scoring process scores, which only the scorer can see
+        (`src.score_universe._shuffled_prefix_conditions`), and reaches this
+        class as an explicit ``z`` argument to `logits_from_encoded`.
 
         Raises:
-            ValueError: On an unknown intervention name, ``shuffle``/``mean``
-                with a static prefix (``z is None``), or ``shuffle`` on a
-                batch of fewer than 2 pairs.
+            ValueError: On an unknown intervention name, ``mean`` with a static
+                prefix (``z is None``), or ``mean`` on a generator that has
+                never seen a training forward (``z_count == 0``).
         """
         if self.intervention not in INTERVENTIONS:
             raise ValueError(f"unknown prefix intervention {self.intervention!r}")
@@ -502,17 +503,12 @@ class V3_1Prefix(nn.Module):
             raise ValueError(
                 f"prefix intervention {self.intervention!r} requires conditioning='pair'"
             )
-        if self.intervention == "mean":
-            return self.generator.z_mean.to(z.dtype).unsqueeze(0).expand_as(z), 1.0
-        batch_size = z.size(0)
-        if batch_size < 2:
+        if float(self.generator.z_count) == 0.0:
             raise ValueError(
-                f"prefix intervention 'shuffle' needs a batch of at least 2 pairs, got {batch_size}"
+                "prefix intervention 'mean' needs a trained z_mean, but the generator's "
+                "z_count is 0 (no training forward has accumulated one)"
             )
-        gen = torch.Generator(device="cpu").manual_seed(self.intervention_seed)
-        offset = int(torch.randint(1, batch_size, (1,), generator=gen).item())
-        perm = (torch.arange(batch_size) + offset) % batch_size
-        return z[perm.to(z.device)], 1.0
+        return self.generator.z_mean.to(z.dtype).unsqueeze(0).expand_as(z), 1.0
 
     def _trunk(
         self,
@@ -539,21 +535,20 @@ class V3_1Prefix(nn.Module):
             )
         return base_repr
 
-    def logits_from_encoded(
+    def condition_from_encoded(
         self,
         encoded_a: torch.Tensor,
         encoded_b: torch.Tensor,
         lengths_a: torch.Tensor,
         lengths_b: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute logits from already-encoded per-node token states.
+    ) -> torch.Tensor | None:
+        """Return the raw pair condition ``z`` for a batch, or ``None`` when static.
 
-        Everything `forward` does after the frozen encoder: the pair
-        condition, the intervention substitution (one permutation draw per
-        call, via `_apply_intervention`), the AB/BA-aggregated prefix trunk,
-        and the frozen output head. Shared by `forward` and packed scoring
-        (`src.score_universe._score_v3_1_packed`, which caches `encoder`
-        output across pairs) so the logic exists once.
+        No intervention is applied: this is exactly the ``z`` that
+        `logits_from_encoded` would compute for the same inputs, exposed so a
+        scorer can collect every row's condition, permute it across the whole
+        scored universe, and feed it back through `logits_from_encoded`'s ``z``
+        argument (the ``shuffle`` intervention).
 
         Args:
             encoded_a: Frozen encoder output for item A ``(B, L_a, d_model)``.
@@ -562,24 +557,66 @@ class V3_1Prefix(nn.Module):
             lengths_b: True sequence lengths for B.
 
         Returns:
+            ``(B, bottleneck)`` conditions, or ``None`` for a static prefix.
+        """
+        mask_a = _build_padding_mask(lengths_a, encoded_a.size(1))
+        mask_b = _build_padding_mask(lengths_b, encoded_b.size(1))
+        return self.generator.condition(encoded_a, encoded_b, mask_a, mask_b)
+
+    def logits_from_encoded(
+        self,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+        *,
+        z: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute logits from already-encoded per-node token states.
+
+        Everything `forward` does after the frozen encoder: the pair
+        condition, the intervention substitution (via `_apply_intervention`),
+        the AB/BA-aggregated prefix trunk, and the frozen output head. Shared
+        by `forward` and packed scoring
+        (`src.score_universe._score_v3_1_packed`, which caches `encoder`
+        output across pairs) so the logic exists once.
+
+        Args:
+            encoded_a: Frozen encoder output for item A ``(B, L_a, d_model)``.
+            encoded_b: Frozen encoder output for item B ``(B, L_b, d_model)``.
+            lengths_a: True sequence lengths for A.
+            lengths_b: True sequence lengths for B.
+            z: Optional ``(B, bottleneck)`` condition to use instead of the one
+                this batch's own encodings would produce -- the scorer's
+                universe-level ``shuffle`` substitution. `_apply_intervention`
+                still runs on it, so ``gates_off`` composes with a substituted
+                condition; ``mean`` does not (it *is* a substitution).
+
+        Returns:
             The pair logits, exactly as `forward` computes them post-encoder.
 
         Raises:
             ValueError: If a non-``"none"`` `intervention` is set while
                 `self.training` (interventions are scoring-time only; calling
                 `self.generator.condition` in that state would also fold the
-                live pair condition into its running `z_sum`/`z_count`), or
-                (via `_apply_intervention`) on an unknown intervention name,
-                ``shuffle``/``mean`` with a static prefix, or ``shuffle`` on a
-                batch of fewer than 2 pairs.
+                live pair condition into its running `z_sum`/`z_count`), if an
+                explicit `z` is passed to a static-prefix model or combined
+                with the ``mean`` intervention, or (via `_apply_intervention`)
+                on an unknown intervention name or ``mean`` with a static
+                prefix or an untrained ``z_mean``.
         """
         if self.intervention != "none" and self.training:
             raise ValueError("prefix interventions are scoring-time only; call eval() first")
-        mask_a = _build_padding_mask(lengths_a, encoded_a.size(1))
-        mask_b = _build_padding_mask(lengths_b, encoded_b.size(1))
-        z, gate_scale = self._apply_intervention(
-            self.generator.condition(encoded_a, encoded_b, mask_a, mask_b)
-        )
+        if z is None:
+            z = self.condition_from_encoded(encoded_a, encoded_b, lengths_a, lengths_b)
+        elif self.prefix_cfg.conditioning != "pair":
+            raise ValueError("an explicit prefix condition requires conditioning='pair'")
+        elif self.intervention == "mean":
+            raise ValueError(
+                "prefix intervention 'mean' substitutes the condition itself and cannot be "
+                "combined with an explicit z"
+            )
+        z, gate_scale = self._apply_intervention(z)
         feature_ab = self._trunk(encoded_a, encoded_b, lengths_a, lengths_b, z, gate_scale)
         if self.base.order_aggregation == "single":
             pair_repr = feature_ab
@@ -608,9 +645,8 @@ class V3_1Prefix(nn.Module):
                 `self.training` (interventions are scoring-time only; calling
                 `self.generator.condition` in that state would also fold the
                 live pair condition into its running `z_sum`/`z_count`), or
-                (via `_apply_intervention`) on an unknown intervention name,
-                ``shuffle``/``mean`` with a static prefix, or ``shuffle`` on a
-                batch of fewer than 2 pairs.
+                (via `_apply_intervention`) on an unknown intervention name or
+                ``mean`` with a static prefix or an untrained ``z_mean``.
         """
         merged: dict[str, torch.Tensor] = {}
         if batch is not None:

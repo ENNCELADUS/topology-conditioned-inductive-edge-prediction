@@ -35,8 +35,8 @@ selected method. Every piece of writing must explain how its context helps decid
   topology-supervision control. Studies: `src.experiments.struct_hpo --arm prefix_{static,pair}` and
   `--arm prefix_pair_bce --n-trials 3 --lr-center <winner lr>`. Scoring-time interventions:
   `score_universe --prefix-intervention {gates_off,shuffle,mean}`. `shuffle`/`mean` require a
-  pair-conditioned checkpoint and `shuffle` needs every scoring batch to hold at least two pairs;
-  both fail closed.
+  pair-conditioned checkpoint and fail closed without one; `shuffle` permutes the pair condition
+  across all pairs the scoring process scores (per shard under fan-out), not within a batch.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.
