@@ -368,6 +368,13 @@ class V3_1Prefix(nn.Module):
     Registration order matters: ``generator`` is registered before ``base`` so
     ``next(model.parameters())`` is a trainable parameter (the structural stream
     builds its zero-loss anchor from it).
+
+    Null identity (zero gates, or ``intervention="gates_off"``) is bit-exact
+    (``torch.equal``) against the frozen base: parameters with
+    ``requires_grad=False``, in eval mode -- the deployed function. Against a
+    scoring pass of the *same weights* with ``requires_grad=True``, PyTorch's
+    attention kernel path differs internally, and the identity holds only to
+    about ``1e-7`` in float32 (verified on torch 2.10.0).
     """
 
     name: str = "v3_1_prefix"

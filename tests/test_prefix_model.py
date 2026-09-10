@@ -191,6 +191,13 @@ def _trained_base(seed: int = 1) -> V3_1:
     with torch.no_grad():  # perturb so the frozen function is not the init
         for param in base.parameters():
             param.add_(torch.randn_like(param) * 0.1)
+    # Freeze the reference too: null identity is defined against a frozen base
+    # (requires_grad=False, eval mode) -- the deployed function. On torch 2.10.0,
+    # nn.MultiheadAttention's kernel path is sensitive to parameter requires_grad
+    # state, so comparing against an unfrozen reference only holds to ~1e-7.
+    base.eval()
+    for param in base.parameters():
+        param.requires_grad_(False)
     return base
 
 
