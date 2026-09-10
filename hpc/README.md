@@ -258,6 +258,7 @@ hpc/run.sh test \
   --checkpoint outputs/struct_hpo/prefix_pair/trial_<k>/best.pt \
   --output-dir outputs/struct_hpo/prefix_pair/trial_<k>/prefix_shuffle \
   --data-root data --strategy breadth_first \
+  --pack-dir outputs/feature_packs/b0_v31_bf16 \
   --arm prefix_pair_shuffle --seed 0 \
   --prefix-intervention shuffle --report-filename test_report_shuffle.json
 ```

@@ -359,6 +359,8 @@ class TestRunTestProtocol:
         arm_block = result.report["arm"]
         assert isinstance(arm_block, dict)
         assert arm_block["prefix_intervention"] == intervention
+        # A live run records the flag's own default seed beside the mode.
+        assert arm_block["prefix_intervention_seed"] == 0
 
     def test_parser_accepts_prefix_intervention_seed(self) -> None:
         args = test_protocol.build_parser().parse_args(
@@ -408,7 +410,7 @@ class TestRunTestProtocol:
             controlled_artifacts[pairs_source] = destination
         runner = _FakeScoreRunner(controlled_artifacts)
 
-        run_test_protocol(
+        result = run_test_protocol(
             checkpoint=_write_checkpoint(tmp_path),
             output_dir=tmp_path / "outputs" / "prefix_shuffle_seed",
             data_root=fixture.data_root,
@@ -423,6 +425,10 @@ class TestRunTestProtocol:
         for pairs_source in ("val_topology", "val_cls", "test", "test_topology"):
             call = runner.call_for(pairs_source)
             assert _arg_value(call, "--prefix-intervention-seed") == "7"
+        arm_block = result.report["arm"]
+        assert isinstance(arm_block, dict)
+        assert arm_block["prefix_intervention"] == "shuffle"
+        assert arm_block["prefix_intervention_seed"] == 7
 
     def test_full_report_shape_ordering_and_leakage_guarantee(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)

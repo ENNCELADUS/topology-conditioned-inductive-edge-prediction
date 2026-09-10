@@ -1061,9 +1061,11 @@ def _base_loss_kwargs(model_cfg: ModelConfig) -> Mapping[str, object]:
 def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     """Embed the frozen base's ``model_config`` and record the base file's SHA-256.
 
-    Provenance only: the digest is recorded in the checkpoint's ``model_config``
-    (hence in ``run_metadata.json``) and never verified (project rule: no
-    digest pinning).
+    Provenance only: the digest is embedded in the checkpoint payload's
+    ``model_config`` (under ``prefix``) and never verified (project rule: no
+    digest pinning). ``run_metadata.json`` does not carry ``model_config``, so
+    :func:`_run_metadata` copies the path and digest into its own
+    ``prefix_base`` block.
 
     Args:
         model_cfg: The ``model:`` config section (``family == "v3_1_prefix"``).
@@ -1656,6 +1658,57 @@ def _checkpoint_payload(
     }
 
 
+def _run_metadata(
+    result: TrainResult,
+    cfg: Config,
+    model_kwargs: Mapping[str, object],
+    dropped_pair_counts: dict[str, int],
+    config_dict: dict[str, object],
+) -> dict[str, object]:
+    """Build the ``run_metadata.json`` payload.
+
+    ``run_metadata.json`` is a fixed key list and deliberately does not embed
+    ``model_config``, so a ``v3_1_prefix`` run's frozen-base provenance would
+    otherwise live only inside ``best.pt``. This copies it out as
+    ``prefix_base`` (``{"checkpoint", "sha256"}``) -- recorded, never verified.
+
+    Args:
+        result: The finished training result.
+        cfg: The full training config.
+        model_kwargs: Resolved model constructor kwargs (the checkpoint's ``model_config``).
+        dropped_pair_counts: Per-file dropped-row counts from data assembly.
+        config_dict: The serialized config, hashed into ``config_hash``.
+
+    Returns:
+        The metadata mapping written to ``run_metadata.json``.
+    """
+    run_metadata: dict[str, object] = {
+        "config_hash": hashlib.sha256(
+            json.dumps(config_dict, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "checkpoint_id": _state_digest(result.best_state_dict)[:16],
+        "torch_version": str(torch.__version__),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "dropped_pair_counts": dropped_pair_counts,
+        "training_interactions": "all_train_positives",
+        "arm": (
+            cfg.distill.arm if cfg.distill is not None and cfg.distill.active else cfg.model.family
+        ),
+        "selected_epoch": result.best_epoch,
+    }
+    if cfg.model.family == "v3_1_prefix":
+        prefix_kwargs = cast(Mapping[str, object], model_kwargs["prefix"])
+        run_metadata["prefix_base"] = {
+            "checkpoint": prefix_kwargs.get("base_checkpoint"),
+            "sha256": prefix_kwargs.get("base_checkpoint_sha256"),
+        }
+    if result.val_threshold_transfer is not None:
+        # Freeze the selected checkpoint and its own validation threshold together.
+        run_metadata["selection_rule"] = SELECTION_RULE
+        run_metadata["val_threshold_transfer"] = asdict(result.val_threshold_transfer)
+    return run_metadata
+
+
 def write_outputs(
     result: TrainResult,
     cfg: Config,
@@ -1670,9 +1723,10 @@ def write_outputs(
     ``run_metadata.json`` (config hash, checkpoint id = first
     16 hex of the sha256 over the best
     checkpoint's model_state tensor bytes, torch version, timestamp, dropped-pair
-    counts, positives mode, and — when ``result.val_threshold_transfer`` is set —
-    a ``val_threshold_transfer`` block). The training loop owns incremental
-    ``metrics.jsonl``; finalization never rewrites it.
+    counts, positives mode, a ``prefix_base`` provenance block for
+    ``v3_1_prefix`` runs, and — when ``result.val_threshold_transfer`` is set —
+    a ``val_threshold_transfer`` block; see :func:`_run_metadata`). The training
+    loop owns incremental ``metrics.jsonl``; finalization never rewrites it.
 
     Args:
         result: The finished training result.
@@ -1708,24 +1762,7 @@ def write_outputs(
         output_dir / "last.pt",
     )
 
-    run_metadata = {
-        "config_hash": hashlib.sha256(
-            json.dumps(config_dict, sort_keys=True).encode("utf-8")
-        ).hexdigest(),
-        "checkpoint_id": _state_digest(result.best_state_dict)[:16],
-        "torch_version": str(torch.__version__),
-        "timestamp": datetime.now(UTC).isoformat(),
-        "dropped_pair_counts": dropped_pair_counts,
-        "training_interactions": "all_train_positives",
-        "arm": (
-            cfg.distill.arm if cfg.distill is not None and cfg.distill.active else cfg.model.family
-        ),
-        "selected_epoch": result.best_epoch,
-    }
-    if result.val_threshold_transfer is not None:
-        # Freeze the selected checkpoint and its own validation threshold together.
-        run_metadata["selection_rule"] = SELECTION_RULE
-        run_metadata["val_threshold_transfer"] = asdict(result.val_threshold_transfer)
+    run_metadata = _run_metadata(result, cfg, model_kwargs, dropped_pair_counts, config_dict)
     _write_json_atomic(output_dir / "run_metadata.json", run_metadata)
     logger.info(
         "wrote artifacts to %s (checkpoint_id %s)", output_dir, run_metadata["checkpoint_id"]

@@ -4,7 +4,10 @@ Five arms: the frozen-trunk structural baselines ``grand`` and ``new``, and thre
 arms (frozen ``prefix_base`` trunk, trainable gated KV prefix) that additionally search a
 learning rate. ``prefix_static`` and ``prefix_pair`` search ``rank``/``degree``/``motif`` (the
 ``struct_new`` weights) together with ``lr``; a searched ``lr`` is written to both ``optim.lr``
-and ``optim.scheduler.max_lr``, never into ``struct.weights``. ``prefix_pair_bce`` is the BCE-only
+and ``optim.scheduler.max_lr``, never into ``struct.weights``. Their two enqueued priors are the
+fixed :data:`PREFIX_PRIORS` pair -- ``(rank 1.0, degree 0.1, motif 0.1, lr 1e-3)`` and the fallback
+``(rank 3.0, degree 0.5, motif 0.5, lr 3e-3)`` -- used unconditionally: no flag overrides them, and
+they are not read from any ``struct_new`` study result. ``prefix_pair_bce`` is the BCE-only
 control for the ``prefix_pair`` conditioning: it searches only ``lr``, and its three priors are
 derived from ``--lr-center X`` (the ``prefix_pair`` winner's lr) as ``(X/3, X, 3X)``. Launch it
 with ``--arm prefix_pair_bce --n-trials 3 --lr-center <prefix_pair winner lr>``: Optuna's

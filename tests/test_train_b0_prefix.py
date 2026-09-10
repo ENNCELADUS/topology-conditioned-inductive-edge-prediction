@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
+from src.eval.edge_metrics import EdgeMetrics
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.prefix import V3_1Prefix
 from src.train_b0 import (
     MODEL_FAMILIES,
+    TrainResult,
     _base_loss_kwargs,
     _build_optimizer,
     _init_prefix_from_loader,
+    _run_metadata,
     build_model,
     is_v3_1_family,
     load_config,
@@ -79,6 +83,53 @@ def test_resolve_embeds_base_config_and_provenance(tmp_path: Path) -> None:
     sha256 = prefix["base_checkpoint_sha256"]
     assert isinstance(sha256, str) and len(sha256) == 64
     json.dumps(kwargs)  # checkpoint-embeddable
+
+
+def test_run_metadata_records_the_frozen_base_provenance(tmp_path: Path) -> None:
+    """`run_metadata.json` has a fixed key list that omits ``model_config``.
+
+    Review P2: without this block a published prefix run's only record of which
+    base it froze lives inside ``best.pt``. Recorded, never verified.
+    """
+    cfg = load_config(_prefix_yaml(tmp_path))
+    kwargs = resolve_model_kwargs(cfg.model)
+    metrics = EdgeMetrics(
+        auroc=0.9,
+        auprc=0.85,
+        accuracy=0.8,
+        sensitivity=0.7,
+        specificity=0.9,
+        precision=0.75,
+        recall=0.7,
+        f1=0.72,
+        mcc=0.5,
+        ece=0.05,
+        brier=0.1,
+        threshold=0.5,
+        n_pos=10,
+        n_neg=10,
+    )
+    state: dict[str, torch.Tensor] = {"w": torch.zeros(2)}
+    result = TrainResult(
+        best_state_dict=state,
+        best_epoch=2,
+        best_val_metrics=metrics,
+        last_state_dict=state,
+        last_epoch=3,
+        last_val_metrics=metrics,
+        history=[],
+        stopped_early=False,
+    )
+
+    metadata = _run_metadata(result, cfg, kwargs, {}, {})
+
+    prefix_base = metadata["prefix_base"]
+    assert isinstance(prefix_base, dict)
+    assert str(prefix_base["checkpoint"]).endswith("best.pt")
+    sha256 = prefix_base["sha256"]
+    assert isinstance(sha256, str) and len(sha256) == 64
+    assert sha256 == cast(dict[str, object], kwargs["prefix"])["base_checkpoint_sha256"]
+    json.dumps(metadata)
 
 
 def test_base_loss_kwargs_unwraps_the_nested_base_for_prefix(tmp_path: Path) -> None:

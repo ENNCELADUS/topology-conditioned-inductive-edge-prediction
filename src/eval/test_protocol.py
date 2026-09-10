@@ -431,9 +431,14 @@ def run_test_protocol(
         topo_gen_control: Optional topology-generator scoring-time control.
         prefix_intervention: ``v3_1_prefix`` scoring-time intervention
             (``"none"``/``"gates_off"``/``"shuffle"``/``"mean"``); forwarded
-            to every pass and cross-checked against each artifact's meta.
-        prefix_intervention_seed: Draw seed for the ``"shuffle"`` intervention;
-            forwarded to every pass the same way as `prefix_intervention`.
+            to every pass and cross-checked against each artifact's meta. An
+            intervention run re-selects **both** thresholds on its own
+            intervened V_val scores, exactly as a normal arm does (spec §7):
+            it is read as the deployable arm that intervention defines, not as
+            the primary arm evaluated at a borrowed operating point.
+        prefix_intervention_seed: Permutation seed for the ``"shuffle"``
+            intervention; forwarded to every pass the same way as
+            `prefix_intervention`.
         rescore_reason: Required by the test-access ledger when this
             ``(arm, seed)`` has already opened held-out data.
         model_family: Explicit model family for a bare legacy checkpoint (only
@@ -736,6 +741,9 @@ def run_test_protocol(
         "model_family": meta.get("model_family"),
         "topo_gen_control": meta.get("topo_gen_control"),
         "prefix_intervention": meta.get("prefix_intervention", "none"),
+        # A missing key predates --prefix-intervention-seed; 0 is the flag's
+        # own default, matching `_validate_artifact`'s fallback.
+        "prefix_intervention_seed": int(cast(int, meta.get("prefix_intervention_seed", 0))),
         # `score_universe` never writes `run_kind` into score metadata, so the
         # artifact's own value is always absent. The published training
         # metadata is the only place a run's formal/diagnostic classification

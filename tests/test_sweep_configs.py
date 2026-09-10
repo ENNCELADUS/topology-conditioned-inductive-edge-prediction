@@ -88,8 +88,9 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
 
 
 def test_prefix_base_differs_from_headline_b0_only_in_mixing_and_output_dir() -> None:
-    base = yaml.safe_load(Path("configs/split_seed42/b0_v31.yaml").read_text(encoding="utf-8"))
-    cross_path = Path("configs/split_seed42/prefix_base.yaml")
+    base_path = _REPO_ROOT / "configs" / "split_seed42" / "b0_v31.yaml"
+    base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+    cross_path = _REPO_ROOT / "configs" / "split_seed42" / "prefix_base.yaml"
     cross = yaml.safe_load(cross_path.read_text(encoding="utf-8"))
     assert cross["model"]["config"]["mixing"] == {"mode": "bidirectional_cross"}
     assert cross["output_dir"] == "outputs/split_seed42/prefix_base"
@@ -100,8 +101,9 @@ def test_prefix_base_differs_from_headline_b0_only_in_mixing_and_output_dir() ->
 
 @pytest.mark.parametrize("arm", ["prefix_static", "prefix_pair", "prefix_pair_bce"])
 def test_prefix_arm_configs_share_the_struct_new_recipe(arm: str) -> None:
-    base = yaml.safe_load(Path("configs/split_seed42/struct_new.yaml").read_text(encoding="utf-8"))
-    cfg = yaml.safe_load(Path(f"configs/split_seed42/{arm}.yaml").read_text(encoding="utf-8"))
+    split_dir = _REPO_ROOT / "configs" / "split_seed42"
+    base = yaml.safe_load((split_dir / "struct_new.yaml").read_text(encoding="utf-8"))
+    cfg = yaml.safe_load((split_dir / f"{arm}.yaml").read_text(encoding="utf-8"))
     assert cfg["model"] == {
         "family": "v3_1_prefix",
         "config": {
