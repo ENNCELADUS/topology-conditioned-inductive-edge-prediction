@@ -34,7 +34,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import cycle, islice
@@ -114,6 +114,7 @@ from src.eval.val_topology import (
     val_region_topology_metrics,
 )
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
+from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
 
 # Arms that regress the auxiliary head (`kd_struct_head`) onto ``teacher_rep`` by MSE.
@@ -123,7 +124,15 @@ _REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep"})
 
 logger = logging.getLogger(__name__)
 
-MODEL_FAMILIES = ("v3_1", "f0_mlp")
+MODEL_FAMILIES = ("v3_1", "v3_1_prefix", "f0_mlp")
+V3_1_FAMILIES = frozenset({"v3_1", "v3_1_prefix"})
+
+
+def is_v3_1_family(family: str) -> bool:
+    """True for the packed-token student families (`V3_1` and its prefix wrapper)."""
+    return family in V3_1_FAMILIES
+
+
 MIXED_PRECISION_MODES = ("no", "bf16")
 
 Batch = dict[str, torch.Tensor]
@@ -570,6 +579,13 @@ def _validate_topo_gen_distill_contract(
 def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
     """Build AdamW, separating the kd_gen core from base/fusion parameters."""
     raw_model = _unwrapped_model(model)
+    prefix_getter = getattr(raw_model, "prefix_parameters", None)
+    if callable(prefix_getter):
+        return torch.optim.AdamW(
+            cast(list[nn.Parameter], prefix_getter()),
+            lr=cfg.optim.lr,
+            weight_decay=cfg.optim.weight_decay,
+        )
     generator_getter = getattr(raw_model, "topo_gen_parameters", None)
     generator_params = (
         list(cast(Callable[[], list[nn.Parameter]], generator_getter)())
@@ -1008,11 +1024,49 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     Raises:
         ValueError: If the family is unknown.
     """
+    if model_cfg.family == "v3_1_prefix":
+        return _resolve_prefix_kwargs(model_cfg)
     if model_cfg.family == "v3_1":
         return dict(model_cfg.config) if model_cfg.config else dict(BEST_V3_1_CONFIG)
     if model_cfg.family == "f0_mlp":
         return dict(model_cfg.config)
     raise ValueError(f"unknown model family '{model_cfg.family}' (expected v3_1 or f0_mlp)")
+
+
+def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
+    """Embed the frozen base's ``model_config`` and record the base file's SHA-256.
+
+    Provenance only: the digest is recorded in the checkpoint's ``model_config``
+    (hence in ``run_metadata.json``) and never verified (project rule: no
+    digest pinning).
+
+    Args:
+        model_cfg: The ``model:`` config section (``family == "v3_1_prefix"``).
+
+    Returns:
+        ``{"base": <base checkpoint's model_config>, "prefix": {...}}`` with
+        ``base_checkpoint`` and ``base_checkpoint_sha256`` embedded in ``prefix``.
+
+    Raises:
+        ValueError: If ``model.config.prefix.base_checkpoint`` is missing, the
+            base checkpoint is not a ``v3_1`` checkpoint, or ``model.config``
+            carries keys other than ``prefix``.
+    """
+    raw_prefix = model_cfg.config.get("prefix")
+    if not isinstance(raw_prefix, Mapping) or "base_checkpoint" not in raw_prefix:
+        raise ValueError("model.config.prefix.base_checkpoint is required for v3_1_prefix")
+    extra = sorted(set(model_cfg.config) - {"prefix"})
+    if extra:
+        raise ValueError(f"v3_1_prefix accepts only model.config.prefix, got {extra}")
+    path = Path(str(raw_prefix["base_checkpoint"]))
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("model_family") != "v3_1":
+        raise ValueError(f"{path}: prefix base must be a v3_1 checkpoint")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    prefix = PrefixConfig.from_mapping({**dict(raw_prefix), "base_checkpoint": str(path)})
+    prefix = PrefixConfig.from_mapping({**prefix.to_dict(), "base_checkpoint_sha256": digest})
+    base_config = dict(cast(Mapping[str, object], payload["model_config"]))
+    return {"base": base_config, "prefix": prefix.to_dict()}
 
 
 def build_model(cfg: Config) -> nn.Module:
@@ -1033,14 +1087,37 @@ def build_model(cfg: Config) -> nn.Module:
             ``docs/results/E2-pair-to-topology-gap.md`` for its closed result.
     """
     kwargs = resolve_model_kwargs(cfg.model)
+    if cfg.model.family == "v3_1_prefix":
+        prefix_model = V3_1Prefix(**kwargs)  # type: ignore[arg-type]
+        base_path = Path(str(cast(Mapping[str, object], kwargs["prefix"])["base_checkpoint"]))
+        payload = torch.load(base_path, map_location="cpu", weights_only=False)
+        prefix_model.base.load_state_dict(payload["model_state"])
+        return prefix_model
     if cfg.model.family == "v3_1":
-        model = V3_1(**kwargs)
-        _validate_topo_gen_distill_contract(model, cfg.distill)
-        return model
+        v3_1_model = V3_1(**kwargs)
+        _validate_topo_gen_distill_contract(v3_1_model, cfg.distill)
+        return v3_1_model
     raise ValueError(
         f"model family '{cfg.model.family}' has no buildable model: "
         "src/model/b0_alt.py (F0PairMLP) was removed 2026-08-03 by owner decision"
     )
+
+
+def _init_prefix_from_loader(
+    model: V3_1Prefix, loader: Iterable[dict[str, torch.Tensor]], seed: int
+) -> None:
+    """Draw ``p0`` from the frozen encoder's token states of the first validation batch.
+
+    Runs before ``accelerator.prepare``; DDP's construction-time broadcast then
+    makes rank 0's draw authoritative on every rank.
+
+    Args:
+        model: The prefix-wrapped model whose static prefix to initialise.
+        loader: The validation loader; only its first batch is used.
+        seed: Draw seed passed through to `V3_1Prefix.init_static_prefix`.
+    """
+    batch = next(iter(loader))
+    model.init_static_prefix({k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}, seed)
 
 
 # --------------------------------------------------------------------------- data assembly
@@ -5043,7 +5120,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         raise ValueError(
             "DDP worker modes require --pack-dir, --token-budget-per-rank, and --profile-output"
         )
-    if cfg.model.family != "v3_1":
+    if not is_v3_1_family(cfg.model.family):
         raise ValueError(f"DDP worker modes only support the v3_1 family, got {cfg.model.family!r}")
     if cfg.runtime is None:
         raise ValueError("DDP worker modes require a configured cfg.runtime")
@@ -5070,6 +5147,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         world_size=accelerator.num_processes,
     )
     model = build_model(cfg)
+    if isinstance(model, V3_1Prefix):
+        _init_prefix_from_loader(model, val_loader, cfg.seed)
 
     if args.ddp_mode == "probe":
         _run_probe_mode(
@@ -5398,8 +5477,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     model = build_model(cfg)
     model_kwargs = resolve_model_kwargs(cfg.model)
 
-    if cfg.model.family == "v3_1":
+    if is_v3_1_family(cfg.model.family):
         factory, val_loader = _build_v3_1_loaders(cfg, assembled)
+        if isinstance(model, V3_1Prefix):
+            _init_prefix_from_loader(model, val_loader, cfg.seed)
     else:
         factory, val_loader = _build_f0_loaders(cfg, assembled)
 
