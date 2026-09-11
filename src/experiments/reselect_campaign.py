@@ -101,6 +101,24 @@ def replay_run(source: Path, target: Path, config: Path, pack: Path) -> None:
     """Replay a run; resume an interrupted run from its migrated saved prefix."""
     if (target / "complete.json").exists():
         return
+    # Prefer progress made after migration over the older source snapshot.
+    current = target / "current_attempt.json"
+    if current.exists():
+        prior = target / "attempts" / json.loads(current.read_text())["attempt_id"]
+        if (prior / "training_state.pt").exists():
+            subprocess.run(
+                [
+                    "bash",
+                    "hpc/run.sh",
+                    "train",
+                    str(target / "config.yaml"),
+                    "--skip-test",
+                    "--resume-attempt",
+                    str(prior),
+                ],
+                check=True,
+            )
+            return
     started = time.monotonic()
     target.mkdir(parents=True, exist_ok=True)
     manifest = json.loads(Path("data/val_region/breadth_first.json").read_text())
@@ -314,7 +332,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--lane", choices=["rank", "rank_rep", "struct"], required=True)
+    parser.add_argument("--lane", choices=["rank", "rank_rep", "kd", "struct"], required=True)
     parser.add_argument("--pack-dir", type=Path, default=Path("outputs/feature_packs/b0_v31_bf16"))
     args = parser.parse_args()
     if args.source_root.resolve() == args.output_root.resolve():
@@ -324,7 +342,7 @@ def main() -> None:
     status = dest / f"lane_{args.lane}.json"
     write_json(status, {"status": "running", "selection_rule": SELECTION_RULE})
     try:
-        if args.lane == "rank":
+        if args.lane in {"rank", "kd"}:
             replay_run(
                 root / "b0_v31", dest / "b0_v31", Path("configs/split_seed42/b0_v31.yaml"), pack
             )
@@ -341,6 +359,22 @@ def main() -> None:
                     str(dest / "kd_hpo/rank"),
                 ]
             )
+            if args.lane == "kd":
+                migrate_study(root / "kd_hpo/rank_rep", dest / "kd_hpo/rank_rep", pack)
+                kd_rank_rep_hpo.main(
+                    [
+                        "--base-config",
+                        "configs/split_seed42/kd_rank_rep.yaml",
+                        "--bank-root",
+                        "outputs/distill/split_seed42",
+                        "--bank",
+                        "h2ns3",
+                        "--margin",
+                        ".1",
+                        "--sweep-dir",
+                        str(dest / "kd_hpo/rank_rep"),
+                    ]
+                )
             grids = ["kd_rep_*", "kd_logit_*"]
         elif args.lane == "rank_rep":
             migrate_study(root / "kd_hpo/rank_rep", dest / "kd_hpo/rank_rep", pack)

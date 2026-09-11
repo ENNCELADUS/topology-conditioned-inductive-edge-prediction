@@ -14,6 +14,30 @@ from src.experiments import reselect_campaign as replay
 from src.score_universe import ScoresArtifact, save_scores
 
 
+def test_retry_resumes_latest_target_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "new"
+    attempt = target / "attempts/latest"
+    attempt.mkdir(parents=True)
+    (attempt / "training_state.pt").write_bytes(b"state")
+    (target / "current_attempt.json").write_text('{"attempt_id":"latest"}')
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda command, **kwargs: calls.append(command))
+    replay.replay_run(tmp_path / "old", target, Path("old.yaml"), Path("pack"))
+    assert calls == [
+        [
+            "bash",
+            "hpc/run.sh",
+            "train",
+            str(target / "config.yaml"),
+            "--skip-test",
+            "--resume-attempt",
+            str(attempt),
+        ]
+    ]
+
+
 def test_validation_union_contains_only_validation_nodes() -> None:
     manifest = {
         "v_val": ["a", "b", "c"],

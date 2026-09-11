@@ -461,3 +461,9 @@ The teacher checkpoint and target banks remain the original frozen sources.
 After rank/rank_rep HPO, the driver runs their assigned rep/logit/gram grids;
 all stages remain validation-only (`--skip-test`). `lane_<name>.json` records
 running/complete/failed; publication is not evidence of held-out evaluation.
+
+For a single KD container, `--lane kd` continues rank, rank+rep, rep, then logit;
+it does not run the gram grid. Retry uses the target's latest resumable attempt
+before the older migrated prefix. A saved early-stop state republishes without
+additional epochs. Use `PYTORCH_ALLOC_CONF=expandable_segments:True` for the
+fragmentation observed in rank trial 011, preserving its training configuration.
