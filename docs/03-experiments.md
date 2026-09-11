@@ -119,6 +119,13 @@ test replay, a zero RD is reported as geometric RD 0; infinite mean absolute log
 RD is encoded as JSON null with an explicit zero-RD subgraph count, never hidden
 by an arbitrary epsilon.
 
+Prefix scoring interventions (`gates_off`, `shuffle`, `mean`) select their own
+step-1 threshold on their intervened V_val logits, and their own max-F1 threshold
+on intervened `val_cls`; test replays both unchanged. Ordinary checkpoint runs
+replay the threshold embedded at publication. The mean intervention uses the
+selected checkpoint's eval-mode mean over its selected epoch's 1:5 training task
+rows, counted once and reduced across ranks at publication.
+
 **Frozen replay.** Publish the selected checkpoint with its own topology threshold
 embedded in `best.pt`. Validation rescoring may report drift but never silently
 reselects the threshold. Test replays it unchanged. The teacher's true-G_val

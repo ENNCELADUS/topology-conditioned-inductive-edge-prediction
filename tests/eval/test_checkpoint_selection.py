@@ -1,11 +1,4 @@
-"""Selection over pairwise + five-topology validation metrics (B1 fix).
-
-The kd_d2 postmortem (2026-08-14): `select_e2e_checkpoint`'s absolute AUPRC
-tolerance went vacuous (whole-range spread < 0.02), fell through to clustering
-MMD alone, and published the untrained epoch-1 phase-A snapshot. The corrected
-rule ranks every candidate on AUPRC plus all five topology metrics together,
-so no single degenerate criterion can select an untrained checkpoint.
-"""
+"""Five-metric equal mean rank; RD is reporting-only, without a density gate."""
 
 from __future__ import annotations
 
@@ -58,8 +51,8 @@ class TestSelectCheckpoint:
         selected = select_checkpoint([untrained, trained])
         assert selected is not None and selected.epoch == 25
 
-    def test_three_three_criteria_split_breaks_on_gs(self) -> None:
-        """3-vs-3 criteria tie -> equal mean rank -> higher GS wins."""
+    def test_three_of_five_criteria_win(self) -> None:
+        """AUPRC, GS and degree outrank the two remaining MMD ratios."""
         low = CheckpointCandidate(
             epoch=1, auprc=0.0084, topology=_topo(0.30, 1.0, 0.10, 0.10, 0.20)
         )
@@ -68,6 +61,16 @@ class TestSelectCheckpoint:
         )
         selected = select_checkpoint([low, high])
         assert selected is not None and selected.epoch == 25
+
+    def test_equal_mean_rank_prefers_gs_before_auprc(self) -> None:
+        a = CheckpointCandidate(1, 0.9, _topo(0.4, 1.0, 1, 2, 1))
+        b = CheckpointCandidate(2, 0.8, _topo(0.5, 1.0, 2, 1, 1))
+        assert select_checkpoint([a, b]) == b
+
+    def test_equal_mean_rank_and_gs_prefer_geo_mmd_before_epoch(self) -> None:
+        a = CheckpointCandidate(1, 0.9, _topo(0.5, 1.0, 1, 4, 4))
+        b = CheckpointCandidate(2, 0.8, _topo(0.5, 1.0, 2, 1, 1))
+        assert select_checkpoint([a, b]) == b
 
     def test_full_tie_prefers_earlier_epoch(self) -> None:
         topo = _topo(0.30, 1.0, 0.10, 0.10, 0.10)

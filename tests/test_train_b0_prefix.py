@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pytest
 import torch
-from src.eval.edge_metrics import EdgeMetrics
+from accelerate import Accelerator
+from src.eval.edge_metrics import EdgeMetrics, compute_edge_metrics
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.prefix import V3_1Prefix
 from src.train_b0 import (
@@ -16,6 +18,7 @@ from src.train_b0 import (
     TrainResult,
     _base_loss_kwargs,
     _build_optimizer,
+    _finalize_prefix_mean,
     _init_prefix_from_loader,
     _run_metadata,
     build_model,
@@ -255,3 +258,55 @@ def test_init_prefix_from_loader_raises_on_an_empty_loader() -> None:
     model = _tiny_prefix_model()
     with pytest.raises(ValueError, match="non-empty"):
         _init_prefix_from_loader(model, [], seed=0)
+
+
+@pytest.mark.parametrize("from_checkpoint", [False, True])
+def test_publication_mean_uses_selected_weights_and_global_row_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, from_checkpoint: bool
+) -> None:
+    model = _tiny_prefix_model()
+    selected = {key: value.clone() for key, value in model.state_dict().items()}
+    batch = _pair_batch()
+    remote = _pair_batch(n=2, seed=17)
+    model.eval()
+
+    def conditions(rows: dict[str, torch.Tensor]) -> torch.Tensor:
+        with torch.no_grad():
+            z = model.condition_from_encoded(
+                model.encoder(rows["emb_a"], rows["len_a"]),
+                model.encoder(rows["emb_b"], rows["len_b"]),
+                rows["len_a"],
+                rows["len_b"],
+            )
+        assert z is not None
+        return z
+
+    local_z, remote_z = conditions(batch), conditions(remote)
+    expected = torch.cat([local_z, remote_z]).mean(0)
+    # The live model represents a later epoch; publication must reload selection.
+    with torch.no_grad():
+        model.generator.cond_proj.bias.add_(5)
+    metrics = compute_edge_metrics(np.array([0, 1]), np.array([0.1, 0.9]))
+    result = TrainResult(selected, 1, metrics, {}, 2, metrics, [], False)
+    checkpoint = tmp_path / "selected.pt" if from_checkpoint else None
+    if checkpoint is not None:
+        torch.save({"model_state": selected}, checkpoint)
+    accelerator = Accelerator(mixed_precision="no")
+
+    def reduce(tensor: torch.Tensor, reduction: str) -> torch.Tensor:
+        assert reduction == "sum"
+        assert tensor[-1] == 6
+        assert torch.allclose(tensor[:-1], local_z.double().sum(0), atol=1e-6)
+        return tensor + torch.cat([remote_z.double().sum(0), torch.tensor([2.0])])
+
+    monkeypatch.setattr(accelerator, "reduce", reduce)
+    # Unequal batch sizes catch averaging batch means instead of counting rows.
+    batches = [
+        {key: value[:2] for key, value in batch.items()},
+        {key: value[2:] for key, value in batch.items()},
+    ]
+    _finalize_prefix_mean(model, result, batches, accelerator, checkpoint=checkpoint)
+    assert torch.allclose(result.best_state_dict["generator.z_mean"], expected, atol=1e-6)
+    assert result.best_state_dict["generator.z_count"] == 8
+    assert not model.training
+    assert all(p.grad is None for p in model.parameters())

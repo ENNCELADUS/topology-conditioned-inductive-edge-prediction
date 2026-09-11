@@ -401,6 +401,45 @@ class TestRunTestProtocol:
         )
         assert default.prefix_intervention_seed == 0
 
+    @pytest.mark.parametrize("intervention", ["none", "gates_off", "shuffle", "mean"])
+    def test_topology_threshold_reselection_only_for_interventions(
+        self, tmp_path: Path, intervention: str
+    ) -> None:
+        fixture = _build_fixture(tmp_path)
+        artifacts = {}
+        for name, source in fixture.artifacts.items():
+            artifact = load_scores(source)
+            destination = tmp_path / "shifted" / f"{name}.npz"
+            save_scores(
+                destination,
+                node_ids=artifact.node_ids,
+                u_idx=artifact.u_idx,
+                v_idx=artifact.v_idx,
+                logit=artifact.logit + 10.0,
+                label=artifact.label,
+                row_start=0,
+                meta={**artifact.meta, "prefix_intervention": intervention},
+            )
+            artifacts[name] = destination
+        checkpoint = _write_checkpoint(tmp_path, model_family="v3_1_prefix")
+        original = torch.load(checkpoint, weights_only=True)["val_threshold_transfer"]["threshold"]
+        result = run_test_protocol(
+            checkpoint=checkpoint,
+            output_dir=tmp_path / "out",
+            data_root=fixture.data_root,
+            strategy=_STRATEGY,
+            arm=f"prefix_{intervention}",
+            seed=0,
+            score_runner=_FakeScoreRunner(artifacts),
+            prefix_intervention=intervention,
+        )
+        graph = cast(dict[str, Any], result.report["graph"])["fixed_threshold"]
+        expected = original + (10.0 if intervention != "none" else 0.0)
+        selected = graph["validation_selection"]["selected"]["logit_threshold"]
+        assert selected == pytest.approx(expected)
+        assert graph["test"]["logit_threshold"] == pytest.approx(expected)
+        assert "density_diagnostics" in graph["validation_selection"]
+
     def test_forwards_prefix_intervention_seed_to_every_score_pass(self, tmp_path: Path) -> None:
         fixture = _build_fixture(tmp_path)
         controlled_artifacts: dict[str, Path] = {}

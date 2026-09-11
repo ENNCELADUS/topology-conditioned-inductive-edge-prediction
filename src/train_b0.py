@@ -1709,6 +1709,69 @@ def _run_metadata(
     return run_metadata
 
 
+@torch.no_grad()
+def _finalize_prefix_mean(
+    model: nn.Module,
+    result: TrainResult,
+    loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    checkpoint: Path | None = None,
+) -> None:
+    """Publish the selected model's mean over its epoch's 1:5 training task rows.
+
+    Each row counts once, without BCE weighting or structural-stream repeats.
+    Rank-local sums and counts are reduced once after the encoder-only pass.
+    ``checkpoint`` supplies the selected state on every DDP rank; the local
+    debug path already holds that state in ``result``. No validation rows enter.
+    """
+    raw_model = _unwrapped_model(model)
+    if not isinstance(raw_model, V3_1Prefix) or raw_model.prefix_cfg.conditioning != "pair":
+        return
+
+    def collect() -> torch.Tensor:
+        state = (
+            result.best_state_dict
+            if checkpoint is None
+            else torch.load(checkpoint, map_location="cpu", weights_only=False)["model_state"]
+        )
+        raw_model.load_state_dict(state)
+        raw_model.eval()
+        totals = torch.zeros(
+            raw_model.prefix_cfg.bottleneck + 1, device=accelerator.device, dtype=torch.float64
+        )
+        for batch in loader:
+            batch = _to_device(batch, accelerator.device)
+            count, _ = _batch_pair_counts(batch, accelerator.num_processes)
+            if count == 0:
+                continue
+            with accelerator.autocast():
+                encoded_a = raw_model.encoder(batch["emb_a"], batch["len_a"])
+                encoded_b = raw_model.encoder(batch["emb_b"], batch["len_b"])
+                z = raw_model.condition_from_encoded(
+                    encoded_a, encoded_b, batch["len_a"], batch["len_b"]
+                )
+            assert z is not None
+            totals[:-1] += z[:count].double().sum(dim=0)
+            totals[-1] += count
+        return totals
+
+    totals = accelerator.reduce(
+        _run_rank_symmetric(accelerator, "prefix mean publication", collect), reduction="sum"
+    )
+    if not torch.isfinite(totals).all() or totals[-1] <= 0:
+        raise ValueError(
+            "prefix mean publication needs finite conditions and non-empty training rows"
+        )
+    raw_model.generator.z_mean.copy_(totals[:-1] / totals[-1])
+    raw_model.generator.z_count.copy_(totals[-1])
+    if accelerator.is_main_process:
+        for key in ("z_mean", "z_count"):
+            result.best_state_dict[f"generator.{key}"] = (
+                getattr(raw_model.generator, key).detach().cpu().clone()
+            )
+
+
 def write_outputs(
     result: TrainResult,
     cfg: Config,
@@ -5476,6 +5539,14 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
     )
+    if cfg.model.family == "v3_1_prefix":
+        _finalize_prefix_mean(
+            model,
+            result,
+            factory(result.best_epoch),
+            accelerator,
+            checkpoint=cfg.output_dir / "checkpoints" / f"epoch-{result.best_epoch:04d}.pt",
+        )
     finalization_error: list[str | None] = [None]
     if accelerator.is_main_process:
         try:
@@ -5594,6 +5665,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         schedule_total_steps=schedule_total_steps,
         on_eval=on_eval,
     )
+    if cfg.model.family == "v3_1_prefix":
+        _finalize_prefix_mean(model, result, factory(result.best_epoch), accelerator)
     write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
     logger.info(
         "training complete: best epoch %d val AUPRC %.4f (stopped_early=%s)",

@@ -275,6 +275,10 @@ $z_{uv}$ and `abba_max` symmetry is preserved:
    over the same batches — collect every row's $z_{uv}$, permute once with
    `--prefix-intervention-seed`, then score — and the permutation is not a model-level mode.
 3. *Mean* — $z_{uv}$ replaced by its training-set mean (a `z_mean` buffer computed at publish time).
+   Reload the selected checkpoint, use eval mode, and replay that epoch's 1:5 training task
+   pairs, each row once without BCE weighting or structural-stream repeats. Sum conditions and
+   counts across ranks before taking the mean; never average conditions from changing training
+   weights. `z_count` records the global row count. This pass reads no validation or test rows.
 
 Each intervention run **re-selects its own thresholds on its intervened V_val scores, exactly as a
 normal arm does** (the fixed topology threshold and the `val_cls` max-F1 classification threshold

@@ -114,7 +114,7 @@ class PrefixGenerator(nn.Module):
     soon as a gate opens.
     """
 
-    z_sum: torch.Tensor
+    z_mean: torch.Tensor
     z_count: torch.Tensor
 
     def __init__(self, d_model: int, n_layers: int, n_heads: int, cfg: PrefixConfig) -> None:
@@ -144,13 +144,8 @@ class PrefixGenerator(nn.Module):
             self.shift_out = nn.ParameterList(
                 nn.Parameter(torch.randn(cfg.rank, d_model) * 0.02) for _ in range(n_layers)
             )
-        self.register_buffer("z_sum", torch.zeros(cfg.bottleneck))
+        self.register_buffer("z_mean", torch.zeros(cfg.bottleneck))
         self.register_buffer("z_count", torch.zeros(()))
-
-    @property
-    def z_mean(self) -> torch.Tensor:
-        """Running mean of ``z`` over training forwards (zeros before any)."""
-        return self.z_sum / self.z_count.clamp_min(1.0)
 
     def condition(
         self,
@@ -175,12 +170,7 @@ class PrefixGenerator(nn.Module):
         e_a = masked_mean(encoded_a, inner_token_mask(x=encoded_a, padding_mask=mask_a))
         e_b = masked_mean(encoded_b, inner_token_mask(x=encoded_b, padding_mask=mask_b))
         c = torch.cat([e_a + e_b, (e_a - e_b).abs(), e_a * e_b], dim=-1)
-        z = F.gelu(self.cond_proj(self.cond_norm(c)))
-        if self.training:
-            with torch.no_grad():
-                self.z_sum += z.detach().float().sum(dim=0)
-                self.z_count += float(z.size(0))
-        return z
+        return F.gelu(self.cond_proj(self.cond_norm(c)))
 
     def prefix(self, layer_index: int, z: torch.Tensor | None, batch_size: int) -> torch.Tensor:
         """Return the prefix tokens for one layer, ``(B, tokens, d_model)``.
@@ -480,7 +470,7 @@ class V3_1Prefix(nn.Module):
 
         Fails closed rather than silently no-opping: ``mean`` needs a pair
         condition (``z`` is only ``None`` under ``conditioning="static"``) and
-        an accumulated training mean (``z_count > 0``); an untrained
+        a published training mean (``z_count > 0``); an unpublished
         `PrefixGenerator`'s ``z_mean`` is an all-zero vector that is not the
         training-set mean of anything. The ``shuffle`` intervention is not a
         model-level mode at all -- it permutes conditions across every row the
@@ -491,7 +481,7 @@ class V3_1Prefix(nn.Module):
         Raises:
             ValueError: On an unknown intervention name, ``mean`` with a static
                 prefix (``z is None``), or ``mean`` on a generator that has
-                never seen a training forward (``z_count == 0``).
+                no published training mean (``z_count == 0``).
         """
         if self.intervention not in INTERVENTIONS:
             raise ValueError(f"unknown prefix intervention {self.intervention!r}")
@@ -505,8 +495,8 @@ class V3_1Prefix(nn.Module):
             )
         if float(self.generator.z_count) == 0.0:
             raise ValueError(
-                "prefix intervention 'mean' needs a trained z_mean, but the generator's "
-                "z_count is 0 (no training forward has accumulated one)"
+                "prefix intervention 'mean' needs a published z_mean, but the generator's "
+                "z_count is 0 (no publication pass has computed one)"
             )
         return self.generator.z_mean.to(z.dtype).unsqueeze(0).expand_as(z), 1.0
 
@@ -597,9 +587,7 @@ class V3_1Prefix(nn.Module):
 
         Raises:
             ValueError: If a non-``"none"`` `intervention` is set while
-                `self.training` (interventions are scoring-time only; calling
-                `self.generator.condition` in that state would also fold the
-                live pair condition into its running `z_sum`/`z_count`), if an
+                `self.training` (interventions are scoring-time only), if an
                 explicit `z` is passed to a static-prefix model or combined
                 with the ``mean`` intervention, or (via `_apply_intervention`)
                 on an unknown intervention name or ``mean`` with a static
@@ -642,9 +630,7 @@ class V3_1Prefix(nn.Module):
 
         Raises:
             ValueError: If a non-``"none"`` `intervention` is set while
-                `self.training` (interventions are scoring-time only; calling
-                `self.generator.condition` in that state would also fold the
-                live pair condition into its running `z_sum`/`z_count`), or
+                `self.training` (interventions are scoring-time only), or
                 (via `_apply_intervention`) on an unknown intervention name or
                 ``mean`` with a static prefix or an untrained ``z_mean``.
         """

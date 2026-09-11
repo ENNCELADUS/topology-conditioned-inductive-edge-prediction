@@ -583,8 +583,9 @@ def run_test_protocol(
     )
     validation_split = _load_val_region_split(data_root, strategy)
     config = MMDConfig()
-    if is_egostitch_e2e_family:
-        # The true-structure oracle has a separate diagnostic validation surface.
+    if is_egostitch_e2e_family or prefix_intervention != "none":
+        # An intervention defines a different scorer: select on its own V_val
+        # logits, then freeze this operating point for every test sample.
         fixed_selection = select_fixed_threshold(
             pairs=list(validation_artifact.pairs()),
             logits=validation_artifact.logit.astype(np.float64),
@@ -615,6 +616,7 @@ def run_test_protocol(
             {
                 "rule": SELECTION_RULE,
                 "source": "checkpoint_frozen_threshold",
+                "density_diagnostics": replay_report["density_diagnostics"],
                 "validation_replay": replay_report,
                 "selected": {
                     "logit_threshold": frozen_threshold,

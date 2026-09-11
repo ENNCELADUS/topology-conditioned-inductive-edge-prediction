@@ -99,7 +99,7 @@ def test_gates_start_at_zero_and_shift_out_is_small_but_nonzero() -> None:
     assert all(p.abs().max() < 0.2 for p in gen.shift_out)
 
 
-def test_init_static_from_tokens_copies_rows_and_z_mean_accumulates() -> None:
+def test_init_static_from_tokens_and_condition_has_no_publication_side_effects() -> None:
     cfg = PrefixConfig(tokens=2, rank=2, conditioning="pair", bottleneck=6)
     gen = PrefixGenerator(d_model=8, n_layers=1, n_heads=2, cfg=cfg)
     rows = torch.arange(40, dtype=torch.float32).view(5, 8)
@@ -108,8 +108,8 @@ def test_init_static_from_tokens_copies_rows_and_z_mean_accumulates() -> None:
     gen.train()
     z = gen.condition(torch.randn(4, 3, 8), torch.randn(4, 3, 8), None, None)
     assert z is not None
-    assert float(gen.z_count) == 4.0
-    assert torch.allclose(gen.z_mean, z.mean(dim=0))
+    assert float(gen.z_count) == 0.0
+    assert torch.count_nonzero(gen.z_mean) == 0
 
 
 def test_config_round_trip_and_validation() -> None:
@@ -283,7 +283,7 @@ def test_interventions() -> None:
     model.eval()
     with torch.no_grad():
         model.generator.gates.fill_(0.4)
-        model.generator.z_sum.copy_(torch.randn(6))
+        model.generator.z_mean.copy_(torch.randn(6))
         model.generator.z_count.fill_(10.0)
     batch = _pair_batch()
     with torch.no_grad():
@@ -345,7 +345,7 @@ def test_mean_intervention_fails_closed_before_any_training_forward() -> None:
     except ValueError as err:
         assert "z_count" in str(err)
     else:
-        raise AssertionError("mean without an accumulated z_mean must raise")
+        raise AssertionError("mean without a published z_mean must raise")
 
 
 def test_shuffle_is_not_a_model_level_intervention() -> None:
@@ -387,7 +387,7 @@ def test_condition_from_encoded_is_symmetric_and_matches_the_forward_condition()
     assert z is not None and z_swapped is not None
     assert z.shape == (6, 6)
     assert torch.allclose(z, z_swapped)
-    # No side effects: a scoring-time condition must not feed the running mean.
+    # No side effects: computing conditions must not change the published mean.
     assert float(model.generator.z_count) == 0.0
     # It is exactly the condition `forward` uses: replaying it explicitly is a no-op.
     with torch.no_grad():
