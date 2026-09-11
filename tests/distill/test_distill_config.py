@@ -75,13 +75,21 @@ def test_kd_rank_rep_requires_all_three_weights_and_the_context_bank() -> None:
 
 def test_mixed_arm_groups_are_rejected() -> None:
     with pytest.raises(ValueError, match="exactly one arm group"):
-        DistillConfig(targets_path="t", w_logit=1.0, w_rep=1.0)
+        DistillConfig(targets_path="t", w_logit=1.0, w_gram=1.0)
     with pytest.raises(ValueError, match="exactly one arm group"):
         DistillConfig(targets_path="t", context_targets_path="c", w_rank=1.0)
     with pytest.raises(ValueError, match="exactly one arm group"):
         DistillConfig(targets_path="t", context_targets_path="c", w_dist=1.0)
     with pytest.raises(ValueError, match="exactly one arm group"):
         DistillConfig(targets_path="t", w_gram=1.0, w_rep=1.0)
+
+
+def test_logit_rep_uses_rows_without_context_bank() -> None:
+    assert DistillConfig(targets_path="t", w_logit=10.0, w_rep=0.1).arm == "kd_logit_rep"
+    with pytest.raises(ValueError, match="targets_path is required"):
+        DistillConfig(w_logit=10.0, w_rep=0.1)
+    with pytest.raises(ValueError, match="only valid when w_rank"):
+        DistillConfig(targets_path="t", context_targets_path="c", w_logit=10.0, w_rep=0.1)
 
 
 def test_kd_gen_cannot_stack() -> None:

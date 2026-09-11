@@ -120,7 +120,7 @@ from src.model.egostitch.classifier.topo_gen import TopoGenBase
 # Arms that regress the auxiliary head (`kd_struct_head`) onto ``teacher_rep`` by MSE.
 _AUX_HEAD_ARMS = frozenset({"kd_struct", "kd_white"})
 # Arms that align pair representations to teacher vectors by per-row cosine.
-_REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep"})
+_REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep", "kd_logit_rep"})
 
 logger = logging.getLogger(__name__)
 
@@ -3744,7 +3744,7 @@ class KDRowBank:
 
         total = student_logit.new_zeros(())
         logit_term: torch.Tensor | None = None
-        if self.arm == "kd_logit":
+        if self._w_logit > 0.0:
             logit_term = kd_logit_loss(student_logit, teacher_logit)
             total = total + self._w_logit * logit_term
 
@@ -3886,7 +3886,7 @@ class KDRowBank:
                 n,
             )
             telemetry["kd_prob_mae"] = reduced_sums["sum_prob_err"] / n
-        if self.arm == "kd_logit":
+        if self._w_logit > 0.0:
             telemetry["kd_logit_loss"] = reduced_sums["sum_logit_bce"] / n
         if self.arm in _REP_COS_ARMS:
             telemetry["kd_rep_cos"] = reduced_sums["sum_rep_cos"] / n

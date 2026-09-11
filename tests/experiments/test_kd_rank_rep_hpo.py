@@ -112,7 +112,7 @@ def test_parser_defaults_match_spec() -> None:
     args = hpo.build_parser().parse_args([])
     assert args.base_config == BASE_CONFIG
     assert args.sweep_dir == Path("outputs/b1_kd_rank_rep_hpo")
-    assert (args.n_trials, args.rd_band, args.bank, args.margin) == (12, 0.05, "h2ns3", 0.1)
+    assert (args.n_trials, args.bank, args.margin) == (12, "h2ns3", 0.1)
     with pytest.raises(SystemExit):
         hpo.build_parser().parse_args(["--bank", "h9"])
 

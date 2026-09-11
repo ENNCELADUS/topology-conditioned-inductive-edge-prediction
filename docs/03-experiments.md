@@ -133,6 +133,7 @@ Only completed tests of validation-selected checkpoints receive numbers.
 | + Rank KD (`kd_rank`) | Context rank and distribution matching | — | — | — | — | — | — | — |
 | + Representation KD (`kd_rep`) | Per-row teacher representation cosine | — | — | — | — | — | — | — |
 | + Rank and representation KD (`kd_rank_rep`) | Joint context and representation losses | — | — | — | — | — | — | — |
+| + Logit and representation KD (`kd_logit_rep`) | Joint soft-target BCE and per-row cosine losses | — | — | — | — | — | — | — |
 | + Gram KD (`kd_gram`) | Teacher cosine-Gram matching | — | — | — | — | — | — | — |
 | + Structural-stream BCE (`struct_bce`) | Additional subgraph BCE, no topology terms | — | — | — | — | — | — | — |
 | + GRAND (`struct_grand`) | Subgraph BCE, soft GS and RD losses | 0.7140 | 0.7392 | 0.4312 | 0.6210 | 8.063 | 6.740 | 11.872 |

@@ -439,6 +439,22 @@ the current attempt and publication/test artifacts separately.
 
 ## Selection protocol: geometric RD, then five-metric checkpoint ranking
 
+The 30838 KD follow-up is `python -m src.experiments.kd_followup_queue --root
+outputs/split_seed42_geometric_20260910 --wait-pid <current KD lane PID>`.
+It waits for that lane to exit successfully, selects one published winner per
+Rank, Rank+Rep, Rep and Logit arm using V_val five-metric ranking, then runs their
+held-out tests through `hpc/run.sh test`. It next runs the five existing Gram
+weight configs and tests the V_val-selected winner. Finally it runs 12 completed
+Logit+Rep Optuna trials, without test feedback or automatic test of that new arm.
+Progress and tested checkpoint identities are in `followup_queue.json`; a failed
+stage stops the queue. A file lock prevents duplicate follow-up runners.
+
+`src.experiments.kd_logit_rep_hpo` searches `w_logit,w_rep` independently over
+`[0.01,100]` on a log scale, starting with `(10,.01)`, `(10,.1)`, `(10,1)`, `(1,.1)`.
+It inherits the seed-42 Logit config's model, optimizer, cadence and training row
+bank; only weights and output directories change. Both losses use the same task
+forward. Search objectives and final selection are shared with the other KD HPOs.
+
 Publication checks required checkpoint fields and accepts additional selection
 metadata. A valid checkpoint must not fail publication merely because it carries
 `selection_rule`, `selection_metrics`, or its frozen `val_threshold_transfer`.

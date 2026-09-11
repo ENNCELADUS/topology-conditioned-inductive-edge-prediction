@@ -808,6 +808,47 @@ def test_kd_rank_row_bank_is_telemetry_only(tmp_path: Path) -> None:
     assert bank.global_relational is False
 
 
+def test_logit_rep_adds_both_losses_and_gradients(tmp_path: Path) -> None:
+    pairs = [("n0", "n2"), ("n1", "n2")]
+    teacher_rep = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    teacher_logit = np.array([1.0, -1.0], dtype=np.float32)
+    _write_targets(
+        tmp_path / "targets",
+        node_ids=["n0", "n1", "n2"],
+        train_pairs=pairs,
+        train_labels=[1, 0],
+        teacher_logit=teacher_logit,
+        teacher_rep=teacher_rep,
+    )
+    model = nn.Module()
+    model.d_model = 2  # type: ignore[assignment]
+    bank = KDRowBank(
+        DistillConfig(targets_path="t", w_logit=10.0, w_rep=0.1),
+        load_kd_targets(tmp_path / "targets"),
+        train_pairs=pairs,
+        train_labels=[1, 0],
+        model=model,
+        device=torch.device("cpu"),
+    )
+    logits = torch.zeros(2, requires_grad=True)
+    rep = torch.tensor([[0.0, 1.0], [1.0, 0.0]], requires_grad=True)
+    loss, stats = bank.loss({"_row_id": torch.tensor([0, 1])}, {"logits": logits, "pair_repr": rep})
+    expected = (
+        10
+        * nn.functional.binary_cross_entropy_with_logits(
+            logits, torch.tensor(teacher_logit).sigmoid()
+        )
+        + 0.1 * (1 - nn.functional.cosine_similarity(rep, torch.tensor(teacher_rep))).mean()
+    )
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert logits.grad is not None and logits.grad.abs().sum() > 0
+    assert rep.grad is not None and rep.grad.abs().sum() > 0
+    telemetry = bank.epoch_telemetry(Accelerator(cpu=True), stats)
+    assert telemetry["kd_logit_loss"] > 0
+    assert telemetry["kd_rep_loss"] == pytest.approx(1.0)
+
+
 def test_kd_gram_uses_shared_forward_pair_representations(tmp_path: Path) -> None:
     node_ids = ["n0", "n1", "n2"]
     train_pairs = [("n0", "n2"), ("n1", "n2")]

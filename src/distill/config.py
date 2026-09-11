@@ -7,7 +7,8 @@ for every official training row (`src/distill/teacher_targets.py`, format
 bank (``kd_ctx_targets_v2``); other terms share the task-row forward. Exactly
 one arm group's weight(s) may be nonzero at a time: ``kd_logit`` (`w_logit`,
 pointwise soft-target logit KD), ``kd_rank`` (`w_rank` + `w_dist`, anchor
-ranking/distribution KD), ``kd_rank_rep`` (kd_rank plus `w_rep`), ``kd_gram`` (`w_gram`,
+ranking/distribution KD), ``kd_rank_rep`` (kd_rank plus `w_rep`),
+``kd_logit_rep`` (soft logits plus per-row cosine KD), ``kd_gram`` (`w_gram`,
 batch-relational Gram KD), ``kd_rep`` (`w_rep`, per-row representation
 alignment), ``kd_gen`` (`w_gen`, generator distillation), or ``kd_struct``
 (`w_struct`, descriptor-level structural auxiliary head with in-process
@@ -109,6 +110,7 @@ class DistillConfig:
         legal_patterns: tuple[frozenset[str], ...] = (
             frozenset(),
             frozenset({"w_logit"}),
+            frozenset({"w_logit", "w_rep"}),
             frozenset({"w_rank", "w_dist"}),
             frozenset({"w_rank", "w_dist", "w_rep"}),
             frozenset({"w_gram"}),
@@ -120,7 +122,8 @@ class DistillConfig:
         if nonzero not in legal_patterns:
             raise ValueError(
                 "distill weights must follow exactly one arm group -- all zero, only "
-                "w_logit (kd_logit), w_rank and w_dist (kd_rank), w_rank, w_dist and w_rep "
+                "w_logit (kd_logit), w_logit and w_rep (kd_logit_rep), "
+                "w_rank and w_dist (kd_rank), w_rank, w_dist and w_rep "
                 "(kd_rank_rep), only w_gram (kd_gram), only w_rep (kd_rep), only w_gen (kd_gen), "
                 "only w_struct (kd_struct), or only w_white (kd_white); got nonzero weights "
                 f"{sorted(nonzero)}"
@@ -153,6 +156,7 @@ class DistillConfig:
         mapped = {
             frozenset(): "none",
             frozenset({"w_logit"}): "kd_logit",
+            frozenset({"w_logit", "w_rep"}): "kd_logit_rep",
             frozenset({"w_rank", "w_dist"}): "kd_rank",
             frozenset({"w_rank", "w_dist", "w_rep"}): "kd_rank_rep",
             frozenset({"w_gram"}): "kd_gram",
