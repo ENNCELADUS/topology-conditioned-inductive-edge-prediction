@@ -87,15 +87,28 @@ def test_sweep_config_differs_from_base_only_in_distill_eval_and_output_dir(stem
     assert sweep["output_dir"] == f"outputs/b1_row_kd_hpo/{stem}"
 
 
-def test_prefix_base_differs_from_headline_b0_only_in_mixing_and_output_dir() -> None:
+# The per-rank micro-batch every bidirectional-cross config uses (half of B0's).
+PREFIX_TOKEN_BUDGET = 262144
+PREFIX_MAX_PAIRS_PER_RANK = 2048
+
+
+def test_prefix_base_differs_from_headline_b0_in_mixing_output_dir_and_micro_batch() -> None:
     base_path = _REPO_ROOT / "configs" / "split_seed42" / "b0_v31.yaml"
     base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
     cross_path = _REPO_ROOT / "configs" / "split_seed42" / "prefix_base.yaml"
     cross = yaml.safe_load(cross_path.read_text(encoding="utf-8"))
     assert cross["model"]["config"]["mixing"] == {"mode": "bidirectional_cross"}
     assert cross["output_dir"] == "outputs/split_seed42/prefix_base"
+    # The three bidirectional cross-attention layers hold two extra attention maps each, and B0's
+    # micro-batch (which already peaks at 59.7 GiB per rank) then OOMs a 95 GiB H20, so the prefix
+    # trunk halves it. Nothing else about the recipe moves.
+    assert base["runtime"]["token_budget"] == 524288
+    assert base["runtime"]["max_pairs_per_rank"] == 4096
+    assert cross["runtime"]["token_budget"] == PREFIX_TOKEN_BUDGET
+    assert cross["runtime"]["max_pairs_per_rank"] == PREFIX_MAX_PAIRS_PER_RANK
     cross["model"]["config"]["mixing"] = base["model"]["config"]["mixing"]
     cross["output_dir"] = base["output_dir"]
+    cross["runtime"] = base["runtime"]
     assert cross == base
 
 
@@ -140,8 +153,16 @@ def test_prefix_arm_configs_share_the_struct_new_recipe(arm: str) -> None:
             "motif": 0.1,
         }
     assert cfg["struct"]["weights"] == expected_weights
-    for key in ("data", "runtime", "seed", "mixed_precision"):
+    for key in ("data", "seed", "mixed_precision"):
         assert cfg[key] == base[key]
+    # Same halved micro-batch as the frozen trunk they load; the rest of the runtime is
+    # struct_new's.
+    assert cfg["runtime"]["token_budget"] == PREFIX_TOKEN_BUDGET
+    assert cfg["runtime"]["max_pairs_per_rank"] == PREFIX_MAX_PAIRS_PER_RANK
+    assert cfg["runtime"] == base["runtime"] | {
+        "token_budget": PREFIX_TOKEN_BUDGET,
+        "max_pairs_per_rank": PREFIX_MAX_PAIRS_PER_RANK,
+    }
     assert {k: v for k, v in cfg["struct"].items() if k != "weights"} == {
         k: v for k, v in base["struct"].items() if k != "weights"
     }

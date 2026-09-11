@@ -44,14 +44,14 @@ optim:
 output_dir: outputs/split_seed42/prefix_pair
 runtime:
   loader_workers_per_rank: 4
-  max_pairs_per_rank: 4096
+  max_pairs_per_rank: 2048
   memory_limit_gib: 85.0
   pack_dir: outputs/feature_packs/b0_v31_bf16
   pack_workers: 16
   prefetch_factor: 4
   probe_timed_steps: 30
   probe_warmup_steps: 10
-  token_budget: 524288
+  token_budget: 262144
   world_size: auto
 seed: 0
 struct:

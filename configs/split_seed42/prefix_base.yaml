@@ -1,6 +1,7 @@
 # prefix_base: the headline B0 recipe with bidirectional cross-attention in the pair trunk.
 # The exact frozen base of the prefix arms (spec 2026-09-10-prefix-tuning-frozen-trunk-design §4);
-# identical to b0_v31.yaml except mixing.mode and output_dir.
+# identical to b0_v31.yaml except mixing.mode, output_dir, and the halved per-rank micro-batch
+# (runtime.token_budget / max_pairs_per_rank) the extra attention maps require on a 95 GiB H20.
 model:
   family: v3_1
   config:
@@ -61,8 +62,8 @@ runtime:
   pack_workers: 16
   loader_workers_per_rank: 4
   prefetch_factor: 4
-  token_budget: 524288
-  max_pairs_per_rank: 4096
+  token_budget: 262144
+  max_pairs_per_rank: 2048
   memory_limit_gib: 85.0
   probe_warmup_steps: 10
   probe_timed_steps: 30

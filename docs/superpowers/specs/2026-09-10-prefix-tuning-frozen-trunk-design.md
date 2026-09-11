@@ -83,11 +83,16 @@ independent Siamese encoding, with AB/BA evaluation and `abba_max`. There is no 
 a prefix can be read. Attaching the prefix to the Siamese encoder's self-attention or to the readout
 would be a different design and could not be described as prefix tuning of the pair trunk.
 
-**`prefix_base`.** The headline B0 recipe with exactly one change, `mixing.mode: bidirectional_cross`,
+**`prefix_base`.** The headline B0 recipe with one model change, `mixing.mode: bidirectional_cross`,
 which instantiates three `CrossAttentionLayer`s (shared-weight bidirectional cross-attention with
 FFN and a CLS attention over both streams) ahead of the same `pair_context_gated` readout. Same
-split (root `node_007630`, split seed 42), seed 0, optimizer, schedule, sampler, token budget,
-patience, and held-out protocol. Config `configs/split_seed42/prefix_base.yaml`, output
+split (root `node_007630`, split seed 42), seed 0, optimizer, schedule, sampler, patience, and
+held-out protocol. The one further difference is the per-rank micro-batch: the three bidirectional
+cross-attention layers hold two extra attention maps per layer, and B0's `runtime.token_budget:
+524288` / `max_pairs_per_rank: 4096` OOMs on a 95 GiB H20 (B0 itself peaks at 59.7 GiB per rank), so
+`prefix_base` and every prefix arm use `262144` / `2048`. The loss, the data, and the optimizer are
+unchanged; the halved batch doubles the optimizer steps per epoch, and the `onecycle` schedule
+re-resolves `total_steps` from the plan. Config `configs/split_seed42/prefix_base.yaml`, output
 `outputs/split_seed42/prefix_base`, published checkpoint `best.pt`, tested once.
 
 - **The readout stays.** `PairCrossAttention.forward` runs the layers and then hands the
