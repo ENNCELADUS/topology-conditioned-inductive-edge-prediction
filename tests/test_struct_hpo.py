@@ -142,3 +142,44 @@ def test_driver_never_touches_frozen_paths() -> None:
     source = Path("src/experiments/struct_hpo.py").read_text()
     assert "autoresearch/" not in source
     assert "configs/sweep" not in source
+
+
+def test_degree_motif_priors_materialize_true_rd_off_and_on(tmp_path: Path) -> None:
+    from src.train_b0 import load_config
+
+    spec = struct_hpo.ARMS["degree_motif"]
+    study = optuna.create_study(directions=["maximize", "maximize", "minimize"])
+    for prior in spec.priors:
+        study.enqueue_trial(prior)
+    configs = []
+    for index in range(4):
+        trial = study.ask()
+        params = spec.suggest(trial)
+        cfg = load_config(
+            struct_hpo.materialize_trial_config(spec.base_config, params, index, tmp_path)
+        )
+        assert cfg.struct is not None
+        assert cfg.struct.weights["rank"] == cfg.struct.weights["gs"] == 0.0
+        assert cfg.eval.early_stop_metric == "val_total_loss"
+        assert cfg.eval.patience == 10
+        assert cfg.model.config["positive_weight"] == 5.0
+        assert cfg.struct.weights["rd"] == (0.0, 0.42, 0.0, 0.10)[index]
+        if index % 2 == 0:
+            assert "rd" not in trial.params  # No meaningless magnitude when the term is off.
+        configs.append(cfg)
+        study.tell(trial, [0.8, 0.4, 10.0])
+    for left, right in [(0, 1), (2, 3)]:
+        a, b = configs[left].struct, configs[right].struct
+        assert a is not None and b is not None
+        assert a.weights["degree"] == b.weights["degree"]
+        assert a.weights["motif"] == b.weights["motif"]
+
+
+def test_matched_degree_motif_control_only_removes_structural_terms() -> None:
+    main = yaml.safe_load(Path("configs/split_seed42/struct_degree_motif.yaml").read_text())
+    control = yaml.safe_load(Path("configs/split_seed42/struct_degree_motif_bce.yaml").read_text())
+    assert control["struct"]["weights"]["bce"] == 1.0
+    assert all(value == 0.0 for key, value in control["struct"]["weights"].items() if key != "bce")
+    control["struct"]["weights"] = main["struct"]["weights"]
+    control["output_dir"] = main["output_dir"]
+    assert main == control

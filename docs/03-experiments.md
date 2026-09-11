@@ -100,6 +100,25 @@ with the new oracle threshold, not a newly selected or retrained teacher.
 
 ## 3. Ablation study
 
+The degree/motif follow-up uses task BCE plus sampled-subgraph BCE, degree and motif
+losses, with RD explicitly off or on. Its 12-trial HPO searches degree/motif in
+[0.01, 1] and active RD in [0.03, 1] (log scales), starting with two matched RD-off/on
+pairs. A separate BCE-only run matches its sampler, architecture and stopping policy.
+Both retain positive weight 5, `mixing:none`, and the split-seed-42 training universe.
+
+For these new configs, `eval.early_stop_metric: val_total_loss` monitors validation task
+BCE plus the weighted per-subgraph mean of all active structural terms on a fixed
+validation sample. These terms are evaluated every epoch; patience is 10 epochs,
+with stopping deferred to a topology-evaluation epoch (cadence 2, maximum 25 epochs).
+Checkpoint and HPO selection retain the five-metric ranking; total loss is not compared
+across trials. Other configs continue to monitor validation task BCE. HPO skips test.
+
+Soft adjacency is the masked symmetric sigmoid-score matrix, with zero diagonal.
+Degree and open/closed two-hop targets describe the sampled legal subgraph, not
+full-network degrees. These are differentiable structural surrogates; class-weighted
+BCE does not establish calibrated interaction probabilities. No sigmoid shift or
+structural BCE reweighting is introduced in this study.
+
 ### 3.1 Endpoint-only variants
 
 Each row is an independent variant of the common backbone, not a cumulative

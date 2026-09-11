@@ -250,6 +250,10 @@ mkdir -p outputs/logs && nohup hpc/run.sh train configs/b0_v31_breadth_first.yam
 .venv/bin/python -m src.experiments.kd_rank_rep_hpo --bank h2ns3 --margin 0.1  # existing bank, 4 priors + 8 guided trials
 .venv/bin/python -m src.experiments.struct_hpo --arm grand   # struct_grand: 2 priors + 8 guided trials, resumes from outputs/struct_hpo/grand/optuna.db
 .venv/bin/python -m src.experiments.struct_hpo --arm new     # struct_new: 2 priors + 8 guided trials, resumes from outputs/struct_hpo/new/optuna.db
+# Fresh degree/motif study: run the matched control first, then 12 HPO completions.
+hpc/run.sh train configs/split_seed42/struct_degree_motif_bce.yaml --skip-test
+.venv/bin/python -m src.experiments.struct_hpo --arm degree_motif --n-trials 12 \
+  --sweep-dir outputs/split_seed42_degree_motif_20260911/degree_motif
 hpc/run.sh train configs/split_seed42/prefix_base.yaml                          # frozen base of the prefix arms
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_static           # 10 trials
 .venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair             # 10 trials

@@ -3079,3 +3079,180 @@ def test_ddp_loop_selects_measured_checkpoint_without_density_gate(tmp_path: Pat
     assert len((attempt / "metrics.jsonl").read_text().splitlines()) == 2
     assert result.best_epoch == 1
     assert not (attempt / "best.pt").exists()
+
+
+class _ControlledStructStream:
+    """Exercise real optimizer/stopping bookkeeping with prescribed validation terms."""
+
+    def __init__(self, values: dict[int, dict[str, float]]) -> None:
+        self.values = values
+        self.epoch = 0
+        self.validated: list[int] = []
+        self.last_terms: dict[str, torch.Tensor] = {}
+
+    def loss(
+        self, model: nn.Module, *, epoch: int, step: int, steps: int
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        self.epoch = epoch
+        zero = next(model.parameters()).sum() * 0.0
+        self.last_terms = {"bce": zero}
+        return zero, {}
+
+    def epoch_telemetry(self, accelerator: Accelerator, sums: dict[str, float]) -> dict[str, float]:
+        return {}
+
+    def validation_telemetry(
+        self, model: nn.Module, accelerator: Accelerator, *, threshold: float | None
+    ) -> dict[str, float]:
+        self.validated.append(self.epoch)
+        return self.values[self.epoch]
+
+
+def test_struct_total_stopping_measures_odd_epochs_and_keeps_task_bce(tmp_path: Path) -> None:
+    from src.train_b0 import StructStream
+
+    path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        path,
+        {
+            "optim.epochs": 6,
+            "eval.patience": 1,
+            "eval.topology_every": 2,
+            "eval.early_stop_metric": "val_total_loss",
+            "struct": {"weights": {"bce": 1.0, "degree": 2.0, "motif": 3.0}},
+        },
+    )
+    cfg = load_config(path)
+    stream = _ControlledStructStream(
+        {
+            epoch: {
+                "val_struct_bce_loss": 0.1,
+                "val_struct_degree_loss": degree,
+                "val_struct_motif_loss": 0.05,
+            }
+            for epoch, degree in enumerate([0.425, 0.2, 0.1, 0.1], 1)
+        }
+    )
+    tasks = iter([0.1, 0.2, 0.3, 0.4])
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+    result = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=tmp_path / "attempt",
+        struct_stream=cast(StructStream, stream),
+        evaluate_fn=lambda *args: ValidationOutcome(_constant_metrics(), None, next(tasks)),
+    )
+    assert stream.validated == [1, 2, 3, 4]
+    assert result.stop_epoch == 4  # Task BCE alone would have stopped at epoch 2.
+    assert [r["val_total_loss"] for r in result.history] == pytest.approx([1.2, 0.85, 0.75, 0.85])
+    assert [r["val_struct_loss"] for r in result.history] == pytest.approx([1.1, 0.65, 0.45, 0.45])
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_struct_total_stopping_rejects_nonfinite_validation(
+    tmp_path: Path, bad_value: float
+) -> None:
+    from src.train_b0 import StructStream
+
+    path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        path,
+        {
+            "optim.epochs": 2,
+            "eval.early_stop_metric": "val_total_loss",
+            "struct": {"weights": {"bce": 1.0}},
+        },
+    )
+    stream = _ControlledStructStream({1: {"val_struct_bce_loss": bad_value}})
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+    with pytest.raises(RuntimeError, match="non-finite validation total loss"):
+        train_ddp_loop(
+            _StochasticLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            load_config(path),
+            Accelerator(cpu=True),
+            warmup_steps=1,
+            artifact_dir=tmp_path / "attempt",
+            struct_stream=cast(StructStream, stream),
+            evaluate_fn=lambda *args: ValidationOutcome(_constant_metrics(), None, 0.2),
+        )
+
+
+def test_struct_total_resume_restores_total_low_water_mark(tmp_path: Path) -> None:
+    from src.train_b0 import StructStream
+
+    path = tmp_path / "cfg.yaml"
+    _write_yaml_config(
+        path,
+        {
+            "optim.epochs": 4,
+            "eval.patience": 2,
+            "eval.classification_only": True,
+            "eval.early_stop_metric": "val_total_loss",
+            "struct": {"weights": {"bce": 1.0}},
+        },
+    )
+    cfg = load_config(path)
+    batch = _loss_batch(1.0, [0, 1, 2, 3])
+    values = {i: {"val_struct_bce_loss": v} for i, v in enumerate([0.1, 0.6, 0.5], 1)}
+    stream = _ControlledStructStream(values)
+
+    def interrupted(*args: object) -> ValidationOutcome:
+        if stream.epoch == 3:
+            raise RuntimeError("interrupted after two epochs")
+        return ValidationOutcome(_constant_metrics(), None, 0.5 - stream.epoch * 0.1)
+
+    prior = tmp_path / "prior"
+    with pytest.raises(RuntimeError, match="interrupted after two epochs"):
+        train_ddp_loop(
+            _StochasticLossModel(),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(cpu=True),
+            warmup_steps=1,
+            artifact_dir=prior,
+            struct_stream=cast(StructStream, stream),
+            evaluate_fn=interrupted,
+        )
+    dest = tmp_path / "resumed"
+    (dest / "checkpoints").mkdir(parents=True)
+    shutil.copy2(prior / "metrics.jsonl", dest / "metrics.jsonl")
+    for checkpoint in (prior / "checkpoints").glob("epoch-*.pt"):
+        shutil.copy2(checkpoint, dest / "checkpoints" / checkpoint.name)
+    result = train_ddp_loop(
+        _StochasticLossModel(),
+        lambda epoch: [batch],
+        [batch],
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=dest,
+        resume_attempt=prior,
+        struct_stream=cast(StructStream, _ControlledStructStream(values)),
+        evaluate_fn=lambda *args: ValidationOutcome(_constant_metrics(), None, 0.2),
+    )
+    assert result.stop_epoch == 3
+    assert [r["val_total_loss"] for r in result.history] == pytest.approx([0.5, 0.9, 0.7])
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"struct": {"weights": {"bce": 1.0}, "val_subgraphs": 0}},
+        {"struct": {"weights": {"bce": 1.0}}, "eval.eval_every": 2},
+    ],
+)
+def test_total_stopping_requires_fixed_structural_validation(
+    tmp_path: Path, overrides: dict[str, object]
+) -> None:
+    path = tmp_path / "cfg.yaml"
+    _write_yaml_config(path, {"eval.early_stop_metric": "val_total_loss", **overrides})
+    with pytest.raises(ValueError, match="val_total_loss requires"):
+        load_config(path)

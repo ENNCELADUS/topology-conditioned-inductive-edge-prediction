@@ -257,8 +257,9 @@ class EvalConfig:
     """The ``eval:`` config section.
 
     Attributes:
-        patience: Early stop after this many evals without a lower total
-            validation task loss.
+        patience: Early stop after this many evals without a lower monitored loss.
+        early_stop_metric: Validation task BCE by default; ``val_total_loss`` adds
+            weighted structural losses on fixed validation subgraphs every epoch.
         eval_every: Evaluate every N epochs.
         topology_every: Run the V_val topology pass only on epochs divisible by
             N (the final epoch always runs it); classification metrics keep the
@@ -271,6 +272,7 @@ class EvalConfig:
     eval_every: int
     topology_every: int = 1
     classification_only: bool = False
+    early_stop_metric: str = "val_task_loss"
 
 
 @dataclass(frozen=True)
@@ -783,16 +785,23 @@ def load_config(path: Path) -> Config:
 
     eval_raw = _as_mapping(_require(raw, "eval", ""), "eval")
     _check_no_unknown_keys(
-        eval_raw, ("patience", "eval_every", "topology_every", "classification_only"), "eval"
+        eval_raw,
+        ("patience", "eval_every", "topology_every", "classification_only", "early_stop_metric"),
+        "eval",
     )
     eval_cfg = EvalConfig(
         patience=_as_int(_require(eval_raw, "patience", "eval."), "eval.patience"),
         eval_every=_as_int(_require(eval_raw, "eval_every", "eval."), "eval.eval_every"),
         topology_every=_as_int(eval_raw.get("topology_every", 1), "eval.topology_every"),
+        early_stop_metric=_as_str(
+            eval_raw.get("early_stop_metric", "val_task_loss"), "eval.early_stop_metric"
+        ),
         classification_only=_as_bool(
             eval_raw.get("classification_only", False), "eval.classification_only"
         ),
     )
+    if eval_cfg.early_stop_metric not in {"val_task_loss", "val_total_loss"}:
+        raise ValueError("eval.early_stop_metric must be val_task_loss or val_total_loss")
     if eval_cfg.topology_every < 1:
         raise ValueError(f"eval.topology_every must be >= 1, got {eval_cfg.topology_every}")
 
@@ -875,6 +884,11 @@ def load_config(path: Path) -> Config:
     struct: StructConfig | None = None
     if "struct" in raw:
         struct = StructConfig.from_mapping(_as_mapping(raw["struct"], "struct"))
+
+    if eval_cfg.early_stop_metric == "val_total_loss" and (
+        struct is None or struct.val_subgraphs < 1 or eval_cfg.eval_every != 1
+    ):
+        raise ValueError("val_total_loss requires struct.val_subgraphs > 0 and eval.eval_every = 1")
 
     return Config(
         model=model,
@@ -1006,7 +1020,11 @@ def config_to_dict(cfg: Config) -> dict[str, Any]:
             return [convert(item) for item in value]
         return value
 
-    return cast(dict[str, Any], convert(asdict(cfg)))
+    result = cast(dict[str, Any], convert(asdict(cfg)))
+    # Keep the canonical config of existing task-BCE runs unchanged.
+    if cfg.eval.early_stop_metric == "val_task_loss":
+        result["eval"].pop("early_stop_metric")
+    return result
 
 
 # --------------------------------------------------------------------------- model building
@@ -1494,6 +1512,8 @@ def train_loop(
     Raises:
         RuntimeError: If training ends without a single evaluation.
     """
+    if cfg.eval.early_stop_metric == "val_total_loss":
+        raise ValueError("val_total_loss requires the packed structural DDP training path")
     optimizer = _build_optimizer(model, cfg)
     model, optimizer = accelerator.prepare(model, optimizer)
     scheduler = _build_scheduler(
@@ -4042,6 +4062,8 @@ def train_ddp_loop(
     Raises:
         RuntimeError: On a non-finite loss or a per-rank step-count divergence.
     """
+    if cfg.eval.early_stop_metric == "val_total_loss" and struct_stream is None:
+        raise ValueError("val_total_loss requires a structural stream")
     optimizer = _build_optimizer(model, cfg)
     model, optimizer = accelerator.prepare(model, optimizer)
     scheduler = _build_scheduler(
@@ -4056,7 +4078,7 @@ def train_ddp_loop(
     history: list[dict[str, object]] = []
     metrics_by_epoch: dict[int, EdgeMetrics] = {}
     topology_by_epoch: dict[int, ValTopologyResult | None] = {}
-    best_val_task_loss = float("inf")
+    best_val_monitor_loss = float("inf")
     last_metrics: EdgeMetrics | None = None
     evals_without_improvement = 0
     stop_epoch: int | None = None
@@ -4239,11 +4261,11 @@ def train_ddp_loop(
         # The persisted rows are the monitor's only state; an attempt written
         # before this key existed cannot reach here at all, because its
         # `training_state.pt` lacks `stop_epoch` and the load above raises.
-        best_val_task_loss = min(
+        best_val_monitor_loss = min(
             (
                 float(cast(float, value))
                 for row in metrics_rows
-                if (value := row.get("val_task_loss")) is not None
+                if (value := row.get(cfg.eval.early_stop_metric)) is not None
             ),
             default=float("inf"),
         )
@@ -4590,7 +4612,9 @@ def train_ddp_loop(
                 epoch_struct_telemetry["struct_seconds"] / epoch_wall
             )
             entry.update(epoch_struct_telemetry)
-        if struct_stream is not None and run_topology:
+        if struct_stream is not None and (
+            run_topology or cfg.eval.early_stop_metric == "val_total_loss"
+        ):
             entry.update(
                 struct_stream.validation_telemetry(
                     model,
@@ -4598,6 +4622,17 @@ def train_ddp_loop(
                     threshold=outcome.topology.threshold if outcome.topology is not None else None,
                 )
             )
+        if cfg.eval.early_stop_metric == "val_total_loss":
+            assert cfg.struct is not None
+            entry["val_struct_loss"] = sum(
+                weight * float(cast(float, entry[f"val_struct_{key}_loss"]))
+                for key, weight in cfg.struct.active_weights.items()
+            )
+            if val_task_loss is None:
+                raise RuntimeError("val_total_loss requires a measured validation task loss")
+            entry["val_total_loss"] = val_task_loss + cast(float, entry["val_struct_loss"])
+            if not math.isfinite(cast(float, entry["val_total_loss"])):
+                raise RuntimeError("non-finite validation total loss")
         if outcome.diagnostics is not None:
             entry.update(outcome.diagnostics)
             entry["val_kd_truth_source"] = "validation_structure"
@@ -4630,12 +4665,13 @@ def train_ddp_loop(
         topology_by_epoch[epoch] = outcome.topology
         # No monitor value (zero validation rows) leaves patience untouched: a
         # missing measurement is not evidence of stagnation.
-        improved = val_task_loss is not None and val_task_loss < best_val_task_loss
+        monitor_loss = cast(float | None, entry.get(cfg.eval.early_stop_metric))
+        improved = monitor_loss is not None and monitor_loss < best_val_monitor_loss
         if improved:
-            assert val_task_loss is not None
-            best_val_task_loss = val_task_loss
+            assert monitor_loss is not None
+            best_val_monitor_loss = monitor_loss
             evals_without_improvement = 0
-        elif val_task_loss is not None:
+        elif monitor_loss is not None:
             evals_without_improvement += 1
             # Defer an exhausted patience to the next topology-due epoch: only
             # those epochs produce a `CheckpointCandidate`, so stopping between
@@ -4651,15 +4687,15 @@ def train_ddp_loop(
 
         if accelerator.is_main_process:
             logger.info(
-                "ddp eval epoch %d/%d: train_loss %.4f val_auroc %.4f val_auprc %.4f "
-                "val_task_loss %s%s",
+                "ddp eval epoch %d/%d: train_loss %.4f val_auroc %.4f val_auprc %.4f %s %s%s",
                 epoch,
                 cfg.optim.epochs,
                 train_loss,
                 metrics.auroc,
                 metrics.auprc,
-                "n/a" if val_task_loss is None else f"{val_task_loss:.4f}",
-                " (new val-task-loss low)" if improved else "",
+                cfg.eval.early_stop_metric,
+                "n/a" if monitor_loss is None else f"{monitor_loss:.4f}",
+                f" (new {cfg.eval.early_stop_metric} low)" if improved else "",
             )
         per_epoch_profiles.append(
             {
@@ -5392,7 +5428,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     )
     if accelerator.is_main_process:
         logger.info(
-            "early-stop monitor: val_task_loss (patience %d)",
+            "early-stop monitor: %s (patience %d)",
+            cfg.eval.early_stop_metric,
             cfg.eval.patience,
         )
     validation_bank = None

@@ -1,8 +1,9 @@
 """Structural-arm HPO using the shared three-objective search and five-metric rank protocol.
 
-Five arms: the frozen-trunk structural baselines ``grand`` and ``new``, and three prefix-tuning
-arms (frozen ``prefix_base`` trunk, trainable gated KV prefix) that additionally search a
-learning rate. ``prefix_static`` and ``prefix_pair`` search ``rank``/``degree``/``motif`` (the
+The degree/motif arm searches optional RD. The other arms are ``grand``, ``new``,
+and three prefix-tuning arms (frozen ``prefix_base`` trunk, trainable gated KV prefix)
+that additionally search a learning rate.
+``prefix_static`` and ``prefix_pair`` search ``rank``/``degree``/``motif`` (the
 ``struct_new`` weights) together with ``lr``; a searched ``lr`` is written to both ``optim.lr``
 and ``optim.scheduler.max_lr``, never into ``struct.weights``. Their two enqueued priors are the
 fixed :data:`PREFIX_PRIORS` pair -- ``(rank 1.0, degree 0.1, motif 0.1, lr 1e-3)`` and the fallback
@@ -74,7 +75,28 @@ def _suggest_for(arm: str) -> Callable[[optuna.Trial], dict[str, object]]:
     return suggest
 
 
+def suggest_degree_motif(trial: optuna.Trial) -> dict[str, object]:
+    """Search degree/motif and a true zero-or-positive RD term."""
+    degree = float(trial.suggest_float("degree", 0.01, 1.0, log=True))
+    motif = float(trial.suggest_float("motif", 0.01, 1.0, log=True))
+    enabled = trial.suggest_categorical("rd_enabled", [False, True])
+    rd = float(trial.suggest_float("rd", 0.03, 1.0, log=True)) if enabled else 0.0
+    return {"degree": degree, "motif": motif, "rd": rd}
+
+
 ARMS: dict[str, ArmSpec] = {
+    "degree_motif": ArmSpec(
+        study_name="struct_degree_motif_optional_rd",
+        base_config=Path("configs/split_seed42/struct_degree_motif.yaml"),
+        priors=(
+            {"degree": 0.15, "motif": 0.70, "rd_enabled": False},
+            {"degree": 0.15, "motif": 0.70, "rd_enabled": True, "rd": 0.42},
+            {"degree": 0.05, "motif": 0.20, "rd_enabled": False},
+            {"degree": 0.05, "motif": 0.20, "rd_enabled": True, "rd": 0.10},
+        ),
+        param_names=("degree", "motif", "rd_enabled", "rd"),
+        suggest=suggest_degree_motif,
+    ),
     "grand": ArmSpec(
         study_name="struct_grand",
         base_config=Path("configs/struct_grand_breadth_first.yaml"),
@@ -167,7 +189,7 @@ def build_spec(args: argparse.Namespace) -> SweepSpec:
         priors = ({"lr": float(center) / 3.0}, {"lr": float(center)}, {"lr": float(center) * 3.0})
     return SweepSpec(
         study_name=arm.study_name,
-        n_startup_trials=N_STARTUP_TRIALS,
+        n_startup_trials=4 if str(args.arm) == "degree_motif" else N_STARTUP_TRIALS,
         priors=priors,
         param_names=arm.param_names,
         suggest=arm.suggest,
