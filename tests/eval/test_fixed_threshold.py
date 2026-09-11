@@ -451,3 +451,28 @@ def test_zero_density_reporting_uses_zero_and_null_without_epsilon() -> None:
     assert diagnostics["geometric_mean"] == 0.0
     assert diagnostics["mean_abs_log"] is None
     assert diagnostics["zero_rd_samples"] == 1
+
+
+def test_unequal_bucket_counts_keep_equal_size_weights() -> None:
+    pairs, logits, graph, _ = _graded_fixture()
+    buckets = {2: [{"a", "b"}] * 2, 3: [{"a", "b", "c"}] * 5}
+    samples = _local_samples(pairs=pairs, logits=logits, g_ref=graph, buckets=buckets)
+    thresholds = _candidate_thresholds(samples)
+    log_rd, _ = _macro_log_rd_gs_curves(samples, thresholds)
+    for index, threshold in enumerate(thresholds):
+        per_size = {}
+        for size in buckets:
+            values = [
+                float(np.count_nonzero(sample.logits >= threshold) / sample.truth.sum())
+                for sample in samples
+                if sample.size == size
+            ]
+            per_size[size] = values
+        diagnostics = fixed_threshold.density_diagnostics(per_size)
+        if any(value == 0 for values in per_size.values() for value in values):
+            assert np.isneginf(log_rd[index])
+        else:
+            expected = np.mean([np.log(values).mean() for values in per_size.values()])
+            assert log_rd[index] == pytest.approx(expected)
+            assert diagnostics["geometric_mean"] == pytest.approx(np.exp(expected))
+    assert np.isfinite(log_rd[-1])  # The all-pairs candidate always remains available.

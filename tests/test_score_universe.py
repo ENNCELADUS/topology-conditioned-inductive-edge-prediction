@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from numpy.typing import NDArray
 from src import score_universe
 from src.data import packed_features
 from src.data.artifacts import canonical_pair
@@ -31,9 +32,12 @@ from src.data.grounding import build_grounding_pool
 from src.data.packed_features import PackedFeatureTable, build_packed_features
 from src.data.val_region import ValRegionParams
 from src.model.egostitch.classifier.b0_v31 import V3_1, B0V31PairClassifier, GatedCrossAttention
+from src.model.egostitch.classifier.prefix import V3_1Prefix
 from src.model.egostitch.composite import E2ENodeState, E2EPairContext, EgoStitchModel
 from src.model.egostitch.config import E2EConfig, GeneratorConfig
 from src.model.egostitch.generator.egostitch import EgoStitchImagineGenerator
+
+from tests.test_prefix_model import _pair_batch, _tiny_base_config
 
 INPUT_DIM = 4
 
@@ -269,6 +273,166 @@ def test_packed_path_matches_forward_for_live_topo_gen(
     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=0.0)
 
 
+def _tiny_v3_1_prefix(*, gates: float = 0.4, conditioning: str = "pair") -> V3_1Prefix:
+    """A tiny pair-conditioned `V3_1Prefix` with open gates, in eval mode."""
+    torch.manual_seed(0)
+    model = V3_1Prefix(
+        base=_tiny_base_config(),
+        prefix={"tokens": 3, "rank": 2, "conditioning": conditioning, "bottleneck": 6},
+    )
+    with torch.no_grad():
+        model.generator.gates.fill_(gates)
+    model.eval()
+    return model
+
+
+def _build_prefix_packed_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, node_count: int = 3
+) -> tuple[Path, list[tuple[str, str]]]:
+    """Build a tiny packed-feature pack (matching `_tiny_base_config`'s `input_dim`).
+
+    Returns the pack root and every unordered pair over its nodes, in the
+    lexicographic order the real scorer sees.
+    """
+    feature_root = tmp_path / "features"
+    nodes = {f"node_{i:02d}": torch.randn(3 + i, INPUT_DIM) for i in range(node_count)}
+    _write_feature_store(feature_root, nodes)
+    pack_root = tmp_path / "pack"
+    monkeypatch.setattr(packed_features, "ProcessPoolExecutor", ThreadPoolExecutor)
+    build_packed_features(feature_root, pack_root, workers=1)
+    names = sorted(nodes)
+    pairs = [(u, v) for index, u in enumerate(names) for v in names[index + 1 :]]
+    return pack_root, pairs
+
+
+def test_packed_scoring_matches_forward_for_v3_1_prefix_with_open_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _tiny_v3_1_prefix()
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch)
+
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    node_index = table.manifest.node_index()
+    compact = CompactPairBatch(
+        row_ids=torch.arange(len(pairs)),
+        node_a=torch.tensor([node_index[u] for u, _ in pairs]),
+        node_b=torch.tensor([node_index[v] for _, v in pairs]),
+        labels=torch.zeros(len(pairs)),
+        bucket_boundary=128,
+        global_pair_count=len(pairs),
+    )
+    reference_batch = table.assemble(compact)
+    reference_batch["emb_a"] = reference_batch["emb_a"].float()
+    reference_batch["emb_b"] = reference_batch["emb_b"].float()
+    with torch.inference_mode():
+        reference = model(reference_batch)["logits"].numpy().reshape(-1)
+
+    actual = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=512,
+    )
+
+    # The packed path pads every batch to its bucket boundary rather than the
+    # natural per-pair lengths `model(reference_batch)` uses, so this is a
+    # close match rather than a bit-exact one (unlike the `V3_1` guards above).
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-6)
+
+
+def test_packed_scoring_shuffle_is_universe_level_seeded_and_batch_invariant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review P0: ``shuffle`` permutes over every scored row, not within a batch.
+
+    All unordered pairs over 5 nodes is 10 rows; ``token_budget=512`` caps a
+    128-bucket batch at 2 rows (5 batches) and ``token_budget=8192`` at 32 (one
+    batch). A batch-local shuffle gives different logits under the two budgets;
+    a universe-level permutation gives the same ones.
+    """
+    model = _tiny_v3_1_prefix()
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
+    device = torch.device("cpu")
+    assert len(pairs) == 10
+
+    def _score(*, budget: int, intervention: str, seed: int = 0) -> NDArray[np.float32]:
+        return score_universe._score_v3_1_packed(
+            model,
+            pairs,
+            pack_root,
+            device=device,
+            amp="off",
+            token_budget=budget,
+            prefix_intervention=intervention,
+            prefix_intervention_seed=seed,
+        )
+
+    baseline = _score(budget=512, intervention="none")
+    shuffled_first = _score(budget=512, intervention="shuffle")
+    shuffled_second = _score(budget=512, intervention="shuffle")
+    other_seed = _score(budget=512, intervention="shuffle", seed=7)
+    one_batch = _score(budget=8192, intervention="shuffle")
+
+    assert not np.allclose(baseline, shuffled_first)
+    np.testing.assert_array_equal(shuffled_first, shuffled_second)
+    assert not np.allclose(shuffled_first, other_seed)
+    np.testing.assert_allclose(shuffled_first, one_batch, rtol=0.0, atol=1e-6)
+    # The model itself never enters an intervention mode for `shuffle`.
+    assert model.intervention == "none"
+
+
+def test_unpacked_scoring_shuffle_is_universe_level_and_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same two-pass shuffle on the non-packed path (`_score_v3_1`)."""
+    model = _tiny_v3_1_prefix()
+    _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
+    store = FeatureStore(tmp_path / "features")
+    pairs = [(f"node_{i:02d}", f"node_{j:02d}") for i in range(5) for j in range(i + 1, 5)]
+    device = torch.device("cpu")
+
+    def _score(*, budget: int, intervention: str, seed: int = 0) -> NDArray[np.float32]:
+        return score_universe._score_v3_1(
+            model,
+            pairs,
+            store,
+            device=device,
+            amp="off",
+            token_budget=budget,
+            prefix_intervention=intervention,
+            prefix_intervention_seed=seed,
+        )
+
+    baseline = _score(budget=512, intervention="none")
+    shuffled = _score(budget=512, intervention="shuffle")
+    one_batch = _score(budget=8192, intervention="shuffle")
+
+    assert not np.allclose(baseline, shuffled)
+    np.testing.assert_array_equal(shuffled, _score(budget=512, intervention="shuffle"))
+    assert not np.allclose(shuffled, _score(budget=512, intervention="shuffle", seed=7))
+    np.testing.assert_allclose(shuffled, one_batch, rtol=0.0, atol=1e-6)
+
+
+def test_packed_scoring_shuffle_rejects_a_static_prefix_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _tiny_v3_1_prefix(conditioning="static")
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(SystemExit, match="pair-conditioned"):
+        score_universe._score_v3_1_packed(
+            model,
+            pairs,
+            pack_root,
+            device=torch.device("cpu"),
+            amp="off",
+            token_budget=512,
+            prefix_intervention="shuffle",
+        )
+
+
 @pytest.mark.parametrize("control", ["branch_zero", "shuffle"])
 def test_parser_accepts_topo_gen_control(control: str) -> None:
     args = score_universe.build_parser().parse_args(
@@ -415,6 +579,52 @@ def test_score_metadata_records_topo_gen_control(tmp_path: Path, control: str | 
     meta = score_universe.load_scores(output).meta
     assert "topo_gen_control" in meta
     assert meta["topo_gen_control"] == control
+
+
+def test_score_metadata_records_prefix_intervention_and_seed(tmp_path: Path) -> None:
+    nodes = {
+        "node_00": torch.randn(3, INPUT_DIM),
+        "node_01": torch.randn(4, INPUT_DIM),
+    }
+    data_root = _data_root_with_features(tmp_path, nodes)
+    pairs_path = tmp_path / "pairs.tsv"
+    _write_tsv(pairs_path, [("node_00", "node_01", None)])
+    checkpoint = tmp_path / "prefix.pt"
+    model_config: dict[str, object] = {
+        "base": _tiny_base_config(),
+        "prefix": {"tokens": 3, "rank": 2, "conditioning": "static", "bottleneck": 6},
+    }
+    _write_checkpoint(
+        checkpoint,
+        model=score_universe.build_model("v3_1_prefix", model_config),
+        model_family="v3_1_prefix",
+        model_config=model_config,
+    )
+    output = tmp_path / "scores.npz"
+
+    score_universe.main(
+        [
+            "score",
+            "--checkpoint",
+            str(checkpoint),
+            "--pairs",
+            f"file:{pairs_path}",
+            "--data-root",
+            str(data_root),
+            "--output",
+            str(output),
+            "--device",
+            "cpu",
+            "--prefix-intervention",
+            "gates_off",
+            "--prefix-intervention-seed",
+            "5",
+        ]
+    )
+
+    meta = score_universe.load_scores(output).meta
+    assert meta["prefix_intervention"] == "gates_off"
+    assert meta["prefix_intervention_seed"] == 5
 
 
 def test_load_bare_legacy_checkpoint_with_explicit_model_metadata(tmp_path: Path) -> None:
@@ -1041,8 +1251,24 @@ def _write_fake_shard(
     num_rows: int,
     checkpoint_id: str = "abc123abc123abcd",
     topo_gen_control: str | None = None,
+    prefix_intervention: str | None = None,
+    prefix_intervention_seed: int | None = None,
 ) -> None:
     node_ids = ["node_a", "node_b"]
+    meta: dict[str, object] = {
+        "checkpoint_id": checkpoint_id,
+        "model_family": "v3_1",
+        "pairs_source": "candidate",
+        "strategy": "breadth_first",
+        "num_rows": num_rows,
+        "created_utc": "2026-07-09T00:00:00+00:00",
+        "torch_version": torch.__version__,
+        "topo_gen_control": topo_gen_control,
+    }
+    if prefix_intervention is not None:
+        meta["prefix_intervention"] = prefix_intervention
+    if prefix_intervention_seed is not None:
+        meta["prefix_intervention_seed"] = prefix_intervention_seed
     score_universe.save_scores(
         path,
         node_ids=node_ids,
@@ -1051,16 +1277,7 @@ def _write_fake_shard(
         logit=np.zeros(n_rows, dtype=np.float32),
         label=np.full(n_rows, -1, dtype=np.int8),
         row_start=row_start,
-        meta={
-            "checkpoint_id": checkpoint_id,
-            "model_family": "v3_1",
-            "pairs_source": "candidate",
-            "strategy": "breadth_first",
-            "num_rows": num_rows,
-            "created_utc": "2026-07-09T00:00:00+00:00",
-            "torch_version": torch.__version__,
-            "topo_gen_control": topo_gen_control,
-        },
+        meta=meta,
     )
 
 
@@ -1116,6 +1333,72 @@ def test_merge_mismatched_topo_gen_control_raises_clear_error(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="topo_gen_control"):
         score_universe.merge_scores([shard0, shard1])
+
+
+def test_merge_mismatched_prefix_intervention_raises_clear_error(tmp_path: Path) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20, prefix_intervention="none")
+    _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention="mean")
+
+    with pytest.raises(ValueError, match="prefix_intervention"):
+        score_universe.merge_scores([shard0, shard1])
+
+
+def test_merge_missing_prefix_intervention_defaults_to_none_and_merges(tmp_path: Path) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20)
+    _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention="none")
+
+    merged = score_universe.merge_scores([shard0, shard1])
+
+    assert merged.meta.get("prefix_intervention", "none") == "none"
+    assert len(merged.logit) == 20
+
+
+def test_merge_mismatched_prefix_intervention_seed_raises_clear_error(tmp_path: Path) -> None:
+    """A rerun with a different shuffle seed must not merge with an earlier shard.
+
+    Review round 1 P2: the seed used to go unchecked at merge time, so a
+    partially completed rerun could silently combine shards scored under
+    different shuffle permutations.
+    """
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(
+        shard0,
+        row_start=0,
+        n_rows=10,
+        num_rows=20,
+        prefix_intervention="shuffle",
+        prefix_intervention_seed=3,
+    )
+    _write_fake_shard(
+        shard1,
+        row_start=10,
+        n_rows=10,
+        num_rows=20,
+        prefix_intervention="shuffle",
+        prefix_intervention_seed=7,
+    )
+
+    with pytest.raises(ValueError, match="prefix_intervention_seed"):
+        score_universe.merge_scores([shard0, shard1])
+
+
+def test_merge_missing_prefix_intervention_seed_defaults_to_zero_and_merges(
+    tmp_path: Path,
+) -> None:
+    shard0 = tmp_path / "s0.npz"
+    shard1 = tmp_path / "s1.npz"
+    _write_fake_shard(shard0, row_start=0, n_rows=10, num_rows=20)
+    _write_fake_shard(shard1, row_start=10, n_rows=10, num_rows=20, prefix_intervention_seed=0)
+
+    merged = score_universe.merge_scores([shard0, shard1])
+
+    assert merged.meta.get("prefix_intervention_seed", 0) == 0
+    assert len(merged.logit) == 20
 
 
 def test_merge_missing_topo_gen_control_rejects_explicit_null(tmp_path: Path) -> None:
@@ -3122,3 +3405,52 @@ def test_oracle_val_topology_truth_diagnostic_still_writes_no_ledger_record(
     assert oracle_diagnostic["truth_source"] == "val_topology_g_val"
     assert artifact.meta["heldout"] is False
     assert not list(tmp_path.rglob("test_access_ledger.jsonl"))
+
+
+def test_prefix_family_round_trips_through_build_model(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = V3_1Prefix(
+        base=_tiny_base_config(),
+        prefix={"tokens": 3, "rank": 2, "conditioning": "pair", "bottleneck": 6},
+    )
+    with torch.no_grad():
+        model.generator.gates.fill_(0.3)
+    payload: dict[str, object] = {
+        "model_state": model.state_dict(),
+        "model_family": "v3_1_prefix",
+        "model_config": {"base": _tiny_base_config(), "prefix": model.prefix_cfg.to_dict()},
+    }
+    rebuilt = score_universe.build_model(
+        cast(str, payload["model_family"]),
+        cast("dict[str, object]", payload["model_config"]),
+    )
+    rebuilt.load_state_dict(cast("dict[str, torch.Tensor]", payload["model_state"]))
+    rebuilt.eval()
+    model.eval()
+    batch = _pair_batch()
+    with torch.no_grad():
+        assert torch.equal(rebuilt(batch)["logits"], model(batch)["logits"])
+
+
+def test_prefix_intervention_flag_is_parsed_and_defaults_to_none() -> None:
+    parser = score_universe.build_parser()
+    args = parser.parse_args(
+        [
+            "score",
+            "--checkpoint",
+            "x.pt",
+            "--pairs",
+            "candidate",
+            "--output",
+            "y.npz",
+            "--prefix-intervention",
+            "shuffle",
+            "--prefix-intervention-seed",
+            "7",
+        ]
+    )
+    assert args.prefix_intervention == "shuffle" and args.prefix_intervention_seed == 7
+    default = parser.parse_args(
+        ["score", "--checkpoint", "x.pt", "--pairs", "candidate", "--output", "y.npz"]
+    )
+    assert default.prefix_intervention == "none"

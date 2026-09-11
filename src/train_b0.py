@@ -34,7 +34,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import cycle, islice
@@ -114,6 +114,7 @@ from src.eval.val_topology import (
     val_region_topology_metrics,
 )
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
+from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
 
 # Arms that regress the auxiliary head (`kd_struct_head`) onto ``teacher_rep`` by MSE.
@@ -123,7 +124,15 @@ _REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep"})
 
 logger = logging.getLogger(__name__)
 
-MODEL_FAMILIES = ("v3_1", "f0_mlp")
+MODEL_FAMILIES = ("v3_1", "v3_1_prefix", "f0_mlp")
+V3_1_FAMILIES = frozenset({"v3_1", "v3_1_prefix"})
+
+
+def is_v3_1_family(family: str) -> bool:
+    """True for the packed-token student families (`V3_1` and its prefix wrapper)."""
+    return family in V3_1_FAMILIES
+
+
 MIXED_PRECISION_MODES = ("no", "bf16")
 
 Batch = dict[str, torch.Tensor]
@@ -154,11 +163,13 @@ class ModelConfig:
     """The ``model:`` config section.
 
     Attributes:
-        family: Scorer family, one of ``v3_1`` or ``f0_mlp``. ``f0_mlp`` (the B0-alt
-            baseline) has no buildable model: :func:`build_model` raises for it.
+        family: Scorer family, one of ``v3_1``, ``v3_1_prefix``, or ``f0_mlp``. ``f0_mlp``
+            (the B0-alt baseline) has no buildable model: :func:`build_model` raises for it.
         config: Model constructor kwargs. Empty for ``v3_1`` means
             :data:`~src.model.egostitch.classifier.b0_v31.BEST_V3_1_CONFIG`; for
-            ``f0_mlp`` this is stored but never consumed (see above).
+            ``v3_1_prefix`` this holds the ``prefix`` block (see
+            :func:`_resolve_prefix_kwargs`); for ``f0_mlp`` this is stored but never
+            consumed (see above).
     """
 
     family: str
@@ -570,6 +581,13 @@ def _validate_topo_gen_distill_contract(
 def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
     """Build AdamW, separating the kd_gen core from base/fusion parameters."""
     raw_model = _unwrapped_model(model)
+    prefix_getter = getattr(raw_model, "prefix_parameters", None)
+    if callable(prefix_getter):
+        return torch.optim.AdamW(
+            cast(list[nn.Parameter], prefix_getter()),
+            lr=cfg.optim.lr,
+            weight_decay=cfg.optim.weight_decay,
+        )
     generator_getter = getattr(raw_model, "topo_gen_parameters", None)
     generator_params = (
         list(cast(Callable[[], list[nn.Parameter]], generator_getter)())
@@ -1008,11 +1026,77 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     Raises:
         ValueError: If the family is unknown.
     """
+    if model_cfg.family == "v3_1_prefix":
+        return _resolve_prefix_kwargs(model_cfg)
     if model_cfg.family == "v3_1":
         return dict(model_cfg.config) if model_cfg.config else dict(BEST_V3_1_CONFIG)
     if model_cfg.family == "f0_mlp":
         return dict(model_cfg.config)
-    raise ValueError(f"unknown model family '{model_cfg.family}' (expected v3_1 or f0_mlp)")
+    raise ValueError(
+        f"unknown model family '{model_cfg.family}' (expected v3_1, v3_1_prefix, or f0_mlp)"
+    )
+
+
+def _base_loss_kwargs(model_cfg: ModelConfig) -> Mapping[str, object]:
+    """Return the frozen base's flat loss-setting kwargs (``positive_weight``, ``label_smoothing``).
+
+    For ``v3_1_prefix``, :func:`resolve_model_kwargs` nests the frozen base's
+    ``model_config`` under ``"base"``, so a plain ``.get("positive_weight", ...)``
+    on its return value always misses and silently falls back to the default.
+    This unwraps that nesting so struct/val loss settings still read the frozen
+    base's configured values for prefix arms.
+
+    Args:
+        model_cfg: The ``model:`` config section.
+
+    Returns:
+        The flat kwargs mapping to read ``positive_weight`` / ``label_smoothing`` from.
+    """
+    kwargs = resolve_model_kwargs(model_cfg)
+    if model_cfg.family == "v3_1_prefix":
+        return cast(Mapping[str, object], kwargs["base"])
+    return kwargs
+
+
+def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
+    """Embed the frozen base's ``model_config`` and record the base file's SHA-256.
+
+    Provenance only: the digest is embedded in the checkpoint payload's
+    ``model_config`` (under ``prefix``) and never verified (project rule: no
+    digest pinning). ``run_metadata.json`` does not carry ``model_config``, so
+    :func:`_run_metadata` copies the path and digest into its own
+    ``prefix_base`` block.
+
+    Args:
+        model_cfg: The ``model:`` config section (``family == "v3_1_prefix"``).
+
+    Returns:
+        ``{"base": <base checkpoint's model_config>, "prefix": {...}}`` with
+        ``base_checkpoint`` and ``base_checkpoint_sha256`` embedded in ``prefix``.
+
+    Raises:
+        ValueError: If ``model.config.prefix.base_checkpoint`` is missing, the base
+            checkpoint payload is not a mapping or is not a ``v3_1`` checkpoint, or
+            ``model.config`` carries keys other than ``prefix``.
+    """
+    raw_prefix = model_cfg.config.get("prefix")
+    if not isinstance(raw_prefix, Mapping) or "base_checkpoint" not in raw_prefix:
+        raise ValueError("model.config.prefix.base_checkpoint is required for v3_1_prefix")
+    extra = sorted(set(model_cfg.config) - {"prefix"})
+    if extra:
+        raise ValueError(f"v3_1_prefix accepts only model.config.prefix, got {extra}")
+    path = Path(str(raw_prefix["base_checkpoint"]))
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{path}: prefix base must be a v3_1 checkpoint payload")
+    if payload.get("model_family") != "v3_1":
+        raise ValueError(f"{path}: prefix base must be a v3_1 checkpoint")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    prefix = PrefixConfig.from_mapping(
+        {**dict(raw_prefix), "base_checkpoint": str(path), "base_checkpoint_sha256": digest}
+    )
+    base_config = dict(cast(Mapping[str, object], payload["model_config"]))
+    return {"base": base_config, "prefix": prefix.to_dict()}
 
 
 def build_model(cfg: Config) -> nn.Module:
@@ -1033,14 +1117,47 @@ def build_model(cfg: Config) -> nn.Module:
             ``docs/results/E2-pair-to-topology-gap.md`` for its closed result.
     """
     kwargs = resolve_model_kwargs(cfg.model)
+    if cfg.model.family == "v3_1_prefix":
+        prefix_model = V3_1Prefix(**kwargs)  # type: ignore[arg-type]
+        base_path = Path(str(cast(Mapping[str, object], kwargs["prefix"])["base_checkpoint"]))
+        payload = torch.load(base_path, map_location="cpu", weights_only=False)
+        prefix_model.base.load_state_dict(payload["model_state"])
+        _validate_topo_gen_distill_contract(prefix_model, cfg.distill)
+        return prefix_model
     if cfg.model.family == "v3_1":
-        model = V3_1(**kwargs)
-        _validate_topo_gen_distill_contract(model, cfg.distill)
-        return model
+        v3_1_model = V3_1(**kwargs)
+        _validate_topo_gen_distill_contract(v3_1_model, cfg.distill)
+        return v3_1_model
     raise ValueError(
         f"model family '{cfg.model.family}' has no buildable model: "
         "src/model/b0_alt.py (F0PairMLP) was removed 2026-08-03 by owner decision"
     )
+
+
+def _init_prefix_from_loader(
+    model: V3_1Prefix, loader: Iterable[dict[str, torch.Tensor]], seed: int
+) -> None:
+    """Draw ``p0`` from the frozen encoder's token states of the first training batch.
+
+    Runs before ``accelerator.prepare``; DDP's construction-time broadcast then
+    makes rank 0's draw authoritative on every rank. ``loader`` must be a
+    training-epoch loader (e.g. ``factory(1)``, epoch 1 being the first real
+    training epoch): V_val pairs may never be read during training, so the
+    validation loader must not be passed here.
+
+    Args:
+        model: The prefix-wrapped model whose static prefix to initialise.
+        loader: The epoch-1 training loader; only its first batch is used.
+        seed: Draw seed passed through to `V3_1Prefix.init_static_prefix`.
+
+    Raises:
+        ValueError: If ``loader`` yields no batches.
+    """
+    try:
+        batch = next(iter(loader))
+    except StopIteration as error:
+        raise ValueError("prefix init needs a non-empty training loader") from error
+    model.init_static_prefix({k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}, seed)
 
 
 # --------------------------------------------------------------------------- data assembly
@@ -1387,7 +1504,7 @@ def train_loop(
     )
 
     val_label_smoothing = float(
-        cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
+        cast(float, _base_loss_kwargs(cfg.model).get("label_smoothing", 0.0))
     )
     history: list[dict[str, object]] = []
     best_state: dict[str, torch.Tensor] | None = None
@@ -1541,6 +1658,120 @@ def _checkpoint_payload(
     }
 
 
+def _run_metadata(
+    result: TrainResult,
+    cfg: Config,
+    model_kwargs: Mapping[str, object],
+    dropped_pair_counts: dict[str, int],
+    config_dict: dict[str, object],
+) -> dict[str, object]:
+    """Build the ``run_metadata.json`` payload.
+
+    ``run_metadata.json`` is a fixed key list and deliberately does not embed
+    ``model_config``, so a ``v3_1_prefix`` run's frozen-base provenance would
+    otherwise live only inside ``best.pt``. This copies it out as
+    ``prefix_base`` (``{"checkpoint", "sha256"}``) -- recorded, never verified.
+
+    Args:
+        result: The finished training result.
+        cfg: The full training config.
+        model_kwargs: Resolved model constructor kwargs (the checkpoint's ``model_config``).
+        dropped_pair_counts: Per-file dropped-row counts from data assembly.
+        config_dict: The serialized config, hashed into ``config_hash``.
+
+    Returns:
+        The metadata mapping written to ``run_metadata.json``.
+    """
+    run_metadata: dict[str, object] = {
+        "config_hash": hashlib.sha256(
+            json.dumps(config_dict, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "checkpoint_id": _state_digest(result.best_state_dict)[:16],
+        "torch_version": str(torch.__version__),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "dropped_pair_counts": dropped_pair_counts,
+        "training_interactions": "all_train_positives",
+        "arm": (
+            cfg.distill.arm if cfg.distill is not None and cfg.distill.active else cfg.model.family
+        ),
+        "selected_epoch": result.best_epoch,
+    }
+    if cfg.model.family == "v3_1_prefix":
+        prefix_kwargs = cast(Mapping[str, object], model_kwargs["prefix"])
+        run_metadata["prefix_base"] = {
+            "checkpoint": prefix_kwargs.get("base_checkpoint"),
+            "sha256": prefix_kwargs.get("base_checkpoint_sha256"),
+        }
+    if result.val_threshold_transfer is not None:
+        # Freeze the selected checkpoint and its own validation threshold together.
+        run_metadata["selection_rule"] = SELECTION_RULE
+        run_metadata["val_threshold_transfer"] = asdict(result.val_threshold_transfer)
+    return run_metadata
+
+
+@torch.no_grad()
+def _finalize_prefix_mean(
+    model: nn.Module,
+    result: TrainResult,
+    loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    checkpoint: Path | None = None,
+) -> None:
+    """Publish the selected model's mean over its epoch's 1:5 training task rows.
+
+    Each row counts once, without BCE weighting or structural-stream repeats.
+    Rank-local sums and counts are reduced once after the encoder-only pass.
+    ``checkpoint`` supplies the selected state on every DDP rank; the local
+    debug path already holds that state in ``result``. No validation rows enter.
+    """
+    raw_model = _unwrapped_model(model)
+    if not isinstance(raw_model, V3_1Prefix) or raw_model.prefix_cfg.conditioning != "pair":
+        return
+
+    def collect() -> torch.Tensor:
+        state = (
+            result.best_state_dict
+            if checkpoint is None
+            else torch.load(checkpoint, map_location="cpu", weights_only=False)["model_state"]
+        )
+        raw_model.load_state_dict(state)
+        raw_model.eval()
+        totals = torch.zeros(
+            raw_model.prefix_cfg.bottleneck + 1, device=accelerator.device, dtype=torch.float64
+        )
+        for batch in loader:
+            batch = _to_device(batch, accelerator.device)
+            count, _ = _batch_pair_counts(batch, accelerator.num_processes)
+            if count == 0:
+                continue
+            with accelerator.autocast():
+                encoded_a = raw_model.encoder(batch["emb_a"], batch["len_a"])
+                encoded_b = raw_model.encoder(batch["emb_b"], batch["len_b"])
+                z = raw_model.condition_from_encoded(
+                    encoded_a, encoded_b, batch["len_a"], batch["len_b"]
+                )
+            assert z is not None
+            totals[:-1] += z[:count].double().sum(dim=0)
+            totals[-1] += count
+        return totals
+
+    totals = accelerator.reduce(
+        _run_rank_symmetric(accelerator, "prefix mean publication", collect), reduction="sum"
+    )
+    if not torch.isfinite(totals).all() or totals[-1] <= 0:
+        raise ValueError(
+            "prefix mean publication needs finite conditions and non-empty training rows"
+        )
+    raw_model.generator.z_mean.copy_(totals[:-1] / totals[-1])
+    raw_model.generator.z_count.copy_(totals[-1])
+    if accelerator.is_main_process:
+        for key in ("z_mean", "z_count"):
+            result.best_state_dict[f"generator.{key}"] = (
+                getattr(raw_model.generator, key).detach().cpu().clone()
+            )
+
+
 def write_outputs(
     result: TrainResult,
     cfg: Config,
@@ -1555,9 +1786,10 @@ def write_outputs(
     ``run_metadata.json`` (config hash, checkpoint id = first
     16 hex of the sha256 over the best
     checkpoint's model_state tensor bytes, torch version, timestamp, dropped-pair
-    counts, positives mode, and — when ``result.val_threshold_transfer`` is set —
-    a ``val_threshold_transfer`` block). The training loop owns incremental
-    ``metrics.jsonl``; finalization never rewrites it.
+    counts, positives mode, a ``prefix_base`` provenance block for
+    ``v3_1_prefix`` runs, and — when ``result.val_threshold_transfer`` is set —
+    a ``val_threshold_transfer`` block; see :func:`_run_metadata`). The training
+    loop owns incremental ``metrics.jsonl``; finalization never rewrites it.
 
     Args:
         result: The finished training result.
@@ -1593,24 +1825,7 @@ def write_outputs(
         output_dir / "last.pt",
     )
 
-    run_metadata = {
-        "config_hash": hashlib.sha256(
-            json.dumps(config_dict, sort_keys=True).encode("utf-8")
-        ).hexdigest(),
-        "checkpoint_id": _state_digest(result.best_state_dict)[:16],
-        "torch_version": str(torch.__version__),
-        "timestamp": datetime.now(UTC).isoformat(),
-        "dropped_pair_counts": dropped_pair_counts,
-        "training_interactions": "all_train_positives",
-        "arm": (
-            cfg.distill.arm if cfg.distill is not None and cfg.distill.active else cfg.model.family
-        ),
-        "selected_epoch": result.best_epoch,
-    }
-    if result.val_threshold_transfer is not None:
-        # Freeze the selected checkpoint and its own validation threshold together.
-        run_metadata["selection_rule"] = SELECTION_RULE
-        run_metadata["val_threshold_transfer"] = asdict(result.val_threshold_transfer)
+    run_metadata = _run_metadata(result, cfg, model_kwargs, dropped_pair_counts, config_dict)
     _write_json_atomic(output_dir / "run_metadata.json", run_metadata)
     logger.info(
         "wrote artifacts to %s (checkpoint_id %s)", output_dir, run_metadata["checkpoint_id"]
@@ -5043,7 +5258,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         raise ValueError(
             "DDP worker modes require --pack-dir, --token-budget-per-rank, and --profile-output"
         )
-    if cfg.model.family != "v3_1":
+    if not is_v3_1_family(cfg.model.family):
         raise ValueError(f"DDP worker modes only support the v3_1 family, got {cfg.model.family!r}")
     if cfg.runtime is None:
         raise ValueError("DDP worker modes require a configured cfg.runtime")
@@ -5070,6 +5285,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         world_size=accelerator.num_processes,
     )
     model = build_model(cfg)
+    model.to(accelerator.device)
+    if isinstance(model, V3_1Prefix):
+        _init_prefix_from_loader(model, factory(1), cfg.seed)
 
     if args.ddp_mode == "probe":
         _run_probe_mode(
@@ -5130,7 +5348,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
 
     struct_stream: StructStream | None = None
     if cfg.struct is not None:
-        struct_model_kwargs = resolve_model_kwargs(cfg.model)
+        struct_model_kwargs = _base_loss_kwargs(cfg.model)
         struct_sampler = StructSampler(
             val_split.build_training_graph(),
             nodes=cfg.struct.nodes,
@@ -5170,7 +5388,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             )
 
     val_label_smoothing = float(
-        cast(float, resolve_model_kwargs(cfg.model).get("label_smoothing", 0.0))
+        cast(float, _base_loss_kwargs(cfg.model).get("label_smoothing", 0.0))
     )
     if accelerator.is_main_process:
         logger.info(
@@ -5321,6 +5539,14 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
     )
+    if cfg.model.family == "v3_1_prefix":
+        _finalize_prefix_mean(
+            model,
+            result,
+            factory(result.best_epoch),
+            accelerator,
+            checkpoint=cfg.output_dir / "checkpoints" / f"epoch-{result.best_epoch:04d}.pt",
+        )
     finalization_error: list[str | None] = [None]
     if accelerator.is_main_process:
         try:
@@ -5398,8 +5624,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     model = build_model(cfg)
     model_kwargs = resolve_model_kwargs(cfg.model)
 
-    if cfg.model.family == "v3_1":
+    if is_v3_1_family(cfg.model.family):
         factory, val_loader = _build_v3_1_loaders(cfg, assembled)
+        if isinstance(model, V3_1Prefix):
+            _init_prefix_from_loader(model, factory(1), cfg.seed)
     else:
         factory, val_loader = _build_f0_loaders(cfg, assembled)
 
@@ -5437,6 +5665,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         schedule_total_steps=schedule_total_steps,
         on_eval=on_eval,
     )
+    if cfg.model.family == "v3_1_prefix":
+        _finalize_prefix_mean(model, result, factory(result.best_epoch), accelerator)
     write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
     logger.info(
         "training complete: best epoch %d val AUPRC %.4f (stopped_early=%s)",

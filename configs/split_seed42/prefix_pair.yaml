@@ -1,0 +1,78 @@
+# prefix_pair: frozen prefix_base trunk + trainable gated KV prefix (model.family v3_1_prefix),
+# supervised by the struct_new structural stream. Spec:
+# docs/superpowers/specs/2026-09-10-prefix-tuning-frozen-trunk-design.md. Base config of
+# src.experiments.struct_hpo --arm prefix_pair; the study rewrites struct.weights, optim.lr,
+# optim.scheduler.max_lr, and output_dir per trial.
+data:
+  batch_pairs: 1024
+  expected_missing_features:
+  - node_004764
+  - node_007050
+  f0_cache: outputs/f0_cache/f0_matrix.pt
+  negative_ratio: 5
+  num_workers: 0
+  root: data
+  strategy: breadth_first
+  token_budget: 131072
+eval:
+  patience: 5
+  eval_every: 1
+  topology_every: 2
+mixed_precision: bf16
+model:
+  family: v3_1_prefix
+  config:
+    prefix:
+      base_checkpoint: outputs/split_seed42/prefix_base/best.pt
+      tokens: 16
+      rank: 8
+      conditioning: pair
+      bottleneck: 128
+optim:
+  epochs: 25
+  grad_clip: 1.0
+  lr: 0.001
+  scheduler:
+    anneal_strategy: cos
+    div_factor: 25
+    final_div_factor: 10000
+    max_lr: 0.001
+    pct_start: 0.1
+    type: onecycle
+  warmup_steps: 500
+  weight_decay: 0.05
+output_dir: outputs/split_seed42/prefix_pair
+runtime:
+  loader_workers_per_rank: 4
+  max_pairs_per_rank: 4096
+  memory_limit_gib: 85.0
+  pack_dir: outputs/feature_packs/b0_v31_bf16
+  pack_workers: 16
+  prefetch_factor: 4
+  probe_timed_steps: 30
+  probe_warmup_steps: 10
+  token_budget: 524288
+  world_size: auto
+seed: 0
+struct:
+  background_nodes: 8
+  huber_delta: 1.0
+  mix:
+    bfs: 0.5
+    bridge: 0.25
+    motif: 0.25
+  mmd_bins: 48
+  mmd_sigma: 1.25
+  nodes: 40
+  rank_margin: 0.1
+  rank_temperature: 1.0
+  subgraphs_per_epoch: null
+  val_subgraphs: 32
+  weights:
+    bce: 1.0
+    gs: 0.0
+    rd: 0.0
+    deg_mmd: 0.0
+    rank: 1.0
+    degree: 0.1
+    motif: 0.1

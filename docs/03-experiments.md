@@ -119,6 +119,13 @@ test replay, a zero RD is reported as geometric RD 0; infinite mean absolute log
 RD is encoded as JSON null with an explicit zero-RD subgraph count, never hidden
 by an arbitrary epsilon.
 
+Prefix scoring interventions (`gates_off`, `shuffle`, `mean`) select their own
+step-1 threshold on their intervened V_val logits, and their own max-F1 threshold
+on intervened `val_cls`; test replays both unchanged. Ordinary checkpoint runs
+replay the threshold embedded at publication. The mean intervention uses the
+selected checkpoint's eval-mode mean over its selected epoch's 1:5 training task
+rows, counted once and reduced across ranks at publication.
+
 **Frozen replay.** Publish the selected checkpoint with its own topology threshold
 embedded in `best.pt`. Validation rescoring may report drift but never silently
 reselects the threshold. Test replays it unchanged. The teacher's true-G_val
@@ -166,14 +173,19 @@ they reuse selected hyperparameters, not old teacher banks or old-split checkpoi
 | struct_bce | none (structural stream, BCE only) | — | none | sampler-matched structural baseline |
 | struct_grand | GRAND soft-GS + log-ratio RD on the structural stream | — | `gs`, `rd` log-uniform [0.1, 2.0] | ported density/overlap terms |
 | struct_new | neighbour ranking + node-wise degree + open/closed motif counts on the structural stream | — | `rank` [0.1, 3.0], `degree` [0.01, 1.0], `motif` [0.01, 1.0], log-uniform | direct output-adjacency supervision |
+| prefix_base | none | — | none | the headline B0 recipe with `mixing.mode: bidirectional_cross`; frozen base of the prefix arms |
+| prefix_static | none (structural stream through a frozen trunk) | — | `rank`, `degree`, `motif` as struct_new; `lr` log-uniform [1e-4, 1e-2] | shared-prompt control (spec 2026-09-10) |
+| prefix_pair | none (structural stream through a frozen trunk) | — | as prefix_static | primary prefix arm: pair-conditioned slot-specific prefix |
+| prefix_pair_bce | none (subgraph BCE only) | — | `lr` at {c/3, c, 3c} around the prefix_pair winner | topology-supervision control |
 | Oracles | observed topology | Full-Ego graph → GRIT → PMA | none (diagnostic only) | diagnostic ceilings |
 
 ![Teacher and student architecture](results/kd_rep_audit/teacher_architecture.svg)
 
 ### 1.5 Training, HPO, and reproducibility
 
-The V3.1 student uses d_model 512, 3 encoder + 3 cross-attention layers, 8 heads, rich pooling (mean/attn/max/gated), pair_context_gated readout with abba_max aggregation, and zero label smoothing in the current split campaign (historical grid runs used 0.05).
+The V3.1 student uses d_model 512, 3 encoder layers, 8 heads, `mixing.mode: none` (the configured `cross_attn_layers: 3` build no pair cross-attention layers under that mode; `prefix_base` is the arm that instantiates them), pair_context_gated readout with abba_max aggregation, and zero label smoothing in the current split campaign (historical grid runs used 0.05).
 Optimization: AdamW, lr 1e-4, weight decay 0.05, onecycle, 25 epochs, 1,024 pairs per batch, clip 1.0, bf16 DDP.
+The prefix arms freeze `prefix_base` and train only a gated KV prefix (spec `docs/superpowers/specs/2026-09-10-prefix-tuning-frozen-trunk-design.md`); their interventions are scoring-time flags of `score_universe` (`--prefix-intervention`).
 
 **Current Optuna selection.** TPE uses three fixed objectives: maximize AUPRC,
 maximize GS, minimize geo-MMD. There is no RD constraint. Each trial reports its

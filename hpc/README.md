@@ -250,6 +250,17 @@ mkdir -p outputs/logs && nohup hpc/run.sh train configs/b0_v31_breadth_first.yam
 .venv/bin/python -m src.experiments.kd_rank_rep_hpo --bank h2ns3 --margin 0.1  # existing bank, 4 priors + 8 guided trials
 .venv/bin/python -m src.experiments.struct_hpo --arm grand   # struct_grand: 2 priors + 8 guided trials, resumes from outputs/struct_hpo/grand/optuna.db
 .venv/bin/python -m src.experiments.struct_hpo --arm new     # struct_new: 2 priors + 8 guided trials, resumes from outputs/struct_hpo/new/optuna.db
+hpc/run.sh train configs/split_seed42/prefix_base.yaml                          # frozen base of the prefix arms
+.venv/bin/python -m src.experiments.struct_hpo --arm prefix_static           # 10 trials
+.venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair             # 10 trials
+.venv/bin/python -m src.experiments.struct_hpo --arm prefix_pair_bce --n-trials 3 --lr-center <prefix_pair winner lr>
+hpc/run.sh test \
+  --checkpoint outputs/struct_hpo/prefix_pair/trial_<k>/best.pt \
+  --output-dir outputs/struct_hpo/prefix_pair/trial_<k>/prefix_shuffle \
+  --data-root data --strategy breadth_first \
+  --pack-dir outputs/feature_packs/b0_v31_bf16 \
+  --arm prefix_pair_shuffle --seed 0 \
+  --prefix-intervention shuffle --report-filename test_report_shuffle.json
 ```
 
 `--max-steps` remains debug-only, skips the test stage, and must not be used for a
