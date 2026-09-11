@@ -424,6 +424,10 @@ the current attempt and publication/test artifacts separately.
 
 ## Selection protocol: geometric RD, then five-metric checkpoint ranking
 
+Publication checks required checkpoint fields and accepts additional selection
+metadata. A valid checkpoint must not fail publication merely because it carries
+`selection_rule`, `selection_metrics`, or its frozen `val_threshold_transfer`.
+
 New runs use `geometric_rd_five_rank_v1` (Experiments §1.2/§1.5). Each epoch first
 minimizes the absolute size-macro mean log RD. Exact ties use GS, geo-MMD, then
 the larger threshold. Empty predicted subgraphs give infinite density error; the

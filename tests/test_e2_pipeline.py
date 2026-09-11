@@ -239,6 +239,29 @@ def test_diagnostic_cannot_replace_a_formal_output_directory(tmp_path: Path) -> 
         _assert_no_cross_kind_completion(output_dir, run_kind="formal")
 
 
+def test_staged_checkpoint_allows_selection_metadata(tmp_path: Path) -> None:
+    _write_train_outputs(tmp_path)
+    path = tmp_path / "best.pt"
+    payload = torch.load(path, weights_only=False)
+    payload.update(
+        selection_rule="geometric_rd_five_rank_v1",
+        val_threshold_transfer={"n_val": 869, "threshold": 1.6875},
+        selection_metrics={"val_gs_bfs": 0.4},
+    )
+    torch.save(payload, path)
+    _validate_staged_artifacts(tmp_path, epochs=2, model_family="v3_1")
+
+
+def test_staged_checkpoint_rejects_missing_model_state(tmp_path: Path) -> None:
+    _write_train_outputs(tmp_path)
+    path = tmp_path / "best.pt"
+    payload = torch.load(path, weights_only=False)
+    del payload["model_state"]
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="missing required keys: model_state"):
+        _validate_staged_artifacts(tmp_path, epochs=2, model_family="v3_1")
+
+
 def test_staged_metadata_role_must_match_diagnostic_execution(tmp_path: Path) -> None:
     _write_train_outputs(tmp_path)
     metadata_path = tmp_path / "run_metadata.json"

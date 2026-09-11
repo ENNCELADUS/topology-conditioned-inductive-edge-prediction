@@ -678,8 +678,13 @@ def _validate_staged_artifacts(
             raise ValueError(f"{filename} is missing or empty")
     for filename, exact_epoch in (("best.pt", None), ("last.pt", epochs)):
         payload = torch.load(staging_dir / filename, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict) or set(payload) != _CHECKPOINT_KEYS:
-            raise ValueError(f"{filename} has an invalid checkpoint payload")
+        if not isinstance(payload, dict):
+            raise ValueError(f"{filename} checkpoint payload must be a dict")
+        missing = _CHECKPOINT_KEYS.difference(payload)
+        if missing:
+            raise ValueError(
+                f"{filename} checkpoint missing required keys: {', '.join(sorted(missing))}"
+            )
         if payload["model_family"] != model_family:
             raise ValueError(f"{filename} model_family does not match config")
         epoch = payload["epoch"]
@@ -1296,7 +1301,7 @@ def _run_pipeline_unlocked(
         _write_json_atomic(profile_path, rejected_profile)
         return fail(
             stage="artifacts",
-            message=f"worker profile is missing or malformed: {error}",
+            message=f"worker profile or artifact validation failed: {error}",
         )
     final_profile: dict[str, object] = {
         **worker_runtime_profile,
