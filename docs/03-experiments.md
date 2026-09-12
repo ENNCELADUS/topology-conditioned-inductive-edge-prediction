@@ -106,6 +106,13 @@ losses, with RD explicitly off or on. Its 12-trial HPO searches degree/motif in
 pairs. A separate BCE-only run matches its sampler, architecture and stopping policy.
 Both retain positive weight 5, `mixing:none`, and the split-seed-42 training universe.
 
+Structural scheduling was corrected on 2026-09-12: the default now assigns one
+subgraph to every global optimizer step, rotating ranks and compensating for DDP
+gradient averaging. The per-epoch subgraph budget is unchanged. Earlier four-rank
+runs concentrated supervision in the final quarter of each epoch; their results
+remain observations under that schedule. The correction's metric and wall-time
+effects require matched reruns; existing results do not measure them.
+
 For these new configs, `eval.early_stop_metric: val_total_loss` monitors validation task
 BCE plus the weighted per-subgraph mean of all active structural terms on a fixed
 validation sample. These terms are evaluated every epoch; patience is 10 epochs,
@@ -129,19 +136,26 @@ Only completed tests of validation-selected checkpoints receive numbers.
 | Variant | Added training signal | Test AUROC ↑ | Test AUPRC ↑ | GS ↑ | RD → 1 | Degree MMD ↓ | Clustering MMD ↓ | Spectral MMD ↓ |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | B0 | Task BCE only | 0.7006 | 0.7363 | 0.4296 | 0.5574 | 9.667 | 8.118 | 14.549 |
-| + Logit KD (`kd_logit`) | Teacher soft-target BCE | — | — | — | — | — | — | — |
-| + Rank KD (`kd_rank`) | Context rank and distribution matching | — | — | — | — | — | — | — |
-| + Representation KD (`kd_rep`) | Per-row teacher representation cosine | — | — | — | — | — | — | — |
-| + Rank and representation KD (`kd_rank_rep`) | Joint context and representation losses | — | — | — | — | — | — | — |
+| + Logit KD (`kd_logit`) | Teacher soft-target BCE | 0.7024 | 0.7357 | 0.4157 | 0.5325 | 8.485 | 7.490 | 12.815 |
+| + Rank KD (`kd_rank`) | Context rank and distribution matching | 0.7290 | 0.7543 | 0.4037 | 0.3829 | 19.597 | 16.234 | 28.092 |
+| + Representation KD (`kd_rep`) | Per-row teacher representation cosine | 0.7037 | 0.7365 | 0.4293 | 0.4863 | 13.818 | 11.569 | 20.370 |
+| + Rank and representation KD (`kd_rank_rep`) | Joint context and representation losses | 0.7050 | 0.7364 | 0.4217 | 0.4609 | 15.068 | 12.726 | 22.382 |
 | + Logit and representation KD (`kd_logit_rep`) | Joint soft-target BCE and per-row cosine losses | — | — | — | — | — | — | — |
-| + Gram KD (`kd_gram`) | Teacher cosine-Gram matching | — | — | — | — | — | — | — |
+| + Gram KD (`kd_gram`) | Teacher cosine-Gram matching | 0.7175 | 0.7428 | 0.4304 | 0.5524 | 11.631 | 9.516 | 16.227 |
 | + Structural-stream BCE (`struct_bce`) | Additional subgraph BCE, no topology terms | — | — | — | — | — | — | — |
 | + GRAND (`struct_grand`) | Subgraph BCE, soft GS and RD losses | 0.7140 | 0.7392 | 0.4312 | 0.6210 | 8.063 | 6.740 | 11.872 |
-| + NEW (`struct_new`) | Subgraph BCE, neighbor rank, degree and motif losses | — | — | — | — | — | — | — |
+| + NEW (`struct_new`) | Subgraph BCE, neighbor rank, degree and motif losses | 0.7013 | 0.7324 | 0.4258 | 0.6540 | 8.348 | 6.846 | 12.021 |
 
-GRAND is trial 006, epoch 14, selected by the completed study's
-`best_trial.json`; B0 is epoch 8. The current KD continuation is rank → rank+rep
-→ rep → logit; gram and `struct_bce` have no completed test in this campaign.
+Each arm uses its V_val-selected checkpoint, not the best held-out score. The completed
+KD grids select Logit weight 100, Rep weight 0.01 and Gram weight 100; Rank selects
+trial 008 and Rank+Rep trial 004. GRAND is trial 006 / epoch 14, NEW is trial 009 /
+epoch 10, and B0 is epoch 8. Logit+Rep HPO has completed but has no test report;
+its row remains blank, as does the untested structural-stream BCE control.
+
+Rank improves test AUPRC but worsens GS and all three MMD ratios. Logit improves
+all three MMD ratios but lowers GS; Gram improves AUPRC and slightly improves GS
+while worsening MMD. NEW improves MMD but lowers AUPRC and GS. No tested KD arm
+improves all reported edge and topology metrics over B0.
 
 GRAND exceeds B0 by 0.0029 AUPRC and 0.0016 GS and improves RD and all three MMD
 ratios in this seed. However, B0 versus GRAND changes both the structural sample
@@ -164,6 +178,12 @@ candidate deployable model.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | B0 | 0.6044 | 0.6709 | 0.2283 | 0.2017 | 0.2663 | 0.5348 | 0.6266 |
 | + GRAND | 0.6321 | 0.6794 | 0.2766 | 0.3092 | 0.3289 | 0.5956 | 0.5217 |
+| + Rank | 0.6530 | 0.6803 | 0.3105 | 0.1713 | 0.2424 | 0.3613 | 1.0181 |
+| + Rank+Rep | 0.6166 | 0.6692 | 0.2459 | 0.2232 | 0.2748 | 0.4385 | 0.8259 |
+| + Logit | 0.6116 | 0.6730 | 0.2408 | 0.2669 | 0.2991 | 0.5169 | 0.6603 |
+| + Rep | 0.6088 | 0.6736 | 0.2371 | 0.2150 | 0.2726 | 0.4635 | 0.7698 |
+| + Gram | 0.6228 | 0.6843 | 0.2667 | 0.1537 | 0.2429 | 0.5260 | 0.6447 |
+| + NEW | 0.6159 | 0.6695 | 0.2450 | 0.3168 | 0.3293 | 0.6211 | 0.4913 |
 | PMA1 oracle | 0.8762 | 0.8794 | 0.7534 | 0.0993 | 0.1130 | 0.6670 | 0.4451 |
 
 GRAND's calibration is worse than B0 despite its edge/topology gains. Even the
@@ -172,21 +192,29 @@ operating point does not eliminate density transfer error.
 
 ## 4. Result provenance
 
-Reports were verified on H20 on 2026-09-11. All three direct test commands
-finished, their reports were written, no run-level failure marker remained,
-and their test container released its GPUs. Direct tests do not write the
-pipeline's `test_complete.json`; completion is established here by the terminal
-logs and reports. Full per-size metrics and score provenance are preserved in
-the linked reports.
+The added KD and NEW reports were verified on H20 on 2026-09-12 against their
+published checkpoint IDs and merged score artifacts, with no run-level failure
+marker. The KD follow-up queue reached `complete` and its container released all
+GPUs. B0, GRAND and the oracle retain their 2026-09-11 verification. Direct tests
+do not write the pipeline's `test_complete.json`; terminal execution and reports
+establish their completion. Full per-size metrics and score provenance are
+preserved in the linked raw reports.
 
 | Model | Checkpoint ID | Frozen topology logit threshold | Raw report |
 |---|---|---:|---|
 | B0, epoch 8 | `7e78609f8c904284` | 1.687500 | [B0](results/split_seed42_geometric_20260910/b0_test_report.json) |
 | GRAND, trial 006 / epoch 14 | `47e62521e7491bee` | 0.992188 | [GRAND](results/split_seed42_geometric_20260910/grand_trial006_test_report.json) |
 | PMA1 oracle, fixed bank-source checkpoint | `94fa2e50d9fc6c46` | 5.431674 | [PMA1 diagnostic](results/split_seed42_geometric_20260910/teacher_pma1_diagnostic_test_report.json) |
+| Rank, trial_008 / epoch 7 | `384d8d93ef40f347` | 3.640625 | [Rank](results/split_seed42_geometric_20260910/rank_trial008_test_report.json) |
+| Rank+Rep, trial_004 / epoch 7 | `d13ac2b88ebf36ac` | 1.820312 | [Rank+Rep](results/split_seed42_geometric_20260910/rank_rep_trial004_test_report.json) |
+| Logit, kd_logit_w100 / epoch 12 | `00f9a6ec6f660144` | 0.636719 | [Logit](results/split_seed42_geometric_20260910/logit_w100_test_report.json) |
+| Rep, kd_rep_w0p01 / epoch 8 | `f717370ad937ad30` | 1.523438 | [Rep](results/split_seed42_geometric_20260910/rep_w0p01_test_report.json) |
+| Gram, kd_gram_w100 / epoch 8 | `47fb1066898c95b8` | 0.863281 | [Gram](results/split_seed42_geometric_20260910/gram_w100_test_report.json) |
+| NEW, trial_009 / epoch 10 | `f3aa183d4a422f24` | -0.640625 | [NEW](results/split_seed42_geometric_20260910/new_trial009_test_report.json) |
 
 H20 sources are under `outputs/split_seed42_geometric_20260910/`: `b0_v31/`,
-`struct_hpo/grand/trial_006/`, and `teacher_pma1/`. The teacher checkpoint remains
+`struct_hpo/{grand/trial_006,new/trial_009}/`, `kd_hpo/{rank,rank_rep,grid}/`,
+and `teacher_pma1/`. The teacher checkpoint remains
 `outputs/split_seed42/teacher_pma1/best.pt`. Base configs and teacher banks are in
 `configs/split_seed42/` and `outputs/distill/split_seed42/`; resumed trial configs
 remain alongside their outputs. See [the HPC runbook](../hpc/README.md) for execution.

@@ -3290,8 +3290,8 @@ class StructStream:
     """One sampled training subgraph per optimizer step, scored as a logit matrix.
 
     Sibling of :class:`KDContextStream`: the plan for ``(seed, epoch)`` is
-    identical on every rank; rank ``r`` of ``W`` takes plan positions
-    ``r, r+W, ...`` and spreads them across its steps exactly once. Legal pairs
+    identical on every rank. Subgraphs are spread over global optimizer steps
+    first, then position ``p`` is scored on rank ``p % W`` exactly once. Legal pairs
     are bucketed by token boundary, chunked to the token budget, and forwarded
     through the unwrapped model under activation checkpointing; the loss is
     computed on the assembled ``n x n`` matrix (`src/distill/struct_losses.py`).
@@ -3348,9 +3348,13 @@ class StructStream:
         return self._plan
 
     def _positions(self, size: int, *, rank: int, steps: int, step: int) -> list[int]:
-        shard = list(range(rank, size, self._world_size))
-        start, stop = KDContextStream._step_slice(len(shard), steps, step)
-        return shard[start:stop]
+        if steps < 1 or step < 0 or step >= steps:
+            raise ValueError(f"invalid struct step {step} for {steps} steps")
+        # Partition the global plan before rank striping. Ceiling boundaries put
+        # the first subgraph at step zero and space shorter plans across the epoch.
+        start = (step * size + steps - 1) // steps
+        stop = ((step + 1) * size + steps - 1) // steps
+        return [position for position in range(start, stop) if position % self._world_size == rank]
 
     def _global_step_count(self, size: int, *, steps: int, step: int) -> int:
         return sum(
@@ -3450,10 +3454,9 @@ class StructStream:
         stats: dict[str, float] = {"struct_pairs": 0.0, "struct_subgraphs": 0.0}
         if not positions:
             return zero, stats
-        # DDP averages gradients over ranks while the plan stripes subgraphs across
-        # them, so rescale the rank-local sum by world_size * local / global (as the
-        # KD context stream does) to keep struct.weights world-size independent.
-        scale = self._world_size * len(positions) / global_count if global_count else 0.0
+        # DDP averages gradients over all ranks, including idle structural ranks.
+        # Scale the local sum so the reduced gradient is the global subgraph mean.
+        scale = self._world_size / global_count if global_count else 0.0
         total = zero
         for position in positions:
             subgraph = plan.subgraphs[position]
@@ -3482,10 +3485,13 @@ class StructStream:
 
     def epoch_telemetry(self, accelerator: Accelerator, sums: dict[str, float]) -> dict[str, float]:
         """Reduce rank-local sums into per-subgraph means plus plan coverage."""
-        keys = sorted(sums)
+        # A short plan can leave a rank without any subgraphs for the whole epoch.
+        keys = sorted(set(gather_object(list(sums))))
         reduced = accelerator.reduce(
             torch.tensor(
-                [sums[key] for key in keys], device=accelerator.device, dtype=torch.float64
+                [sums.get(key, 0.0) for key in keys],
+                device=accelerator.device,
+                dtype=torch.float64,
             ),
             reduction="sum",
         )
@@ -4388,7 +4394,9 @@ def train_ddp_loop(
                 )
                 for key, value in struct_stats.items():
                     epoch_struct_sums[key] = epoch_struct_sums.get(key, 0.0) + value
-                if epoch_steps == 0:
+                if not grad_norm_struct and struct_stream.last_terms:
+                    # Probe each rank's first live subgraph, which need not be
+                    # step zero. These are raw term norms, before weights/scaling.
                     grad_norm_struct = {
                         key: _grad_norm(term, model)
                         for key, term in struct_stream.last_terms.items()
@@ -4552,19 +4560,22 @@ def train_ddp_loop(
                 torch.tensor([epoch_struct_seconds], device=accelerator.device, dtype=torch.float64)
             )
             epoch_struct_telemetry["struct_seconds"] = float(struct_seconds.max().item())
-            struct_keys = sorted(grad_norm_struct)
+            struct_keys = sorted(set(gather_object(list(grad_norm_struct))))
             if struct_keys:
                 struct_norms = accelerator.reduce(
                     torch.tensor(
-                        [grad_norm_struct[key] for key in struct_keys],
+                        [
+                            [grad_norm_struct.get(key, 0.0), float(key in grad_norm_struct)]
+                            for key in struct_keys
+                        ],
                         device=accelerator.device,
                         dtype=torch.float64,
                     ),
-                    reduction="mean",
+                    reduction="sum",
                 )
                 for index, key in enumerate(struct_keys):
                     epoch_struct_telemetry[f"grad_norm_struct_{key}"] = float(
-                        struct_norms[index].item()
+                        (struct_norms[index, 0] / struct_norms[index, 1]).item()
                     )
         validation_start = time.monotonic()
         run_topology = _topology_due(

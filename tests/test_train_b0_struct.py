@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import networkx as nx
 import pytest
 import torch
+import torch.distributed as dist
 import yaml
 from accelerate import Accelerator
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable, PackedNodeRecord
@@ -22,6 +25,7 @@ from src.train_b0 import (
     train_ddp_loop,
 )
 from torch import nn
+from torch.multiprocessing.spawn import spawn
 
 from tests.test_train_b0 import (
     _batch_of,
@@ -186,35 +190,55 @@ def test_stream_assembles_the_same_logits_as_a_direct_forward() -> None:
     assert stats["struct_pairs"] == float(len(rows))
 
 
-def test_two_rank_ddp_mean_equals_mean_raw_loss_of_live_subgraphs() -> None:
-    """DDP averages rank losses; the stream rescales so that average is the per-subgraph mean.
-
-    With one rank every step carries exactly one subgraph, so its loss is that subgraph's
-    raw loss. With two ranks the plan stripes unevenly across steps; at every step the
-    rank-averaged loss must equal the mean raw loss of the subgraphs live at that step,
-    so ``struct.weights`` mean the same thing at any world size.
-    """
+@pytest.mark.parametrize("world_size", [1, 2, 4])
+def test_ddp_mean_loss_and_gradient_match_single_rank_at_every_step(world_size: int) -> None:
+    """Changing world size preserves the subgraph, loss and gradient at every step."""
     sampler, table = _struct_fixture()
     steps = 3
     model = _StructToy()
     single = _stream(sampler, table, rank=0, world_size=1)
-    raw = [float(single.loss(model, epoch=2, step=t, steps=steps)[0]) for t in range(steps)]
-    ranks = [_stream(sampler, table, rank=r, world_size=2) for r in range(2)]
-    live_steps = 0
+    ranks = [_stream(sampler, table, rank=r, world_size=world_size) for r in range(world_size)]
     for step in range(steps):
-        ddp_mean = sum(float(s.loss(model, epoch=2, step=step, steps=steps)[0]) for s in ranks) / 2
+        expected = single.loss(model, epoch=2, step=step, steps=steps)[0]
+        ddp_mean = torch.stack(
+            [s.loss(model, epoch=2, step=step, steps=steps)[0] for s in ranks]
+        ).mean()
         live = [
             position
-            for r in range(2)
+            for r in range(world_size)
             for position in ranks[r]._positions(steps, rank=r, steps=steps, step=step)
         ]
-        if not live:
-            assert ddp_mean == 0.0
-            continue
-        live_steps += 1
-        expected = sum(raw[position] for position in live) / len(live)
-        assert ddp_mean == pytest.approx(expected, rel=1e-5)
-    assert live_steps >= 2  # the fixture really exercises a multi-subgraph step
+        assert live == [step]
+        torch.testing.assert_close(ddp_mean, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(ddp_mean, model.weight)[0],
+            torch.autograd.grad(expected, model.weight)[0],
+        )
+
+
+@pytest.mark.parametrize("count", [1, 3, 68, 271, 272])
+def test_four_rank_plan_is_spread_globally_once(count: int) -> None:
+    sampler, table = _struct_fixture()
+    stream = _stream(sampler, table, world_size=4)
+    steps = 272
+    schedule = [
+        [
+            position
+            for rank in range(4)
+            for position in stream._positions(count, rank=rank, steps=steps, step=step)
+        ]
+        for step in range(steps)
+    ]
+    assert [p for positions in schedule for p in positions] == list(range(count))
+    assert all(len(positions) <= 1 for positions in schedule)
+    live_steps = [step for step, positions in enumerate(schedule) if positions]
+    assert live_steps == [position * steps // count for position in range(count)]
+    if count == steps:
+        assert all(len(positions) == 1 for positions in schedule)
+        assert [
+            sum(len(stream._positions(count, rank=r, steps=steps, step=t)) for t in range(steps))
+            for r in range(4)
+        ] == [68] * 4
 
 
 def test_plan_longer_than_steps_is_rejected_and_shorter_plan_yields_zero_steps() -> None:
@@ -343,6 +367,121 @@ class _MLPOnTokens(_TinyPairMLP):
                 "x_b": merged["emb_b"].mean(dim=1).expand(-1, 4),
             }
         return super().forward(merged)
+
+
+def _run_struct_ddp_fixture(
+    path: Path, *, rank: int, world_size: int, count: int | None
+) -> dict[str, torch.Tensor]:
+    sampler, table = _struct_fixture()
+    struct_cfg = StructConfig.from_mapping(
+        {
+            "nodes": 8,
+            "background_nodes": 2,
+            "val_subgraphs": 0,
+            "subgraphs_per_epoch": count,
+            "weights": {"bce": 1.0, "motif": 0.1},
+        }
+    )
+    cfg = replace(_tiny_config(epochs=1), struct=struct_cfg)
+    torch.manual_seed(7)
+    model = _MLPOnTokens(input_dim=4, hidden_dims=(8,), dropout=0.0)
+    stream = StructStream(
+        struct_cfg,
+        sampler,
+        table,
+        rank=rank,
+        world_size=world_size,
+        token_budget=1 << 20,
+        positive_weight=5.0,
+        label_smoothing=0.0,
+        seed=0,
+    )
+    batches = []
+    local_count = 16 // world_size
+    for step in range(3):
+        batch = {
+            key: torch.cat([value, value])[rank * local_count : (rank + 1) * local_count]
+            for key, value in _task_batch().items()
+            if value.ndim > 0
+        }
+        batch["_row_id"] = torch.arange(local_count) + step * 16 + rank * local_count
+        batch["_local_pair_count"] = torch.tensor(local_count)
+        batch["_global_pair_count"] = torch.tensor(16)
+        batches.append(batch)
+    result = train_ddp_loop(
+        model,
+        lambda epoch: batches,
+        batches,
+        cfg,
+        Accelerator(cpu=True),
+        warmup_steps=1,
+        artifact_dir=path,
+        evaluate_fn=lambda model, loader, accelerator: ValidationOutcome(_constant_metrics(), None),
+        struct_stream=stream,
+    )
+    # The returned checkpoint is main-rank-only; inspect live parameters on every rank.
+    assert result.history
+    return {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+
+def _struct_ddp_worker(
+    rank: int, world_size: int, init_file: str, result_dir: str, count: int | None
+) -> None:
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(world_size),
+        LOCAL_RANK=str(rank),
+        LOCAL_WORLD_SIZE=str(world_size),
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT="29500",
+        OMP_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
+    )
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=45),
+    )
+    try:
+        state = _run_struct_ddp_fixture(
+            Path(result_dir) / "ddp", rank=rank, world_size=world_size, count=count
+        )
+        torch.save(state, Path(result_dir) / f"rank-{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("count", [None, 1])
+def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
+    tmp_path: Path, count: int | None
+) -> None:
+    # Default: rank 1 first sees structure at step 1. Sparse: rank 1 never sees it.
+    spawn(  # type: ignore[no-untyped-call]
+        _struct_ddp_worker,
+        args=(2, str(tmp_path / "init"), str(tmp_path), count),
+        nprocs=2,
+        join=True,
+    )
+    expected = _run_struct_ddp_fixture(tmp_path / "serial", rank=0, world_size=1, count=count)
+    for rank in range(2):
+        observed = torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True)
+        for key in expected:
+            torch.testing.assert_close(observed[key], expected[key], rtol=1e-5, atol=1e-6)
+    ddp_row = json.loads((tmp_path / "ddp" / "metrics.jsonl").read_text().splitlines()[-1])
+    serial_row = json.loads((tmp_path / "serial" / "metrics.jsonl").read_text().splitlines()[-1])
+    for key in ("train_struct_loss", "struct_bce_loss", "struct_motif_loss", "struct_pairs"):
+        assert ddp_row[key] == pytest.approx(serial_row[key], rel=1e-5)
+    for key in ("grad_norm_struct_bce", "grad_norm_struct_motif"):
+        assert ddp_row[key] > 0
+        if count == 1:
+            assert ddp_row[key] == pytest.approx(serial_row[key], rel=1e-5)
+    weighted_raw = ddp_row["struct_bce_loss"] + 0.1 * ddp_row["struct_motif_loss"]
+    assert ddp_row["train_struct_loss"] == pytest.approx(
+        weighted_raw * (1.0 if count is None else count / 3), rel=1e-5
+    )
 
 
 def test_struct_stream_changes_weights_and_logs_keys(tmp_path: Path) -> None:
