@@ -34,10 +34,22 @@ hpc/run.sh train configs/cazi_mbn_breadth_first.yaml \
   --worker-module src.train_cazi_mbn
 ```
 
-This direct branch preserves CAZI's early-stopped teacher-then-student schedule, writes
-its checkpoints and topology report under the config's `output_dir`, then runs
-`python -m src.eval.test_protocol` against the `student.pt` checkpoint it just published,
-writing `test_report.json`/`test_complete.json` under the same `output_dir`.
+CAZI uses the current seed-42 node-held-out split and dynamic 1:5 LP negatives
+with positive BCE weight 5. Its node-specific teacher cannot score unseen V_val
+nodes: teacher convergence uses training total loss only (patience 30), while the
+student stops on unweighted val_cls BCE. The student evaluates topology at epoch 1,
+every 10 epochs, and the final epoch; stopping waits for a topology epoch.
+Five-metric mean rank selects `student.pt`, which stores its own
+closest-geometric-RD threshold. The pair classifier averages both endpoint orders.
+The released Adam/StepLR schedules and 10,000-epoch caps remain unchanged.
+
+This existing isolated trainer uses one CUDA device; the subsequent shared scoring
+runner fans out over all visible GPUs. `complete.json` records training publication.
+The chained `src.eval.test_protocol` replays the frozen topology threshold, chooses
+the max-F1 threshold on val_cls, then writes `test_report.json`. This direct test
+path does not write `test_complete.json`; verify its exit status and report.
+Use a fresh config output directory; old CAZI checkpoints predate this protocol.
+Direct `--stage all` and `--stage score` also use the shared test protocol.
 
 ## Required target environment
 

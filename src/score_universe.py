@@ -2295,15 +2295,14 @@ def _score_cazi_mbn(
 
     Reuses `src.train_cazi_mbn._standardize_f0` verbatim so standardization is
     bit-for-bit identical to the released training/scoring code, rather than a
-    parallel reimplementation that could silently drift. Only the final
-    sigmoid is skipped -- `train_cazi_mbn.score_pairs` returns probabilities,
-    but this file's artifact contract pins ``logit`` to the raw pre-sigmoid
-    value for every family, so this calls `CAZIStudent.pair_logits` directly.
+    parallel reimplementation that could silently drift. The artifact contract
+    pins ``logit`` to the raw pre-sigmoid value for every family, so this calls
+    `CAZIStudent.pair_logits` directly.
 
     `missing_features` (the release's two known feature-store gaps,
     `CAZIConfig.expected_missing_features`) get an all-zero raw F0 row before
-    standardization, exactly as `src.train_cazi_mbn._test_features` does for
-    the benchmark's own held-out test nodes: a node this scorer has never seen
+    standardization, matching the benchmark feature-gap convention: a node
+    this scorer has never seen
     raw features for still needs a row to standardize and classify, not a
     `KeyError`.
 
