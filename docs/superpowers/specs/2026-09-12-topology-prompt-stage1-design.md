@@ -189,7 +189,8 @@ stream supervision for this family, and a fixed-size context variant of the coor
 Numbers and tables: `docs/results/topo_prompt_stage1.md`. On V_val, `topo_prompt_full` reads
 val_cls AUROC/AUPRC 0.952/0.961 against `prefix_base`'s 0.793/0.814 and GS 0.691 against 0.401
 at RD ≈ 1.03; `mean` returns it to 0.743/0.779 and GS 0.376, `gates_off` to 0.725/0.768 and
-0.374, and `shuffle` on the ball-union universe drops it below the base (AUROC 0.647, GS 0.262).
+0.374, and the universe-level `shuffle` drops it to near chance (val_cls AUROC 0.579, test 0.553,
+ball-union 0.641, GS 0.265), far below the base.
 This is outcome 1 of §7: the interface transmits structure and the reader uses it. Per field,
 `mean_relation` costs the most (GS 0.542), `mean_endpoint` little (0.674), `mean_context`
 nothing (0.703). The three V_val MMD ratios do not improve with GS. On the test universe the
@@ -200,4 +201,4 @@ Correction found while reading the result: the scorer's `shuffle` permuted withi
 shard, and the 1:1 `val_cls`/`test` lists are label-sorted, so on those two universes every
 substitute carried the row's own label (shuffle scored *above* the true coordinates there). The
 scorer now draws one permutation of the whole universe (§5); the ball-union V_val topology
-readout was unaffected, and the two 1:1 shuffle rows are rerun under the corrected scorer.
+readout was unaffected (0.647 → 0.641 AUROC), and the rerun 1:1 rows fall to near chance.
