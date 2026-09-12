@@ -140,12 +140,14 @@ the KD banks are refused for this family (Stage I is task BCE only).
 | `topo_prompt_frozen` | `configs/split_seed42/topo_prompt_frozen.yaml` | prompt only on frozen `prefix_base` | true `s*` | freezing control; read against `prefix_pair_bce` (same trainable scope, attribute condition) |
 | interventions on both | scoring only | — | shuffled / mean / off | attribution |
 
-Launch (2026-09-12, both containers were idle; 30030 still runs the old `prefix_static` study):
+Launch (2026-09-12; 30030 still runs the old `prefix_static` study; 30838 had picked up the
+CAZI-MBN baseline in the meantime, so the frozen lane is queued there behind it by
+`outputs/logs/topo_prompt_frozen_wait.sh`):
 
 ```bash
-# 30846
+# 30846, started 09:51 UTC at c75dddf
 hpc/run.sh train configs/split_seed42/topo_prompt_full.yaml --run-kind diagnostic
-# 30838
+# 30838, queued until every GPU is idle
 hpc/run.sh train configs/split_seed42/topo_prompt_frozen.yaml --run-kind diagnostic
 # afterwards, per run (each writes its own output-dir)
 hpc/run.sh test --checkpoint outputs/split_seed42/<run>/best.pt \
