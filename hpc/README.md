@@ -136,6 +136,22 @@ hpc/run.sh train configs/egostitch_e2e_v3_oracle_grit_film_logit_breadth_first.y
   --worker-module src.train_egostitch --run-kind diagnostic
 ```
 
+The B0 worker has one true-structure family of its own, the topology prompt
+(`model.family: v3_1_topo_prompt`). It measures each queried pair's structural
+coordinates on the true graph of the universe being scored (query edge removed),
+so it likewise runs only as a diagnostic and its test stage scores with
+`--allow-oracle-diagnostic`; the pipeline sets both from the flag:
+
+```bash
+hpc/run.sh train configs/split_seed42/topo_prompt_full.yaml --run-kind diagnostic
+hpc/run.sh train configs/split_seed42/topo_prompt_frozen.yaml --run-kind diagnostic
+# scoring-time interventions on a published checkpoint (own --output-dir each)
+hpc/run.sh test --checkpoint outputs/split_seed42/topo_prompt_full/best.pt \
+  --output-dir outputs/split_seed42/topo_prompt_full/intervention_shuffle \
+  --data-root data --strategy breadth_first --arm topo_prompt_full_shuffle --seed 0 \
+  --allow-oracle-diagnostic --prefix-intervention shuffle
+```
+
 The two scoring-time controls (`structure_control_6a_v3`, `structure_control_6e_v1`)
 are not trained arms and have no `train` invocation of their own — they reuse the `full`
 arm's published checkpoint (`--checkpoint` only; nothing about the control changes what

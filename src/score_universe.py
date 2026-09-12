@@ -128,6 +128,15 @@ _NAMED_PAIR_SOURCES = ("candidate", "test", "test_topology", "val_topology", "va
 #: Non-held-out V_val role-universe sources: the sampled topology union and the
 #: balanced classification rows.
 _VAL_PAIR_SOURCES = frozenset({"val_topology", "val_cls"})
+PREFIX_INTERVENTIONS: tuple[str, ...] = (
+    "none",
+    "gates_off",
+    "shuffle",
+    "mean",
+    "mean_endpoint",
+    "mean_relation",
+    "mean_context",
+)
 #: `derive_val_region_split`'s parameters for `_load_val_region_split`'s
 #: production re-derivation; the test seam a small monkeypatched value lets
 #: synthetic fixtures satisfy (`ValRegionParams`'s own defaults assume a
@@ -1191,6 +1200,13 @@ def _build_v3_1_prefix(model_config: dict[str, object]) -> nn.Module:
     return V3_1Prefix(**cast(dict[str, Any], model_config))
 
 
+def _build_v3_1_topo_prompt(model_config: dict[str, object]) -> nn.Module:
+    """Build a `V3_1TopoPrompt` from its checkpointed config (base state and stats included)."""
+    from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
+
+    return V3_1TopoPrompt(**cast(dict[str, Any], model_config))
+
+
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchModel` from its checkpointed config (design rev 3).
 
@@ -1287,6 +1303,7 @@ def _build_official_ppi(model_config: dict[str, object]) -> nn.Module:
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "v3_1_prefix": _build_v3_1_prefix,
+    "v3_1_topo_prompt": _build_v3_1_topo_prompt,
     "egostitch_e2e": _build_egostitch_e2e,
     "cazi_mbn": _build_cazi_mbn,
     "official_ppi": _build_official_ppi,
@@ -1908,6 +1925,36 @@ def _log_progress(processed: int, total: int, batch_rows: int) -> None:
         logger.info("scored %d/%d rows", processed, total)
 
 
+def _shuffled_row_coords(
+    row_coords: torch.Tensor | None, prefix_intervention: str, *, seed: int, num_rows: int
+) -> torch.Tensor | None:
+    """Permute topology-prompt coordinates across every row this process scores.
+
+    The ``shuffle`` intervention for ``v3_1_topo_prompt``: one permutation of
+    the whole coordinate bank (per shard under fan-out, never within a batch),
+    seeded by ``--prefix-intervention-seed``. A no-op without coordinates or
+    for any other intervention.
+
+    Raises:
+        SystemExit: If the coordinate bank does not cover every row, or the
+            shuffle has fewer than two rows to permute.
+    """
+    if row_coords is None:
+        return None
+    if int(row_coords.shape[0]) != num_rows:
+        raise SystemExit(
+            f"structural coordinates cover {int(row_coords.shape[0])} rows, expected {num_rows}"
+        )
+    if prefix_intervention != "shuffle":
+        return row_coords
+    if num_rows < 2:
+        raise SystemExit(
+            f"--prefix-intervention shuffle needs at least 2 scored rows, got {num_rows}"
+        )
+    permutation = torch.from_numpy(np.random.default_rng(seed).permutation(num_rows))
+    return row_coords.index_select(0, permutation)
+
+
 def _shuffled_prefix_conditions(
     model: V3_1Prefix,
     batches: Sequence[Sequence[int]],
@@ -1981,6 +2028,7 @@ def _score_v3_1(
     token_budget: int,
     prefix_intervention: str = "none",
     prefix_intervention_seed: int = 0,
+    row_coords: torch.Tensor | None = None,
 ) -> NDArray[np.float32]:
     """Score pairs with a `V3_1` model via the length-bucketed batching machinery.
 
@@ -1996,11 +2044,15 @@ def _score_v3_1(
         amp: ``off`` or ``bf16``.
         token_budget: Approximate per-batch token budget for the bucketed sampler.
         prefix_intervention: The scoring-time ``--prefix-intervention`` value
-            (``v3_1_prefix`` only). ``"shuffle"`` is realised here, not in the
-            model: two passes over the same batches, the first collecting every
-            row's condition (`_shuffled_prefix_conditions`), the second scoring
-            against the permuted bank.
+            (``v3_1_prefix`` / ``v3_1_topo_prompt`` only). ``"shuffle"`` is
+            realised here, not in the model: for the prefix arm, two passes over
+            the same batches, the first collecting every row's condition
+            (`_shuffled_prefix_conditions`), the second scoring against the
+            permuted bank; for the topology prompt, one permutation of
+            ``row_coords`` across every row this process scores.
         prefix_intervention_seed: Permutation seed for ``"shuffle"``.
+        row_coords: ``(len(pairs), COORD_DIM)`` structural coordinates of the rows
+            (``v3_1_topo_prompt`` only), attached to each batch as ``struct_coords``.
 
     Returns:
         Shape ``(len(pairs),)`` float32 logits in input row order.
@@ -2009,6 +2061,9 @@ def _score_v3_1(
     dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
     batches = [list(batch) for batch in sampler]
+    row_coords = _shuffled_row_coords(
+        row_coords, prefix_intervention, seed=prefix_intervention_seed, num_rows=len(pairs)
+    )
 
     prefix_model: V3_1Prefix | None = None
 
@@ -2032,7 +2087,7 @@ def _score_v3_1(
             return prefix_model.condition_from_encoded(encoded_a, encoded_b, len_a, len_b)
 
     z_perm: torch.Tensor | None = None
-    if prefix_intervention == "shuffle":
+    if prefix_intervention == "shuffle" and row_coords is None:
         from src.model.egostitch.classifier.prefix import V3_1Prefix as _V3_1Prefix
 
         if not isinstance(model, _V3_1Prefix):
@@ -2048,6 +2103,10 @@ def _score_v3_1(
         if z_perm is None:
             batch = collate_token_pairs([dataset[i] for i in batch_indices])
             batch = {key: tensor.to(device) for key, tensor in batch.items()}
+            if row_coords is not None:
+                batch["struct_coords"] = row_coords[
+                    torch.as_tensor(batch_indices, dtype=torch.int64)
+                ].to(device)
             with torch.inference_mode(), _autocast_context(device, amp):
                 logits = cast(torch.Tensor, model(batch)["logits"])
         else:
@@ -2079,19 +2138,28 @@ def _score_v3_1_packed(
     token_budget: int,
     prefix_intervention: str = "none",
     prefix_intervention_seed: int = 0,
+    row_coords: torch.Tensor | None = None,
 ) -> NDArray[np.float32]:
     """Score V3.1 pairs with packed features and cached per-node encodings.
 
     ``prefix_intervention == "shuffle"`` runs the same two-pass, universe-level
     substitution as `_score_v3_1` (`_shuffled_prefix_conditions`), reading both
-    passes out of the per-node encoding cache built here.
+    passes out of the per-node encoding cache built here; with ``row_coords``
+    (``v3_1_topo_prompt``) it permutes the coordinates across every row instead.
     """
     from src.model.egostitch.classifier.prefix import V3_1Prefix
+    from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
-    if not isinstance(model, (V3_1, V3_1Prefix)):
+    if not isinstance(model, (V3_1, V3_1Prefix, V3_1TopoPrompt)):
         raise TypeError(
-            f"packed V3.1 scoring requires V3_1 or V3_1Prefix, got {type(model).__name__}"
+            "packed V3.1 scoring requires V3_1, V3_1Prefix or V3_1TopoPrompt, "
+            f"got {type(model).__name__}"
         )
+    if isinstance(model, V3_1TopoPrompt) and row_coords is None:
+        raise ValueError("packed scoring of a v3_1_topo_prompt checkpoint needs row_coords")
+    row_coords = _shuffled_row_coords(
+        row_coords, prefix_intervention, seed=prefix_intervention_seed, num_rows=len(pairs)
+    )
     load_started = perf_counter()
     table = PackedFeatureTable.from_pack(pack_dir, device)
     logger.info(
@@ -2183,7 +2251,7 @@ def _score_v3_1_packed(
         )
 
     z_perm: torch.Tensor | None = None
-    if prefix_intervention == "shuffle":
+    if prefix_intervention == "shuffle" and row_coords is None:
         if not isinstance(model, V3_1Prefix):
             raise SystemExit("--prefix-intervention requires a v3_1_prefix checkpoint")
         prefix_model = model
@@ -2211,8 +2279,18 @@ def _score_v3_1_packed(
             )
         )
         with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
-            if z_rows is None:
-                logits = model.logits_from_encoded(encoded_a, encoded_b, len_a, len_b)
+            if row_coords is not None:
+                logits = cast(V3_1TopoPrompt, model).logits_from_encoded(
+                    encoded_a,
+                    encoded_b,
+                    len_a,
+                    len_b,
+                    coords=row_coords[torch.as_tensor(batch_indices, dtype=torch.int64)].to(device),
+                )
+            elif z_rows is None:
+                logits = cast(V3_1 | V3_1Prefix, model).logits_from_encoded(
+                    encoded_a, encoded_b, len_a, len_b
+                )
             else:
                 logits = cast(V3_1Prefix, model).logits_from_encoded(
                     encoded_a, encoded_b, len_a, len_b, z=z_rows
@@ -3293,9 +3371,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     score.add_argument(
         "--prefix-intervention",
-        choices=["none", "gates_off", "shuffle", "mean"],
+        choices=PREFIX_INTERVENTIONS,
         default="none",
-        help="v3_1_prefix scoring-time intervention (spec §7)",
+        help=(
+            "v3_1_prefix / v3_1_topo_prompt scoring-time intervention (prefix spec §7; the "
+            "mean_* field variants apply to the topology prompt only)"
+        ),
     )
     score.add_argument("--prefix-intervention-seed", type=int, default=0)
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
@@ -3426,16 +3507,20 @@ def _run_score(args: argparse.Namespace) -> None:
         cast(TopoGenBase, topo_gen).control = args.topo_gen_control
 
     if args.prefix_intervention != "none":
-        if model_family != "v3_1_prefix":
-            raise SystemExit("--prefix-intervention requires a v3_1_prefix checkpoint")
         from src.model.egostitch.classifier.prefix import V3_1Prefix
+        from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
+        if not isinstance(model, (V3_1Prefix, V3_1TopoPrompt)):
+            raise SystemExit(
+                "--prefix-intervention requires a v3_1_prefix or v3_1_topo_prompt checkpoint"
+            )
         # `shuffle` is not a model-level mode: it permutes conditions across
         # every row this process scores, which only the scoring loop can see
-        # (`_shuffled_prefix_conditions`). The model stays on `"none"`; the
-        # artifact meta below still records the requested intervention.
+        # (`_shuffled_prefix_conditions` for the prefix arm, the coordinate
+        # permutation in the V3.1 scorers for the topology prompt). The model
+        # stays on `"none"`; the artifact meta below still records the request.
         if args.prefix_intervention != "shuffle":
-            cast(V3_1Prefix, model).intervention = args.prefix_intervention
+            model.intervention = args.prefix_intervention
 
     cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None
 
@@ -3463,12 +3548,27 @@ def _run_score(args: argparse.Namespace) -> None:
             oracle_generator_name = model.cfg.generator.name
     if is_full_ego_family and args.scaffold_control != _SCAFFOLD_CONTROL_NONE:
         raise ValueError(f"{oracle_generator_name} does not support scoring-time scaffold controls")
-    if args.allow_oracle_diagnostic and not is_oracle_generator:
+    # The topology prompt reads each queried pair's true structural coordinates
+    # (query edge removed) from the universe's truth graph: the same ceiling-
+    # diagnostic contract as the oracle generators, gated by the same flag.
+    is_topo_prompt = model_family == "v3_1_topo_prompt"
+    if args.allow_oracle_diagnostic and not (is_oracle_generator or is_topo_prompt):
         raise ValueError(
             "--allow-oracle-diagnostic is valid only when the checkpoint's "
-            "egostitch_e2e generator is oracle_struct or full_ego_oracle"
+            "egostitch_e2e generator is oracle_struct or full_ego_oracle, or the "
+            "checkpoint is a v3_1_topo_prompt"
         )
     oracle_truth_graph: nx.Graph | None = None
+    if is_topo_prompt:
+        if not args.allow_oracle_diagnostic:
+            raise ValueError(
+                "checkpoint family v3_1_topo_prompt consumes ground-truth topology by "
+                "construction; pass --allow-oracle-diagnostic to acknowledge this is a "
+                "ceiling diagnostic, never a formal result"
+            )
+        oracle_truth_graph = _oracle_truth_graph_for_scoring(
+            args.pairs, args.data_root, args.strategy
+        )
     if is_oracle_generator:
         # Airtight by construction, not by trusting the checkpoint's own
         # training-time run_metadata: the 2026-08-04 oracle-scaffold-experiment
@@ -3595,7 +3695,22 @@ def _run_score(args: argparse.Namespace) -> None:
     if full_oracle_telemetry is not None and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     score_started = perf_counter()
-    if model_family in ("v3_1", "v3_1_prefix"):
+    if model_family in ("v3_1", "v3_1_prefix", "v3_1_topo_prompt"):
+        row_coords: torch.Tensor | None = None
+        if is_topo_prompt:
+            from src.data.struct_coords import StructCoordinateTable
+
+            assert oracle_truth_graph is not None  # gated above
+            coords_started = perf_counter()
+            row_coords = torch.from_numpy(
+                StructCoordinateTable(oracle_truth_graph).coords(row_pairs)
+            )
+            logger.info(
+                "measured structural coordinates for %d rows on the %s truth graph in %.1fs",
+                len(row_pairs),
+                args.pairs,
+                perf_counter() - coords_started,
+            )
         if args.pack_dir is None:
             logits = _score_v3_1(
                 model,
@@ -3606,6 +3721,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 token_budget=args.token_budget,
                 prefix_intervention=args.prefix_intervention,
                 prefix_intervention_seed=int(args.prefix_intervention_seed),
+                row_coords=row_coords,
             )
         else:
             logits = _score_v3_1_packed(
@@ -3618,6 +3734,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 token_budget=args.token_budget,
                 prefix_intervention=args.prefix_intervention,
                 prefix_intervention_seed=int(args.prefix_intervention_seed),
+                row_coords=row_coords,
             )
     elif model_family == "f0_mlp":
         logits = _score_f0_mlp(
@@ -3725,6 +3842,20 @@ def _run_score(args: argparse.Namespace) -> None:
             }
     else:  # pragma: no cover - build_model already rejects unknown families
         raise ValueError(f"no scoring path for model_family {model_family!r}")
+    if is_topo_prompt:
+        assert oracle_truth_graph is not None
+        meta_extra["formal"] = False
+        meta_extra["oracle_diagnostic"] = {
+            "generator": "v3_1_topo_prompt",
+            "truth_source": (
+                f"{args.pairs}_g_val" if args.pairs in _VAL_PAIR_SOURCES else "test_graph"
+            ),
+            "diagnostic_only": True,
+            "formal": False,
+            "truth_graph_sha256": _oracle_truth_graph_sha256(oracle_truth_graph),
+            "truth_graph_node_count": oracle_truth_graph.number_of_nodes(),
+            "truth_graph_edge_count": oracle_truth_graph.number_of_edges(),
+        }
 
     if test_access is not None:
         if test_access.ledger_binding is None:  # pragma: no cover - invariant guard

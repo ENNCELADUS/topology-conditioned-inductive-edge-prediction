@@ -53,6 +53,7 @@ from src.experiments.g1_hardened_e2 import (
 )
 from src.score_universe import (
     MODEL_BUILDERS,
+    PREFIX_INTERVENTIONS,
     ScoresArtifact,
     _checkpoint_id,
     _load_val_region_split,
@@ -847,9 +848,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prefix-intervention",
-        choices=["none", "gates_off", "shuffle", "mean"],
+        choices=PREFIX_INTERVENTIONS,
         default="none",
-        help="v3_1_prefix scoring-time intervention",
+        help="v3_1_prefix / v3_1_topo_prompt scoring-time intervention",
     )
     parser.add_argument(
         "--prefix-intervention-seed",

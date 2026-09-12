@@ -68,9 +68,15 @@ cross-region non-edges. Nodes in V_val may appear anywhere; $M$ removes their in
   `_anchor_rng(f"struct:{t}", seed=seed, epoch=epoch)` (the blake2b node-keyed RNG in
   `src/distill/context_sampler.py`), so the plan is identical on every rank and independent of
   world size. Sorted-neighbour lists are cached once per graph, as the context sampler does.
-- `count` defaults to the epoch's global optimizer step count; rank $r$ of $W$ processes
-  subgraphs $r, r+W, r+2W, \dots$ and spreads them across its steps with the same
-  `_step_slice` arithmetic as the context stream, so one epoch is one full pass over the plan.
+- `count` defaults to the epoch's global optimizer step count $S$. Subgraph $p$ is
+  scheduled at global step $\lfloor pS/\mathrm{count}\rfloor$, then assigned to rank
+  $p\bmod W$. Thus the default supplies exactly one global subgraph on every optimizer
+  step; shorter plans are evenly spaced, and each subgraph is scored once. The active
+  rank multiplies its structural loss by $W$ to cancel DDP's gradient averaging.
+- Scheduling correction (2026-09-12): the original implementation sharded before
+  scheduling and packed each rank's subgraphs into the epoch tail. At four ranks and
+  272 steps, that meant 204 task-only steps followed by 68 four-subgraph steps. Earlier
+  runs retain this schedule; their performance cannot establish the correction's effect.
 - Plans are built in memory at epoch start on every rank (identical by construction); no artifact.
 
 ### 3.4 Per-subgraph statistics (telemetry)
@@ -80,6 +86,10 @@ fraction $\sum M / (n(n-1))$, positive fraction $\sum A / \sum M$, open-wedge co
 triangle count of $A$, background count, and per-epoch positive-edge coverage (fraction of
 training positives that appeared in at least one subgraph) and mean reuse. These are averaged
 across the epoch's subgraphs and reduced across ranks into `metrics.jsonl` under `struct_*`.
+`train_struct_loss` instead averages the weighted, DDP-reduced contribution over optimizer
+steps, including any empty steps in a shorter plan. `grad_norm_struct_*` averages raw,
+unweighted term gradient norms from each rank's first live subgraph; ranks with no live
+subgraph are excluded. These norms are diagnostics, not the norm of the reduced gradient.
 
 ## 4. Stream — `StructStream` in `src/train_b0.py`
 
@@ -131,7 +141,7 @@ computed. The arm name is the sorted list of nonzero keys (e.g. `bce+degree+moti
 logged with the effective weights at startup and stored in `run_metadata.json`.
 
 No EMA normalisation and no GradNorm. Balance is observed, not enforced: per-term raw losses
-every epoch, and per-term parameter-gradient norms at each epoch's first step by extending the
+every epoch, and per-term parameter-gradient norms at each rank's first live step by extending the
 existing `_term_grad_norms` probe to a list of terms.
 
 ## 6. Config
@@ -161,7 +171,7 @@ count is rejected. Weights all zero is rejected (use no block instead).
 ## 7. Telemetry, validation, stopping, selection
 
 - Training telemetry per epoch in `metrics.jsonl`: `struct_loss` (weighted total),
-  `struct_<key>_loss` (raw, per active term), `grad_norm_struct_<key>` (first step),
+  `struct_<key>_loss` (raw, per active term), `grad_norm_struct_<key>` (first live step per rank),
   the §3.4 sampler statistics, `struct_pairs` (legal pairs forwarded), and wall-clock share
   of the stream.
 - Validation diagnostics: a fixed set of `val_subgraphs` subgraphs of the same three kinds drawn
