@@ -556,3 +556,10 @@ precision. The mean-field formula uses a per-pair vector shape, correcting the
 upstream `(N,1)`/`(N,)` broadcasting ambiguity. Both checkpoint ranking and threshold
 selection use these same inference logits. Upstream source revisions, license
 notices and the minimal portability changes are recorded in the vendor README.
+
+If every container is occupied, `python -m src.experiments.official_ppi_queue
+--wait-pid <existing-chain-pid> --output outputs/logs/<unique-queue-dir>` runs a
+one-shot sequence after that whole pipeline exits and GPU processes disappear.
+It records `status.json`, then separate `tuna.log` and `ppitrans.log`; a waiting
+queue is not a started training run. Include existing waiters when choosing its
+predecessor so two jobs do not acquire the same container simultaneously.
