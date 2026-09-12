@@ -64,6 +64,19 @@ in a sampled 40-node training subgraph, with 32 locally expanded and eight
 uniform background nodes. The loss supervises edge decisions within this
 subgraph; inference still receives only the queried endpoints.
 
+The topology-prompt Stage I runs (`v3_1_topo_prompt`; spec
+`superpowers/specs/2026-09-12-topology-prompt-stage1-design.md`) are true-structure
+diagnostics like the oracle, not deployable arms: the queried pair's structural
+coordinates are measured on the universe's true graph with the queried edge
+removed (training graph for training rows, V_val gold graph for validation, the
+labelled test graph for held-out scoring) and read by the prefix_base trunk
+through gated key/value prefixes. `topo_prompt_full` trains trunk and prompt from
+scratch under the prefix_base recipe; `topo_prompt_frozen` trains only the prompt
+on the frozen prefix_base. Their `gates_off`, `mean` and `shuffle` interventions
+attribute any gain to the structural content. Results, when complete, are
+reported as a ceiling row beside the oracle in §3.2 and never in the
+endpoint-only table.
+
 ## 2. Selection and evaluation
 
 For each checkpoint, enumerate distinct V_val sampled-union logit boundaries

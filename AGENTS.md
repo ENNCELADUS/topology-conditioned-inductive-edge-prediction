@@ -34,6 +34,16 @@ selected method. Every piece of writing must explain how its context helps decid
   `score_universe --prefix-intervention {gates_off,shuffle,mean}`. `shuffle`/`mean` require a
   pair-conditioned checkpoint and fail closed without one; `shuffle` permutes the pair condition
   across all pairs the scoring process scores (per shard under fan-out), not within a batch.
+- Topology-prompt Stage I (`model.family: v3_1_topo_prompt`, spec
+  `docs/superpowers/specs/2026-09-12-topology-prompt-stage1-design.md`): the prefix_base trunk reads
+  the queried pair's fixed-semantics structural coordinates (`src/data/struct_coords.py`, measured on
+  the universe's true graph with the queried edge removed) through gated KV prefixes at all nine
+  cross-attention sites, task BCE only. `topo_prompt_full` trains trunk and prompt from scratch (the
+  Stage II teacher); `topo_prompt_frozen` trains only the prompt on the frozen prefix_base. Both read
+  true structure, so they are ceiling diagnostics: launch with `--run-kind diagnostic`, score with
+  `--allow-oracle-diagnostic`; interventions `--prefix-intervention {gates_off,shuffle,mean,mean_endpoint,mean_relation,mean_context}`.
+  Never a deployable arm; the deployable descendants (Stages II–IV) feed the prompt a generator's
+  prediction from `(x_u,x_v)`.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

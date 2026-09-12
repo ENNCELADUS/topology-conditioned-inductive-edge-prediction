@@ -1,0 +1,82 @@
+# topo_prompt_full: Stage I of the topology-representation-transfer pipeline.
+# The prefix_base recipe (headline B0 with mixing.mode: bidirectional_cross, halved
+# per-rank micro-batch) trained from scratch while its three cross-attention layers read
+# the queried pair's true structural coordinates (query edge removed) through gated KV
+# prefixes. Task BCE only. It reads V_val truth structure during validation, so it is a
+# ceiling diagnostic: launch with
+#   hpc/run.sh train configs/split_seed42/topo_prompt_full.yaml --run-kind diagnostic
+# Spec: docs/superpowers/specs/2026-09-12-topology-prompt-stage1-design.md.
+model:
+  family: v3_1_topo_prompt
+  config:
+    topo_prompt:
+      trainable: all
+      width: 128
+      slots_per_field: 2
+      field_mask_prob: 0.1
+    base:
+      input_dim: 1536
+      d_model: 512
+      encoder_layers: 3
+      cross_attn_layers: 3
+      n_heads: 8
+      mlp_head:
+        hidden_dims: [512, 256, 128]
+        dropout: 0.2
+        activation: gelu
+        norm: layernorm
+        spectral_norm: false
+      regularization:
+        dropout: 0.1
+        token_dropout: 0.1
+        cross_attention_dropout: 0.1
+        stochastic_depth: 0.1
+      rich_pooling:
+        components: [mean, attn, max, gated]
+      pair_readout:
+        mode: pair_context_gated
+        order_aggregation: abba_max
+        spectral_norm: false
+      mixing:
+        mode: bidirectional_cross
+      label_smoothing: 0.0
+      positive_weight: 5.0
+data:
+  root: data
+  strategy: breadth_first
+  negative_ratio: 5
+  token_budget: 131072
+  batch_pairs: 1024
+  num_workers: 0
+  f0_cache: outputs/f0_cache/f0_matrix.pt
+  expected_missing_features: [node_004764, node_007050]
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  epochs: 25
+  warmup_steps: 500
+  grad_clip: 1.0
+  scheduler:
+    type: onecycle
+    max_lr: 1.0e-4
+    pct_start: 0.1
+    div_factor: 25
+    final_div_factor: 10000
+    anneal_strategy: cos
+eval:
+  patience: 10
+  eval_every: 1
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/b0_v31_bf16
+  pack_workers: 16
+  loader_workers_per_rank: 4
+  prefetch_factor: 4
+  token_budget: 262144
+  max_pairs_per_rank: 2048
+  memory_limit_gib: 85.0
+  probe_warmup_steps: 10
+  probe_timed_steps: 30
+seed: 0
+output_dir: outputs/split_seed42/topo_prompt_full
+mixed_precision: "bf16"

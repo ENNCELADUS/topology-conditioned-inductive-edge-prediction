@@ -41,6 +41,7 @@ from itertools import cycle, islice
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypeVar, cast
 
+import networkx as nx
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -70,6 +71,7 @@ from src.data.pairs import (
     collate_token_pairs,
 )
 from src.data.partition import build_g_struct
+from src.data.struct_coords import StructCoordinateTable, coordinate_statistics
 from src.data.struct_sampler import StructEpochPlan, StructSampler, StructSubgraph
 from src.data.training_sampler import TrainingCorpus, build_training_corpus
 from src.data.val_region import (
@@ -116,6 +118,11 @@ from src.eval.val_topology import (
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
+from src.model.egostitch.classifier.topo_prompt import (
+    COORDS_KEY,
+    TopoPromptConfig,
+    V3_1TopoPrompt,
+)
 
 # Arms that regress the auxiliary head (`kd_struct_head`) onto ``teacher_rep`` by MSE.
 _AUX_HEAD_ARMS = frozenset({"kd_struct", "kd_white"})
@@ -124,8 +131,10 @@ _REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep", "kd_logit_rep"})
 
 logger = logging.getLogger(__name__)
 
-MODEL_FAMILIES = ("v3_1", "v3_1_prefix", "f0_mlp")
-V3_1_FAMILIES = frozenset({"v3_1", "v3_1_prefix"})
+MODEL_FAMILIES = ("v3_1", "v3_1_prefix", "v3_1_topo_prompt", "f0_mlp")
+V3_1_FAMILIES = frozenset({"v3_1", "v3_1_prefix", "v3_1_topo_prompt"})
+TOPO_PROMPT_FAMILY = "v3_1_topo_prompt"
+RUN_KINDS = ("formal", "diagnostic")
 
 
 def is_v3_1_family(family: str) -> bool:
@@ -163,13 +172,16 @@ class ModelConfig:
     """The ``model:`` config section.
 
     Attributes:
-        family: Scorer family, one of ``v3_1``, ``v3_1_prefix``, or ``f0_mlp``. ``f0_mlp``
-            (the B0-alt baseline) has no buildable model: :func:`build_model` raises for it.
+        family: Scorer family, one of ``v3_1``, ``v3_1_prefix``, ``v3_1_topo_prompt``,
+            or ``f0_mlp``. ``f0_mlp`` (the B0-alt baseline) has no buildable model:
+            :func:`build_model` raises for it.
         config: Model constructor kwargs. Empty for ``v3_1`` means
             :data:`~src.model.egostitch.classifier.b0_v31.BEST_V3_1_CONFIG`; for
             ``v3_1_prefix`` this holds the ``prefix`` block (see
-            :func:`_resolve_prefix_kwargs`); for ``f0_mlp`` this is stored but never
-            consumed (see above).
+            :func:`_resolve_prefix_kwargs`); for ``v3_1_topo_prompt`` the
+            ``topo_prompt`` block plus either ``base`` or a base checkpoint (see
+            :func:`_resolve_topo_prompt_kwargs`); for ``f0_mlp`` this is stored but
+            never consumed (see above).
     """
 
     family: str
@@ -311,6 +323,10 @@ class Config:
         distill: Optional B1 KD section; ``None`` or all-zero weights keep the
             plain supervised protocol.
         struct: Optional structural-stream section; ``None`` keeps the plain protocol.
+        run_kind: Execution context set by the pipeline's ``--run-kind`` (never a
+            YAML key): ``"diagnostic"`` marks a run that consumes held-out truth
+            (the ``v3_1_topo_prompt`` family reads V_val structure during
+            validation) and publishes only ``diagnostic_*`` sentinels.
     """
 
     model: ModelConfig
@@ -323,6 +339,7 @@ class Config:
     runtime: RuntimeConfig | None = None
     distill: DistillConfig | None = None
     struct: StructConfig | None = None
+    run_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -342,6 +359,8 @@ class CliArgs:
         token_budget_per_rank: Per-rank token budget for the distributed batch plan.
     profile_output: Path the rank-zero worker writes its JSON profile artifact to.
         resume_attempt: Prior attempt directory to resume at its completed epoch.
+        run_kind: Pipeline execution context (``formal`` / ``diagnostic``); see
+            `Config.run_kind`.
     """
 
     config: Path
@@ -353,6 +372,7 @@ class CliArgs:
     token_budget_per_rank: int | None = None
     profile_output: Path | None = None
     resume_attempt: Path | None = None
+    run_kind: str | None = None
 
 
 def _require(mapping: dict[str, object], key: str, context: str) -> object:
@@ -583,13 +603,14 @@ def _validate_topo_gen_distill_contract(
 def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
     """Build AdamW, separating the kd_gen core from base/fusion parameters."""
     raw_model = _unwrapped_model(model)
-    prefix_getter = getattr(raw_model, "prefix_parameters", None)
-    if callable(prefix_getter):
-        return torch.optim.AdamW(
-            cast(list[nn.Parameter], prefix_getter()),
-            lr=cfg.optim.lr,
-            weight_decay=cfg.optim.weight_decay,
-        )
+    for getter_name in ("trainable_parameters", "prefix_parameters"):
+        getter = getattr(raw_model, getter_name, None)
+        if callable(getter):
+            return torch.optim.AdamW(
+                cast(list[nn.Parameter], getter()),
+                lr=cfg.optim.lr,
+                weight_decay=cfg.optim.weight_decay,
+            )
     generator_getter = getattr(raw_model, "topo_gen_parameters", None)
     generator_params = (
         list(cast(Callable[[], list[nn.Parameter]], generator_getter)())
@@ -956,6 +977,15 @@ def parse_args(argv: Sequence[str] | None = None) -> CliArgs:
         default=None,
         help="prior attempt directory containing an epoch-boundary training snapshot",
     )
+    parser.add_argument(
+        "--run-kind",
+        choices=RUN_KINDS,
+        default=None,
+        help=(
+            "pipeline execution context; 'diagnostic' is required by families that "
+            "consume held-out truth (v3_1_topo_prompt) and never publishes formal sentinels"
+        ),
+    )
     namespace = parser.parse_args(argv)
     if namespace.ddp_mode is not None:
         missing = [
@@ -980,11 +1010,12 @@ def parse_args(argv: Sequence[str] | None = None) -> CliArgs:
         token_budget_per_rank=namespace.token_budget_per_rank,
         profile_output=namespace.profile_output,
         resume_attempt=namespace.resume_attempt,
+        run_kind=namespace.run_kind,
     )
 
 
 def apply_overrides(cfg: Config, args: CliArgs) -> Config:
-    """Apply CLI overrides (``--seed``, ``--output-dir``) on top of the config.
+    """Apply CLI overrides (``--seed``, ``--output-dir``, ``--run-kind``) on top of the config.
 
     Args:
         cfg: Loaded config.
@@ -997,6 +1028,8 @@ def apply_overrides(cfg: Config, args: CliArgs) -> Config:
         cfg = replace(cfg, seed=args.seed)
     if args.output_dir is not None:
         cfg = replace(cfg, output_dir=args.output_dir)
+    if args.run_kind is not None:
+        cfg = replace(cfg, run_kind=args.run_kind)
     return cfg
 
 
@@ -1024,6 +1057,8 @@ def config_to_dict(cfg: Config) -> dict[str, Any]:
     # Keep the canonical config of existing task-BCE runs unchanged.
     if cfg.eval.early_stop_metric == "val_task_loss":
         result["eval"].pop("early_stop_metric")
+    # Execution context, not scientific config: it never enters the config hash.
+    result.pop("run_kind", None)
     return result
 
 
@@ -1046,12 +1081,15 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     """
     if model_cfg.family == "v3_1_prefix":
         return _resolve_prefix_kwargs(model_cfg)
+    if model_cfg.family == TOPO_PROMPT_FAMILY:
+        return _resolve_topo_prompt_kwargs(model_cfg)
     if model_cfg.family == "v3_1":
         return dict(model_cfg.config) if model_cfg.config else dict(BEST_V3_1_CONFIG)
     if model_cfg.family == "f0_mlp":
         return dict(model_cfg.config)
     raise ValueError(
-        f"unknown model family '{model_cfg.family}' (expected v3_1, v3_1_prefix, or f0_mlp)"
+        f"unknown model family '{model_cfg.family}' "
+        "(expected v3_1, v3_1_prefix, v3_1_topo_prompt, or f0_mlp)"
     )
 
 
@@ -1071,9 +1109,77 @@ def _base_loss_kwargs(model_cfg: ModelConfig) -> Mapping[str, object]:
         The flat kwargs mapping to read ``positive_weight`` / ``label_smoothing`` from.
     """
     kwargs = resolve_model_kwargs(model_cfg)
-    if model_cfg.family == "v3_1_prefix":
+    if model_cfg.family in ("v3_1_prefix", TOPO_PROMPT_FAMILY):
         return cast(Mapping[str, object], kwargs["base"])
     return kwargs
+
+
+def _load_base_checkpoint(path: Path) -> tuple[Mapping[str, object], str]:
+    """Load a ``v3_1`` checkpoint payload and digest the file (provenance only).
+
+    Args:
+        path: The base checkpoint path.
+
+    Returns:
+        ``(payload, sha256)``.
+
+    Raises:
+        ValueError: If the payload is not a ``v3_1`` checkpoint mapping.
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{path}: base must be a v3_1 checkpoint payload")
+    if payload.get("model_family") != "v3_1":
+        raise ValueError(f"{path}: base must be a v3_1 checkpoint")
+    return payload, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resolve_topo_prompt_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
+    """Resolve the ``v3_1_topo_prompt`` constructor kwargs.
+
+    The base trunk config comes from exactly one place: ``model.config.base``
+    (explicit ``V3_1`` kwargs, the from-scratch Stage I run) or the embedded
+    config of ``model.config.topo_prompt.base_checkpoint`` (a warm start, or
+    the frozen trunk of ``trainable: prompt``). The digest is recorded, never
+    verified.
+
+    Args:
+        model_cfg: The ``model:`` config section (``family == "v3_1_topo_prompt"``).
+
+    Returns:
+        ``{"base": <V3_1 kwargs>, "topo_prompt": {...}}``.
+
+    Raises:
+        ValueError: If the block is missing, carries unknown sibling keys, or
+            names both a base checkpoint and an explicit base config (or neither).
+    """
+    raw_block = model_cfg.config.get("topo_prompt")
+    if not isinstance(raw_block, Mapping):
+        raise ValueError("model.config.topo_prompt is required for v3_1_topo_prompt")
+    extra = sorted(set(model_cfg.config) - {"topo_prompt", "base"})
+    if extra:
+        raise ValueError(
+            f"v3_1_topo_prompt accepts only model.config.{{topo_prompt,base}}, got {extra}"
+        )
+    base_checkpoint = str(raw_block.get("base_checkpoint", "") or "")
+    explicit_base = model_cfg.config.get("base")
+    if bool(base_checkpoint) == (explicit_base is not None):
+        raise ValueError(
+            "v3_1_topo_prompt needs exactly one of model.config.base or "
+            "model.config.topo_prompt.base_checkpoint"
+        )
+    digest: str | None = None
+    if base_checkpoint:
+        payload, digest = _load_base_checkpoint(Path(base_checkpoint))
+        base_config = dict(cast(Mapping[str, object], payload["model_config"]))
+    else:
+        if not isinstance(explicit_base, Mapping):
+            raise ValueError("model.config.base must be a mapping of V3_1 kwargs")
+        base_config = dict(explicit_base)
+    block = TopoPromptConfig.from_mapping(
+        {**dict(raw_block), "base_checkpoint": base_checkpoint, "base_checkpoint_sha256": digest}
+    )
+    return {"base": base_config, "topo_prompt": block.to_dict()}
 
 
 def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
@@ -1142,6 +1248,16 @@ def build_model(cfg: Config) -> nn.Module:
         prefix_model.base.load_state_dict(payload["model_state"])
         _validate_topo_gen_distill_contract(prefix_model, cfg.distill)
         return prefix_model
+    if cfg.model.family == TOPO_PROMPT_FAMILY:
+        topo_model = V3_1TopoPrompt(**kwargs)  # type: ignore[arg-type]
+        base_checkpoint = str(
+            cast(Mapping[str, object], kwargs["topo_prompt"]).get("base_checkpoint", "") or ""
+        )
+        if base_checkpoint:
+            payload, _ = _load_base_checkpoint(Path(base_checkpoint))
+            topo_model.base.load_state_dict(cast(Mapping[str, Any], payload["model_state"]))
+        _validate_topo_gen_distill_contract(topo_model, cfg.distill)
+        return topo_model
     if cfg.model.family == "v3_1":
         v3_1_model = V3_1(**kwargs)
         _validate_topo_gen_distill_contract(v3_1_model, cfg.distill)
@@ -1722,6 +1838,22 @@ def _run_metadata(
             "checkpoint": prefix_kwargs.get("base_checkpoint"),
             "sha256": prefix_kwargs.get("base_checkpoint_sha256"),
         }
+    if cfg.model.family == TOPO_PROMPT_FAMILY:
+        topo_kwargs = cast(Mapping[str, object], model_kwargs["topo_prompt"])
+        run_metadata["topo_prompt"] = {
+            "trainable": topo_kwargs.get("trainable"),
+            "coord_spec": topo_kwargs.get("coord_spec"),
+            "base_checkpoint": topo_kwargs.get("base_checkpoint") or None,
+            "sha256": topo_kwargs.get("base_checkpoint_sha256"),
+        }
+    if cfg.run_kind is not None:
+        # Same vocabulary as the EgoStitch worker so the test protocol and readers
+        # classify the run identically; a diagnostic run consumed held-out truth.
+        run_metadata["run_kind"] = cfg.run_kind
+        run_metadata["checkpoint_role"] = (
+            "diagnostic_only" if cfg.run_kind == "diagnostic" else "formal_plan_selected"
+        )
+        run_metadata["formal_artifacts_published"] = cfg.run_kind == "formal"
     if result.val_threshold_transfer is not None:
         # Freeze the selected checkpoint and its own validation threshold together.
         run_metadata["selection_rule"] = SELECTION_RULE
@@ -2591,6 +2723,7 @@ def _evaluate_distributed(
     expected_row_ids: np.ndarray | None = None,
     label_smoothing: float = 0.0,
     validation_bank: OracleValidationBank | None = None,
+    attach: Callable[[Batch], None] | None = None,
 ) -> ValidationOutcome:
     """Score the fixed cls validation set across all ranks and agree on the metrics.
 
@@ -2614,6 +2747,8 @@ def _evaluate_distributed(
         validation_bank: Optional G_val teacher targets, used only for diagnostics.
         label_smoothing: Symmetric binary smoothing ε applied to the labels for
             `ValidationOutcome.task_loss`, matching the training objective.
+        attach: Optional per-batch hook run before the forward (the
+            topology-prompt arm injects each row's structural coordinates).
 
     Returns:
         The `ValidationOutcome` with `topology=None`, identical on every rank.
@@ -2629,6 +2764,8 @@ def _evaluate_distributed(
     with torch.no_grad():
         for batch in val_loader:
             batch = _to_device(batch, accelerator.device)
+            if attach is not None:
+                attach(batch)
             output = model(batch)
             if validation_bank is not None and validation_bank.rep_key is not None:
                 rep = output.get(validation_bank.rep_key)
@@ -2765,6 +2902,7 @@ def _evaluate_val_universe(
     u_idx: np.ndarray,
     v_idx: np.ndarray,
     reference: ValTopologyReference,
+    row_coords: torch.Tensor | None = None,
 ) -> ValTopologyResult:
     """Score the exact ball-union rows and select sampled-only topology threshold.
 
@@ -2789,6 +2927,8 @@ def _evaluate_val_universe(
         v_idx: `(n_u,)` `reference.nodes` index for the U rows only, aligned
             with `u_idx`.
         reference: The once-per-run `ValTopologyReference`.
+        row_coords: Optional ``(n_rows, COORD_DIM)`` CPU structural coordinates
+            of the universe rows (the topology-prompt arm), sliced per batch.
 
     Returns:
         The `ValTopologyResult`, identical on every rank.
@@ -2800,6 +2940,11 @@ def _evaluate_val_universe(
     rank = accelerator.process_index
     n_rows = int(node_a_all.shape[0])
     device = accelerator.device
+    if row_coords is not None and int(row_coords.shape[0]) != n_rows:
+        raise ValueError(
+            f"V_val universe coordinates cover {int(row_coords.shape[0])} rows, "
+            f"universe has {n_rows}"
+        )
 
     row_ids = torch.arange(rank, n_rows, world_size, dtype=torch.int64)
     model.eval()
@@ -2809,7 +2954,10 @@ def _evaluate_val_universe(
             rows = row_ids[start : start + batch_pairs]
             emb_a, len_a = table.gather_nodes(node_a_all.index_select(0, rows), boundary)
             emb_b, len_b = table.gather_nodes(node_b_all.index_select(0, rows), boundary)
-            output = model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b})
+            batch: Batch = {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
+            if row_coords is not None:
+                batch[COORDS_KEY] = row_coords.index_select(0, rows).to(device)
+            output = model(batch)
             logits = output["logits"]
             if logits.dim() > 1 and logits.size(-1) == 1:
                 logits = logits.squeeze(-1)
@@ -3283,6 +3431,86 @@ class KDContextStream:
             "kd_rank_tie_fraction": values.get("context_ties", 0.0) / max(tie_pairs, 1.0),
             "kd_rank_live_pairs": pairs,
             "kd_dist_live_anchors": anchors,
+        }
+
+
+class TopoPromptRows:
+    """Query-masked structural coordinates for every row a topology-prompt run scores.
+
+    Training rows are measured on the V_val-masked training graph; the V_val
+    classification rows and the V_val topology universe on the V_val gold graph
+    (`ValRegionSplit.build_g_val_simple`), which is held-out truth -- the reason
+    the family runs only under ``--run-kind diagnostic``. Every rank builds the
+    same tensors (deterministic), keeps them on the CPU, and slices per batch by
+    ``_row_id``. The standardisation statistics come from epoch 1's 1:5 rows,
+    the distribution one training epoch actually presents (the multi-epoch union
+    over-weights negatives ``epochs``-fold).
+    """
+
+    def __init__(
+        self,
+        *,
+        train_graph: nx.Graph,
+        train_pairs: Sequence[Pair],
+        stats_rows: np.ndarray,
+        val_graph: nx.Graph,
+        val_cls_pairs: Sequence[Pair],
+        universe_pairs: Sequence[Pair],
+        device: torch.device,
+    ) -> None:
+        """Measure every row once.
+
+        Args:
+            train_graph: Loopless training structural graph (V_val excluded).
+            train_pairs: The trainer's training rows in row-id order.
+            stats_rows: Row ids the standardisation statistics are taken over.
+            val_graph: Loopless V_val gold graph.
+            val_cls_pairs: The V_val classification rows in row-id order.
+            universe_pairs: The V_val topology ball-union rows in row-id order.
+            device: Device batches live on.
+        """
+        started = time.monotonic()
+        train_table = StructCoordinateTable(train_graph)
+        self.train = torch.from_numpy(train_table.coords(train_pairs))
+        del train_table
+        mean, std = coordinate_statistics(self.train.numpy()[np.asarray(stats_rows)])
+        self.coord_mean = torch.from_numpy(mean)
+        self.coord_std = torch.from_numpy(std)
+        self.coord_count = int(len(stats_rows))
+        val_table = StructCoordinateTable(val_graph)
+        self.val_cls = torch.from_numpy(val_table.coords(val_cls_pairs))
+        self.universe = torch.from_numpy(val_table.coords(universe_pairs))
+        del val_table
+        self._device = device
+        self.build_seconds = time.monotonic() - started
+
+    def install(self, model: nn.Module) -> None:
+        """Copy the training statistics into the model's published buffers."""
+        raw_model = _unwrapped_model(model)
+        if not isinstance(raw_model, V3_1TopoPrompt):
+            raise TypeError("TopoPromptRows.install needs a V3_1TopoPrompt")
+        raw_model.generator.set_coord_stats(self.coord_mean, self.coord_std, self.coord_count)
+
+    def _attach(self, batch: Batch, table: torch.Tensor) -> None:
+        rows = batch["_row_id"].detach().to("cpu", torch.int64)
+        batch[COORDS_KEY] = table.index_select(0, rows).to(self._device, non_blocking=True)
+
+    def attach_train(self, batch: Batch) -> None:
+        """Inject this training batch's coordinates by ``_row_id``."""
+        self._attach(batch, self.train)
+
+    def attach_val(self, batch: Batch) -> None:
+        """Inject this V_val classification batch's coordinates by ``_row_id``."""
+        self._attach(batch, self.val_cls)
+
+    def summary(self) -> dict[str, object]:
+        """Provenance for logs and ``run_metadata.json``."""
+        return {
+            "train_rows": int(self.train.shape[0]),
+            "stats_rows": self.coord_count,
+            "val_cls_rows": int(self.val_cls.shape[0]),
+            "universe_rows": int(self.universe.shape[0]),
+            "build_seconds": self.build_seconds,
         }
 
 
@@ -4016,6 +4244,7 @@ def train_ddp_loop(
     struct_stream: StructStream | None = None,
     require_topology: bool = False,
     val_topology_reference: ValTopologyReference | None = None,
+    topo_rows: TopoPromptRows | None = None,
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
@@ -4060,6 +4289,9 @@ def train_ddp_loop(
         val_topology_reference: The once-per-run `ValTopologyReference`, used
             only to attach `TrainResult.val_threshold_transfer` (node count
             and sampled-only threshold). `None` leaves that field unset.
+        topo_rows: Optional structural coordinates of every training row
+            (`TopoPromptRows`), attached to each batch before the forward for
+            the ``v3_1_topo_prompt`` family.
 
     Returns:
         The `TrainResult`, identical across ranks except for the main-rank-only
@@ -4333,6 +4565,8 @@ def train_ddp_loop(
             local_count, global_count = _batch_pair_counts(batch, world_size)
             if kd_bank is not None:
                 kd_bank.attach(batch)
+            if topo_rows is not None:
+                topo_rows.attach_train(batch)
 
             start_event, end_event = _maybe_cuda_events(use_cuda)
             output = model(batch)
@@ -5171,6 +5405,7 @@ def _run_probe_mode(
     *,
     token_budget_per_rank: int,
     profile_output: Path,
+    topo_rows: TopoPromptRows | None = None,
 ) -> None:
     """Run warm-up + timed steps and write one rank-zero ``ProbeResult`` JSON."""
     runtime = cfg.runtime
@@ -5209,6 +5444,8 @@ def _run_probe_mode(
             timed_start = time.monotonic()
         batch = _to_device(next(iterator), accelerator.device)
         local_count, global_count = _batch_pair_counts(batch, world_size)
+        if topo_rows is not None:
+            topo_rows.attach_train(batch)
         loss: torch.Tensor | None = None
         local_failure: tuple[str, str] | None = None
         try:
@@ -5336,6 +5573,48 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     if isinstance(model, V3_1Prefix):
         _init_prefix_from_loader(model, factory(1), cfg.seed)
 
+    val_split = assembled.val_split
+
+    val_cls_pairs, val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
+    num_val_rows = len(val_cls_pairs)
+
+    topo_rows: TopoPromptRows | None = None
+    reference: ValTopologyReference | None = None
+    if isinstance(model, V3_1TopoPrompt):
+        # The prompt reads true structure: training rows from the training graph
+        # (legal) and validation rows from the V_val gold graph (held-out truth),
+        # so this is a ceiling diagnostic by construction and fails closed otherwise.
+        if cfg.run_kind != "diagnostic":
+            raise RuntimeError(
+                "v3_1_topo_prompt reads V_val truth structure during validation; launch it "
+                "with --run-kind diagnostic (hpc/run.sh train <config> --run-kind diagnostic)"
+            )
+        if cfg.struct is not None or (cfg.distill is not None and cfg.distill.active):
+            raise RuntimeError(
+                "v3_1_topo_prompt (Stage I) trains on task BCE only; struct/distill sections "
+                "are not supported for this family"
+            )
+        if cfg.eval.classification_only:
+            raise RuntimeError("v3_1_topo_prompt requires the V_val topology pass")
+        corpus = _dynamic_training_corpus(cfg, assembled)
+        reference = build_val_topology_reference(val_split)
+        universe = val_ball_union_universe(val_split)
+        topo_rows = TopoPromptRows(
+            train_graph=val_split.build_training_graph(),
+            train_pairs=corpus.pairs,
+            stats_rows=corpus.epoch_rows[1],
+            val_graph=val_split.build_g_val_simple(),
+            val_cls_pairs=val_cls_pairs,
+            universe_pairs=[
+                (reference.nodes[int(a)], reference.nodes[int(b)])
+                for a, b in zip(universe.u_idx.tolist(), universe.v_idx.tolist(), strict=True)
+            ],
+            device=accelerator.device,
+        )
+        topo_rows.install(model)
+        if accelerator.is_main_process:
+            logger.info("topo_prompt coordinates ready: %s", topo_rows.summary())
+
     if args.ddp_mode == "probe":
         _run_probe_mode(
             model,
@@ -5344,13 +5623,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             accelerator,
             token_budget_per_rank=args.token_budget_per_rank,
             profile_output=args.profile_output,
+            topo_rows=topo_rows,
         )
         return
-
-    val_split = assembled.val_split
-
-    val_cls_pairs, val_cls_labels = _val_cls_rows(val_split, assembled.exclude_nodes)
-    num_val_rows = len(val_cls_pairs)
 
     kd_bank: KDRowBank | None = None
     kd_context_stream: KDContextStream | None = None
@@ -5453,7 +5728,6 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             val_cls_pairs,
             val_cls_labels,
         )
-    reference: ValTopologyReference | None = None
     cls_evaluate_fn = cast(
         EvaluateFn,
         functools.partial(
@@ -5461,6 +5735,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
             label_smoothing=val_label_smoothing,
             validation_bank=validation_bank,
+            attach=topo_rows.attach_val if topo_rows is not None else None,
         ),
     )
     evaluate_cls_fn: EvaluateFn | None = None
@@ -5468,7 +5743,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         evaluate_fn = cls_evaluate_fn
     else:
         evaluate_cls_fn = cls_evaluate_fn
-        reference = build_val_topology_reference(val_split)
+        if reference is None:
+            reference = build_val_topology_reference(val_split)
         universe = val_ball_union_universe(val_split)
         u_idx, v_idx = universe.u_idx, universe.v_idx
         node_index = table.manifest.node_index()
@@ -5500,6 +5776,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                         u_idx=u_idx,
                         v_idx=v_idx,
                         reference=reference,
+                        row_coords=topo_rows.universe if topo_rows is not None else None,
                     ),
                 ),
                 label_smoothing=val_label_smoothing,
@@ -5543,6 +5820,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     kd_context_stream=kd_context_stream,
                     struct_stream=struct_stream,
                     require_topology=not cfg.eval.classification_only,
+                    topo_rows=topo_rows,
                 ),
             )
         except BaseException:
@@ -5586,6 +5864,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         struct_stream=struct_stream,
         require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
+        topo_rows=topo_rows,
     )
     if cfg.model.family == "v3_1_prefix":
         _finalize_prefix_mean(
@@ -5651,6 +5930,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError(
             "distill training runs only through the DDP pipeline path "
             "(hpc/run.sh train <config>), not the direct single-process debug CLI"
+        )
+    if cfg.model.family == TOPO_PROMPT_FAMILY:
+        raise ValueError(
+            "v3_1_topo_prompt runs only through the DDP pipeline path "
+            "(hpc/run.sh train <config> --run-kind diagnostic); the direct debug CLI "
+            "has no structural-coordinate rows"
         )
 
     set_seed(cfg.seed)
