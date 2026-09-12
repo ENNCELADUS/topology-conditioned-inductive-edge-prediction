@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from itertools import combinations_with_replacement
@@ -342,77 +342,167 @@ def test_packed_scoring_matches_forward_for_v3_1_prefix_with_open_gates(
     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-6)
 
 
-def test_packed_scoring_shuffle_is_universe_level_seeded_and_batch_invariant(
+def _shuffle_sources(
+    pairs: Sequence[tuple[str, str]], *, seed: int = 0, start: int = 0, end: int | None = None
+) -> list[tuple[str, str]]:
+    """Row-aligned source pairs of the universe-level shuffle for rows ``[start, end)``."""
+    perm = score_universe._shuffle_source_rows(len(pairs), seed)
+    return [pairs[int(index)] for index in perm[start:end]]
+
+
+def _prefix_source_reference(
+    model: V3_1Prefix,
+    pack_root: Path,
+    rows: Sequence[tuple[str, str]],
+    sources: Sequence[tuple[str, str]],
+) -> NDArray[np.float32]:
+    """Each row on its own endpoints under its source pair's condition, from the model itself."""
+    table = PackedFeatureTable.from_pack(pack_root, torch.device("cpu"))
+    node_index = table.manifest.node_index()
+
+    def encoded(
+        pairs: Sequence[tuple[str, str]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        compact = CompactPairBatch(
+            row_ids=torch.arange(len(pairs)),
+            node_a=torch.tensor([node_index[u] for u, _ in pairs]),
+            node_b=torch.tensor([node_index[v] for _, v in pairs]),
+            labels=torch.zeros(len(pairs)),
+            bucket_boundary=128,
+            global_pair_count=len(pairs),
+        )
+        batch = table.assemble(compact)
+        with torch.inference_mode():
+            return (
+                model.encoder(batch["emb_a"].float(), batch["len_a"]),
+                model.encoder(batch["emb_b"].float(), batch["len_b"]),
+                batch["len_a"],
+                batch["len_b"],
+            )
+
+    with torch.inference_mode():
+        z_sources = model.condition_from_encoded(*encoded(sources))
+        logits = model.logits_from_encoded(*encoded(rows), z=z_sources)
+    return logits.numpy().reshape(-1)
+
+
+def test_packed_shuffle_reads_the_source_pair_condition_and_composes_across_shards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review P0: ``shuffle`` permutes over every scored row, not within a batch.
+    """``shuffle`` is one permutation of the whole universe, not of a batch or shard.
 
-    All unordered pairs over 5 nodes is 10 rows; ``token_budget=512`` caps a
-    128-bucket batch at 2 rows (5 batches) and ``token_budget=8192`` at 32 (one
-    batch). A batch-local shuffle gives different logits under the two budgets;
-    a universe-level permutation gives the same ones.
+    Row ``i`` keeps its own endpoints and takes the condition of pair
+    ``perm[i]``. Ten rows over 5 nodes; ``token_budget=512`` caps a 128-bucket
+    batch at 2 rows and ``8192`` at 32, so batching must not matter; two
+    contiguous shards reading their slices of the map must compose the
+    single-process result; and a shard-local permutation (the behaviour before
+    2026-09-12, label-pure on the label-sorted 1:1 lists) must not.
     """
     model = _tiny_v3_1_prefix()
     pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
     device = torch.device("cpu")
     assert len(pairs) == 10
 
-    def _score(*, budget: int, intervention: str, seed: int = 0) -> NDArray[np.float32]:
+    def _score(
+        rows: Sequence[tuple[str, str]],
+        sources: Sequence[tuple[str, str]] | None = None,
+        *,
+        budget: int = 512,
+    ) -> NDArray[np.float32]:
         return score_universe._score_v3_1_packed(
             model,
-            pairs,
+            rows,
             pack_root,
             device=device,
             amp="off",
             token_budget=budget,
-            prefix_intervention=intervention,
-            prefix_intervention_seed=seed,
+            shuffle_sources=sources,
         )
 
-    baseline = _score(budget=512, intervention="none")
-    shuffled_first = _score(budget=512, intervention="shuffle")
-    shuffled_second = _score(budget=512, intervention="shuffle")
-    other_seed = _score(budget=512, intervention="shuffle", seed=7)
-    one_batch = _score(budget=8192, intervention="shuffle")
-
-    assert not np.allclose(baseline, shuffled_first)
-    np.testing.assert_array_equal(shuffled_first, shuffled_second)
-    assert not np.allclose(shuffled_first, other_seed)
-    np.testing.assert_allclose(shuffled_first, one_batch, rtol=0.0, atol=1e-6)
+    baseline = _score(pairs)
+    shuffled = _score(pairs, _shuffle_sources(pairs))
+    assert not np.allclose(baseline, shuffled)
+    np.testing.assert_array_equal(shuffled, _score(pairs, _shuffle_sources(pairs)))
+    assert not np.allclose(shuffled, _score(pairs, _shuffle_sources(pairs, seed=7)))
+    np.testing.assert_allclose(
+        shuffled, _score(pairs, _shuffle_sources(pairs), budget=8192), rtol=0.0, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        shuffled,
+        _prefix_source_reference(model, pack_root, pairs, _shuffle_sources(pairs)),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    composed = np.concatenate(
+        [
+            _score(pairs[:4], _shuffle_sources(pairs, start=0, end=4)),
+            _score(pairs[4:], _shuffle_sources(pairs, start=4)),
+        ]
+    )
+    np.testing.assert_allclose(composed, shuffled, rtol=0.0, atol=1e-6)
+    within_shard = np.concatenate(
+        [
+            _score(pairs[:4], _shuffle_sources(pairs[:4])),
+            _score(pairs[4:], _shuffle_sources(pairs[4:])),
+        ]
+    )
+    assert not np.allclose(within_shard, shuffled)
     # The model itself never enters an intervention mode for `shuffle`.
     assert model.intervention == "none"
+    with pytest.raises(SystemExit, match="cover 9 rows, expected 10"):
+        _score(pairs, _shuffle_sources(pairs)[:9])
 
 
-def test_unpacked_scoring_shuffle_is_universe_level_and_seeded(
+def test_unpacked_shuffle_matches_the_packed_source_substitution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The same two-pass shuffle on the non-packed path (`_score_v3_1`)."""
+    """The same source substitution on the non-packed path (`_score_v3_1`)."""
     model = _tiny_v3_1_prefix()
-    _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
     store = FeatureStore(tmp_path / "features")
-    pairs = [(f"node_{i:02d}", f"node_{j:02d}") for i in range(5) for j in range(i + 1, 5)]
     device = torch.device("cpu")
 
-    def _score(*, budget: int, intervention: str, seed: int = 0) -> NDArray[np.float32]:
+    def _score(
+        rows: Sequence[tuple[str, str]],
+        sources: Sequence[tuple[str, str]] | None = None,
+        *,
+        budget: int = 512,
+    ) -> NDArray[np.float32]:
         return score_universe._score_v3_1(
             model,
-            pairs,
+            rows,
             store,
             device=device,
             amp="off",
             token_budget=budget,
-            prefix_intervention=intervention,
-            prefix_intervention_seed=seed,
+            shuffle_sources=sources,
         )
 
-    baseline = _score(budget=512, intervention="none")
-    shuffled = _score(budget=512, intervention="shuffle")
-    one_batch = _score(budget=8192, intervention="shuffle")
-
+    baseline = _score(pairs)
+    shuffled = _score(pairs, _shuffle_sources(pairs))
     assert not np.allclose(baseline, shuffled)
-    np.testing.assert_array_equal(shuffled, _score(budget=512, intervention="shuffle"))
-    assert not np.allclose(shuffled, _score(budget=512, intervention="shuffle", seed=7))
-    np.testing.assert_allclose(shuffled, one_batch, rtol=0.0, atol=1e-6)
+    np.testing.assert_array_equal(shuffled, _score(pairs, _shuffle_sources(pairs)))
+    np.testing.assert_allclose(
+        shuffled, _score(pairs, _shuffle_sources(pairs), budget=8192), rtol=0.0, atol=1e-6
+    )
+    composed = np.concatenate(
+        [
+            _score(pairs[:3], _shuffle_sources(pairs, start=0, end=3)),
+            _score(pairs[3:], _shuffle_sources(pairs, start=3)),
+        ]
+    )
+    np.testing.assert_allclose(composed, shuffled, rtol=0.0, atol=1e-6)
+    packed = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=device,
+        amp="off",
+        token_budget=512,
+        shuffle_sources=_shuffle_sources(pairs),
+    )
+    # The pack stores bf16 tokens, so the two paths agree only loosely.
+    np.testing.assert_allclose(shuffled, packed, rtol=0.0, atol=5e-3)
 
 
 def test_packed_scoring_shuffle_rejects_a_static_prefix_checkpoint(
@@ -429,7 +519,7 @@ def test_packed_scoring_shuffle_rejects_a_static_prefix_checkpoint(
             device=torch.device("cpu"),
             amp="off",
             token_budget=512,
-            prefix_intervention="shuffle",
+            shuffle_sources=_shuffle_sources(pairs),
         )
 
 

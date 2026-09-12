@@ -473,9 +473,9 @@ class V3_1Prefix(nn.Module):
         a published training mean (``z_count > 0``); an unpublished
         `PrefixGenerator`'s ``z_mean`` is an all-zero vector that is not the
         training-set mean of anything. The ``shuffle`` intervention is not a
-        model-level mode at all -- it permutes conditions across every row the
-        scoring process scores, which only the scorer can see
-        (`src.score_universe._shuffled_prefix_conditions`), and reaches this
+        model-level mode at all -- it gives every row the condition of another
+        row of the whole scored universe, which only the scorer can see
+        (`src.score_universe._prefix_source_conditions`), and reaches this
         class as an explicit ``z`` argument to `logits_from_encoded`.
 
         Raises:

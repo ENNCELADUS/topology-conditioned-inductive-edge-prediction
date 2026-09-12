@@ -37,22 +37,17 @@ def _coords(n: int, seed: int = 0) -> torch.Tensor:
     return torch.rand(n, COORD_DIM, generator=torch.Generator().manual_seed(seed)) * 2.0
 
 
-def test_shuffled_row_coords_is_seeded_universe_level_and_checks_coverage() -> None:
-    coords = _coords(6)
-    assert score_universe._shuffled_row_coords(None, "shuffle", seed=0, num_rows=6) is None
-    same = score_universe._shuffled_row_coords(coords, "none", seed=0, num_rows=6)
-    assert same is not None and torch.equal(same, coords)
-    first = score_universe._shuffled_row_coords(coords, "shuffle", seed=0, num_rows=6)
-    again = score_universe._shuffled_row_coords(coords, "shuffle", seed=0, num_rows=6)
-    other = score_universe._shuffled_row_coords(coords, "shuffle", seed=3, num_rows=6)
-    assert first is not None and again is not None and other is not None
-    assert torch.equal(first, again) and not torch.equal(first, coords)
-    assert not torch.equal(first, other)
-    assert torch.equal(first.sort(dim=0).values, coords.sort(dim=0).values)
-    with pytest.raises(SystemExit, match="cover 6 rows, expected 7"):
-        score_universe._shuffled_row_coords(coords, "none", seed=0, num_rows=7)
+def test_shuffle_source_rows_is_a_seeded_permutation_of_the_whole_universe() -> None:
+    first = score_universe._shuffle_source_rows(6, 0)
+    assert first.dtype == np.int64 and sorted(first.tolist()) == list(range(6))
+    np.testing.assert_array_equal(first, score_universe._shuffle_source_rows(6, 0))
+    assert not np.array_equal(first, score_universe._shuffle_source_rows(6, 3))
     with pytest.raises(SystemExit, match="at least 2"):
-        score_universe._shuffled_row_coords(coords[:1], "shuffle", seed=0, num_rows=1)
+        score_universe._shuffle_source_rows(1, 0)
+    score_universe._check_row_coords(None, 7)
+    score_universe._check_row_coords(_coords(6), 6)
+    with pytest.raises(SystemExit, match="cover 6 rows, expected 7"):
+        score_universe._check_row_coords(_coords(6), 7)
 
 
 def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
@@ -64,20 +59,12 @@ def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
     coords = _coords(len(pairs))
     device = torch.device("cpu")
 
-    def unpacked(intervention: str, seed: int = 0) -> NDArray[np.float32]:
+    def unpacked(row_coords: torch.Tensor) -> NDArray[np.float32]:
         return score_universe._score_v3_1(
-            model,
-            pairs,
-            store,
-            device=device,
-            amp="off",
-            token_budget=512,
-            prefix_intervention=intervention,
-            prefix_intervention_seed=seed,
-            row_coords=coords,
+            model, pairs, store, device=device, amp="off", token_budget=512, row_coords=row_coords
         )
 
-    def packed(intervention: str, seed: int = 0) -> NDArray[np.float32]:
+    def packed(row_coords: torch.Tensor) -> NDArray[np.float32]:
         return score_universe._score_v3_1_packed(
             model,
             pairs,
@@ -85,12 +72,10 @@ def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
             device=device,
             amp="off",
             token_budget=512,
-            prefix_intervention=intervention,
-            prefix_intervention_seed=seed,
-            row_coords=coords,
+            row_coords=row_coords,
         )
 
-    baseline = unpacked("none")
+    baseline = unpacked(coords)
     # The pack stores bf16 tokens, so packed scoring is compared against a forward
     # over the packed table's own assembled batch, as the prefix-arm test does.
     table = PackedFeatureTable.from_pack(pack_root, device)
@@ -108,17 +93,23 @@ def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
     packed_batch["emb_b"] = packed_batch["emb_b"].float()
     with torch.inference_mode():
         packed_reference = model({**packed_batch, "struct_coords": coords})["logits"]
-        permutation = torch.from_numpy(np.random.default_rng(0).permutation(len(pairs)))
+        # `shuffle` reaches this family as substituted coordinates: the scorer
+        # measures each row's universe-level source pair and passes the result
+        # as `row_coords`, so the scoring functions see plain row-aligned banks.
+        sources = torch.from_numpy(score_universe._shuffle_source_rows(len(pairs), 0))
         packed_shuffled_reference = model(
-            {**packed_batch, "struct_coords": coords.index_select(0, permutation)}
+            {**packed_batch, "struct_coords": coords.index_select(0, sources)}
         )["logits"]
     np.testing.assert_allclose(
-        packed("none"), packed_reference.numpy().reshape(-1), rtol=0.0, atol=1e-5
+        packed(coords), packed_reference.numpy().reshape(-1), rtol=0.0, atol=1e-5
     )
     np.testing.assert_allclose(
-        packed("shuffle"), packed_shuffled_reference.numpy().reshape(-1), rtol=0.0, atol=1e-5
+        packed(coords.index_select(0, sources)),
+        packed_shuffled_reference.numpy().reshape(-1),
+        rtol=0.0,
+        atol=1e-5,
     )
-    np.testing.assert_allclose(packed("none"), baseline, rtol=0.0, atol=5e-3)
+    np.testing.assert_allclose(packed(coords), baseline, rtol=0.0, atol=5e-3)
     other_coords = score_universe._score_v3_1(
         model,
         pairs,
@@ -130,11 +121,22 @@ def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
     )
     assert not np.allclose(baseline, other_coords)
 
-    shuffled = unpacked("shuffle")
+    shuffled = unpacked(coords.index_select(0, sources))
     assert not np.allclose(baseline, shuffled)
-    np.testing.assert_array_equal(shuffled, unpacked("shuffle"))
-    assert not np.allclose(shuffled, unpacked("shuffle", seed=5))
+    np.testing.assert_array_equal(shuffled, unpacked(coords.index_select(0, sources)))
     assert model.intervention == "none"
+    # The prefix arm's source-condition path is not this family's shuffle.
+    with pytest.raises(SystemExit, match="v3_1_prefix"):
+        score_universe._score_v3_1(
+            model,
+            pairs,
+            store,
+            device=device,
+            amp="off",
+            token_budget=512,
+            shuffle_sources=list(pairs),
+            row_coords=coords,
+        )
 
     # gates_off is the base function on the same (unpacked) path.
     base = V3_1(**_tiny_base_config())
@@ -144,7 +146,7 @@ def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
         base, pairs, store, device=device, amp="off", token_budget=512
     )
     model.intervention = "gates_off"
-    np.testing.assert_allclose(unpacked("gates_off"), reference, rtol=0.0, atol=1e-5)
+    np.testing.assert_allclose(unpacked(coords), reference, rtol=0.0, atol=1e-5)
     model.intervention = "none"
 
 

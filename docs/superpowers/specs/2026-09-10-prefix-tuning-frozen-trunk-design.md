@@ -273,12 +273,15 @@ each row's own frozen threshold, with AUPRC alongside:
 $z_{uv}$ and `abba_max` symmetry is preserved:
 
 1. *Gates off* — all $g\leftarrow 0$; must reproduce `prefix_base`'s logits within 1e-6 (a correctness check, reported; see §5.2).
-2. *Shuffle* — $z_{uv}$ permuted across **all pairs the scoring process scores** (per shard under
-   fan-out), never within a scoring batch: pairs arrive lexicographically sorted and the
-   length-bucketed sampler cuts contiguous chunks, so a batch-local permutation would mostly
-   substitute the condition of a pair sharing an endpoint. The scorer therefore makes two passes
-   over the same batches — collect every row's $z_{uv}$, permute once with
-   `--prefix-intervention-seed`, then score — and the permutation is not a model-level mode.
+2. *Shuffle* — $z_{uv}$ replaced by the $z$ of another pair drawn by **one seeded permutation of
+   the whole universe** (`--prefix-intervention-seed`), identical under fan-out and never within a
+   scoring batch or a shard: pairs arrive lexicographically sorted and the length-bucketed sampler
+   cuts contiguous chunks, so a batch-local permutation would mostly substitute the condition of a
+   pair sharing an endpoint; and the 1:1 `val_cls`/`test` lists are label-sorted, so a shard-local
+   permutation (the implementation until 2026-09-12) left every substitute with the row's own
+   label and was vacuous there. The scorer makes two passes — encode each row's source pair and
+   collect its $z_{uv}$, then score the row's own endpoints under it — and the permutation is not
+   a model-level mode.
 3. *Mean* — $z_{uv}$ replaced by its training-set mean (a `z_mean` buffer computed at publish time).
    Reload the selected checkpoint, use eval mode, and replay that epoch's 1:5 training task
    pairs, each row once without BCE weighting or structural-stream repeats. Sum conditions and
@@ -340,8 +343,9 @@ teacher-KD or descriptor-bottleneck prefix.
   frozen base state is inside the checkpoint, so no base file is needed at scoring time).
 - **Interventions.** A `--prefix-intervention {none,gates_off,shuffle,mean}` scoring option.
   `gates_off` and `mean` are `V3_1Prefix.intervention` modes; `shuffle` lives in the scorer, which
-  collects every scored row's $z_{uv}$, permutes them once with `--prefix-intervention-seed`
-  (recorded in the artifact meta and cross-checked at merge), and feeds them back through
+  encodes every scored row's universe-level source pair (`--prefix-intervention-seed` draws the
+  map; recorded in the artifact meta with `prefix_shuffle_scope: universe` and cross-checked at
+  merge), collects its $z_{uv}$, and feeds it back through
   `V3_1Prefix.logits_from_encoded(..., z=...)`.
 - **Configs.** `configs/split_seed42/prefix_static.yaml`, `prefix_pair.yaml`,
   `prefix_pair_bce.yaml`: the `struct_new` config with `model.family: v3_1_prefix`,

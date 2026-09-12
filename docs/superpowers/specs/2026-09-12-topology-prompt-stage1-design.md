@@ -1,7 +1,8 @@
 # Topology Prompt, Stage I: a reader that uses true structure through a prefix
 
 **Design spec and implementation record.** Date: 2026-09-12. Status: implemented
-(`model.family: v3_1_topo_prompt`), two diagnostic runs launched on the H20 containers.
+(`model.family: v3_1_topo_prompt`); `topo_prompt_full` complete, `topo_prompt_frozen` running;
+results in `docs/results/topo_prompt_stage1.md` (§9 below summarises).
 Supersedes the attribute-conditioned prefix arms of
 `2026-09-10-prefix-tuning-frozen-trunk-design.md` as the prefix design under study; those
 arms remain as comparison rows.
@@ -126,9 +127,10 @@ the KD banks are refused for this family (Stage I is task BCE only).
   edge removed), and marks the artifact `formal: False`.
 - Interventions, `--prefix-intervention`: `gates_off` (the base function), `mean`
   (every field at its training mean), `mean_endpoint` / `mean_relation` / `mean_context`
-  (one field at a time), `shuffle` (the coordinate bundle permuted across every row the
-  scoring process scores, per shard under fan-out, never within a batch, seeded by
-  `--prefix-intervention-seed`). Each intervention run re-selects its own V_val thresholds, as
+  (one field at a time), `shuffle` (every row reads the coordinates of another row drawn by one seeded permutation
+  of the whole universe, `--prefix-intervention-seed`; identical under fan-out and never within a
+  batch or a shard: the 1:1 `val_cls`/`test` lists are label-sorted, so the within-shard
+  permutation used until 2026-09-12 left every substitute with the row's own label there). Each intervention run re-selects its own V_val thresholds, as
   the prefix arms do.
 
 ## 6. Runs and comparison rows (headline split, seed 0)
@@ -140,14 +142,14 @@ the KD banks are refused for this family (Stage I is task BCE only).
 | `topo_prompt_frozen` | `configs/split_seed42/topo_prompt_frozen.yaml` | prompt only on frozen `prefix_base` | true `s*` | freezing control; read against `prefix_pair_bce` (same trainable scope, attribute condition) |
 | interventions on both | scoring only | — | shuffled / mean / off | attribution |
 
-Launch (2026-09-12; 30030 still runs the old `prefix_static` study; 30838 had picked up the
-CAZI-MBN baseline in the meantime, so the frozen lane is queued there behind it by
-`outputs/logs/topo_prompt_frozen_wait.sh`):
+Launch (2026-09-12; 30030 runs the old `prefix_static`/`prefix_pair` studies throughout; 30838
+carried another session's CAZI-MBN and official-PPI baselines, so the frozen lane took 30846 as
+soon as the full lane had freed it):
 
 ```bash
-# 30846, started 09:51 UTC at c75dddf
+# 30846, 09:51-15:12 UTC at c75dddf (train, test diagnostic, six interventions)
 hpc/run.sh train configs/split_seed42/topo_prompt_full.yaml --run-kind diagnostic
-# 30838, queued until every GPU is idle
+# 30846, started 16:02 UTC
 hpc/run.sh train configs/split_seed42/topo_prompt_frozen.yaml --run-kind diagnostic
 # afterwards, per run (each writes its own output-dir)
 hpc/run.sh test --checkpoint outputs/split_seed42/<run>/best.pt \
@@ -181,3 +183,21 @@ read; the paired bootstrap in the test protocol governs claims.
 
 Stage II–IV code (the coordinate generator, its supervision, joint fine-tuning), any struct-
 stream supervision for this family, and a fixed-size context variant of the coordinates.
+
+## 9. Result (2026-09-12, full lane; frozen lane pending)
+
+Numbers and tables: `docs/results/topo_prompt_stage1.md`. On V_val, `topo_prompt_full` reads
+val_cls AUROC/AUPRC 0.952/0.961 against `prefix_base`'s 0.793/0.814 and GS 0.691 against 0.401
+at RD ≈ 1.03; `mean` returns it to 0.743/0.779 and GS 0.376, `gates_off` to 0.725/0.768 and
+0.374, and `shuffle` on the ball-union universe drops it below the base (AUROC 0.647, GS 0.262).
+This is outcome 1 of §7: the interface transmits structure and the reader uses it. Per field,
+`mean_relation` costs the most (GS 0.542), `mean_endpoint` little (0.674), `mean_context`
+nothing (0.703). The three V_val MMD ratios do not improve with GS. On the test universe the
+edge family transfers (AUPRC 0.939 vs 0.744) but the V_val-selected threshold under-densifies
+the dense test region (RD 0.34) and the shape ratios triple — the §3 shift, read with that caveat.
+
+Correction found while reading the result: the scorer's `shuffle` permuted within each fan-out
+shard, and the 1:1 `val_cls`/`test` lists are label-sorted, so on those two universes every
+substitute carried the row's own label (shuffle scored *above* the true coordinates there). The
+scorer now draws one permutation of the whole universe (§5); the ball-union V_val topology
+readout was unaffected, and the two 1:1 shuffle rows are rerun under the corrected scorer.

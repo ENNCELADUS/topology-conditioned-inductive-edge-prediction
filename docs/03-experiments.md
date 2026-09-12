@@ -186,6 +186,14 @@ candidate deployable model.
 | Oracle reference | Test AUROC ↑ | Test AUPRC ↑ | GS ↑ | RD → 1 | Degree MMD ↓ | Clustering MMD ↓ | Spectral MMD ↓ |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Full-Ego PMA1 | 0.9498 | 0.9547 | 0.6019 | 0.7079 | 6.962 | 6.430 | 11.472 |
+| Topology prompt, Stage I (`topo_prompt_full`, true coordinates) | 0.9295 | 0.9392 | 0.4608 | 0.3442 | 33.345 | 25.267 | 44.234 |
+
+The topology-prompt row is a second true-structure ceiling, not a comparator: the
+prefix_base trunk reads the queried pair's structural coordinates measured on the
+test graph with the query removed. Its V_val-selected threshold under-densifies the
+denser test region (RD 0.34), so its test topology numbers are dominated by the
+density shift; the V_val readout and the interventions that attribute the gain to
+the structural content are in `docs/results/topo_prompt_stage1.md`.
 
 | Model | Accuracy ↑ | F1 ↑ | MCC ↑ | ECE ↓ | Brier ↓ | Test geometric RD → 1 | Test mean absolute log RD ↓ |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -198,6 +206,7 @@ candidate deployable model.
 | + Gram | 0.6228 | 0.6843 | 0.2667 | 0.1537 | 0.2429 | 0.5260 | 0.6447 |
 | + NEW | 0.6159 | 0.6695 | 0.2450 | 0.3168 | 0.3293 | 0.6211 | 0.4913 |
 | PMA1 oracle | 0.8762 | 0.8794 | 0.7534 | 0.0993 | 0.1130 | 0.6670 | 0.4451 |
+| Topology prompt, Stage I (ceiling) | 0.7909 | 0.7414 | 0.6299 | 0.0774 | 0.1151 | 0.3000 | 1.2042 |
 
 GRAND's calibration is worse than B0 despite its edge/topology gains. Even the
 oracle's validation geometric RD of 1.0000 falls to 0.6670 on test: the frozen

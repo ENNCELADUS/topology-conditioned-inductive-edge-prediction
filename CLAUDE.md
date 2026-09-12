@@ -35,8 +35,9 @@ selected method. Every piece of writing must explain how its context helps decid
   topology-supervision control. Studies: `src.experiments.struct_hpo --arm prefix_{static,pair}` and
   `--arm prefix_pair_bce --n-trials 3 --lr-center <winner lr>`. Scoring-time interventions:
   `score_universe --prefix-intervention {gates_off,shuffle,mean}`. `shuffle`/`mean` require a
-  pair-conditioned checkpoint and fail closed without one; `shuffle` permutes the pair condition
-  across all pairs the scoring process scores (per shard under fan-out), not within a batch.
+  pair-conditioned checkpoint and fail closed without one; `shuffle` gives every row the condition
+  of another row drawn by one seeded permutation of the whole universe (identical under fan-out,
+  never within a batch or a shard: the 1:1 pair lists are label-sorted, so a shard is label-pure).
 - Topology-prompt Stage I (`model.family: v3_1_topo_prompt`, spec
   `docs/superpowers/specs/2026-09-12-topology-prompt-stage1-design.md`): the prefix_base trunk reads
   the queried pair's fixed-semantics structural coordinates (`src/data/struct_coords.py`, measured on

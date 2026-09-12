@@ -152,6 +152,11 @@ hpc/run.sh test --checkpoint outputs/split_seed42/topo_prompt_full/best.pt \
   --allow-oracle-diagnostic --prefix-intervention shuffle
 ```
 
+`--prefix-intervention shuffle` draws one seeded permutation of the whole universe, so the
+fan-out shards compose the same null and the artifact records `prefix_shuffle_scope: universe`.
+Shuffle artifacts scored before 2026-09-12 permuted within each shard; on the label-sorted 1:1
+universes (`val_cls`, `test`) that kept every substitute's label and they are vacuous there.
+
 The two scoring-time controls (`structure_control_6a_v3`, `structure_control_6e_v1`)
 are not trained arms and have no `train` invocation of their own — they reuse the `full`
 arm's published checkpoint (`--checkpoint` only; nothing about the control changes what
