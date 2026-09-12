@@ -1276,11 +1276,20 @@ def _build_cazi_mbn(model_config: dict[str, object]) -> nn.Module:
     return CAZIStudent(**cast(dict[str, Any], model_config))
 
 
+
+def _build_official_ppi(model_config: dict[str, object]) -> nn.Module:
+    """Build a vendored PPI classifier from its embedded configuration."""
+    from src.baselines.official_ppi import build_official_ppi
+
+    return build_official_ppi(model_config)
+
+
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "v3_1_prefix": _build_v3_1_prefix,
     "egostitch_e2e": _build_egostitch_e2e,
     "cazi_mbn": _build_cazi_mbn,
+    "official_ppi": _build_official_ppi,
 }
 
 
@@ -3620,6 +3629,17 @@ def _run_score(args: argparse.Namespace) -> None:
             batch_pairs=args.batch_pairs,
             f0_cache=args.f0_cache,
         )
+    elif model_family == "official_ppi":
+        from src.baselines.official_ppi import OfficialPPI, PairFeatures, score_pairs
+
+        if args.pack_dir is None:
+            raise ValueError("official_ppi scoring requires --pack-dir")
+        assert isinstance(model, OfficialPPI)
+        features = PairFeatures(args.pack_dir, device, model.max_length)
+        logits = score_pairs(model, features, list(row_pairs))
+        meta_extra["score_precision"] = {
+            "encode_autocast": "off", "pair_autocast": "off", "logit_storage_dtype": "float32",
+        }
     elif model_family == "cazi_mbn":
         assert cazi_context is not None
         cazi_cfg, feature_stats = cazi_context

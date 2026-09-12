@@ -510,3 +510,33 @@ it does not run the gram grid. Retry uses the target's latest resumable attempt
 before the older migrated prefix. A saved early-stop state republishes without
 additional epochs. Use `PYTORCH_ALLOC_CONF=expandable_segments:True` for the
 fragmentation observed in rank trial 011, preserving its training configuration.
+
+## Official PPI classifiers
+
+TUnA and PPITrans use vendored author model code under `src/baselines/vendor/`.
+These are feature-controlled adaptations: both read the existing 1536-dimensional
+frozen token pack (up to 1024 tokens), not newly generated ESM-2/ProtT5 embeddings.
+They train from scratch on the current seed-42 node holdout, dynamic 1:5 negatives,
+positive BCE weight 5, and use the common five-metric checkpoint selector and
+frozen geometric-RD/max-F1 test protocol.
+
+```bash
+hpc/run.sh train configs/split_seed42/tuna_official.yaml --worker-module src.train_official_ppi
+hpc/run.sh train configs/split_seed42/ppitrans_official.yaml --worker-module src.train_official_ppi
+```
+
+The runner auto-sizes torchrun to visible GPUs and chains the shared test evaluator
+once all workers exit. Run the commands sequentially on one idle container.
+`complete.json` is publication; successful test requires terminal exit plus
+`test_report.json` and merged scores. Defaults retain TUnA's Adam+Lookahead and
+14-epoch cap, PPITrans's Adam and 5-epoch cap. Validation BCE patience is 5;
+topology is evaluated at epoch 1, every second epoch, and the final epoch.
+Each rank uses four pairs per step, FP32 model math, and the shared BF16 input pack.
+
+TUnA retains the original GP head and mean-field prediction. For every evaluated
+network state, covariance is recomputed using only that epoch's training stream
+with fixed weights; precision sums across ranks once. Validation/test never update
+precision. The mean-field formula uses a per-pair vector shape, correcting the
+upstream `(N,1)`/`(N,)` broadcasting ambiguity. Both checkpoint ranking and threshold
+selection use these same inference logits. Upstream source revisions, license
+notices and the minimal portability changes are recorded in the vendor README.

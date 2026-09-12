@@ -1,0 +1,21 @@
+model:
+  method: ppitrans
+  input_dim: 1536
+  max_length: 1024
+  hidden_dim: 256
+  layers: 8
+  heads: 8
+  dropout: 0.2
+  rffs: 4096
+  seed: 0
+  batch_size: 4
+optim:
+  lr: 3.0e-05
+  weight_decay: 0.0
+  epochs: 5
+  patience: 5
+topology_every: 2
+seed: 0
+data_root: data
+pack_dir: outputs/feature_packs/b0_v31_bf16
+output_dir: outputs/official_ppi/ppitrans_seed0_20260912

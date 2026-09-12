@@ -207,3 +207,19 @@ original 10,000-epoch caps/patience 30 are retained; student topology cadence is
 plus the first/final epochs. This is a benchmark-adapted CAZI run, not an unchanged
 upstream reproduction. Publication alone is not a completed test; no new result
 is claimed here. Execution details are in `hpc/README.md`.
+
+### 5.1 Official TUnA / PPITrans feature-controlled baselines
+
+The author implementations are vendored and run through `src.train_official_ppi`
+and `hpc/run.sh`; see the source provenance in `src/baselines/vendor/README.md`.
+Both consume the same frozen 1536-dimensional token features as our task, not the
+papers' original ESM-2/ProtT5 embeddings. No supervised upstream PPI checkpoints
+or upstream train/test splits are used. This is a classifier comparison with fixed
+features; it does not reproduce either paper's native-embedding result.
+
+The current node-held-out split, dynamic 1:5 negative stream, positive weight 5,
+val_cls BCE stopping, five-metric checkpoint selection and test threshold replay
+are shared. Architecture and method-specific optimizer defaults are retained;
+TUnA's GP precision is fitted only on training rows at each evaluated network state,
+and its mean-field logits are frozen consistently for validation and test. The
+execution runbook records budgets and cadence. No completed results are claimed.

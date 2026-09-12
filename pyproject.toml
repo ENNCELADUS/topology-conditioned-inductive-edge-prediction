@@ -67,7 +67,7 @@ markers = [
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
-extend-exclude = [".codex"]
+extend-exclude = [".codex", "src/baselines/vendor"]
 
 [tool.ruff.lint]
 select = [
@@ -117,3 +117,7 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["src.baselines.vendor.*"]
+ignore_errors = true

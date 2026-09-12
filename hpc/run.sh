@@ -133,6 +133,20 @@ case "${COMMAND}" in
     CONFIG_PATH="$1"
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
+    if [[ $# -eq 2 && "$1" == "--worker-module" && "$2" == "src.train_official_ppi" ]]; then
+      "${PYTHON_BIN}" -m torch.distributed.run --standalone --nproc_per_node="${GPU_COUNT}" \
+        -m src.train_official_ppi "${CONFIG_PATH}"
+      read -r PPI_OUTPUT PPI_PACK PPI_SEED PPI_ARM < <("${PYTHON_BIN}" -c '
+import sys, yaml
+with open(sys.argv[1]) as handle:
+    cfg = yaml.safe_load(handle)
+print(cfg["output_dir"], cfg["pack_dir"], cfg["seed"], cfg["model"]["method"])
+' "${CONFIG_PATH}")
+      exec "${PYTHON_BIN}" -m src.eval.test_protocol \
+        --checkpoint "${PPI_OUTPUT}/best.pt" --output-dir "${PPI_OUTPUT}" \
+        --pack-dir "${PPI_PACK}" --data-root "${DATA_ROOT}" --strategy breadth_first \
+        --arm "${PPI_ARM}" --seed "${PPI_SEED}"
+    fi
     if [[ $# -eq 2 && "$1" == "--worker-module" && "$2" == "src.train_cazi_mbn" ]]; then
       # Not exec: the CAZI runner is not an E2 pack/train/publish/test worker,
       # so this branch chains the same held-out test protocol itself once
