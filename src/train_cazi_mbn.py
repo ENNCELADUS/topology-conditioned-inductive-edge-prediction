@@ -25,12 +25,19 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from torch import nn
 
 from src.baselines.cazi_mbn import CAZIStudent, CAZITeacher
-from src.data.artifacts import Benchmark, LabeledPairs, load_benchmark, load_candidate_pairs
+from src.data.artifacts import Benchmark, load_benchmark
 from src.data.feature_stats import FeatureStats, feature_stats_for_universe
 from src.data.features import FeatureStore, build_f0_matrix
+from src.data.pairs import NegativeSampler
 from src.data.partition import build_g_struct
+from src.data.training_sampler import enumerate_edge_stream
 from src.data.val_region import derive_val_region_split, val_ball_union_universe
-from src.eval.edge_metrics import compute_edge_metrics
+from src.eval.checkpoint_selection import SELECTION_RULE, CheckpointCandidate, select_checkpoint
+from src.eval.val_topology import (
+    ValTopologyReference,
+    build_val_topology_reference,
+    val_region_topology_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +69,7 @@ class CAZIConfig:
     classification_coef: float
     distillation_weight: float
     supervised_weight: float
+    topology_every: int = 10
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,10 +82,10 @@ class PreparedData:
     topology: torch.Tensor
     positive_edge_index: torch.Tensor
     negative_edge_index: torch.Tensor
-    train_pairs: list[tuple[str, str]]
-    train_labels: NDArray[np.float32]
-    teacher_val_pairs: list[tuple[str, str]]
-    teacher_val_labels: NDArray[np.int8]
+    training_positives: list[tuple[str, str]]
+    sampler: NegativeSampler
+    topology_reference: ValTopologyReference
+    topology_pairs: list[tuple[str, str]]
     student_val_nodes: list[str]
     student_val_sequence: torch.Tensor
     student_val_pairs: list[tuple[str, str]]
@@ -126,6 +134,7 @@ def load_config(path: Path) -> CAZIConfig:
         classification_coef=float(loss["classification_coef"]),
         distillation_weight=float(loss["distillation_weight"]),
         supervised_weight=float(loss["supervised_weight"]),
+        topology_every=int(_mapping(raw.get("eval", {}), "eval").get("topology_every", 10)),
     )
 
 
@@ -349,30 +358,21 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         for pair in val_split.training_positives
         if pair[0] not in missing and pair[1] not in missing
     )
-    training_negatives = [
-        pair
-        for pair in val_split.training_negatives
-        if pair[0] not in missing and pair[1] not in missing
-    ]
     g_struct = build_g_struct(train_nodes, training_positives)
     topology_edges = sorted(cast(Iterable[tuple[str, str]], g_struct.edges()))
-    fit_pair_rows = training_positives + training_negatives
-    fit_labels = np.asarray(
-        [1] * len(training_positives) + [0] * len(training_negatives), dtype=np.int8
+    sampler = NegativeSampler(train_nodes, dict(g_struct.degree()), frozenset(training_positives))
+    rows = enumerate_edge_stream(
+        training_positives,
+        sampler,
+        negative_ratio=5,
+        seed=cfg.seed,
+        epoch=1,
+        rank=0,
+        world_size=1,
     )
-    rng = np.random.default_rng(cfg.seed)
-    permutation = rng.permutation(len(fit_pair_rows))
-    train_pairs = [fit_pair_rows[int(i)] for i in permutation]
-    train_labels = fit_labels[permutation].astype(np.float32, copy=False)
-    negative_candidates = [
-        pair
-        for pair, label in zip(fit_pair_rows, fit_labels, strict=True)
-        if label == 0 and pair[0] != pair[1]
+    negative_edges = [(u, v) for u, v, label in rows if label == 0 and u != v][
+        : len(topology_edges)
     ]
-    if len(negative_candidates) < len(topology_edges):
-        raise ValueError("not enough frozen negatives to build the CAZI negative graph")
-    negative_choice = rng.choice(len(negative_candidates), size=len(topology_edges), replace=False)
-    negative_edges = [negative_candidates[int(i)] for i in negative_choice]
     topology = load_or_build_ugt(
         cfg.output_dir / "ugt_projection.npz",
         train_nodes,
@@ -381,19 +381,23 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         feature_length=cfg.topology_dim,
         seed=cfg.seed,
     )
-    teacher_val_pairs = list(val_split.val_cls_pairs)
-    teacher_val_labels = np.asarray(val_split.val_cls_labels, dtype=np.int8)
-    if not teacher_val_pairs or len(set(teacher_val_labels.tolist())) != 2:
-        raise ValueError("CAZI teacher validation must contain both classes on V_val")
+    student_val_pairs = list(val_split.val_cls_pairs)
+    student_val_labels = np.asarray(val_split.val_cls_labels, dtype=np.int8)
+    if not student_val_pairs or len(set(student_val_labels.tolist())) != 2:
+        raise ValueError("CAZI validation must contain both classes on V_val")
     union = val_ball_union_universe(val_split)
-    u_idx, v_idx = union.u_idx, union.v_idx
-    g_val = val_split.build_g_val()
-    student_val_pairs = [
+    topology_pairs = [
         (student_val_nodes[int(u)], student_val_nodes[int(v)])
-        for u, v in zip(u_idx, v_idx, strict=True)
+        for u, v in zip(union.u_idx, union.v_idx, strict=True)
     ]
-    student_val_labels = np.asarray(
-        [1 if g_val.has_edge(a, b) else 0 for a, b in student_val_pairs], dtype=np.int8
+    logger.info(
+        "split seed=%d root=%s train_nodes=%d train_positives=%d V_val_nodes=%d val_cls=%d",
+        val_split.params.split_seed,
+        val_split.region_seeds,
+        len(train_nodes),
+        len(training_positives),
+        len(student_val_nodes),
+        len(student_val_pairs),
     )
     return PreparedData(
         benchmark=benchmark,
@@ -402,10 +406,10 @@ def prepare_data(cfg: CAZIConfig) -> PreparedData:
         topology=topology,
         positive_edge_index=_edge_index(topology_edges, train_node_position),
         negative_edge_index=_edge_index(negative_edges, train_node_position),
-        train_pairs=train_pairs,
-        train_labels=train_labels,
-        teacher_val_pairs=teacher_val_pairs,
-        teacher_val_labels=teacher_val_labels,
+        training_positives=training_positives,
+        sampler=sampler,
+        topology_reference=build_val_topology_reference(val_split),
+        topology_pairs=topology_pairs,
         student_val_nodes=student_val_nodes,
         student_val_sequence=student_val_sequence,
         student_val_pairs=student_val_pairs,
@@ -453,11 +457,8 @@ def _validation_metrics(
 ) -> tuple[float, float, float]:
     """Return ``(auroc, auprc, task_loss)`` over the validation pairs.
 
-    ``task_loss`` is the unweighted validation BCE: the total validation loss
-    both loops count patience on. Neither the teacher's graph terms nor the
-    student's distillation term has a validation counterpart, and the student's
-    ``supervised_weight`` is a positive constant that cannot change a monotone
-    comparison, so the raw BCE is the whole monitored total.
+    ``task_loss`` is the unweighted val_cls BCE used for student early stopping.
+    Teacher graph terms and student distillation have no V_val targets.
     """
     u_idx, v_idx = _pair_indices(pairs, position)
     model.eval()
@@ -474,7 +475,9 @@ def _validation_metrics(
                 logits, torch.as_tensor(labels, dtype=logits.dtype, device=logits.device)
             )
         )
-    probs = torch.sigmoid(logits).cpu().numpy()
+    probs = logits.cpu().numpy()
+    if not np.isfinite(probs).all() or not math.isfinite(task_loss):
+        raise ValueError("non-finite validation state")
     return (
         float(roc_auc_score(labels, probs)),
         float(average_precision_score(labels, probs)),
@@ -492,6 +495,26 @@ def _write_history(path: Path, row: Mapping[str, object]) -> None:
         handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
 
 
+def _epoch_pairs(
+    cfg: CAZIConfig,
+    data: PreparedData,
+    epoch: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows = enumerate_edge_stream(
+        data.training_positives,
+        data.sampler,
+        negative_ratio=5,
+        seed=cfg.seed,
+        epoch=epoch,
+        rank=0,
+        world_size=1,
+    )
+    u, v = _pair_indices([(a, b) for a, b, _ in rows], data.train_node_position)
+    labels = torch.tensor([label for _, _, label in rows], dtype=torch.float32, device=device)
+    return u.to(device), v.to(device), labels
+
+
 def train_teacher(
     cfg: CAZIConfig,
     data: PreparedData,
@@ -504,10 +527,6 @@ def train_teacher(
     topology = data.topology.to(device)
     positive_edge_index = data.positive_edge_index.to(device)
     negative_edge_index = data.negative_edge_index.to(device)
-    train_u, train_v = _pair_indices(data.train_pairs, data.train_node_position)
-    train_u = train_u.to(device)
-    train_v = train_v.to(device)
-    labels = torch.from_numpy(data.train_labels).to(device)
     model = CAZITeacher(
         len(data.train_nodes),
         sequence.shape[1],
@@ -520,13 +539,14 @@ def train_teacher(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.75)
-    best_auroc = -math.inf
-    best_val_loss = math.inf
+    best_training_loss = math.inf
     best_state = _clone_state(model)
+    best_epoch = 0
     patience = 0
     history_path = cfg.output_dir / "teacher_history.jsonl"
     history_path.unlink(missing_ok=True)
-    for epoch in range(epochs):
+    for epoch in range(1, epochs + 1):
+        train_u, train_v, labels = _epoch_pairs(cfg, data, epoch, device)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         discriminator_loss, regularization_loss = model.graph_objective(
@@ -542,52 +562,50 @@ def train_teacher(
         for start in range(0, len(train_u), cfg.batch_size):
             batch = permutation[start : start + cfg.batch_size]
             logits = model.pair_logits(sequence, train_u[batch], train_v[batch])
-            loss = nn.functional.binary_cross_entropy_with_logits(logits, labels[batch])
+            loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, labels[batch], pos_weight=logits.new_tensor(5.0)
+            )
             weighted = cfg.classification_coef * loss * (len(batch) / len(train_u))
             weighted.backward()  # type: ignore[no-untyped-call]
             classification_sum += float(loss.detach()) * len(batch)
+        nn.utils.clip_grad_norm_(model.parameters(), math.inf, error_if_nonfinite=True)
         optimizer.step()
         scheduler.step()
-        val_auroc, val_auprc, val_total_loss = _validation_metrics(
-            model,
-            sequence,
-            data.teacher_val_pairs,
-            data.teacher_val_labels,
-            data.train_node_position,
-            batch_size=cfg.score_batch_size,
-            device=device,
+        total_loss = float(
+            graph_loss.detach()
+        ) + cfg.classification_coef * classification_sum / len(train_u)
+        if not math.isfinite(total_loss):
+            raise ValueError("non-finite CAZI teacher loss")
+        _write_history(
+            history_path,
+            {
+                "epoch": epoch,
+                "training_total_loss": total_loss,
+                "discriminator_loss": float(discriminator_loss.detach()),
+                "regularization_loss": float(regularization_loss.detach()),
+                "classification_loss": classification_sum / len(train_u),
+            },
         )
-        row = {
-            "epoch": epoch,
-            "discriminator_loss": float(discriminator_loss.detach()),
-            "regularization_loss": float(regularization_loss.detach()),
-            "classification_loss": classification_sum / len(train_u),
-            "val_auroc": val_auroc,
-            "val_auprc": val_auprc,
-            "val_total_loss": val_total_loss,
-        }
-        _write_history(history_path, row)
-        logger.info(
-            "teacher epoch=%d val_auroc=%.6f val_auprc=%.6f val_total=%.6f",
-            epoch,
-            val_auroc,
-            val_auprc,
-            val_total_loss,
-        )
-        if val_auroc > best_auroc:
-            best_auroc = val_auroc
+        logger.info("teacher epoch=%d training_total_loss=%.6f", epoch, total_loss)
+        # Consensus is a train-node lookup: V_val cannot be scored by this teacher.
+        # This is training convergence, not a validation-selected deployable model.
+        if total_loss < best_training_loss:
+            best_training_loss = total_loss
             best_state = _clone_state(model)
-        if val_total_loss < best_val_loss:
-            best_val_loss = val_total_loss
+            best_epoch = epoch
             patience = 0
         else:
             patience += 1
             if patience >= cfg.patience:
-                logger.info("teacher early stop at epoch %d", epoch)
                 break
     model.load_state_dict(best_state)
     torch.save(
-        {"state_dict": best_state, "best_val_auroc": best_auroc},
+        {
+            "state_dict": best_state,
+            "epoch": best_epoch,
+            "selection_rule": "teacher_training_total_loss",
+            "training_total_loss": best_training_loss,
+        },
         cfg.output_dir / "teacher.pt",
     )
     return model
@@ -604,10 +622,6 @@ def train_student(
     """Distill the teacher node latent into the sequence-only student."""
     sequence = data.train_sequence.to(device)
     student_val_sequence = data.student_val_sequence.to(device)
-    train_u, train_v = _pair_indices(data.train_pairs, data.train_node_position)
-    train_u = train_u.to(device)
-    train_v = train_v.to(device)
-    labels = torch.from_numpy(data.train_labels).to(device)
     teacher.eval()
     with torch.no_grad():
         teacher_latent = teacher.distilled_latent().detach()
@@ -620,13 +634,15 @@ def train_student(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.95)
-    best_auroc = -math.inf
     best_val_loss = math.inf
-    best_state = _clone_state(model)
+    candidates: list[CheckpointCandidate] = []
+    checkpoint_dir = cfg.output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     patience = 0
     history_path = cfg.output_dir / "student_history.jsonl"
     history_path.unlink(missing_ok=True)
-    for epoch in range(epochs):
+    for epoch in range(1, epochs + 1):
+        train_u, train_v, labels = _epoch_pairs(cfg, data, epoch, device)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         student_latent = model.node_latent(sequence)
@@ -643,13 +659,18 @@ def train_student(
             )
             classification_labels.append(labels[batch])
         classification_loss = nn.functional.binary_cross_entropy_with_logits(
-            torch.cat(classification_parts), torch.cat(classification_labels)
+            torch.cat(classification_parts),
+            torch.cat(classification_labels),
+            pos_weight=sequence.new_tensor(5.0),
         )
         total_loss = (
             cfg.distillation_weight * distillation_loss
             + cfg.supervised_weight * classification_loss
         )
+        if not bool(torch.isfinite(total_loss)):
+            raise ValueError("non-finite CAZI student loss")
         total_loss.backward()  # type: ignore[no-untyped-call]
+        nn.utils.clip_grad_norm_(model.parameters(), math.inf, error_if_nonfinite=True)
         optimizer.step()
         scheduler.step()
         val_auroc, val_auprc, val_total_loss = _validation_metrics(
@@ -677,161 +698,80 @@ def train_student(
             val_auprc,
             val_total_loss,
         )
-        if val_auroc > best_auroc:
-            best_auroc = val_auroc
-            best_state = _clone_state(model)
+        due = epoch == 1 or epoch % cfg.topology_every == 0 or epoch == epochs
+        if due:
+            u, v = _pair_indices(data.topology_pairs, data.student_val_position)
+            model.eval()
+            with torch.no_grad():
+                logits = (
+                    _batched_logits(
+                        model,
+                        student_val_sequence,
+                        u.to(device),
+                        v.to(device),
+                        batch_size=cfg.score_batch_size,
+                    )
+                    .cpu()
+                    .numpy()
+                )
+            topology = val_region_topology_metrics(
+                u_idx=u.numpy(),
+                v_idx=v.numpy(),
+                logits=logits,
+                reference=data.topology_reference,
+            )
+            candidates.append(CheckpointCandidate(epoch, val_auprc, topology.metrics))
+            payload = {
+                "state_dict": _clone_state(model),
+                "epoch": epoch,
+                "selection_rule": SELECTION_RULE,
+                "val_threshold_transfer": {
+                    "n_val": len(data.student_val_nodes),
+                    "threshold": topology.threshold,
+                },
+                "val_auprc": val_auprc,
+                "topology": dataclasses.asdict(topology),
+            }
+            torch.save(payload, checkpoint_dir / f"epoch-{epoch:04d}.pt")
+            _write_history(
+                cfg.output_dir / "validation_topology.jsonl",
+                {key: value for key, value in payload.items() if key != "state_dict"},
+            )
+            logger.info("student epoch=%d topology=%s", epoch, dataclasses.asdict(topology))
         if val_total_loss < best_val_loss:
             best_val_loss = val_total_loss
             patience = 0
         else:
             patience += 1
-            if patience >= cfg.patience:
-                logger.info("student early stop at epoch %d", epoch)
-                break
-    model.load_state_dict(best_state)
-    torch.save(
-        {"state_dict": best_state, "best_val_auroc": best_auroc},
-        cfg.output_dir / "student.pt",
+        if patience >= cfg.patience and due:
+            logger.info("student early stop at epoch %d", epoch)
+            break
+    selected = select_checkpoint(candidates)
+    if selected is None:
+        raise RuntimeError("no CAZI checkpoint received topology validation")
+    selected_payload = torch.load(
+        checkpoint_dir / f"epoch-{selected.epoch:04d}.pt", map_location="cpu", weights_only=True
+    )
+    model.load_state_dict(selected_payload["state_dict"])
+    torch.save(selected_payload, cfg.output_dir / "student.pt")
+    (cfg.output_dir / "selection.json").write_text(
+        json.dumps(
+            {
+                "selection_rule": SELECTION_RULE,
+                "selected_epoch": selected.epoch,
+                "candidates": [dataclasses.asdict(candidate) for candidate in candidates],
+                "val_threshold_transfer": selected_payload["val_threshold_transfer"],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    logger.info(
+        "selected student epoch=%d threshold=%s",
+        selected.epoch,
+        selected_payload["val_threshold_transfer"],
     )
     return model
-
-
-def _test_features(
-    cfg: CAZIConfig,
-    data: PreparedData,
-) -> tuple[list[str], torch.Tensor, dict[str, int]]:
-    test_nodes = sorted(data.benchmark.split.test_nodes)
-    store = FeatureStore(cfg.data_root / "features" / "frozen_node_features_1024")
-    present = [node for node in test_nodes if node not in data.missing_features]
-    present_f0, present_position = build_f0_matrix(
-        store,
-        present,
-        cache_path=cfg.output_dir / "test_f0_cache.pt",
-    )
-    sequence = torch.zeros((len(test_nodes), present_f0.shape[1]), dtype=torch.float32)
-    position = {node: i for i, node in enumerate(test_nodes)}
-    for node in present:
-        sequence[position[node]] = present_f0[present_position[node]]
-    return test_nodes, _standardize_f0(sequence, data.feature_stats), position
-
-
-def score_pairs(
-    model: CAZIStudent,
-    sequence: torch.Tensor,
-    pairs: Sequence[tuple[str, str]],
-    position: Mapping[str, int],
-    *,
-    batch_size: int,
-    device: torch.device,
-) -> NDArray[np.float32]:
-    """Score pairs in deterministic artifact order."""
-    u_idx, v_idx = _pair_indices(pairs, position)
-    model.eval()
-    sequence = sequence.to(device)
-    parts: list[NDArray[np.float32]] = []
-    with torch.no_grad():
-        for start in range(0, len(u_idx), batch_size):
-            stop = min(start + batch_size, len(u_idx))
-            logits = model.pair_logits(
-                sequence,
-                u_idx[start:stop].to(device),
-                v_idx[start:stop].to(device),
-            )
-            parts.append(torch.sigmoid(logits).cpu().numpy().astype(np.float32, copy=False))
-    return np.concatenate(parts)
-
-
-def _metrics_dict(labels: NDArray[np.int8], probs: NDArray[np.float32]) -> dict[str, float]:
-    return {
-        key: float(value)
-        for key, value in dataclasses.asdict(
-            compute_edge_metrics(labels, probs, threshold=0.5)
-        ).items()
-    }
-
-
-def score_and_evaluate(
-    cfg: CAZIConfig,
-    data: PreparedData,
-    student: CAZIStudent,
-    *,
-    device: torch.device,
-) -> dict[str, object]:
-    """Score classification rows; the shared test protocol owns topology evaluation."""
-    benchmark_root = cfg.data_root / "benchmark_2025_neurips"
-    test_nodes, test_sequence, test_position = _test_features(cfg, data)
-    balanced = data.benchmark.split.test_pairs
-    balanced_probs = score_pairs(
-        student,
-        test_sequence,
-        balanced.pairs,
-        test_position,
-        batch_size=cfg.score_batch_size,
-        device=device,
-    )
-    candidate: LabeledPairs = load_candidate_pairs(benchmark_root, cfg.strategy)
-    universe_probs = score_pairs(
-        student,
-        test_sequence,
-        candidate.pairs,
-        test_position,
-        batch_size=cfg.score_batch_size,
-        device=device,
-    )
-    node_position = {node: i for i, node in enumerate(test_nodes)}
-    u_idx = np.asarray([node_position[u] for u, _ in candidate.pairs], dtype=np.int32)
-    v_idx = np.asarray([node_position[v] for _, v in candidate.pairs], dtype=np.int32)
-    np.savez_compressed(
-        cfg.output_dir / "student_candidate_scores.npz",
-        node_ids=np.asarray(test_nodes),
-        u_idx=u_idx,
-        v_idx=v_idx,
-        label=candidate.labels.astype(np.int8, copy=False),
-        probability=universe_probs,
-    )
-    result: dict[str, object] = {
-        "model": "CAZI-MBN student",
-        "teacher_role": "train-only topology-aware distillation teacher",
-        "benchmark": cfg.strategy,
-        "seed": cfg.seed,
-        "pairwise": {
-            "balanced_test": _metrics_dict(balanced.labels, balanced_probs),
-            "full_universe": _metrics_dict(candidate.labels, universe_probs),
-            "decision_threshold": 0.5,
-            "balanced_rows": len(balanced.pairs),
-            "full_universe_rows": len(candidate.pairs),
-        },
-    }
-    (cfg.output_dir / "results.json").write_text(
-        json.dumps(result, indent=2, sort_keys=True, allow_nan=True) + "\n",
-        encoding="utf-8",
-    )
-    return result
-
-
-def _load_models(
-    cfg: CAZIConfig,
-    data: PreparedData,
-    device: torch.device,
-) -> tuple[CAZITeacher, CAZIStudent]:
-    teacher = CAZITeacher(
-        len(data.train_nodes),
-        data.train_sequence.shape[1],
-        topology_dim=cfg.topology_dim,
-        latent_dim=cfg.latent_dim,
-        network_layers=cfg.network_layers,
-        heads=cfg.heads,
-    ).to(device)
-    student = CAZIStudent(
-        data.train_sequence.shape[1],
-        latent_dim=cfg.latent_dim,
-        network_layers=cfg.network_layers,
-    ).to(device)
-    teacher_payload = torch.load(cfg.output_dir / "teacher.pt", map_location="cpu")
-    student_payload = torch.load(cfg.output_dir / "student.pt", map_location="cpu")
-    teacher.load_state_dict(teacher_payload["state_dict"])
-    student.load_state_dict(student_payload["state_dict"])
-    return teacher, student
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -854,12 +794,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.output_dir is not None:
         cfg = dataclasses.replace(cfg, output_dir=args.output_dir)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.topology_every < 1:
+        raise ValueError("eval.topology_every must be positive")
     started = time.monotonic()
     seed_everything(cfg.seed)
     device = select_device(args.device)
     logger.info("device=%s output_dir=%s", device, cfg.output_dir)
     try:
-        data = prepare_data(cfg)
+        if args.stage != "score":
+            data = prepare_data(cfg)
         if args.stage == "prepare":
             return
         if args.stage in {"train", "all"}:
@@ -869,24 +812,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 device=device,
                 epochs=args.max_teacher_epochs or cfg.teacher_epochs,
             )
-            student = train_student(
+            train_student(
                 cfg,
                 data,
                 teacher,
                 device=device,
                 epochs=args.max_student_epochs or cfg.student_epochs,
             )
-        else:
-            teacher, student = _load_models(cfg, data, device)
-        if args.stage in {"score", "all"}:
-            result = score_and_evaluate(
-                cfg,
-                data,
-                student,
-                device=device,
-            )
-            logger.info("results=%s", json.dumps(result["pairwise"], sort_keys=True))
-        if args.stage == "all":
+        if args.stage in {"train", "all"}:
             (cfg.output_dir / "failure.json").unlink(missing_ok=True)
             (cfg.output_dir / "complete.json").write_text(
                 json.dumps(
@@ -895,6 +828,29 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 + "\n",
                 encoding="utf-8",
+            )
+        if args.stage in {"score", "all"}:
+            from src.eval.test_protocol import main as test_main
+
+            test_main(
+                [
+                    "--checkpoint",
+                    str(cfg.output_dir / "student.pt"),
+                    "--model-family",
+                    "cazi_mbn",
+                    "--model-config",
+                    str(args.config),
+                    "--output-dir",
+                    str(cfg.output_dir),
+                    "--data-root",
+                    str(cfg.data_root),
+                    "--strategy",
+                    cfg.strategy,
+                    "--arm",
+                    "cazi_mbn",
+                    "--seed",
+                    str(cfg.seed),
+                ]
             )
     except Exception as error:
         (cfg.output_dir / "complete.json").unlink(missing_ok=True)

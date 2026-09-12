@@ -218,3 +218,20 @@ and `teacher_pma1/`. The teacher checkpoint remains
 `outputs/split_seed42/teacher_pma1/best.pt`. Base configs and teacher banks are in
 `configs/split_seed42/` and `outputs/distill/split_seed42/`; resumed trial configs
 remain alongside their outputs. See [the HPC runbook](../hpc/README.md) for execution.
+
+## 5. External CAZI-MBN baseline (protocol adaptation, 2026-09-12)
+
+`configs/cazi_mbn_breadth_first.yaml` now uses the same seed-42 node holdout,
+dynamic 1:5 supervised negative stream, positive BCE weight 5, V_val five-metric
+checkpoint selection and frozen closest-geometric-RD test threshold. Validation
+classification and early stopping use val_cls; topology uses the sampled pair union.
+The endpoint classifier averages both orders. Frozen pooled FP32 features and
+train-only normalization remain CAZI-specific, unlike the token B0 backbone.
+
+The teacher's consensus table is defined only for training nodes. Its convergence
+and checkpoint use training total loss, with no V_val teacher targets; only the
+feature-only student is a deployable, V_val-selected model. Adam/StepLR and the
+original 10,000-epoch caps/patience 30 are retained; student topology cadence is 10,
+plus the first/final epochs. This is a benchmark-adapted CAZI run, not an unchanged
+upstream reproduction. Publication alone is not a completed test; no new result
+is claimed here. Execution details are in `hpc/README.md`.

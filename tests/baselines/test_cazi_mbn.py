@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import scipy.sparse as sp
@@ -89,9 +91,8 @@ def test_sparse_ugt_matches_released_dense_operator_subspace() -> None:
 def test_validation_metrics_returns_the_bce_both_loops_stop_on() -> None:
     """`_validation_metrics` third value is the monitored total validation loss.
 
-    Both CAZI loops keep `best_state` on AUROC and count patience on this
-    number, so it has to be the plain validation BCE -- unweighted, and matching
-    a direct torch computation over the same logits.
+    The student counts patience on this number, so it must match plain
+    validation BCE independently of the five-metric checkpoint selector.
     """
     torch.manual_seed(0)
     sequence = torch.randn(6, 10)
@@ -123,3 +124,101 @@ def test_validation_metrics_returns_the_bce_both_loops_stop_on() -> None:
     assert task_loss == pytest.approx(float(expected), rel=1e-6)
     assert 0.0 <= auroc <= 1.0
     assert 0.0 <= auprc <= 1.0
+
+
+def test_pair_logits_are_symmetric_and_batch_independent() -> None:
+    torch.manual_seed(7)
+    model = CAZIStudent(10, latent_dim=3).eval()
+    sequence = torch.randn(9, 10)
+    u, v = torch.tensor([0, 1, 2]), torch.tensor([4, 5, 6])
+    with torch.no_grad():
+        forward = model.pair_logits(sequence, u, v)
+        reverse = model.pair_logits(sequence, v, u)
+        separate = torch.cat(
+            [model.pair_logits(sequence, u[i : i + 1], v[i : i + 1]) for i in range(3)]
+        )
+    torch.testing.assert_close(forward, reverse)
+    torch.testing.assert_close(forward, separate)
+
+
+def test_node_disjoint_training_publishes_rank_selected_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real teacher/student steps, with conflicting validation rankings and unseen IDs."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from typing import cast
+
+    import networkx as nx
+    from src.data.pairs import NegativeSampler
+    from src.eval.checkpoint_selection import SELECTION_RULE, TopologyValidationMetrics
+    from src.eval.val_topology import ValTopologyReference, ValTopologyResult
+    from src.train_cazi_mbn import (
+        PreparedData,
+        _epoch_pairs,
+        load_config,
+        train_student,
+        train_teacher,
+    )
+
+    cfg = replace(
+        load_config(Path("configs/cazi_mbn_breadth_first.yaml")),
+        output_dir=tmp_path,
+        topology_dim=4,
+        latent_dim=3,
+        heads=2,
+        batch_size=16,
+        score_batch_size=8,
+        topology_every=1,
+    )
+    nodes = [f"t{i}" for i in range(20)]
+    val_nodes = [f"v{i}" for i in range(8)]
+    positives = [(nodes[i], nodes[i + 1]) for i in range(10)]
+    sampler = NegativeSampler(nodes, dict.fromkeys(nodes, 1), frozenset(positives))
+    sequence = torch.randn(20, 10)
+    val_sequence = torch.randn(8, 10)
+    pairs = [(val_nodes[i], val_nodes[(i + 1) % 8]) for i in range(8)]
+    data = cast(
+        PreparedData,
+        SimpleNamespace(
+            train_nodes=nodes,
+            train_sequence=sequence,
+            topology=torch.randn(20, 4),
+            positive_edge_index=torch.tensor([[0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6]]),
+            negative_edge_index=torch.tensor([[0, 2, 4, 6, 7, 3], [2, 4, 6, 7, 3, 0]]),
+            training_positives=positives,
+            sampler=sampler,
+            train_node_position={n: i for i, n in enumerate(nodes)},
+            student_val_nodes=val_nodes,
+            student_val_sequence=val_sequence,
+            student_val_pairs=pairs,
+            student_val_labels=np.array([0, 1] * 4, dtype=np.int8),
+            student_val_position={n: i for i, n in enumerate(val_nodes)},
+            topology_pairs=pairs,
+            topology_reference=ValTopologyReference(tuple(val_nodes), nx.Graph(), {}),
+        ),
+    )
+    first = _epoch_pairs(cfg, data, 1, torch.device("cpu"))
+    second = _epoch_pairs(cfg, data, 2, torch.device("cpu"))
+    assert int(first[2].sum()) == 10 and len(first[2]) == 60
+    assert max(first[0].tolist() + first[1].tolist()) < len(nodes)
+    assert not torch.equal(first[0], second[0])
+    # Teacher must never try to index the unseen validation nodes.
+    teacher = train_teacher(cfg, data, device=torch.device("cpu"), epochs=1)
+    results = iter(
+        [
+            ValTopologyResult(TopologyValidationMetrics(0.8, 1.0, 1.0, 1.0, 1.0), 0.25),
+            ValTopologyResult(TopologyValidationMetrics(0.2, 1.0, 5.0, 5.0, 5.0), -0.5),
+        ]
+    )
+    monkeypatch.setattr(
+        "src.train_cazi_mbn.val_region_topology_metrics", lambda **kw: next(results)
+    )
+    student = train_student(cfg, data, teacher, device=torch.device("cpu"), epochs=2)
+    payload = torch.load(tmp_path / "student.pt", weights_only=True)
+    assert payload["epoch"] == 1
+    assert payload["selection_rule"] == SELECTION_RULE
+    assert payload["val_threshold_transfer"] == {"n_val": 8, "threshold": 0.25}
+    for key, value in student.state_dict().items():
+        torch.testing.assert_close(value.cpu(), payload["state_dict"][key])
+    assert (tmp_path / "selection.json").exists()

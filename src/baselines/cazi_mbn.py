@@ -186,7 +186,9 @@ class MoE(nn.Module):
                 f"MoE endpoint dimensions must be ({self.in1_dim}, {self.in2_dim}), "
                 f"got ({x1.shape[1]}, {x2.shape[1]})"
             )
-        return cast(torch.Tensor, self.classifier(torch.cat((x1, x2), dim=1)))
+        forward = self.classifier(torch.cat((x1, x2), dim=1))
+        reverse = self.classifier(torch.cat((x2, x1), dim=1))
+        return cast(torch.Tensor, (forward + reverse) * 0.5)
 
 
 class CAZITeacher(nn.Module):
