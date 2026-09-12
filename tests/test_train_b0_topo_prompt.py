@@ -13,6 +13,8 @@ import pytest
 import torch
 from accelerate import Accelerator
 from src.data.struct_coords import COORD_DIM
+from src.eval.checkpoint_selection import TopologyValidationMetrics
+from src.eval.val_topology import ValTopologyResult
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 from src.train_b0 import (
@@ -23,6 +25,7 @@ from src.train_b0 import (
     _base_loss_kwargs,
     _build_optimizer,
     _evaluate_distributed,
+    _evaluate_two_pass,
     _run_metadata,
     apply_overrides,
     build_model,
@@ -275,6 +278,48 @@ def test_ddp_loop_trains_the_prompt_model_from_attached_coordinates(tmp_path: Pa
     )
     assert not torch.equal(before["generator.gates"], after["generator.gates"])
     torch.testing.assert_close(after["generator.coord_mean"], rows.coord_mean)
+
+
+def test_two_pass_validation_forwards_the_coordinate_hook() -> None:
+    train, val, nodes = _tiny_graph()
+    val_pairs = [("v0", "v1"), ("v1", "v3"), ("v2", "v4"), ("v0", "v3")]
+    rows = TopoPromptRows(
+        train_graph=train,
+        train_pairs=[(nodes[0], nodes[1]), (nodes[2], nodes[3])],
+        stats_rows=np.arange(2),
+        val_graph=val,
+        val_cls_pairs=val_pairs,
+        universe_pairs=val_pairs,
+        device=torch.device("cpu"),
+    )
+    torch.manual_seed(0)
+    model = V3_1TopoPrompt(base=_tiny_base_config(), topo_prompt={"trainable": "all", "width": 8})
+    rows.install(model)
+    val_batches = _prompt_batches(1, len(val_pairs))
+    topology = ValTopologyResult(
+        metrics=TopologyValidationMetrics(
+            gs=0.5, rd=1.0, degree_mmd=1.0, clustering_mmd=1.0, spectral_mmd=1.0
+        ),
+        threshold=0.0,
+    )
+    accelerator = Accelerator(cpu=True)
+    outcome = _evaluate_two_pass(
+        model,
+        val_batches,
+        accelerator,
+        expected_row_ids=np.arange(len(val_pairs)),
+        topology_eval_fn=lambda m, a: topology,
+        attach=rows.attach_val,
+    )
+    assert outcome.topology is topology and outcome.task_loss is not None
+    with pytest.raises(ValueError, match="struct_coords"):
+        _evaluate_two_pass(
+            model,
+            _prompt_batches(1, len(val_pairs)),
+            accelerator,
+            expected_row_ids=np.arange(len(val_pairs)),
+            topology_eval_fn=lambda m, a: topology,
+        )
 
 
 def test_ddp_loop_fails_closed_without_coordinates(tmp_path: Path) -> None:

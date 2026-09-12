@@ -446,15 +446,20 @@ def coordinate_statistics(
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Per-coordinate mean and standard deviation for standardisation.
 
-    Constant coordinates get a unit scale so they standardise to zero instead
-    of blowing up.
+    The two endpoint fields share one set of statistics, pooled over both
+    endpoints of every row: training pairs are canonically ordered, so their
+    marginals differ, and per-field statistics would make the standardised
+    representation of a pair depend on which endpoint came first -- breaking
+    the reader's swap symmetry. Constant coordinates get a unit scale so they
+    standardise to zero instead of blowing up.
 
     Args:
         coords: ``(n, COORD_DIM)`` raw coordinates of the reference rows.
         std_floor: Standard deviations at or below this become ``1.0``.
 
     Returns:
-        ``(mean, std)`` float32 vectors of length ``COORD_DIM``.
+        ``(mean, std)`` float32 vectors of length ``COORD_DIM``; the
+        ``endpoint_u`` and ``endpoint_v`` blocks are identical.
 
     Raises:
         ValueError: On an empty or mis-shaped input.
@@ -464,6 +469,10 @@ def coordinate_statistics(
         raise ValueError(f"expected a non-empty (n, {COORD_DIM}) coordinate matrix")
     mean = array.mean(axis=0)
     std = array.std(axis=0)
+    u_slice, v_slice = FIELD_SLICES["endpoint_u"], FIELD_SLICES["endpoint_v"]
+    pooled = np.concatenate([array[:, u_slice], array[:, v_slice]], axis=0)
+    mean[u_slice] = mean[v_slice] = pooled.mean(axis=0)
+    std[u_slice] = std[v_slice] = pooled.std(axis=0)
     std = np.where(std <= std_floor, 1.0, std)
     return mean.astype(np.float32), std.astype(np.float32)
 

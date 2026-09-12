@@ -3026,8 +3026,14 @@ def _evaluate_two_pass(
     topology_eval_fn: TopologyEvalFn,
     label_smoothing: float = 0.0,
     validation_bank: OracleValidationBank | None = None,
+    attach: Callable[[Batch], None] | None = None,
 ) -> ValidationOutcome:
-    """Run the cls and V_val-topology validation passes and merge their outcomes."""
+    """Run the cls and V_val-topology validation passes and merge their outcomes.
+
+    ``attach`` is forwarded to the classification pass exactly as
+    `_evaluate_distributed` takes it; the topology pass carries its own row
+    coordinates through ``topology_eval_fn``.
+    """
     cls_outcome = _evaluate_distributed(
         model,
         val_loader,
@@ -3035,6 +3041,7 @@ def _evaluate_two_pass(
         expected_row_ids=expected_row_ids,
         label_smoothing=label_smoothing,
         validation_bank=validation_bank,
+        attach=attach,
     )
     topology = topology_eval_fn(model, accelerator)
     return ValidationOutcome(
@@ -5781,6 +5788,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 ),
                 label_smoothing=val_label_smoothing,
                 validation_bank=validation_bank,
+                attach=topo_rows.attach_val if topo_rows is not None else None,
             ),
         )
 

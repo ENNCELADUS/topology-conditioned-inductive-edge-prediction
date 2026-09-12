@@ -123,12 +123,22 @@ def test_rejects_self_loops_and_unknown_nodes() -> None:
         table.coords([("a", "zzz")])
 
 
-def test_coordinate_statistics_floor_constant_columns() -> None:
+def test_coordinate_statistics_pool_endpoints_and_floor_constant_columns() -> None:
     coords = np.zeros((5, COORD_DIM), dtype=np.float32)
-    coords[:, 0] = np.arange(5)
+    coords[:, 0] = np.arange(5)  # endpoint_u degree column; endpoint_v's stays zero
+    relation_start = FIELD_SLICES["relation"].start
+    coords[:, relation_start] = np.arange(5)
     mean, std = coordinate_statistics(coords)
-    assert mean[0] == pytest.approx(2.0)
+    # Endpoint statistics are pooled over both endpoints: {0..4} and five zeros.
+    assert mean[0] == pytest.approx(1.0)
     assert std[0] == pytest.approx(np.sqrt(2.0))
+    np.testing.assert_array_equal(
+        mean[FIELD_SLICES["endpoint_u"]], mean[FIELD_SLICES["endpoint_v"]]
+    )
+    np.testing.assert_array_equal(std[FIELD_SLICES["endpoint_u"]], std[FIELD_SLICES["endpoint_v"]])
+    # Non-endpoint columns keep their own statistics; constant columns get unit scale.
+    assert mean[relation_start] == pytest.approx(2.0)
+    assert std[relation_start] == pytest.approx(np.sqrt(2.0))
     assert std[1] == 1.0
     with pytest.raises(ValueError):
         coordinate_statistics(coords[:0])

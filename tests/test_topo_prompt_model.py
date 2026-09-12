@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from src.data.struct_coords import COORD_DIM, FIELD_SLICES
+from src.data.struct_coords import COORD_DIM, FIELD_SLICES, coordinate_statistics
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.topo_prompt import (
     TopoPromptConfig,
@@ -101,6 +101,33 @@ def test_forward_requires_coordinates_and_set_statistics() -> None:
 
 def test_swapping_the_pair_and_its_coordinates_leaves_logits_unchanged() -> None:
     model = _model("all")
+    _open_gates(model)
+    model.eval()
+    batch = _pair_batch()
+    coords = _coords(6)
+    swapped = {
+        "emb_a": batch["emb_b"],
+        "emb_b": batch["emb_a"],
+        "len_a": batch["len_b"],
+        "len_b": batch["len_a"],
+        "struct_coords": _swap(coords),
+    }
+    with torch.no_grad():
+        forward = model({**batch, "struct_coords": coords})["logits"]
+        backward = model(swapped)["logits"]
+    torch.testing.assert_close(forward, backward, rtol=0, atol=1e-6)
+
+
+def test_swap_symmetry_survives_measured_statistics_with_asymmetric_endpoint_marginals() -> None:
+    # Canonically ordered training pairs give endpoint_u and endpoint_v different
+    # marginals; pooled endpoint statistics keep the standardised pair swap-symmetric.
+    gen = torch.Generator().manual_seed(4)
+    reference = torch.rand(200, COORD_DIM, generator=gen) * 3.0
+    reference[:, FIELD_SLICES["endpoint_u"]] *= 4.0
+    reference[:, FIELD_SLICES["endpoint_u"]] += 2.0
+    mean, std = coordinate_statistics(reference.numpy())
+    model = _model("all")
+    model.generator.set_coord_stats(torch.from_numpy(mean), torch.from_numpy(std), 200)
     _open_gates(model)
     model.eval()
     batch = _pair_batch()
