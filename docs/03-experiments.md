@@ -187,12 +187,14 @@ candidate deployable model.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Full-Ego PMA1 | 0.9498 | 0.9547 | 0.6019 | 0.7079 | 6.962 | 6.430 | 11.472 |
 | Topology prompt, Stage I (`topo_prompt_full`, true coordinates) | 0.9295 | 0.9392 | 0.4608 | 0.3442 | 33.345 | 25.267 | 44.234 |
+| Topology prompt, Stage I frozen trunk (`topo_prompt_frozen`) | 0.8509 | 0.8777 | 0.4934 | 0.3891 | 20.553 | 17.304 | 29.546 |
 
-The topology-prompt row is a second true-structure ceiling, not a comparator: the
+The topology-prompt rows are a second true-structure ceiling, not comparators: the
 prefix_base trunk reads the queried pair's structural coordinates measured on the
-test graph with the query removed. Its V_val-selected threshold under-densifies the
-denser test region (RD 0.34), so its test topology numbers are dominated by the
-density shift; the V_val readout and the interventions that attribute the gain to
+test graph with the query removed (`topo_prompt_full` retrains the trunk with the
+prompt, `topo_prompt_frozen` trains the prompt alone on the frozen prefix_base). Their
+V_val-selected thresholds under-densify the denser test region (RD 0.34 / 0.39), so
+their test topology numbers are dominated by the density shift; the V_val readout and the interventions that attribute the gain to
 the structural content are in `docs/results/topo_prompt_stage1.md`.
 
 | Model | Accuracy ↑ | F1 ↑ | MCC ↑ | ECE ↓ | Brier ↓ | Test geometric RD → 1 | Test mean absolute log RD ↓ |
@@ -207,6 +209,7 @@ the structural content are in `docs/results/topo_prompt_stage1.md`.
 | + NEW | 0.6159 | 0.6695 | 0.2450 | 0.3168 | 0.3293 | 0.6211 | 0.4913 |
 | PMA1 oracle | 0.8762 | 0.8794 | 0.7534 | 0.0993 | 0.1130 | 0.6670 | 0.4451 |
 | Topology prompt, Stage I (ceiling) | 0.7909 | 0.7414 | 0.6299 | 0.0774 | 0.1151 | 0.3000 | 1.2042 |
+| Topology prompt, Stage I frozen trunk (ceiling) | 0.7688 | 0.7273 | 0.5642 | 0.1732 | 0.1994 | 0.3670 | 1.0025 |
 
 GRAND's calibration is worse than B0 despite its edge/topology gains. Even the
 oracle's validation geometric RD of 1.0000 falls to 0.6670 on test: the frozen

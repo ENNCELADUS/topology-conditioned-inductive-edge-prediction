@@ -1,8 +1,8 @@
 # Topology Prompt, Stage I: a reader that uses true structure through a prefix
 
 **Design spec and implementation record.** Date: 2026-09-12. Status: implemented
-(`model.family: v3_1_topo_prompt`); `topo_prompt_full` complete, `topo_prompt_frozen` running;
-results in `docs/results/topo_prompt_stage1.md` (§9 below summarises).
+(`model.family: v3_1_topo_prompt`); both diagnostic runs complete; results in
+`docs/results/topo_prompt_stage1.md` (§9 below summarises).
 Supersedes the attribute-conditioned prefix arms of
 `2026-09-10-prefix-tuning-frozen-trunk-design.md` as the prefix design under study; those
 arms remain as comparison rows.
@@ -184,7 +184,7 @@ read; the paired bootstrap in the test protocol governs claims.
 Stage II–IV code (the coordinate generator, its supervision, joint fine-tuning), any struct-
 stream supervision for this family, and a fixed-size context variant of the coordinates.
 
-## 9. Result (2026-09-12, full lane; frozen lane pending)
+## 9. Result (2026-09-12)
 
 Numbers and tables: `docs/results/topo_prompt_stage1.md`. On V_val, `topo_prompt_full` reads
 val_cls AUROC/AUPRC 0.952/0.961 against `prefix_base`'s 0.793/0.814 and GS 0.691 against 0.401
@@ -202,3 +202,12 @@ shard, and the 1:1 `val_cls`/`test` lists are label-sorted, so on those two univ
 substitute carried the row's own label (shuffle scored *above* the true coordinates there). The
 scorer now draws one permutation of the whole universe (§5); the ball-union V_val topology
 readout was unaffected (0.647 → 0.641 AUROC), and the rerun 1:1 rows fall to near chance.
+
+Frozen lane (`topo_prompt_frozen`, prompt only on the frozen `prefix_base`, selected epoch 7):
+val_cls AUROC/AUPRC 0.925/0.940, GS 0.648 at RD 1.02 with MMD ratios 4.2/2.0/6.0 (the best of any
+row); `gates_off` reproduces `prefix_base` exactly, `mean` returns to it (0.773/0.800, GS 0.405),
+the universe-level `shuffle` falls below it (0.718, GS 0.359). Outcome 3 of §7 does not hold:
+freezing was not the earlier round's bottleneck. The attribute-conditioned `prefix_static` best
+trial, the same trainable scope, sits at the base (AUPRC 0.813, GS 0.401), so the earlier failure
+was the absence of structural information in the condition — what Stage II must supply. The
+`prefix_pair_bce` row (outcome 4 proper) is still pending on 30030.

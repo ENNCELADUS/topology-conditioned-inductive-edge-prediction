@@ -9,7 +9,7 @@ the prefix_base trunk, so every row here is a **ceiling diagnostic** (`--run-kin
 | Run | Trainable | Status (2026-09-12) |
 |---|---|---|
 | `topo_prompt_full` | trunk + prompt from scratch (prefix_base recipe) | complete: trained 09:58–13:31 UTC on 30846, stopped at epoch 15 (val-task-loss patience 10, minimum at epoch 5), selected epoch 15; test diagnostic + six interventions by 15:12 UTC |
-| `topo_prompt_frozen` | prompt only on frozen `prefix_base/best.pt` | training on 30846 since 16:02 UTC; `shuffle`, `mean`, `gates_off` follow |
+| `topo_prompt_frozen` | prompt only on frozen `prefix_base/best.pt` | complete: trained 16:09–18:49 UTC on 30846, stopped at epoch 15 (val-task-loss patience 10, minimum at epoch 5), selected epoch 7; test diagnostic + `shuffle`/`mean`/`gates_off` (all under the corrected scorer) by 19:46 UTC |
 | `shuffle` rerun, full lane | scoring only | done 17:34–17:46 UTC on 30838 under the corrected scorer (§4); the frozen lane's shuffle runs corrected from the start |
 
 Sources: `outputs/split_seed42/topo_prompt_full/{diagnostic_test_report.json,intervention_*/…}`,
@@ -31,12 +31,18 @@ Edge metrics on val_cls, assembled-graph metrics at the run's own V_val-selected
 | ↳ `mean_endpoint` | — | 0.9471 | 0.9588 | 0.9482 | 0.674 | 1.033 | 9.0 | 4.4 | 11.4 | 5.22 |
 | ↳ `mean_relation` | — | 0.9240 | 0.9354 | 0.9202 | 0.542 | 1.076 | 12.6 | 5.2 | 10.2 | 4.09 |
 | ↳ `mean_context` | — | 0.9504 | 0.9592 | 0.9553 | 0.703 | 1.021 | 11.5 | 5.0 | 12.7 | 4.88 |
-| `topo_prompt_frozen` | | pending | | | | | | | | |
+| **`topo_prompt_frozen`** | 7 | **0.9248** | **0.9399** | **0.9245** | **0.648** | 1.018 | **4.2** | **2.0** | **6.0** | 4.09 |
+| ↳ `gates_off` (= `prefix_base` exactly) | — | 0.7925 | 0.8143 | 0.7908 | 0.401 | 1.102 | 10.6 | 4.6 | 9.0 | 2.70 |
+| ↳ `mean` | — | 0.7725 | 0.7995 | 0.7722 | 0.405 | 1.115 | 13.4 | 5.2 | 9.9 | 2.30 |
+| ↳ `shuffle` (universe-level null) | — | 0.7184 | 0.7184 | 0.7613 | 0.359 | 1.092 | 4.5 | 12.0 | 4.8 | 2.23 |
+| `prefix_static` best trial (attribute-conditioned prompt, same trainable scope) | 2 | — | 0.8129 | — | 0.401 | 1.110 | 10.6 | 4.6 | 9.0 | 2.66 |
 
 Training curve of `topo_prompt_full` (`metrics.jsonl`): val AUPRC 0.738 → 0.901 → 0.949 →
 0.959 over epochs 1–4 and flat (0.958–0.961) afterwards; val task loss minimum 0.340 at epoch 5,
 0.416 at the stop; train loss 0.109 at epoch 15; GS 0.65–0.70 from epoch 4. `prefix_base` under
 the same recipe plateaued at val AUPRC 0.81–0.82 with val loss rising from epoch 4.
+`topo_prompt_frozen` (prompt only, lr 1e-3): val AUPRC 0.849 after one epoch, 0.940 at epochs
+5–7, then 0.93 with val loss rising from its epoch-5 minimum (0.433); selected epoch 7.
 
 ## 2. Test diagnostic (read with the universe-shift caveat)
 
@@ -55,10 +61,14 @@ V_val-selected threshold transfers into a much denser region. Edge metrics on th
 | ↳ `mean_endpoint` | 0.9191 | 0.9321 | 0.079 | 0.121 | 0.756 | 0.682 | 0.580 | 0.450 | 0.335 | 33.9 | 25.9 | 44.7 |
 | ↳ `mean_relation` | 0.9120 | 0.9213 | 0.118 | 0.142 | 0.835 | 0.824 | 0.675 | 0.505 | 0.510 | 18.0 | 14.8 | 23.0 |
 | ↳ `mean_context` | 0.9162 | 0.9304 | 0.089 | 0.126 | 0.786 | 0.734 | 0.622 | 0.457 | 0.337 | 31.1 | 24.3 | 42.1 |
+| **`topo_prompt_frozen`** | **0.8509** | **0.8777** | 0.173 | 0.199 | 0.769 | 0.727 | 0.564 | 0.493 | 0.389 | 20.6 | 17.3 | 29.5 |
+| ↳ `gates_off` (= `prefix_base`) | 0.7205 | 0.7441 | 0.293 | 0.315 | 0.634 | 0.679 | 0.279 | 0.409 | 0.456 | 11.4 | 9.7 | 16.8 |
+| ↳ `mean` | 0.7104 | 0.7371 | 0.278 | 0.308 | 0.629 | 0.667 | 0.265 | 0.402 | 0.424 | 13.3 | 11.6 | 18.4 |
+| ↳ `shuffle` (universe-level null) | 0.6868 | 0.6866 | 0.286 | 0.317 | 0.607 | 0.676 | 0.236 | 0.374 | 0.414 | 11.5 | 15.7 | 15.0 |
 | Full-Ego PMA1 oracle (reference) | 0.9498 | 0.9547 | 0.099 | 0.113 | 0.876 | 0.879 | 0.753 | 0.602 | 0.708 | 7.0 | 6.4 | 11.5 |
 
-Test geometric RD 0.300 and mean |log RD| 1.204 for `topo_prompt_full` (prefix_base 0.445 /
-0.810; oracle 0.667 / 0.445). Per-size GS falls from 0.55 (20-node subgraphs) to 0.38
+Test geometric RD 0.300 and mean |log RD| 1.204 for `topo_prompt_full`, 0.367 / 1.003 for
+`topo_prompt_frozen` (prefix_base 0.445 / 0.810; oracle 0.667 / 0.445). Per-size GS falls from 0.55 (20-node subgraphs) to 0.38
 (200-node), RD from 0.43 to 0.26.
 
 ## 3. Reading (spec §7)
@@ -87,8 +97,23 @@ Test geometric RD 0.300 and mean |log RD| 1.204 for `topo_prompt_full` (prefix_b
    RD 0.51, MMD 18/15/23), consistent with the relation coordinates carrying most of the
    universe shift. The Full-Ego oracle faces the same shift (RD 0.71). V_val is the readout;
    any true-structure reader's test topology depends on threshold transfer across the density gap.
-6. **Frozen lane** (outcomes 3/4 of §7) pending; its `prefix_pair_bce` comparison row does not
-   exist yet (the 30030 studies are in `prefix_pair` trial 1/10; `prefix_pair_bce` follows).
+6. **Frozen lane: freezing was not the bottleneck.** With only the prompt trainable on the frozen
+   `prefix_base`, the reader reaches val_cls AUPRC 0.940 and GS 0.648 — most of the full lane's
+   gain (0.961 / 0.691) — and `gates_off` reproduces `prefix_base` to the digit, so the whole
+   difference is the prompt path. `mean` returns it to the base and the universe-level `shuffle`
+   drops it below the base (0.718; less catastrophic than the full lane's 0.579 because the
+   frozen trunk keeps its attribute path intact). Outcome 3 of §7 therefore does not hold; the
+   earlier prefix round failed for want of structural information in an attribute-derived
+   condition, not for want of trainable trunk: the `prefix_static` best trial, the same
+   trainable scope with an attribute condition, sits exactly at the base (AUPRC 0.813, GS
+   0.401). The planned `prefix_pair_bce` row (attribute *pair* condition, task BCE only) will
+   sharpen this once the 30030 studies reach it (`prefix_pair` trial 3/10 on 2026-09-13; about
+   2.8 h per trial).
+7. **Shape ratios on the frozen trunk.** Unlike the full lane, the frozen reader improves all
+   three V_val MMD ratios (4.2 / 2.0 / 6.0 against the base's 10.6 / 4.6 / 9.0) and carries a
+   better test topology (GS 0.493, RD 0.39, MMD 21 / 17 / 30 against the full lane's 33 / 25 /
+   44) at a lower edge score. The retrained trunk of the full lane buys edge ranking at the cost
+   of the admitted set's shape; Stage III's choice of what to unfreeze should weigh this.
 
 Single-seed differences inside ±0.01 GS / ±0.5 MMD ratio are not read.
 
@@ -107,4 +132,4 @@ shuffle. Rerun on 30838 (17:34–17:46 UTC): val_cls AUROC/AUPRC 0.579/0.596 and
 from 0.647 to 0.641 AUROC and GS 0.262 to 0.265 — the per-shard run was already a clean null
 there. The per-shard reports are kept as
 `outputs/split_seed42/topo_prompt_full/intervention_shuffle_pershard/`; the frozen lane's shuffle
-runs under the corrected scorer from the start.
+ran under the corrected scorer from the start (`prefix_shuffle_scope: universe`).
