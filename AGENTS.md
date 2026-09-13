@@ -45,6 +45,15 @@ selected method. Every piece of writing must explain how its context helps decid
   `--allow-oracle-diagnostic`; interventions `--prefix-intervention {gates_off,shuffle,mean,mean_endpoint,mean_relation,mean_context}`.
   Never a deployable arm; the deployable descendants (Stages II–IV) feed the prompt a generator's
   prediction from `(x_u,x_v)`.
+- Topology-prompt Stage II (`model.family: v3_1_coord_gen`, spec
+  `docs/superpowers/specs/2026-09-13-topology-prompt-stage2-design.md`): a coordinate generator
+  (`src/model/egostitch/classifier/coord_gen.py`) predicts the standardised coordinates from the
+  frozen Stage I reader's endpoint states, and that reader (`coord_gen.reader_checkpoint`, a
+  published `topo_prompt_*` checkpoint) reads the prediction through the same prompt interface.
+  Only the generator trains: coordinate supervision + task BCE + light logit KD towards the reader
+  on true coordinates. Deployable (`(x_u,x_v)` only): formal runs `coord_gen_full` / `coord_gen_frozen`
+  scored without any truth graph; read against `prefix_base` and against the row's own reader
+  (its ceiling); interventions `gates_off` and `mean*` only (`shuffle` fails closed).
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

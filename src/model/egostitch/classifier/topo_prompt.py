@@ -534,10 +534,39 @@ class V3_1TopoPrompt(nn.Module):
             ValueError: If an intervention is set while training, or the
                 coordinates are mis-shaped or unstandardisable.
         """
-        if self.intervention != "none" and self.training:
-            raise ValueError("topo_prompt interventions are scoring-time only; call eval() first")
         z = self.generator.standardize(coords.to(encoded_a.device))
         z = self.generator.training_field_mask(z)
+        return self.logits_from_standardized(encoded_a, encoded_b, lengths_a, lengths_b, z)
+
+    def logits_from_standardized(
+        self,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute logits from encoded token states and *standardised* coordinates.
+
+        The Stage II generator (`src.model.egostitch.classifier.topo_gen`) drives
+        the frozen reader through this entry with its prediction; no field
+        masking is applied here, only the scoring-time intervention.
+
+        Args:
+            encoded_a: Encoder output for item A ``(B, L_a, d_model)``.
+            encoded_b: Encoder output for item B ``(B, L_b, d_model)``.
+            lengths_a: True sequence lengths for A.
+            lengths_b: True sequence lengths for B.
+            z: Standardised coordinates ``(B, COORD_DIM)`` of the pairs ``(a, b)``.
+
+        Returns:
+            The pair logits.
+
+        Raises:
+            ValueError: If an intervention is set while training.
+        """
+        if self.intervention != "none" and self.training:
+            raise ValueError("topo_prompt interventions are scoring-time only; call eval() first")
         z, gate_scale = self._apply_intervention(z)
         view_a, view_b = self.generator.tokens(z)
         prefixes_a = [self.generator.prefix(i, view_a) for i in range(len(self.prompt_layers))]

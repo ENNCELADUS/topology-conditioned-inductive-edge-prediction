@@ -1207,6 +1207,13 @@ def _build_v3_1_topo_prompt(model_config: dict[str, object]) -> nn.Module:
     return V3_1TopoPrompt(**cast(dict[str, Any], model_config))
 
 
+def _build_v3_1_coord_gen(model_config: dict[str, object]) -> nn.Module:
+    """Build a `V3_1CoordGen` from its checkpointed config (reader state and stats included)."""
+    from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
+
+    return V3_1CoordGen(**cast(dict[str, Any], model_config))
+
+
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchModel` from its checkpointed config (design rev 3).
 
@@ -1303,6 +1310,7 @@ MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "v3_1_prefix": _build_v3_1_prefix,
     "v3_1_topo_prompt": _build_v3_1_topo_prompt,
+    "v3_1_coord_gen": _build_v3_1_coord_gen,
     "egostitch_e2e": _build_egostitch_e2e,
     "cazi_mbn": _build_cazi_mbn,
     "official_ppi": _build_official_ppi,
@@ -2152,12 +2160,13 @@ def _score_v3_1_packed(
     pairs' nodes; a ``v3_1_topo_prompt`` checkpoint is shuffled by the caller
     substituting ``row_coords`` instead.
     """
+    from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
     from src.model.egostitch.classifier.prefix import V3_1Prefix
     from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
-    if not isinstance(model, (V3_1, V3_1Prefix, V3_1TopoPrompt)):
+    if not isinstance(model, (V3_1, V3_1Prefix, V3_1TopoPrompt, V3_1CoordGen)):
         raise TypeError(
-            "packed V3.1 scoring requires V3_1, V3_1Prefix or V3_1TopoPrompt, "
+            "packed V3.1 scoring requires V3_1, V3_1Prefix, V3_1TopoPrompt or V3_1CoordGen, "
             f"got {type(model).__name__}"
         )
     if isinstance(model, V3_1TopoPrompt) and row_coords is None:
@@ -3533,12 +3542,19 @@ def _run_score(args: argparse.Namespace) -> None:
         cast(TopoGenBase, topo_gen).control = args.topo_gen_control
 
     if args.prefix_intervention != "none":
+        from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
         from src.model.egostitch.classifier.prefix import V3_1Prefix
         from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
-        if not isinstance(model, (V3_1Prefix, V3_1TopoPrompt)):
+        if not isinstance(model, (V3_1Prefix, V3_1TopoPrompt, V3_1CoordGen)):
             raise SystemExit(
-                "--prefix-intervention requires a v3_1_prefix or v3_1_topo_prompt checkpoint"
+                "--prefix-intervention requires a v3_1_prefix, v3_1_topo_prompt or "
+                "v3_1_coord_gen checkpoint"
+            )
+        if isinstance(model, V3_1CoordGen) and args.prefix_intervention == "shuffle":
+            raise SystemExit(
+                "--prefix-intervention shuffle has no null for v3_1_coord_gen: the model "
+                "predicts its own coordinates; use gates_off or the mean interventions"
             )
         # `shuffle` is not a model-level mode: it gives every row the condition
         # or coordinates of another row of the whole universe, which only the
@@ -3722,7 +3738,7 @@ def _run_score(args: argparse.Namespace) -> None:
     if full_oracle_telemetry is not None and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     score_started = perf_counter()
-    if model_family in ("v3_1", "v3_1_prefix", "v3_1_topo_prompt"):
+    if model_family in ("v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen"):
         row_coords: torch.Tensor | None = None
         # `shuffle`: one seeded permutation of the whole universe, sliced to this
         # shard, so every shard reads the same source map (`_shuffle_source_rows`).

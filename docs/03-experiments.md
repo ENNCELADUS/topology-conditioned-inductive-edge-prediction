@@ -77,6 +77,14 @@ attribute any gain to the structural content. Results, when complete, are
 reported as a ceiling row beside the oracle in §3.2 and never in the
 endpoint-only table.
 
+Stage II (`model.family: v3_1_coord_gen`, `coord_gen_full` / `coord_gen_frozen`) makes
+the prompt deployable: a generator predicts the same coordinates from the frozen
+Stage I reader's endpoint states and the frozen reader scores the pair from the
+prediction, so the model is a function of `(x_u,x_v)` alone and is scored formally
+without any truth graph. It is read against `prefix_base` and against its own
+reader on true coordinates (the ceiling); its `metrics.jsonl` also reports the
+per-field R² of the predicted coordinates on V_val.
+
 ## 2. Selection and evaluation
 
 For each checkpoint, enumerate distinct V_val sampled-union logit boundaries

@@ -71,7 +71,7 @@ from src.data.pairs import (
     collate_token_pairs,
 )
 from src.data.partition import build_g_struct
-from src.data.struct_coords import StructCoordinateTable, coordinate_statistics
+from src.data.struct_coords import COORD_DIM, StructCoordinateTable, coordinate_statistics
 from src.data.struct_sampler import StructEpochPlan, StructSampler, StructSubgraph
 from src.data.training_sampler import TrainingCorpus, build_training_corpus
 from src.data.val_region import (
@@ -116,6 +116,12 @@ from src.eval.val_topology import (
     val_region_topology_metrics,
 )
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
+from src.model.egostitch.classifier.coord_gen import (
+    DISTANCE_INDEX,
+    FIELD_CONTINUOUS_INDEX,
+    CoordGenConfig,
+    V3_1CoordGen,
+)
 from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
 from src.model.egostitch.classifier.topo_prompt import (
@@ -131,9 +137,10 @@ _REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep", "kd_logit_rep"})
 
 logger = logging.getLogger(__name__)
 
-MODEL_FAMILIES = ("v3_1", "v3_1_prefix", "v3_1_topo_prompt", "f0_mlp")
-V3_1_FAMILIES = frozenset({"v3_1", "v3_1_prefix", "v3_1_topo_prompt"})
+MODEL_FAMILIES = ("v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen", "f0_mlp")
+V3_1_FAMILIES = frozenset({"v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen"})
 TOPO_PROMPT_FAMILY = "v3_1_topo_prompt"
+COORD_GEN_FAMILY = "v3_1_coord_gen"
 RUN_KINDS = ("formal", "diagnostic")
 
 
@@ -160,6 +167,7 @@ class ValidationOutcome(NamedTuple):
 
 
 EvaluateFn = Callable[[nn.Module, Iterable[Batch], Accelerator], ValidationOutcome]
+DiagnosticsFn = Callable[[nn.Module, Iterable[Batch], Accelerator], dict[str, float]]
 DDP_MODES = ("probe", "epoch-probe", "train")
 T = TypeVar("T")
 
@@ -1083,13 +1091,15 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
         return _resolve_prefix_kwargs(model_cfg)
     if model_cfg.family == TOPO_PROMPT_FAMILY:
         return _resolve_topo_prompt_kwargs(model_cfg)
+    if model_cfg.family == COORD_GEN_FAMILY:
+        return _resolve_coord_gen_kwargs(model_cfg)
     if model_cfg.family == "v3_1":
         return dict(model_cfg.config) if model_cfg.config else dict(BEST_V3_1_CONFIG)
     if model_cfg.family == "f0_mlp":
         return dict(model_cfg.config)
     raise ValueError(
         f"unknown model family '{model_cfg.family}' "
-        "(expected v3_1, v3_1_prefix, v3_1_topo_prompt, or f0_mlp)"
+        "(expected v3_1, v3_1_prefix, v3_1_topo_prompt, v3_1_coord_gen, or f0_mlp)"
     )
 
 
@@ -1111,6 +1121,9 @@ def _base_loss_kwargs(model_cfg: ModelConfig) -> Mapping[str, object]:
     kwargs = resolve_model_kwargs(model_cfg)
     if model_cfg.family in ("v3_1_prefix", TOPO_PROMPT_FAMILY):
         return cast(Mapping[str, object], kwargs["base"])
+    if model_cfg.family == COORD_GEN_FAMILY:
+        reader = cast(Mapping[str, object], kwargs["reader"])
+        return cast(Mapping[str, object], reader["base"])
     return kwargs
 
 
@@ -1180,6 +1193,65 @@ def _resolve_topo_prompt_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
         {**dict(raw_block), "base_checkpoint": base_checkpoint, "base_checkpoint_sha256": digest}
     )
     return {"base": base_config, "topo_prompt": block.to_dict()}
+
+
+def _load_reader_checkpoint(path: Path) -> tuple[Mapping[str, object], str]:
+    """Load a published ``v3_1_topo_prompt`` checkpoint payload and digest the file.
+
+    Args:
+        path: The Stage I reader checkpoint path.
+
+    Returns:
+        ``(payload, sha256)``; the digest is provenance only.
+
+    Raises:
+        ValueError: If the payload is not a ``v3_1_topo_prompt`` checkpoint mapping.
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping) or payload.get("model_family") != TOPO_PROMPT_FAMILY:
+        raise ValueError(
+            f"{path}: coord_gen.reader_checkpoint must be a published v3_1_topo_prompt checkpoint"
+        )
+    return payload, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resolve_coord_gen_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
+    """Resolve the ``v3_1_coord_gen`` constructor kwargs.
+
+    The frozen reader's config comes from the embedded ``model_config`` of
+    ``model.config.coord_gen.reader_checkpoint`` (a published Stage I
+    ``v3_1_topo_prompt`` run); its state and coordinate statistics are loaded by
+    :func:`build_model`. The digest is recorded, never verified.
+
+    Args:
+        model_cfg: The ``model:`` config section (``family == "v3_1_coord_gen"``).
+
+    Returns:
+        ``{"reader": <topo_prompt model_config>, "coord_gen": {...}}``.
+
+    Raises:
+        ValueError: If the block or the reader checkpoint is missing, or the
+            section carries sibling keys.
+    """
+    raw_block = model_cfg.config.get("coord_gen")
+    if not isinstance(raw_block, Mapping):
+        raise ValueError("model.config.coord_gen is required for v3_1_coord_gen")
+    extra = sorted(set(model_cfg.config) - {"coord_gen"})
+    if extra:
+        raise ValueError(f"v3_1_coord_gen accepts only model.config.coord_gen, got {extra}")
+    reader_checkpoint = str(raw_block.get("reader_checkpoint", "") or "")
+    if not reader_checkpoint:
+        raise ValueError("model.config.coord_gen.reader_checkpoint is required")
+    payload, digest = _load_reader_checkpoint(Path(reader_checkpoint))
+    reader_config = dict(cast(Mapping[str, object], payload["model_config"]))
+    block = CoordGenConfig.from_mapping(
+        {
+            **dict(raw_block),
+            "reader_checkpoint": reader_checkpoint,
+            "reader_checkpoint_sha256": digest,
+        }
+    )
+    return {"reader": reader_config, "coord_gen": block.to_dict()}
 
 
 def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
@@ -1258,6 +1330,17 @@ def build_model(cfg: Config) -> nn.Module:
             topo_model.base.load_state_dict(cast(Mapping[str, Any], payload["model_state"]))
         _validate_topo_gen_distill_contract(topo_model, cfg.distill)
         return topo_model
+    if cfg.model.family == COORD_GEN_FAMILY:
+        gen_model = V3_1CoordGen(**kwargs)  # type: ignore[arg-type]
+        reader_path = Path(
+            str(cast(Mapping[str, object], kwargs["coord_gen"])["reader_checkpoint"])
+        )
+        payload, _ = _load_reader_checkpoint(reader_path)
+        gen_model.reader.load_state_dict(cast(Mapping[str, Any], payload["model_state"]))
+        if float(gen_model.reader.generator.coord_count) <= 0.0:
+            raise ValueError(f"{reader_path}: reader checkpoint carries no coordinate statistics")
+        _validate_topo_gen_distill_contract(gen_model, cfg.distill)
+        return gen_model
     if cfg.model.family == "v3_1":
         v3_1_model = V3_1(**kwargs)
         _validate_topo_gen_distill_contract(v3_1_model, cfg.distill)
@@ -1845,6 +1928,18 @@ def _run_metadata(
             "coord_spec": topo_kwargs.get("coord_spec"),
             "base_checkpoint": topo_kwargs.get("base_checkpoint") or None,
             "sha256": topo_kwargs.get("base_checkpoint_sha256"),
+        }
+    if cfg.model.family == COORD_GEN_FAMILY:
+        gen_kwargs = cast(Mapping[str, object], model_kwargs["coord_gen"])
+        run_metadata["coord_gen"] = {
+            "reader_checkpoint": gen_kwargs.get("reader_checkpoint"),
+            "sha256": gen_kwargs.get("reader_checkpoint_sha256"),
+            "coord_spec": gen_kwargs.get("coord_spec"),
+            "weights": {
+                "coord": gen_kwargs.get("w_coord"),
+                "task": gen_kwargs.get("w_task"),
+                "kd": gen_kwargs.get("w_kd"),
+            },
         }
     if cfg.run_kind is not None:
         # Same vocabulary as the EgoStitch worker so the test protocol and readers
@@ -2724,6 +2819,7 @@ def _evaluate_distributed(
     label_smoothing: float = 0.0,
     validation_bank: OracleValidationBank | None = None,
     attach: Callable[[Batch], None] | None = None,
+    diagnostics_fn: DiagnosticsFn | None = None,
 ) -> ValidationOutcome:
     """Score the fixed cls validation set across all ranks and agree on the metrics.
 
@@ -2749,6 +2845,9 @@ def _evaluate_distributed(
             `ValidationOutcome.task_loss`, matching the training objective.
         attach: Optional per-batch hook run before the forward (the
             topology-prompt arm injects each row's structural coordinates).
+        diagnostics_fn: Optional collective pass over the same loader whose
+            scalar results are merged into ``diagnostics`` (the coordinate
+            generator's fit metrics); it must return the same mapping on every rank.
 
     Returns:
         The `ValidationOutcome` with `topology=None`, identical on every rank.
@@ -2844,6 +2943,8 @@ def _evaluate_distributed(
             rep_ids = np.concatenate([part[0] for part in all_rep_parts])
             rep_sorted = np.concatenate([part[1] for part in all_rep_parts])[np.argsort(rep_ids)]
         diagnostics = validation_bank.metrics(logits_sorted, rep_sorted)
+    if diagnostics_fn is not None:
+        diagnostics = {**(diagnostics or {}), **diagnostics_fn(model, val_loader, accelerator)}
     outcome_payload: list[dict[str, object] | None] = [None]
     if accelerator.is_main_process:
         probs = _stable_sigmoid(logits_sorted.astype(np.float64))
@@ -3027,12 +3128,13 @@ def _evaluate_two_pass(
     label_smoothing: float = 0.0,
     validation_bank: OracleValidationBank | None = None,
     attach: Callable[[Batch], None] | None = None,
+    diagnostics_fn: DiagnosticsFn | None = None,
 ) -> ValidationOutcome:
     """Run the cls and V_val-topology validation passes and merge their outcomes.
 
-    ``attach`` is forwarded to the classification pass exactly as
-    `_evaluate_distributed` takes it; the topology pass carries its own row
-    coordinates through ``topology_eval_fn``.
+    ``attach`` and ``diagnostics_fn`` are forwarded to the classification pass
+    exactly as `_evaluate_distributed` takes them; the topology pass carries its
+    own row coordinates through ``topology_eval_fn``.
     """
     cls_outcome = _evaluate_distributed(
         model,
@@ -3042,6 +3144,7 @@ def _evaluate_two_pass(
         label_smoothing=label_smoothing,
         validation_bank=validation_bank,
         attach=attach,
+        diagnostics_fn=diagnostics_fn,
     )
     topology = topology_eval_fn(model, accelerator)
     return ValidationOutcome(
@@ -3519,6 +3622,91 @@ class TopoPromptRows:
             "universe_rows": int(self.universe.shape[0]),
             "build_seconds": self.build_seconds,
         }
+
+
+def _coordinate_fit_metrics(
+    model: nn.Module,
+    val_loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    attach: Callable[[Batch], None],
+) -> dict[str, float]:
+    """Stage II validation diagnostics: how well the generator predicts V_val's true coordinates.
+
+    Per field, the R² of the standardised prediction over the field's continuous
+    coordinates (both endpoints pooled), plus the shortest-path class accuracy
+    and the mean coordinate and KD losses. Every sum is all-reduced, so every
+    rank returns the same mapping.
+
+    Args:
+        model: The (possibly DDP-wrapped) `V3_1CoordGen`.
+        val_loader: This rank's V_val classification batches (carry ``_row_id``).
+        accelerator: The DDP accelerator.
+        attach: The hook injecting each row's true coordinates.
+
+    Returns:
+        ``val_coord_r2_{endpoint,relation,context}``, ``val_coord_dist_acc``,
+        ``val_coord_loss`` and ``val_kd_loss``.
+
+    Raises:
+        TypeError: If the model is not a `V3_1CoordGen`.
+    """
+    raw_model = _unwrapped_model(model)
+    if not isinstance(raw_model, V3_1CoordGen):
+        raise TypeError("coordinate-fit diagnostics need a V3_1CoordGen")
+    device = accelerator.device
+    sse = torch.zeros(COORD_DIM, dtype=torch.float64, device=device)
+    total = torch.zeros(COORD_DIM, dtype=torch.float64, device=device)
+    squares = torch.zeros(COORD_DIM, dtype=torch.float64, device=device)
+    scalars = torch.zeros(4, dtype=torch.float64, device=device)
+    was_training = raw_model.training
+    raw_model.eval()
+    distance = list(DISTANCE_INDEX)
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = _to_device(batch, device)
+            attach(batch)
+            output = raw_model(batch)
+            z_star = raw_model.reader.generator.standardize(batch[COORDS_KEY]).to(torch.float64)
+            z_hat = output["predicted_coords"].to(torch.float64)
+            sse += ((z_hat - z_star) ** 2).sum(dim=0)
+            total += z_star.sum(dim=0)
+            squares += (z_star**2).sum(dim=0)
+            rows = float(z_star.shape[0])
+            correct = (
+                batch[COORDS_KEY][:, distance].argmax(dim=1)
+                == output["distance_logits"].argmax(dim=1)
+            ).sum()
+            kd = output.get("kd_loss")
+            scalars += torch.tensor(
+                [
+                    rows,
+                    float(correct.item()),
+                    float(output["coord_loss"].item()) * rows,
+                    (0.0 if kd is None else float(kd.item())) * rows,
+                ],
+                dtype=torch.float64,
+                device=device,
+            )
+    if was_training:
+        raw_model.train()
+    sse = accelerator.reduce(sse, reduction="sum")
+    total = accelerator.reduce(total, reduction="sum")
+    squares = accelerator.reduce(squares, reduction="sum")
+    scalars = accelerator.reduce(scalars, reduction="sum")
+    rows_total = max(float(scalars[0].item()), 1.0)
+    sst = squares - total**2 / rows_total
+    result: dict[str, float] = {}
+    for field_name, index in FIELD_CONTINUOUS_INDEX.items():
+        columns = list(index)
+        denominator = float(sst[columns].sum().item())
+        result[f"val_coord_r2_{field_name}"] = (
+            1.0 - float(sse[columns].sum().item()) / denominator if denominator > 0.0 else 0.0
+        )
+    result["val_coord_dist_acc"] = float(scalars[1].item()) / rows_total
+    result["val_coord_loss"] = float(scalars[2].item()) / rows_total
+    result["val_kd_loss"] = float(scalars[3].item()) / rows_total
+    return result
 
 
 class StructStream:
@@ -5621,6 +5809,45 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         topo_rows.install(model)
         if accelerator.is_main_process:
             logger.info("topo_prompt coordinates ready: %s", topo_rows.summary())
+    elif isinstance(model, V3_1CoordGen):
+        # Stage II: the true coordinates are training targets (training graph,
+        # legal) and V_val fit diagnostics; the model itself scores every row,
+        # V_val universe and test included, from its own prediction, so this is
+        # a formal, deployable run. The reader's published statistics stay.
+        if cfg.struct is not None or (cfg.distill is not None and cfg.distill.active):
+            raise RuntimeError(
+                "v3_1_coord_gen (Stage II) trains the generator on coordinate supervision, "
+                "task BCE and logit KD only; struct/distill sections are not supported"
+            )
+        if cfg.eval.classification_only:
+            raise RuntimeError("v3_1_coord_gen requires the V_val topology pass")
+        corpus = _dynamic_training_corpus(cfg, assembled)
+        reference = build_val_topology_reference(val_split)
+        universe = val_ball_union_universe(val_split)
+        topo_rows = TopoPromptRows(
+            train_graph=val_split.build_training_graph(),
+            train_pairs=corpus.pairs,
+            stats_rows=corpus.epoch_rows[1],
+            val_graph=val_split.build_g_val_simple(),
+            val_cls_pairs=val_cls_pairs,
+            universe_pairs=[
+                (reference.nodes[int(a)], reference.nodes[int(b)])
+                for a, b in zip(universe.u_idx.tolist(), universe.v_idx.tolist(), strict=True)
+            ],
+            device=accelerator.device,
+        )
+        if accelerator.is_main_process:
+            logger.info("coord_gen coordinate targets ready: %s", topo_rows.summary())
+    # The prompt family reads true coordinates on the V_val universe; the
+    # generator family predicts them there and only reports its fit on val_cls.
+    universe_coords = (
+        topo_rows.universe if topo_rows is not None and isinstance(model, V3_1TopoPrompt) else None
+    )
+    coord_fit_fn: DiagnosticsFn | None = (
+        functools.partial(_coordinate_fit_metrics, attach=topo_rows.attach_val)
+        if topo_rows is not None and isinstance(model, V3_1CoordGen)
+        else None
+    )
 
     if args.ddp_mode == "probe":
         _run_probe_mode(
@@ -5743,6 +5970,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             label_smoothing=val_label_smoothing,
             validation_bank=validation_bank,
             attach=topo_rows.attach_val if topo_rows is not None else None,
+            diagnostics_fn=coord_fit_fn,
         ),
     )
     evaluate_cls_fn: EvaluateFn | None = None
@@ -5783,12 +6011,13 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                         u_idx=u_idx,
                         v_idx=v_idx,
                         reference=reference,
-                        row_coords=topo_rows.universe if topo_rows is not None else None,
+                        row_coords=universe_coords,
                     ),
                 ),
                 label_smoothing=val_label_smoothing,
                 validation_bank=validation_bank,
                 attach=topo_rows.attach_val if topo_rows is not None else None,
+                diagnostics_fn=coord_fit_fn,
             ),
         )
 
@@ -5944,6 +6173,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "v3_1_topo_prompt runs only through the DDP pipeline path "
             "(hpc/run.sh train <config> --run-kind diagnostic); the direct debug CLI "
             "has no structural-coordinate rows"
+        )
+    if cfg.model.family == COORD_GEN_FAMILY:
+        raise ValueError(
+            "v3_1_coord_gen runs only through the DDP pipeline path "
+            "(hpc/run.sh train <config>); the direct debug CLI has no coordinate targets"
         )
 
     set_seed(cfg.seed)

@@ -850,7 +850,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefix-intervention",
         choices=PREFIX_INTERVENTIONS,
         default="none",
-        help="v3_1_prefix / v3_1_topo_prompt scoring-time intervention",
+        help="v3_1_prefix / v3_1_topo_prompt / v3_1_coord_gen scoring-time intervention",
     )
     parser.add_argument(
         "--prefix-intervention-seed",

@@ -157,6 +157,19 @@ fan-out shards compose the same null and the artifact records `prefix_shuffle_sc
 Shuffle artifacts scored before 2026-09-12 permuted within each shard; on the label-sorted 1:1
 universes (`val_cls`, `test`) that kept every substitute's label and they are vacuous there.
 
+Stage II (`model.family: v3_1_coord_gen`) trains only a coordinate generator on top of a
+published Stage I checkpoint (`model.config.coord_gen.reader_checkpoint`) and scores every
+universe from its own prediction, so it is a formal run with the ordinary artifacts:
+
+```bash
+hpc/run.sh train configs/split_seed42/coord_gen_full.yaml
+hpc/run.sh train configs/split_seed42/coord_gen_frozen.yaml
+hpc/run.sh test --checkpoint outputs/split_seed42/coord_gen_full/best.pt \
+  --output-dir outputs/split_seed42/coord_gen_full/intervention_gates_off \
+  --data-root data --strategy breadth_first --arm coord_gen_full_gates_off --seed 0 \
+  --prefix-intervention gates_off      # gates_off / mean / mean_* only; shuffle fails closed
+```
+
 The two scoring-time controls (`structure_control_6a_v3`, `structure_control_6e_v1`)
 are not trained arms and have no `train` invocation of their own — they reuse the `full`
 arm's published checkpoint (`--checkpoint` only; nothing about the control changes what
