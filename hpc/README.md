@@ -79,8 +79,9 @@ Accelerate world size. G3 is a direct single-process cached-score analysis comma
 outside `run.sh`.
 
 For an isolated rollout, `hpc/run.sh` resolves the checkout containing the script.
-Create that checkout with Git and link its `.venv`, `data`, and `outputs` to the shared
-resources above before running it. This keeps imports and Git provenance on the chosen
+Create that checkout with Git and link its `.venv`, `outputs`, and missing ignored
+`data/` resource directories to the shared resources above; retain tracked split metadata
+in the checkout. This keeps imports and Git provenance on the chosen
 revision without changing a checkout used by another running job. Use the existing
 `--resume-attempt` at a completed epoch boundary when replacing a training process.
 
