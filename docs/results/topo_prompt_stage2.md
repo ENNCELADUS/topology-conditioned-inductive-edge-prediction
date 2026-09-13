@@ -112,6 +112,17 @@ student are far outside it while its GS movement is not.
 
 ### 2.3 Per-epoch curves (validation; `metrics.jsonl`)
 
+![Stage II component loss curves](topo_prompt_stage2_curves/loss_curves.png)
+
+[Generator fit and validation topology curves, full CSV and reproducible plots](topo_prompt_stage2_curves/README.md).
+[Derived unweighted validation composite](topo_prompt_stage2_curves/validation_composite.png):
+`val_task_loss + val_coord_loss + 0.1 * val_kd_loss`; this differs from training's
+5:1 row-weighted objective.
+The audit uses all recorded epochs. Only composite training loss was logged;
+individual training-loss decreases cannot be inferred. KD soft BCE has a nonzero
+teacher-entropy floor, and prompt interventions do not isolate a training loss.
+
+
 `vBCE` = student task BCE on val_cls (the early-stopping monitor), `vCoord` = coordinate loss
 (Huber over 30 continuous standardised coordinates + shortest-path class cross-entropy) against
 V_val truth, `vKD` = soft-BCE of the student logit against the same reader fed the true
@@ -161,36 +172,28 @@ prediction; "swapped" scores the endpoint prediction against the other endpoint'
 
 ## 3. Does each module work?
 
-1. **Coordinate generator — mechanically correct, generalises poorly.** Swap-equivariance and
-   endpoint alignment hold (own-target R² 0.23–0.32 vs −0.05 swapped). On training rows it learns
-   the coordinates a node's or pair's attributes support: degree, triangles, wedges, common
-   neighbours, Jaccard and L3 reach R² 0.4–0.67; walk returns and the longer walk kernels stay
-   near zero (they are global-propagation quantities the endpoints cannot see). On V_val — nodes
-   never seen in training — the same fields fall to R² ≤ 0.2 (relation) and below zero
-   (endpoint), while the validation coordinate loss rises from its epoch-2/3 minimum through the
-   end of training (frozen lane 1.25 → 2.01, full lane 1.33 → 1.56) as the training composite keeps
-   falling. Each training node appears in thousands of rows with a constant endpoint target, so a
-   1.6 M-parameter head on frozen node states memorises node → structure rather than learning an
-   attribute → structure map. The earlier `kd_struct` descriptor head's V_val R² of 0.6–0.7
-   (2026-09-02) predates the node-held-out V_val, which is consistent with this reading.
-2. **L_coord — optimised, overfits, no stopping signal.** Both the continuous Huber term and the
-   distance cross-entropy decrease on training rows throughout; on V_val the loss bottoms out at
-   epoch 2–3 and then increases monotonically. Model selection and early stopping watch the task
-   BCE, so neither reacts to this; the selected epochs (6 and 4) are past the coordinate-fit
-   optimum. Any continuation needs node-level regularisation (dropout on the pooled states, weight
-   decay on the heads, a node-held-out generator split) or an explicit fit-based stop.
-3. **L_BCE — works only as a repair of the retrained trunk.** Full lane: the trunk alone
-   (`gates_off`) is below base (AUPRC 0.768; it was trained to rely on the prompt); the task term
-   teaches the generator coordinates that bring it back to 0.806, i.e. the student learns to
-   drive the prefix path with attribute information, but no further than the attributes already
-   allow. Frozen lane: the validation BCE never moves (1.03–1.08 across 22 epochs) and the
-   predicted coordinates are neutral to slightly harmful (`gates_off` 0.814 ≥ main 0.812 ≥ `mean`
-   0.800). Neither lane exceeds `prefix_base`.
-4. **L_KD — measured, ineffective.** The student-vs-teacher soft BCE falls early (full lane 0.83 →
-   0.56 by epoch 2) and then oscillates at 0.59–0.86; the frozen lane stays at 0.59–0.71. The
-   teacher (the same reader on true coordinates, V_val AUPRC 0.94–0.96) is confident where the
-   student cannot be, so at weight 0.1 the term neither helps nor hurts measurably; a `w_kd = 0`
-   ablation is not worth a GPU day while the stage sits at the base.
+The [complete curve audit](topo_prompt_stage2_curves/README.md) separates observed
+validation behavior from causal attribution:
+
+1. **Generator:** weak node-held-out coordinate fit. Selected endpoint R² is
+   -0.299 / -0.365 (full / frozen); relation R² is 0.031 / 0.198. The training
+   probe in §2.4 and poor validation fit suggest a generalization gap. Memorization
+   versus graph-distribution shift remains unresolved, not proven by these curves.
+2. **L_coord:** validation improves initially, with both minima at epoch 3, then
+   fluctuates and ends higher (full 1.328 → 1.557; frozen 1.247 → 2.008). Separate
+   training Huber and CE trajectories were not logged. The minimum coordinate
+   loss is not the checkpoint selection objective.
+3. **L_BCE:** full shows an early validation improvement; frozen has no sustained
+   downward trend. These are joint-training trajectories, not evidence isolating
+   the benefit of BCE from the other terms.
+4. **L_KD:** full improves early then oscillates; frozen mostly oscillates. Soft
+   BCE includes teacher entropy, which was not recorded, so its absolute size
+   does not establish whether the student matches the teacher. A matched
+   no-KD run is needed to measure KD's benefit or harm.
+
+The causal explanations and future-stage predictions elsewhere in this note
+remain hypotheses. No loss-removal ablation or uncertainty estimate is supplied
+by these single-seed curves.
 
 ## 4. Interventions
 

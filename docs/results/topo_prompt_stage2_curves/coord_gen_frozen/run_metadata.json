@@ -1,0 +1,29 @@
+{
+  "config_hash": "9b9e87010452834a3ad30fa362c9e2f2eef3f470d6acb7f6eff0ac356001d10f",
+  "checkpoint_id": "7f6029234eb140ca",
+  "torch_version": "2.10.0+cu128",
+  "timestamp": "2026-09-13T08:42:08.407869+00:00",
+  "dropped_pair_counts": {
+    "train_edges.txt": 0,
+    "val_edges.txt": 0,
+    "test_edges.txt": 0
+  },
+  "training_interactions": "all_train_positives",
+  "arm": "v3_1_coord_gen",
+  "selected_epoch": 4,
+  "coord_gen": {
+    "reader_checkpoint": "outputs/split_seed42/topo_prompt_frozen/best.pt",
+    "sha256": "35c287c181f58c6c9a809de34e587306005f63373fc686c855ca222e152e157d",
+    "coord_spec": "v1",
+    "weights": {
+      "coord": 1.0,
+      "task": 1.0,
+      "kd": 0.1
+    }
+  },
+  "selection_rule": "geometric_rd_five_rank_v1",
+  "val_threshold_transfer": {
+    "n_val": 869,
+    "threshold": 2.171875
+  }
+}

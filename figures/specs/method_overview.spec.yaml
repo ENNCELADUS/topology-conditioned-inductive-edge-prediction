@@ -1,0 +1,275 @@
+# Method overview figure for the ICLR 2027 paper (canonical source).
+# Style follows docs/results/kd_rep_audit/teacher_architecture.svg: rectangles = layers,
+# stadiums = tensors, fill = who trains / who sees it, orange dashed = supervision.
+# Re-render (draw.io skill CLI):
+#   node ~/.claude/skills/drawio/scripts/cli.js figures/specs/method_overview.spec.yaml figures/method_overview.drawio --validate
+#   node ~/.claude/skills/drawio/scripts/cli.js figures/specs/method_overview.spec.yaml figures/method_overview.svg --validate
+meta:
+  profile: academic-paper
+  figureType: architecture
+  theme: academic-color
+  source: generated
+  layout: vertical
+  routing: orthogonal
+  print: { widthPt: 396, minPt: 5.5 }
+  font:
+    primary: "Helvetica, Arial, sans-serif"
+    cjk: "Helvetica, Arial, sans-serif"
+    formula: "Times New Roman, Times, serif"
+  title: "Topology-conditioned inductive edge prediction: teacher and student"
+  description: >-
+    The teacher reads the queried pair's true structural coordinates, measured on the training graph,
+    through a topology prompt; the student predicts those coordinates from the two endpoint features
+    with a generator g and feeds the same frozen prompt and reader, so the deployed model is a function
+    of (x_u, x_v) alone. Losses attach where the dashed arrows point.
+  legend: >-
+    Rectangles are layers, stadiums are tensors. Blue: trained in Stage I (teacher), frozen afterwards.
+    Yellow: trained in Stage II (student). Pink: teacher only, true structure. Green: student only,
+    predicted from features. Orange dashed: supervision or distillation loss.
+
+nodes:
+  # ============ shared column: (x_u, x_v) -> E ============
+  - id: xin
+    type: terminal
+    label: "(xᵤ, xᵥ)"
+    bounds: { x: 60, y: 40, width: 220, height: 48 }
+    style: { fillColor: "#F2F2F2", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 20 }
+  - id: enc
+    type: matrix
+    label: "Node encoder E"
+    bounds: { x: 60, y: 128, width: 220, height: 52 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111", bold: true, fontSize: 17 }
+
+  # ============ teacher column: training graph -> s* ============
+  - id: gin
+    type: terminal
+    label: "G  (training graph)"
+    bounds: { x: 690, y: 40, width: 280, height: 48 }
+    style: { fillColor: "#F9D9D9", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 20 }
+  - id: meas
+    type: matrix
+    label: "Measure structural coordinates\n(queried edge removed)"
+    bounds: { x: 690, y: 128, width: 280, height: 52 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#111111", bold: true, fontSize: 16 }
+  - id: sstar
+    type: terminal
+    label: "s*ᵤᵥ  (true coordinates)"
+    bounds: { x: 690, y: 216, width: 280, height: 48 }
+    style: { fillColor: "#F9D9D9", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 20 }
+
+  # ============ student branch: generator -> s_hat ============
+  - id: gen
+    type: matrix
+    label: "Coordinate generator g"
+    bounds: { x: 380, y: 216, width: 260, height: 52 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", bold: true, fontSize: 17 }
+  - id: shat
+    type: terminal
+    label: "ŝᵤᵥ = g(E(xᵤ), E(xᵥ))"
+    bounds: { x: 380, y: 304, width: 260, height: 48 }
+    style: { fillColor: "#CFE8D5", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 20 }
+
+  # ============ shared trunk: prompt -> reader -> p_hat ============
+  - id: prompt
+    type: matrix
+    label: "Topology prompt Π\n(gated KV prefix)"
+    bounds: { x: 380, y: 392, width: 260, height: 56 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111", bold: true, fontSize: 17 }
+  - id: reader
+    type: matrix
+    label: "Pair reader F\n(cross-attention + readout)"
+    bounds: { x: 380, y: 480, width: 260, height: 56 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111", bold: true, fontSize: 17 }
+  - id: pout
+    type: terminal
+    label: "p̂ᵤᵥ = P(edge | u, v)"
+    bounds: { x: 380, y: 568, width: 260, height: 48 }
+    style: { fillColor: "#F2F2F2", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 20 }
+  - id: losses
+    type: text
+    label: "L_BCE (edge label yᵤᵥ)\nL_KD (teacher pass: same reader, fed s*ᵤᵥ)"
+    bounds: { x: 330, y: 648, width: 360, height: 44 }
+    style: { align: center, fontSize: 15, fontColor: "#B45309" }
+
+  # edge annotations
+  - id: lbl_student
+    type: text
+    label: "student: ŝᵤᵥ"
+    bounds: { x: 522, y: 358, width: 110, height: 24 }
+    style: { align: left, fontSize: 15, fontColor: "#333333" }
+  - id: lbl_teacher
+    type: text
+    label: "teacher: s*ᵤᵥ"
+    bounds: { x: 690, y: 394, width: 120, height: 24 }
+    style: { align: left, fontSize: 15, fontColor: "#333333" }
+  - id: lbl_coord
+    type: text
+    label: "L_coord"
+    bounds: { x: 678, y: 272, width: 80, height: 24 }
+    style: { align: left, fontSize: 15, fontColor: "#B45309" }
+
+  # ============ Legend (bottom-left) ============
+  - id: leg_title
+    type: text
+    label: "Legend"
+    bounds: { x: 60, y: 250, width: 120, height: 26 }
+    style: { align: left, bold: true, fontSize: 17 }
+  - id: sw1
+    type: matrix
+    label: " "
+    bounds: { x: 60, y: 286, width: 34, height: 20 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#111111" }
+  - id: lg1
+    type: text
+    label: "fixed computation, no parameters"
+    bounds: { x: 104, y: 282, width: 240, height: 28 }
+    style: { align: left, fontSize: 15 }
+  - id: sw2
+    type: matrix
+    label: " "
+    bounds: { x: 60, y: 320, width: 34, height: 20 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111" }
+  - id: lg2
+    type: text
+    label: "trained in Stage I (teacher),\nfrozen in Stage II and at inference"
+    bounds: { x: 104, y: 314, width: 240, height: 44 }
+    style: { align: left, fontSize: 15 }
+  - id: sw3
+    type: matrix
+    label: " "
+    bounds: { x: 60, y: 368, width: 34, height: 20 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111" }
+  - id: lg3
+    type: text
+    label: "trained in Stage II (student)"
+    bounds: { x: 104, y: 364, width: 240, height: 28 }
+    style: { align: left, fontSize: 15 }
+  - id: sw4
+    type: terminal
+    label: " "
+    bounds: { x: 60, y: 402, width: 34, height: 20 }
+    style: { fillColor: "#F2F2F2", strokeColor: "#111111" }
+  - id: lg4
+    type: text
+    label: "tensor: input, state, output"
+    bounds: { x: 104, y: 398, width: 240, height: 28 }
+    style: { align: left, fontSize: 15 }
+  - id: sw5
+    type: terminal
+    label: " "
+    bounds: { x: 60, y: 436, width: 34, height: 20 }
+    style: { fillColor: "#F9D9D9", strokeColor: "#111111" }
+  - id: lg5
+    type: text
+    label: "teacher only: true structure,\nnever available at inference"
+    bounds: { x: 104, y: 430, width: 240, height: 44 }
+    style: { align: left, fontSize: 15 }
+  - id: sw6
+    type: terminal
+    label: " "
+    bounds: { x: 60, y: 484, width: 34, height: 20 }
+    style: { fillColor: "#CFE8D5", strokeColor: "#111111" }
+  - id: lg6
+    type: text
+    label: "student only: predicted from\nthe endpoint features"
+    bounds: { x: 104, y: 478, width: 240, height: 44 }
+    style: { align: left, fontSize: 15 }
+  - id: sw7a
+    type: text
+    label: " "
+    bounds: { x: 60, y: 528, width: 4, height: 20 }
+  - id: sw7b
+    type: text
+    label: " "
+    bounds: { x: 90, y: 528, width: 4, height: 20 }
+  - id: lg7
+    type: text
+    label: "supervision / distillation loss"
+    bounds: { x: 104, y: 526, width: 240, height: 28 }
+    style: { align: left, fontSize: 15 }
+  - id: lg8
+    type: text
+    label: "Stage I trains blue on s*ᵤᵥ with L_BCE.\nStage II freezes blue, trains g with\nL_coord + L_BCE + L_KD. Inference: student\npath only, input (xᵤ, xᵥ)."
+    bounds: { x: 60, y: 566, width: 290, height: 80 }
+    style: { align: left, fontSize: 15, fontColor: "#333333" }
+
+  # ============ Notation (right) ============
+  - id: not_title
+    type: text
+    label: "Notation"
+    bounds: { x: 690, y: 456, width: 120, height: 26 }
+    style: { align: left, bold: true, fontSize: 17 }
+  - id: n1
+    type: text
+    label: "xᵤ, xᵥ: frozen features of the queried\nendpoints (unseen nodes at test time)"
+    bounds: { x: 690, y: 486, width: 330, height: 40 }
+    style: { align: left, fontSize: 15 }
+  - id: n2
+    type: text
+    label: "G: training graph; the queried edge is\nremoved before measuring"
+    bounds: { x: 690, y: 530, width: 330, height: 40 }
+    style: { align: left, fontSize: 15 }
+  - id: n3
+    type: text
+    label: "s*ᵤᵥ: true structural coordinates of (u, v)\non G (endpoint, relation, context fields)"
+    bounds: { x: 690, y: 574, width: 330, height: 40 }
+    style: { align: left, fontSize: 15 }
+  - id: n4
+    type: text
+    label: "ŝᵤᵥ: coordinates predicted by g from\nthe two encoded endpoints only"
+    bounds: { x: 690, y: 618, width: 330, height: 40 }
+    style: { align: left, fontSize: 15 }
+  - id: n5
+    type: text
+    label: "Π: gated key/value prefix that injects s\ninto every cross-attention layer of F"
+    bounds: { x: 690, y: 662, width: 330, height: 40 }
+    style: { align: left, fontSize: 15 }
+  - id: n6
+    type: text
+    label: "p̂ᵤᵥ: edge probability; the teacher pass\nreads s*ᵤᵥ, the student pass reads ŝᵤᵥ"
+    bounds: { x: 690, y: 706, width: 330, height: 40 }
+    style: { align: left, fontSize: 15 }
+  - id: n7
+    type: text
+    label: "Ĝ(τ): graph assembled from p̂ at the V_val\nthreshold τ; graded by GS, RD and MMD"
+    bounds: { x: 690, y: 750, width: 330, height: 40 }
+    style: { align: left, fontSize: 15 }
+
+edges:
+  # forward, shared column
+  - { from: xin, to: enc, type: primary, style: { strokeColor: "#111111" } }
+  - from: enc
+    to: gen
+    type: primary
+    style: { strokeColor: "#111111" }
+    waypoints: [ { x: 510, y: 154 } ]
+  - from: enc
+    to: reader
+    type: primary
+    style: { strokeColor: "#111111" }
+    waypoints: [ { x: 170, y: 200 }, { x: 350, y: 200 }, { x: 350, y: 508 } ]
+  # forward, teacher column
+  - { from: gin, to: meas, type: primary, style: { strokeColor: "#111111" } }
+  - { from: meas, to: sstar, type: primary, style: { strokeColor: "#111111" } }
+  - from: sstar
+    to: prompt
+    type: primary
+    style: { strokeColor: "#111111" }
+    waypoints: [ { x: 830, y: 300 }, { x: 830, y: 420 } ]
+  # forward, student branch and trunk
+  - { from: gen, to: shat, type: primary, style: { strokeColor: "#111111" } }
+  - from: shat
+    to: prompt
+    type: primary
+    style: { strokeColor: "#111111" }
+  - { from: prompt, to: reader, type: primary, style: { strokeColor: "#111111" } }
+  - { from: reader, to: pout, type: primary, style: { strokeColor: "#111111" } }
+
+  # supervision / distillation (orange dashed)
+  - from: sstar
+    to: shat
+    type: data
+    style: { strokeColor: "#B45309" }
+    waypoints: [ { x: 666, y: 240 }, { x: 666, y: 328 } ]
+  - { from: pout, to: losses, type: data, style: { strokeColor: "#B45309" } }
+  - { from: sw7a, to: sw7b, type: data, style: { strokeColor: "#B45309" } }

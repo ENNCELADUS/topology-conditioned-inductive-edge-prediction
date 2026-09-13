@@ -344,5 +344,5 @@ follow `YEAR_venue_short_title.pdf` and are filed by topic; see
 model proposal are by arXiv ID and were verified against arXiv or local PDFs.
 
 Current-split results and failure/retry status are maintained in
-[Experiments §2.1/§3.1](docs/03-experiments.md) and the
+[Experiments §3.4/§4](docs/03-experiments.md) and the
 [2026-09-08 execution audit](docs/results/split20260908_execution/README.md).
