@@ -32,6 +32,7 @@ from src.train_b0 import (
 )
 from torch import nn
 from torch.multiprocessing.spawn import spawn
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from tests.test_prefix_model import _tiny_base_config
 from tests.test_train_b0 import (
@@ -572,6 +573,89 @@ def _run_stochastic_topo_prompt_step(*, rank: int, world_size: int) -> dict[str,
     return {key: value.detach().clone() for key, value in model.state_dict().items()}
 
 
+class _DDPPromptResult(TypedDict):
+    state: dict[str, torch.Tensor]
+    bucket_sizes: str
+    has_rebuilt_buckets: int
+    iteration: int
+    ready_order: str
+
+
+def _run_ddp_topo_prompt_combined_steps(*, rank: int, world_size: int) -> _DDPPromptResult:
+    """Run through DDP bucket rebuild with production-shaped task+struct backwards."""
+    sampler, table, rows = _topo_prompt_fixture()
+    base = _tiny_base_config()
+    base["d_model"] = 64
+    base["n_heads"] = 8
+    base["regularization"] = dict.fromkeys(cast(dict[str, object], base["regularization"]), 0.0)
+    base["mlp_head"] = {
+        **cast(dict[str, object], base["mlp_head"]),
+        "hidden_dims": [64],
+        "dropout": 0.0,
+    }
+    torch.manual_seed(31)
+    raw_model = V3_1TopoPrompt(
+        base=base,
+        topo_prompt={
+            "trainable": "all",
+            "width": 8,
+            "slots_per_field": 1,
+            "field_mask_prob": 0.0,
+        },
+    )
+    rows.install(raw_model)
+    model = DDP(
+        raw_model,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True,
+        bucket_cap_mb=0.001,
+    )
+    stream = _stream(
+        sampler,
+        table,
+        rank=rank,
+        world_size=world_size,
+        token_budget=1 << 20,
+        coordinates=rows,
+    )
+    index = table.manifest.node_index()
+    task_pairs = [("n0", "n1"), ("n2", "n3")]
+    anchor = torch.tensor([index[a] for a, _ in task_pairs])
+    partner = torch.tensor([index[b] for _, b in task_pairs])
+    emb_a, len_a = table.gather_nodes(anchor, 5)
+    emb_b, len_b = table.gather_nodes(partner, 5)
+    batch = {
+        "emb_a": emb_a,
+        "emb_b": emb_b,
+        "len_a": len_a,
+        "len_b": len_b,
+        "label": torch.tensor([1.0, 0.0]),
+        "struct_coords": rows.train,
+    }
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+    for step in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        raw_model.set_corruption_step(step, seed=7)
+        task_loss = model(batch)["loss"]
+        struct_loss, _ = stream.loss(model, epoch=1, step=step, steps=3)
+        (task_loss + struct_loss).backward()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        optimizer.step()
+    logging = model._get_ddp_logging_data()  # type: ignore[no-untyped-call]
+    return {
+        "state": {key: value.detach().clone() for key, value in raw_model.state_dict().items()},
+        "bucket_sizes": str(logging.get("rebuilt_bucket_sizes", logging["bucket_sizes"])),
+        "has_rebuilt_buckets": int(logging.get("has_rebuilt_buckets", 0)),
+        "iteration": int(logging["iteration"]),
+        "ready_order": str(logging.get("prev_iteration_grad_ready_order_indices", "")),
+    }
+
+
 class _CoordGenStepResult(TypedDict):
     teacher_logits: torch.Tensor
     anchor_loss: torch.Tensor
@@ -693,6 +777,11 @@ def _struct_ddp_worker(
             if world_size == 4
             else None
         )
+        ddp_prompt = (
+            _run_ddp_topo_prompt_combined_steps(rank=rank, world_size=world_size)
+            if world_size == 4
+            else None
+        )
         coord_gen_step = (
             _run_coord_gen_anchor_step(rank=rank, world_size=world_size)
             if world_size == 4
@@ -705,6 +794,7 @@ def _struct_ddp_worker(
             {
                 "step": step,
                 "stochastic_state": stochastic_state,
+                "ddp_prompt": ddp_prompt,
                 "coord_gen_step": coord_gen_step,
                 "state": state,
             },
@@ -739,6 +829,7 @@ def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
     expected = _run_struct_ddp_fixture(tmp_path / "serial", rank=0, world_size=1, count=count)
     forward_calls = 0
     stochastic_reference: dict[str, torch.Tensor] | None = None
+    ddp_prompt_reference: dict[str, torch.Tensor] | None = None
     for rank in range(world_size):
         payload = torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True)
         observed_step = cast(_StructStepResult, payload["step"])
@@ -763,6 +854,16 @@ def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
         for key in expected:
             torch.testing.assert_close(observed[key], expected[key], rtol=1e-4, atol=1e-6)
         if world_size == 4:
+            ddp_prompt = cast(_DDPPromptResult, payload["ddp_prompt"])
+            assert ddp_prompt["has_rebuilt_buckets"] == 1, ddp_prompt
+            assert len(ddp_prompt["bucket_sizes"].split(",")) >= 2
+            if ddp_prompt_reference is None:
+                ddp_prompt_reference = ddp_prompt["state"]
+            else:
+                for key, value in ddp_prompt_reference.items():
+                    torch.testing.assert_close(
+                        ddp_prompt["state"][key], value, rtol=1e-4, atol=1e-6
+                    )
             assert expected_coord_gen is not None
             coord_gen_step = cast(_CoordGenStepResult, payload["coord_gen_step"])
             assert coord_gen_step["coordinate_calls"] == 1
