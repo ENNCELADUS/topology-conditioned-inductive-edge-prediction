@@ -63,11 +63,19 @@ V_val-selected threshold.
 | ↳ `mean` | 0.7104 | 0.7371 | 0.278 | 0.308 | 0.629 | 0.667 | 0.265 | 0.402 | 0.424 | 13.3 / 11.6 / 18.4 | 0.413 | 0.884 |
 | ↳ `mean_relation` | 0.7184 | 0.7459 | 0.272 | 0.300 | 0.642 | 0.665 | 0.286 | 0.406 | 0.464 | 11.2 / 9.9 / 16.4 | 0.452 | 0.795 |
 
-The full lane's test topology row (RD 0.91, MMD 4.2 / 3.6 / 6.7) is the best density transfer of
-any deployable row so far, but it comes with the lowest edge AUROC (0.677 vs 0.721) and a
-V_val-selected threshold (1.36) far below every other row's; it is a single-seed calibration
-effect of the retrained trunk, not evidence that the predicted coordinates carry structure (its
-V_val GS is 0.387).
+**Test-set assertion.** The held-out test confirms the V_val reading: the students are
+ineffective. The frozen-reader student equals `prefix_base` on every edge metric (AUROC 0.721 vs
+0.721, AUPRC +0.007 inside the noise band, accuracy / F1 / MCC marginally lower) and its topology
+row is within the band except MMD ratios that move by the same amount the `mean` row moves the
+other way. The full-reader student is *worse* than the comparator on every edge metric (AUROC
+−0.044, AUPRC −0.019, MCC 0.167 vs 0.279; non-self pairs 0.657 / 0.686). Its topology row (RD
+0.91, MMD 4.2 / 3.6 / 6.7, GS +0.021 at the band's edge) is a density-transfer effect of the
+retrained trunk's calibration, not transmitted structure: the same trunk on mean coordinates
+already sits at RD 0.52, the student's V_val GS is unchanged (0.387), its V_val-selected
+threshold (1.36) is half every other row's, and the movement is bought with the worst edge ranking
+in the table. Under the claim rules (both families together) neither student is a working model;
+the test protocol carries no bootstrap intervals, so this reads against the project's single-seed
+noise band (±0.01 GS, ±0.5 MMD ratio).
 
 ### 2.3 Per-epoch curves (validation; `metrics.jsonl`)
 
