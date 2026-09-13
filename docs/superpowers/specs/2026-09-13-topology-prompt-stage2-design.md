@@ -1,7 +1,8 @@
 # Topology Prompt, Stage II: a generator that predicts the coordinates from attributes
 
 **Design spec and implementation record.** Date: 2026-09-13. Status: implemented
-(`model.family: v3_1_coord_gen`); two formal runs launched on the H20 containers. Follows
+(`model.family: v3_1_coord_gen`); both formal runs complete — result in
+`docs/results/topo_prompt_stage2.md` (§8 below summarises). Follows
 `2026-09-12-topology-prompt-stage1-design.md` (Stage I) and its result
 (`docs/results/topo_prompt_stage1.md`).
 
@@ -139,3 +140,17 @@ Single-seed differences inside the split's noise band (±0.01 GS, ±0.5 MMD rati
 Stage III/IV (unfreezing the interface, readout and upper encoder; topology losses),
 generator inputs beyond the two endpoints, and the "coordinates through a plain MLP head"
 control that would attribute the gain between the representation and the prefix.
+
+## 8. Result (2026-09-13)
+
+Both lanes land on `prefix_base` (val_cls AUPRC 0.806 / 0.812 vs 0.814; GS 0.387 / 0.400 vs 0.401)
+against reader ceilings of 0.961 / 0.940. Outcome 3 of §6 with a sharper diagnosis: the generator
+fits the training universe's structure (train R² 0.3–0.5; degree, triangles, Jaccard, common
+neighbours 0.5–0.67) but not held-out nodes (V_val relation R² ≤ 0.2, endpoint R² < 0, validation
+coordinate loss rising from epoch 2–3) — a head on frozen node states seen thousands of times
+memorises node structure rather than learning an attribute → structure map. The task BCE only
+repairs the retrained trunk back to base in the full lane and does nothing in the frozen lane; the
+logit KD never approaches the teacher. Stages III/IV on these predictions would not recover the
+Stage I gain; the next step is the node-held-out generator fit and richer generator inputs
+(`docs/results/topo_prompt_stage2.md` §5).
+

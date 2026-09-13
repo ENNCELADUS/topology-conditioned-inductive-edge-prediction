@@ -83,7 +83,10 @@ Stage I reader's endpoint states and the frozen reader scores the pair from the
 prediction, so the model is a function of `(x_u,x_v)` alone and is scored formally
 without any truth graph. It is read against `prefix_base` and against its own
 reader on true coordinates (the ceiling); its `metrics.jsonl` also reports the
-per-field R² of the predicted coordinates on V_val.
+per-field R² of the predicted coordinates on V_val. Result (2026-09-13,
+`docs/results/topo_prompt_stage2.md`): both lanes land on `prefix_base`; the
+generator fits training-universe structure but not held-out nodes, so the
+predicted coordinates carry nothing the trunk lacked.
 
 ## 2. Selection and evaluation
 
