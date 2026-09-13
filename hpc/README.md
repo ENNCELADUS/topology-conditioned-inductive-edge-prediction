@@ -78,6 +78,19 @@ which owns GPU-count detection, `--device cuda --amp bf16`, sharding, and the st
 Accelerate world size. G3 is a direct single-process cached-score analysis command
 outside `run.sh`.
 
+For an isolated rollout, `hpc/run.sh` resolves the checkout containing the script.
+Create that checkout with Git and link its `.venv`, `data`, and `outputs` to the shared
+resources above before running it. This keeps imports and Git provenance on the chosen
+revision without changing a checkout used by another running job. Use the existing
+`--resume-attempt` at a completed epoch boundary when replacing a training process.
+
+`python -m src.experiments.struct_pipeline_benchmark --help` describes the isolated
+debug benchmark for task plus structural-stream updates. Run the same saved attempt
+with 10 warmup and 40 timed steps in each checkout, rotating legacy, coordinate-only,
+and full implementations over three rounds. Its measurements are engineering evidence,
+not training checkpoints or held-out results; compare GPU thermal telemetry as well as
+step time before attributing a gain to code.
+
 ## Run order
 
 Connect, enter the fixed checkout, and verify the container before any experiment:

@@ -291,7 +291,7 @@ def test_cazi_trains_without_opening_held_out_data() -> None:
 def test_runner_discovers_visible_h20s() -> None:
     text = RUNNER.read_text()
     for value in (
-        "/2023533015/topology-conditioned-inductive-edge-prediction",
+        'dirname -- "${BASH_SOURCE[0]}"',
         "/2023533015/.uv/bin/uv",
         "NVIDIA H20",
         "NVIDIA H20-3e",

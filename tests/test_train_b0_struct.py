@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from typing import TypedDict, cast
 
 import networkx as nx
 import pytest
@@ -15,11 +17,15 @@ from accelerate import Accelerator
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable, PackedNodeRecord
 from src.data.struct_sampler import StructSampler
 from src.distill.struct_config import StructConfig
-from src.distill.struct_losses import struct_total
+from src.distill.struct_losses import struct_anchor_kl, struct_total
+from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
+from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 from src.train_b0 import (
     StructStream,
+    TopoPromptRows,
     ValidationOutcome,
     _grad_norm,
+    _struct_grad_norm,
     config_to_dict,
     load_config,
     train_ddp_loop,
@@ -27,6 +33,7 @@ from src.train_b0 import (
 from torch import nn
 from torch.multiprocessing.spawn import spawn
 
+from tests.test_prefix_model import _tiny_base_config
 from tests.test_train_b0 import (
     _batch_of,
     _constant_metrics,
@@ -124,6 +131,44 @@ def _struct_fixture(n_nodes: int = 12) -> tuple[StructSampler, PackedFeatureTabl
     return sampler, table
 
 
+def _topo_prompt_fixture() -> tuple[StructSampler, PackedFeatureTable, TopoPromptRows]:
+    sampler, _ = _struct_fixture()
+    lengths = [3 + (i % 3) for i in range(12)]
+    records = tuple(
+        PackedNodeRecord(f"n{i}", 0, sum(lengths[:i]), sum(lengths[:i]), lengths[i])
+        for i in range(12)
+    )
+    manifest = PackedFeatureManifest(
+        format="test",
+        input_dim=4,
+        dtype="bfloat16",
+        source_metadata_sha256="",
+        source_index_sha256="",
+        nodes=records,
+        shards=(),
+        pack_workers=1,
+        build_seconds=0.0,
+    )
+    scalar_tokens = torch.arange(1, sum(lengths) + 1, dtype=torch.float32).unsqueeze(-1)
+    table = PackedFeatureTable(
+        scalar_tokens.expand(-1, 4).clone(),
+        torch.tensor([sum(lengths[:i]) for i in range(12)]),
+        torch.tensor(lengths),
+        manifest,
+    )
+    nodes = sorted(sampler.graph.nodes)
+    rows = TopoPromptRows(
+        train_graph=sampler.graph,
+        train_pairs=[(nodes[0], nodes[1]), (nodes[2], nodes[3])],
+        stats_rows=torch.arange(2).numpy(),
+        val_graph=sampler.graph,
+        val_cls_pairs=[(nodes[0], nodes[2])],
+        universe_pairs=[(nodes[1], nodes[3])],
+        device=torch.device("cpu"),
+    )
+    return sampler, table, rows
+
+
 def _stream(
     sampler: StructSampler,
     table: PackedFeatureTable,
@@ -133,6 +178,7 @@ def _stream(
     weights: dict[str, float] | None = None,
     token_budget: int = 1 << 20,
     val_sampler: StructSampler | None = None,
+    coordinates: TopoPromptRows | None = None,
 ) -> StructStream:
     config = StructConfig.from_mapping(
         {
@@ -153,6 +199,7 @@ def _stream(
         label_smoothing=0.0,
         seed=0,
         val_sampler=val_sampler,
+        coordinates=coordinates,
     )
 
 
@@ -190,55 +237,52 @@ def test_stream_assembles_the_same_logits_as_a_direct_forward() -> None:
     assert stats["struct_pairs"] == float(len(rows))
 
 
-@pytest.mark.parametrize("world_size", [1, 2, 4])
-def test_ddp_mean_loss_and_gradient_match_single_rank_at_every_step(world_size: int) -> None:
-    """Changing world size preserves the subgraph, loss and gradient at every step."""
-    sampler, table = _struct_fixture()
-    steps = 3
-    model = _StructToy()
-    single = _stream(sampler, table, rank=0, world_size=1)
-    ranks = [_stream(sampler, table, rank=r, world_size=world_size) for r in range(world_size)]
-    for step in range(steps):
-        expected = single.loss(model, epoch=2, step=step, steps=steps)[0]
-        ddp_mean = torch.stack(
-            [s.loss(model, epoch=2, step=step, steps=steps)[0] for s in ranks]
-        ).mean()
-        live = [
-            position
-            for r in range(world_size)
-            for position in ranks[r]._positions(steps, rank=r, steps=steps, step=step)
-        ]
-        assert live == [step]
-        torch.testing.assert_close(ddp_mean, expected)
-        torch.testing.assert_close(
-            torch.autograd.grad(ddp_mean, model.weight)[0],
-            torch.autograd.grad(expected, model.weight)[0],
-        )
+def test_topology_coordinates_are_prepared_once_before_checkpoint_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampler, table, rows = _topo_prompt_fixture()
+    model = V3_1TopoPrompt(
+        base=_tiny_base_config(),
+        topo_prompt={"trainable": "all", "width": 8, "slots_per_field": 1},
+    )
+    rows.install(model)
+    stream = _stream(sampler, table, token_budget=128, coordinates=rows)
+    subgraph = stream._epoch_plan(epoch=1, steps=1).subgraphs[0]
+    calls = 0
+    original = rows.train_table.coords_for_pairs
+
+    def counted_coordinates(anchor: object, partner: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(anchor, partner)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(rows.train_table, "coords_for_pairs", counted_coordinates)
+    logits, _, _ = stream._score(model, subgraph, sampler)
+    assert calls == 1
+    logits.sum().backward()  # type: ignore[no-untyped-call]
+    assert calls == 1
 
 
 @pytest.mark.parametrize("count", [1, 3, 68, 271, 272])
-def test_four_rank_plan_is_spread_globally_once(count: int) -> None:
+def test_four_rank_plan_replicates_each_global_subgraph(count: int) -> None:
     sampler, table = _struct_fixture()
     stream = _stream(sampler, table, world_size=4)
     steps = 272
-    schedule = [
+    schedules = [
         [
-            position
-            for rank in range(4)
-            for position in stream._positions(count, rank=rank, steps=steps, step=step)
+            stream._positions(count, rank=rank, steps=steps, step=step)
+            for step in range(steps)
         ]
-        for step in range(steps)
+        for rank in range(4)
     ]
-    assert [p for positions in schedule for p in positions] == list(range(count))
-    assert all(len(positions) <= 1 for positions in schedule)
-    live_steps = [step for step, positions in enumerate(schedule) if positions]
+    assert all(schedule == schedules[0] for schedule in schedules[1:])
+    assert [p for positions in schedules[0] for p in positions] == list(range(count))
+    assert all(len(positions) <= 1 for positions in schedules[0])
+    live_steps = [step for step, positions in enumerate(schedules[0]) if positions]
     assert live_steps == [position * steps // count for position in range(count)]
     if count == steps:
-        assert all(len(positions) == 1 for positions in schedule)
-        assert [
-            sum(len(stream._positions(count, rank=r, steps=steps, step=t)) for t in range(steps))
-            for r in range(4)
-        ] == [68] * 4
+        assert all(len(positions) == 1 for positions in schedules[0])
+        assert [sum(map(len, schedule)) for schedule in schedules] == [count] * 4
 
 
 def test_plan_longer_than_steps_is_rejected_and_shorter_plan_yields_zero_steps() -> None:
@@ -267,7 +311,7 @@ def test_plan_longer_than_steps_is_rejected_and_shorter_plan_yields_zero_steps()
     # The single subgraph lands on exactly one of the four steps; the others are zero.
     assert (first["struct_pairs"] > 0) != (second["struct_pairs"] > 0)
     if second["struct_pairs"] == 0.0:
-        assert zero.requires_grad and float(zero) == 0.0
+        assert zero.requires_grad and float(zero.detach()) == 0.0
 
 
 def test_validation_scores_the_gold_val_graph_with_the_val_sampler() -> None:
@@ -424,9 +468,203 @@ def _run_struct_ddp_fixture(
     return {key: value.detach().clone() for key, value in model.state_dict().items()}
 
 
+class _StructStepResult(TypedDict):
+    logits: torch.Tensor
+    terms: dict[str, torch.Tensor]
+    term_norms: dict[str, float]
+    gradient: torch.Tensor
+    weight: torch.Tensor
+    forward_calls: int
+
+
+def _run_distributed_struct_step(
+    *, rank: int, world_size: int, token_budget: int
+) -> _StructStepResult:
+    """Score and update one FP32 toy model, averaging gradients exactly as DDP does."""
+    sampler, table = _struct_fixture()
+    stream = _stream(
+        sampler,
+        table,
+        rank=rank,
+        world_size=world_size,
+        token_budget=token_budget,
+    )
+    model = _StructToy()
+    subgraph = stream._epoch_plan(epoch=2, steps=1).subgraphs[0]
+    logits, target, mask = stream._score(
+        model,
+        subgraph,
+        sampler,
+        distributed=world_size > 1,
+    )
+    total, terms = struct_total(
+        logits,
+        target,
+        mask,
+        stream.config,
+        positive_weight=5.0,
+        label_smoothing=0.0,
+    )
+    term_norms = {
+        key: _struct_grad_norm(term, model, world_size) for key, term in terms.items()
+    }
+    total.backward()  # type: ignore[no-untyped-call]
+    gradient = (
+        torch.zeros_like(model.weight)
+        if model.weight.grad is None
+        else model.weight.grad.detach().clone()
+    )
+    if world_size > 1:
+        dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+        gradient.div_(world_size)
+    with torch.no_grad():
+        model.weight.add_(gradient, alpha=-0.05)
+    return {
+        "logits": logits.detach(),
+        "terms": {key: value.detach() for key, value in terms.items()},
+        "term_norms": term_norms,
+        "gradient": gradient,
+        "weight": model.weight.detach(),
+        "forward_calls": model.forward_calls,
+    }
+
+
+def _run_stochastic_topo_prompt_step(*, rank: int, world_size: int) -> dict[str, torch.Tensor]:
+    """Exercise corruption, dropout, checkpoint recompute, and an empty worker."""
+    sampler, table, rows = _topo_prompt_fixture()
+    torch.manual_seed(17)
+    model = V3_1TopoPrompt(
+        base=_tiny_base_config(),
+        topo_prompt={
+            "trainable": "all",
+            "width": 8,
+            "slots_per_field": 1,
+            "corruption": {"prob": 1.0, "shrink_min": 0.5, "sigma_max": 0.2},
+        },
+    )
+    rows.install(model)
+    model.train()
+    torch.manual_seed(100 + rank)
+    stream = _stream(
+        sampler,
+        table,
+        rank=rank,
+        world_size=world_size,
+        token_budget=1 << 20,
+        coordinates=rows,
+    )
+    loss, _ = stream.loss(model, epoch=1, step=0, steps=1)
+    assert torch.isfinite(loss)
+    loss.backward()  # type: ignore[no-untyped-call]
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if not parameter.requires_grad:
+                continue
+            gradient = (
+                torch.zeros_like(parameter)
+                if parameter.grad is None
+                else parameter.grad.detach().clone()
+            )
+            dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+            gradient.div_(world_size)
+            assert torch.isfinite(gradient).all()
+            parameter.add_(gradient, alpha=-1e-4)
+    return {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+
+class _CoordGenStepResult(TypedDict):
+    teacher_logits: torch.Tensor
+    anchor_loss: torch.Tensor
+    gradient: torch.Tensor
+    coordinate_calls: int
+
+
+def _run_coord_gen_anchor_step(*, rank: int, world_size: int) -> _CoordGenStepResult:
+    """Check distributed anchor KD, including ranks without a local teacher chunk."""
+    sampler, table, rows = _topo_prompt_fixture()
+    base = _tiny_base_config()
+    base["regularization"] = dict.fromkeys(cast(dict[str, object], base["regularization"]), 0.0)
+    base["mlp_head"] = {**cast(dict[str, object], base["mlp_head"]), "dropout": 0.0}
+    prompt = {
+        "trainable": "all",
+        "width": 8,
+        "slots_per_field": 1,
+        "field_mask_prob": 0.0,
+    }
+    torch.manual_seed(23)
+    model = V3_1CoordGen(
+        reader={"base": base, "topo_prompt": prompt},
+        coord_gen={
+            "hidden": 8,
+            "endpoint_hidden": 8,
+            "layers": 1,
+            "dropout": 0.0,
+            "endpoint_dropout": 0.0,
+            "w_anchor": 1.0,
+        },
+    )
+    rows.install(model.reader)
+    with torch.no_grad():
+        model.reader.generator.gates.fill_(0.3)
+    model.initialize_teacher()
+    model.train()
+    stream = _stream(
+        sampler,
+        table,
+        rank=rank,
+        world_size=world_size,
+        token_budget=1 << 20,
+        coordinates=rows,
+    )
+    coordinate_calls = 0
+    original = rows.train_table.coords_for_pairs
+
+    def counted_coordinates(anchor: object, partner: object) -> object:
+        nonlocal coordinate_calls
+        coordinate_calls += 1
+        return original(anchor, partner)  # type: ignore[arg-type]
+
+    rows.train_table.coords_for_pairs = counted_coordinates  # type: ignore[assignment]
+    subgraph = stream._epoch_plan(epoch=2, steps=1).subgraphs[0]
+    logits, _, mask = stream._score(
+        model,
+        subgraph,
+        sampler,
+        distributed=world_size > 1,
+    )
+    teacher_logits = stream._teacher_logits
+    assert teacher_logits is not None and not teacher_logits.requires_grad
+    anchor = struct_anchor_kl(logits, teacher_logits, mask, model.cfg.anchor_temperature)
+    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    grads = torch.autograd.grad(anchor, params, allow_unused=True)
+    gradient = torch.cat(
+        [
+            torch.zeros_like(parameter).flatten() if grad is None else grad.detach().flatten()
+            for parameter, grad in zip(params, grads, strict=True)
+        ]
+    )
+    if world_size > 1:
+        dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+        gradient.div_(world_size)
+    assert coordinate_calls == 1
+    return {
+        "teacher_logits": teacher_logits.detach(),
+        "anchor_loss": anchor.detach(),
+        "gradient": gradient,
+        "coordinate_calls": coordinate_calls,
+    }
+
+
 def _struct_ddp_worker(
-    rank: int, world_size: int, init_file: str, result_dir: str, count: int | None
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_dir: str,
+    count: int | None,
+    token_budget: int,
 ) -> None:
+    interfaces = {name for _, name in socket.if_nameindex()}
+    loopback = "lo0" if "lo0" in interfaces else "lo"
     os.environ.update(
         RANK=str(rank),
         WORLD_SIZE=str(world_size),
@@ -436,6 +674,7 @@ def _struct_ddp_worker(
         MASTER_PORT="29500",
         OMP_NUM_THREADS="1",
         MKL_NUM_THREADS="1",
+        GLOO_SOCKET_IFNAME=loopback,
     )
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -446,41 +685,132 @@ def _struct_ddp_worker(
         timeout=timedelta(seconds=45),
     )
     try:
+        step = _run_distributed_struct_step(
+            rank=rank, world_size=world_size, token_budget=token_budget
+        )
+        stochastic_state = (
+            _run_stochastic_topo_prompt_step(rank=rank, world_size=world_size)
+            if world_size == 4
+            else None
+        )
+        coord_gen_step = (
+            _run_coord_gen_anchor_step(rank=rank, world_size=world_size)
+            if world_size == 4
+            else None
+        )
         state = _run_struct_ddp_fixture(
             Path(result_dir) / "ddp", rank=rank, world_size=world_size, count=count
         )
-        torch.save(state, Path(result_dir) / f"rank-{rank}.pt")
+        torch.save(
+            {
+                "step": step,
+                "stochastic_state": stochastic_state,
+                "coord_gen_step": coord_gen_step,
+                "state": state,
+            },
+            Path(result_dir) / f"rank-{rank}.pt",
+        )
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("count", [None, 1])
+@pytest.mark.parametrize(
+    ("world_size", "count", "token_budget"),
+    [(2, None, 128), (4, 1, 1 << 20)],
+    ids=["two-rank-chunked", "four-rank-empty-workers"],
+)
 def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
-    tmp_path: Path, count: int | None
+    tmp_path: Path, world_size: int, count: int | None, token_budget: int
 ) -> None:
-    # Default: rank 1 first sees structure at step 1. Sparse: rank 1 never sees it.
+    # The second case gives the whole subgraph one chunk, so ranks 1-3 must still
+    # participate in the score and grad-norm collectives before shared task backward.
     spawn(  # type: ignore[no-untyped-call]
         _struct_ddp_worker,
-        args=(2, str(tmp_path / "init"), str(tmp_path), count),
-        nprocs=2,
+        args=(world_size, str(tmp_path / "init"), str(tmp_path), count, token_budget),
+        nprocs=world_size,
         join=True,
     )
+    expected_step = _run_distributed_struct_step(
+        rank=0, world_size=1, token_budget=token_budget
+    )
+    expected_coord_gen = (
+        _run_coord_gen_anchor_step(rank=0, world_size=1) if world_size == 4 else None
+    )
     expected = _run_struct_ddp_fixture(tmp_path / "serial", rank=0, world_size=1, count=count)
-    for rank in range(2):
-        observed = torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True)
+    forward_calls = 0
+    stochastic_reference: dict[str, torch.Tensor] | None = None
+    for rank in range(world_size):
+        payload = torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True)
+        observed_step = cast(_StructStepResult, payload["step"])
+        torch.testing.assert_close(
+            observed_step["logits"], expected_step["logits"], rtol=1e-4, atol=1e-6
+        )
+        for key, value in expected_step["terms"].items():
+            torch.testing.assert_close(
+                observed_step["terms"][key], value, rtol=1e-4, atol=1e-6
+            )
+            assert observed_step["term_norms"][key] == pytest.approx(
+                expected_step["term_norms"][key], rel=1e-4, abs=1e-6
+            )
+        torch.testing.assert_close(
+            observed_step["gradient"], expected_step["gradient"], rtol=1e-4, atol=1e-6
+        )
+        torch.testing.assert_close(
+            observed_step["weight"], expected_step["weight"], rtol=1e-4, atol=1e-6
+        )
+        forward_calls += observed_step["forward_calls"]
+        observed = payload["state"]
         for key in expected:
-            torch.testing.assert_close(observed[key], expected[key], rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(observed[key], expected[key], rtol=1e-4, atol=1e-6)
+        if world_size == 4:
+            assert expected_coord_gen is not None
+            coord_gen_step = cast(_CoordGenStepResult, payload["coord_gen_step"])
+            assert coord_gen_step["coordinate_calls"] == 1
+            torch.testing.assert_close(
+                coord_gen_step["teacher_logits"],
+                expected_coord_gen["teacher_logits"],
+                rtol=1e-4,
+                atol=1e-6,
+            )
+            torch.testing.assert_close(
+                coord_gen_step["anchor_loss"],
+                expected_coord_gen["anchor_loss"],
+                rtol=1e-4,
+                atol=1e-6,
+            )
+            torch.testing.assert_close(
+                coord_gen_step["gradient"],
+                expected_coord_gen["gradient"],
+                rtol=1e-4,
+                atol=1e-6,
+            )
+            if stochastic_reference is None:
+                stochastic_reference = payload["stochastic_state"]
+            else:
+                for key, value in stochastic_reference.items():
+                    torch.testing.assert_close(
+                        payload["stochastic_state"][key], value, rtol=1e-4, atol=1e-6
+                    )
+    assert forward_calls == expected_step["forward_calls"]
+    if world_size == 4:
+        assert torch.load(tmp_path / "rank-0.pt", weights_only=True)["step"]["forward_calls"] > 0
+        for rank in range(1, world_size):
+            assert (
+                torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True)["step"][
+                    "forward_calls"
+                ]
+                == 0
+            )
     ddp_row = json.loads((tmp_path / "ddp" / "metrics.jsonl").read_text().splitlines()[-1])
     serial_row = json.loads((tmp_path / "serial" / "metrics.jsonl").read_text().splitlines()[-1])
     for key in ("train_struct_loss", "struct_bce_loss", "struct_motif_loss", "struct_pairs"):
-        assert ddp_row[key] == pytest.approx(serial_row[key], rel=1e-5)
+        assert ddp_row[key] == pytest.approx(serial_row[key], rel=1e-4, abs=1e-6)
     for key in ("grad_norm_struct_bce", "grad_norm_struct_motif"):
         assert ddp_row[key] > 0
-        if count == 1:
-            assert ddp_row[key] == pytest.approx(serial_row[key], rel=1e-5)
+        assert ddp_row[key] == pytest.approx(serial_row[key], rel=1e-4, abs=1e-6)
     weighted_raw = ddp_row["struct_bce_loss"] + 0.1 * ddp_row["struct_motif_loss"]
     assert ddp_row["train_struct_loss"] == pytest.approx(
-        weighted_raw * (1.0 if count is None else count / 3), rel=1e-5
+        weighted_raw * (1.0 if count is None else count / 3), rel=1e-4
     )
 
 

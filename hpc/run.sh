@@ -2,7 +2,8 @@
 # Direct runner for H20 container instances with automatic GPU discovery.
 set -euo pipefail
 
-readonly EXPECTED_REPO_ROOT="/2023533015/topology-conditioned-inductive-edge-prediction"
+# Resolve this checkout, including isolated Git worktrees used for measured rollouts.
+readonly EXPECTED_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly UV_BIN="/2023533015/.uv/bin/uv"
 readonly PYTHON_BIN="${EXPECTED_REPO_ROOT}/.venv/bin/python"
 readonly DATA_ROOT="${EXPECTED_REPO_ROOT}/data"

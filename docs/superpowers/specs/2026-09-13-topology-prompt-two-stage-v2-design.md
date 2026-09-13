@@ -220,9 +220,11 @@ $$
 
 Per step: all legal pairs of one 40-node subgraph through the student with gradients into
 generator, interface and head (checkpointed as `StructStream._score` does) plus one no-grad
-teacher pass on the same pairs with true coordinates from `coords_for_pairs`. The stream assigns
-the whole subgraph to one rank per global step while the others only synchronise, so the wall
-cost depends on the active rank's workload, not on 780 / global pairs. **Profile one epoch
+teacher pass on the same pairs with true coordinates from `coords_for_pairs`. The stream prepares
+coordinates once outside checkpoint recomputation and shares pair-scoring chunks across ranks,
+balancing their estimated attention cost. A differentiable sum assembles the complete subgraph
+loss on every rank; collective backward and DDP averaging preserve its global gradient.
+Validation retains subgraph striping. **Profile one epoch
 before allocating the wave**; the earlier "2.2×, 7–8 h" figure is unverified.
 `struct.subgraphs_per_epoch` is the compute lever if needed.
 

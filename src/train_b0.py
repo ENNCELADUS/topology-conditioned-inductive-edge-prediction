@@ -52,6 +52,7 @@ import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
+from torch.distributed.nn.functional import all_reduce as differentiable_all_reduce
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Sampler
 
@@ -3956,7 +3957,7 @@ class StructStream:
 
     Sibling of :class:`KDContextStream`: the plan for ``(seed, epoch)`` is
     identical on every rank. Subgraphs are spread over global optimizer steps
-    first, then position ``p`` is scored on rank ``p % W`` exactly once. Legal pairs
+    first, then each subgraph's chunks are distributed over the ranks. Legal pairs
     are bucketed by token boundary, chunked to the token budget, and forwarded
     through the unwrapped model under activation checkpointing; the loss is
     computed on the assembled ``n x n`` matrix (`src/distill/struct_losses.py`).
@@ -4026,22 +4027,24 @@ class StructStream:
     def _positions(self, size: int, *, rank: int, steps: int, step: int) -> list[int]:
         if steps < 1 or step < 0 or step >= steps:
             raise ValueError(f"invalid struct step {step} for {steps} steps")
-        # Partition the global plan before rank striping. Ceiling boundaries put
+        # All ranks score the same subgraph. Ceiling boundaries put
         # the first subgraph at step zero and space shorter plans across the epoch.
         start = (step * size + steps - 1) // steps
         stop = ((step + 1) * size + steps - 1) // steps
-        return [position for position in range(start, stop) if position % self._world_size == rank]
+        return list(range(start, stop))
 
     def _global_step_count(self, size: int, *, steps: int, step: int) -> int:
-        return sum(
-            len(self._positions(size, rank=rank, steps=steps, step=step))
-            for rank in range(self._world_size)
-        )
+        return len(self._positions(size, rank=self._rank, steps=steps, step=step))
 
     # ------------------------------------------------------------ forward
 
     def _score(
-        self, model: nn.Module, subgraph: StructSubgraph, sampler: StructSampler
+        self,
+        model: nn.Module,
+        subgraph: StructSubgraph,
+        sampler: StructSampler,
+        *,
+        distributed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the assembled symmetric logit matrix, the target, and the mask.
 
@@ -4072,10 +4075,10 @@ class StructStream:
         raw_model = _unwrapped_model(model)
         parts: list[torch.Tensor] = []
         teacher_parts: list[torch.Tensor] = []
-        rows_a: list[int] = []
-        rows_b: list[int] = []
-
-        def coordinates_for(anchor: torch.Tensor, partner: torch.Tensor) -> torch.Tensor:
+        local_rows: list[int] = []
+        pair_coords: torch.Tensor | None = None
+        needs_teacher = isinstance(raw_model, V3_1CoordGen) and raw_model.cfg.w_anchor > 0.0
+        if isinstance(raw_model, V3_1TopoPrompt) or needs_teacher:
             if self._coordinates is None:
                 raise RuntimeError("topology prompt structural stream requires coordinate tables")
             coord_table = (
@@ -4083,17 +4086,23 @@ class StructStream:
                 if sampler is self._sampler
                 else self._coordinates.val_table
             )
-            records = self._table.manifest.nodes
-            a = [coord_table.index[records[i].node_id] for i in anchor.cpu().tolist()]
-            b = [coord_table.index[records[i].node_id] for i in partner.cpu().tolist()]
-            return torch.from_numpy(coord_table.coords_for_pairs(np.asarray(a), np.asarray(b))).to(
-                device
-            )
+            a = [coord_table.index[subgraph.nodes[i]] for i, _ in pairs]
+            b = [coord_table.index[subgraph.nodes[j]] for _, j in pairs]
+            pair_coords = torch.from_numpy(
+                coord_table.coords_for_pairs(np.asarray(a), np.asarray(b))
+            ).to(device)
 
+        rank_cost = [0] * self._world_size
         for boundary, rows in buckets.items():
             per_chunk = max(1, self._token_budget // boundary)
             for start in range(0, len(rows), per_chunk):
                 chunk = rows[start : start + per_chunk]
+                if distributed:
+                    owner = min(range(self._world_size), key=lambda rank: rank_cost[rank])
+                    rank_cost[owner] += len(chunk) * boundary * boundary
+                    if owner != self._rank:
+                        continue
+                coords = pair_coords[chunk] if pair_coords is not None else None
                 anchor = torch.as_tensor(
                     [packed[pairs[r][0]] for r in chunk], dtype=torch.int64, device=device
                 )
@@ -4102,7 +4111,10 @@ class StructStream:
                 )
 
                 def forward(
-                    anchor: torch.Tensor, partner: torch.Tensor, boundary: int
+                    anchor: torch.Tensor,
+                    partner: torch.Tensor,
+                    boundary: int,
+                    coords: torch.Tensor | None,
                 ) -> torch.Tensor:
                     # `boundary` is explicit: a closure over the loop variable
                     # would recompute every chunk at the last bucket.
@@ -4110,7 +4122,8 @@ class StructStream:
                     emb_b, len_b = self._table.gather_nodes(partner, boundary)
                     batch = {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
                     if isinstance(raw_model, V3_1TopoPrompt):
-                        batch[COORDS_KEY] = coordinates_for(anchor, partner)
+                        assert coords is not None
+                        batch[COORDS_KEY] = coords
                     output = cast(dict[str, torch.Tensor], raw_model(batch))
                     out = output["logits"]
                     if out.dim() > 1 and out.size(-1) == 1:
@@ -4120,14 +4133,15 @@ class StructStream:
                 if torch.is_grad_enabled():
                     chunk_logits = cast(
                         torch.Tensor,
-                        checkpoint(forward, anchor, partner, boundary, use_reentrant=False),
+                        checkpoint(forward, anchor, partner, boundary, coords, use_reentrant=False),
                     )
                 else:
-                    chunk_logits = forward(anchor, partner, boundary)
+                    chunk_logits = forward(anchor, partner, boundary, coords)
                 parts.append(chunk_logits)
                 # The teacher pass feeds only the anchor KD; arms with w_anchor == 0
                 # (factorial A and C) skip it so the matched pairs cost the same.
-                if isinstance(raw_model, V3_1CoordGen) and raw_model.cfg.w_anchor > 0.0:
+                if needs_teacher:
+                    assert isinstance(raw_model, V3_1CoordGen) and coords is not None
                     with torch.no_grad(), self._autocast():
                         emb_a, len_a = self._table.gather_nodes(anchor, boundary)
                         emb_b, len_b = self._table.gather_nodes(partner, boundary)
@@ -4137,18 +4151,29 @@ class StructStream:
                                 "emb_b": emb_b,
                                 "len_a": len_a,
                                 "len_b": len_b,
-                                COORDS_KEY: coordinates_for(anchor, partner),
+                                COORDS_KEY: coords,
                             }
                         )
                         teacher_parts.append(teacher_output["logits"].reshape(-1).float())
-                rows_a.extend(pairs[r][0] for r in chunk)
-                rows_b.extend(pairs[r][1] for r in chunk)
-        flat = torch.cat(parts)
-        index_a = torch.as_tensor(rows_a, dtype=torch.int64, device=device)
-        index_b = torch.as_tensor(rows_b, dtype=torch.int64, device=device)
+                local_rows.extend(chunk)
+        # Connect an empty rank to a trainable parameter so autograd.grad probes
+        # also traverse the collective (an independent leaf would be pruned).
+        dependency = next(p for p in raw_model.parameters() if p.requires_grad).sum() * 0.0
+        flat = torch.zeros(len(pairs), dtype=torch.float32, device=device) + dependency.float()
+        row_index = torch.as_tensor(local_rows, dtype=torch.int64, device=device)
+        if parts:
+            flat = flat.index_put((row_index,), torch.cat(parts))
+        if distributed:
+            flat = differentiable_all_reduce(flat, op=dist.ReduceOp.SUM)  # type: ignore[no-untyped-call]
+        index_a = torch.as_tensor([i for i, _ in pairs], dtype=torch.int64, device=device)
+        index_b = torch.as_tensor([j for _, j in pairs], dtype=torch.int64, device=device)
         logits = logits.index_put((index_a, index_b), flat).index_put((index_b, index_a), flat)
-        if teacher_parts:
-            teacher_flat = torch.cat(teacher_parts)
+        if needs_teacher:
+            teacher_flat = torch.zeros_like(flat, requires_grad=False)
+            if teacher_parts:
+                teacher_flat.index_put_((row_index,), torch.cat(teacher_parts))
+            if distributed:
+                dist.all_reduce(teacher_flat, op=dist.ReduceOp.SUM)
             self._teacher_logits = (
                 torch.zeros_like(logits)
                 .index_put((index_a, index_b), teacher_flat)
@@ -4171,14 +4196,16 @@ class StructStream:
         stats: dict[str, float] = {"struct_pairs": 0.0, "struct_subgraphs": 0.0}
         if not positions:
             return zero, stats
-        # DDP averages gradients over all ranks, including idle structural ranks.
-        # Scale the local sum so the reduced gradient is the global subgraph mean.
-        scale = self._world_size / global_count if global_count else 0.0
+        # The replicated loss's collective backward sums W identical gradients;
+        # DDP averages the resulting local parameter gradients by W exactly once.
+        scale = 1.0 / global_count if global_count else 0.0
         total = zero
         for position in positions:
             subgraph = plan.subgraphs[position]
             self.last_subgraph = subgraph
-            logits, target, mask = self._score(model, subgraph, self._sampler)
+            logits, target, mask = self._score(
+                model, subgraph, self._sampler, distributed=self._world_size > 1
+            )
             pair_count = float(torch.triu(mask, diagonal=1).sum().item())
             if pair_count == 0.0:
                 continue
@@ -4207,7 +4234,8 @@ class StructStream:
                 stats[f"sum_{key}"] = stats.get(f"sum_{key}", 0.0) + float(term.detach().item())
             for key, value in self._sampler.statistics(subgraph).items():
                 stats[f"sum_{key}"] = stats.get(f"sum_{key}", 0.0) + value
-        return total * scale, stats
+        # Epoch telemetry SUM-reduces ranks; each subgraph is counted once.
+        return total * scale, {key: value / self._world_size for key, value in stats.items()}
 
     def epoch_telemetry(self, accelerator: Accelerator, sums: dict[str, float]) -> dict[str, float]:
         """Reduce rank-local sums into per-subgraph means plus plan coverage."""
@@ -4714,6 +4742,28 @@ def _grad_norm(term: torch.Tensor, model: nn.Module) -> float:
     return float(torch.stack(squares).sum().sqrt().item())
 
 
+def _struct_grad_norm(term: torch.Tensor, model: nn.Module, world_size: int) -> float:
+    """Norm of the global structural gradient, before loss weights and clipping.
+
+    The pair-logit collective's backward has already multiplied local gradients
+    by world_size. Average parameter gradients as DDP does, then take the norm.
+    All ranks call this probe, including ranks without any local pair chunks.
+    """
+    if world_size == 1:
+        return _grad_norm(term, model)
+    params = [p for p in model.parameters() if p.requires_grad]
+    grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+    flat = torch.cat(
+        [
+            (torch.zeros_like(param) if grad is None else grad.detach()).reshape(-1).float()
+            for param, grad in zip(params, grads, strict=True)
+        ]
+    )
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat.div_(world_size)
+    return float(torch.linalg.vector_norm(flat).item())
+
+
 def _topology_due(
     epoch: int, *, epochs: int, topology_every: int, classification_only: bool
 ) -> bool:
@@ -5150,7 +5200,7 @@ def train_ddp_loop(
                     # Probe each rank's first live subgraph, which need not be
                     # step zero. These are raw term norms, before weights/scaling.
                     grad_norm_struct = {
-                        key: _grad_norm(term, model)
+                        key: _struct_grad_norm(term, model, world_size)
                         for key, term in struct_stream.last_terms.items()
                     }
                 loss = loss + struct_loss

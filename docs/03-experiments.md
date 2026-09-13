@@ -490,7 +490,8 @@ with seeds 1–2 before downstream use. Every Stage II run has the full 15 epoch
 | S3 subgraph size | II | nodes, then frequency, at S2 winner | 3 + 2 | 20/40/60; then full/half steps | five-rank with measured epoch cost |
 
 A Stage I run is approximately 3.5 h on four GPUs. Stage II structural-stream cost is
-**unmeasured**: one rank owns a subgraph per global step. Profile one D epoch before allocating
+**unmeasured**: ranks share the pair-scoring chunks of one subgraph per global step,
+then assemble its complete loss through a differentiable sum. Profile one D epoch before allocating
 the wave. Independent boxes can run T1/T2, P and S1 only once their prerequisite artifacts exist;
 F waits for S1, and S2–S3 are sequential. The ask-and-tell study utility is
 `src.experiments.topology_prompt_hpo`, with `--study T1|T2|S1|S2|S3_size|S3_frequency`,
