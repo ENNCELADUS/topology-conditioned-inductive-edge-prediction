@@ -11,10 +11,9 @@ rows. The prefix branch is the separately-softmaxed, zero-init tanh-gated
 attention of `src.model.egostitch.classifier.prefix.prefix_branch`, so at
 initialisation the model computes exactly the base.
 
-Two trainability modes: ``all`` (Stage I proper -- the whole trunk learns how a
-given structure should alter the pair decision) and ``prompt`` (the frozen
-`prefix_base` trunk with only the prompt path trainable -- the frozen-trunk
-control that asks whether a fixed reader can exploit true structure at all).
+Trainability modes are ``all`` (the full Stage I reader), ``prompt`` (only
+the prompt on the frozen base), and ``interface_head`` (prompt and output
+head, used by Stage II with its frozen encoder and cross-attention).
 
 The coordinates are measured on true structure, so every run of this family
 is a ceiling diagnostic: the trainer refuses it outside ``--run-kind
@@ -34,6 +33,7 @@ from torch.nn import functional as F
 from src.data.struct_coords import (
     CONTEXT_DIM,
     COORD_DIM,
+    COORD_NAMES,
     COORD_SPEC,
     ENDPOINT_DIM,
     FIELD_SLICES,
@@ -43,7 +43,7 @@ from src.model.egostitch.classifier.b0_v31 import V3_1, unpack_pair_batch, weigh
 from src.model.egostitch.classifier.layers import CrossAttentionLayer, _build_padding_mask
 from src.model.egostitch.classifier.prefix import SITES, prefix_branch
 
-TRAINABLE_MODES = ("all", "prompt")
+TRAINABLE_MODES = ("all", "prompt", "interface_head")
 INTERVENTIONS = ("none", "gates_off", "mean", "mean_endpoint", "mean_relation", "mean_context")
 FIELD_ORDER = ("endpoint_u", "endpoint_v", "relation", "context")
 ROLE_SELF, ROLE_PARTNER, ROLE_RELATION, ROLE_CONTEXT = range(4)
@@ -51,11 +51,25 @@ COORDS_KEY = "struct_coords"
 
 
 @dataclass(frozen=True)
+class CorruptionConfig:
+    """Stationary training-coordinate perturbation distribution."""
+
+    prob: float = 0.0
+    shrink_min: float = 0.3
+    sigma_max: float = 0.5
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.prob <= 1 or not 0 <= self.shrink_min <= 1 or self.sigma_max < 0:
+            raise ValueError("invalid topo_prompt.corruption distribution")
+
+
+@dataclass(frozen=True)
 class TopoPromptConfig:
     """The ``model.config.topo_prompt`` block.
 
     Attributes:
-        trainable: ``"all"`` (trunk and prompt train) or ``"prompt"`` (frozen trunk).
+        trainable: ``"all"``, ``"prompt"``, or ``"interface_head"``.
+        corruption: Stationary training-coordinate corruption distribution.
         width: Token width of the prompt encoder.
         slots_per_field: Prefix rows each of the four fields expands to, per layer.
         field_mask_prob: Training-time probability of replacing one field of one
@@ -66,6 +80,7 @@ class TopoPromptConfig:
         base_checkpoint_sha256: SHA-256 of that file (provenance only, never verified).
     """
 
+    corruption: CorruptionConfig = CorruptionConfig()
     trainable: str = "all"
     width: int = 128
     slots_per_field: int = 2
@@ -116,6 +131,7 @@ class TopoPromptConfig:
             raise ValueError(f"unknown topo_prompt keys: {unknown}")
         sha = raw.get("base_checkpoint_sha256")
         return cls(
+            corruption=CorruptionConfig(**cast(dict[str, float], raw.get("corruption", {}))),
             trainable=str(raw.get("trainable", "all")),
             width=int(cast(int, raw.get("width", 128))),
             slots_per_field=int(cast(int, raw.get("slots_per_field", 2))),
@@ -237,6 +253,51 @@ class TopoPromptGenerator(nn.Module):
             return z
         mask = torch.rand(z.size(0), len(FIELD_ORDER), device=z.device) < self.cfg.field_mask_prob
         return self.mask_fields(z, mask)
+
+    def perturb_coordinates(
+        self,
+        z: torch.Tensor,
+        *,
+        shrink: float | torch.Tensor = 0.5,
+        sigma: float | torch.Tensor = 0.0,
+        seed: int = 42,
+    ) -> torch.Tensor:
+        """Perturb continuous coordinates and soften distance toward its training prior.
+
+        Endpoint noise follows canonical coordinate order, preserving swap
+        equivariance for the same seed. The fifth class is the remaining probability.
+        """
+        rng = torch.Generator(device=z.device).manual_seed(seed)
+        noise = torch.randn(z.shape, device=z.device, generator=rng)
+        u, v = FIELD_SLICES["endpoint_u"], FIELD_SLICES["endpoint_v"]
+        delta = z[:, u] - z[:, v]
+        first = (delta != 0).to(torch.int64).argmax(dim=1, keepdim=True)
+        reverse = delta.gather(1, first) > 0
+        noise_u, noise_v = noise[:, u].clone(), noise[:, v].clone()
+        noise[:, u] = torch.where(reverse, noise_v, noise_u)
+        noise[:, v] = torch.where(reverse, noise_u, noise_v)
+        # Identical endpoint targets have no orientation to distinguish.
+        noise[:, v] = torch.where((delta == 0).all(dim=1, keepdim=True), noise[:, u], noise[:, v])
+        out = z * shrink + noise * sigma
+        dist = [COORD_NAMES.index(name) for name in ("dist_2", "dist_3", "dist_4plus", "dist_inf")]
+        # Mixing raw one-hots with their mean prior is exactly shrinkage in z-space.
+        out[:, dist] = (z * shrink)[:, dist]
+        return out
+
+    def training_corruption(self, z: torch.Tensor, *, seed: int) -> torch.Tensor:
+        """Apply the stationary distribution only on the training path."""
+        cfg = self.cfg.corruption
+        if not self.training or cfg.prob == 0:
+            return z
+        rng = torch.Generator(device=z.device).manual_seed(seed)
+        selected = torch.rand((len(z), 1), device=z.device, generator=rng) < cfg.prob
+        shrink = cfg.shrink_min + (1 - cfg.shrink_min) * torch.rand(
+            (len(z), 1), device=z.device, generator=rng
+        )
+        sigma = cfg.sigma_max * torch.rand((len(z), 1), device=z.device, generator=rng)
+        return torch.where(
+            selected, self.perturb_coordinates(z, shrink=shrink, sigma=sigma, seed=seed + 1), z
+        )
 
     def tokens(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the ``(B, 4, width)`` token stacks for the two stream views.
@@ -410,15 +471,18 @@ class V3_1TopoPrompt(nn.Module):
             self.d_model, len(trunk.layers), int(base_model.n_heads), self.cfg
         )
         self.base = base_model
-        if self.cfg.trainable == "prompt":
+        if self.cfg.trainable in ("prompt", "interface_head"):
             for param in self.base.parameters():
                 param.requires_grad_(False)
             self.base.eval()
+            if self.cfg.trainable == "interface_head":
+                self.base.output_head.requires_grad_(True)
         self.prompt_layers = nn.ModuleList(
             TopoPromptCrossAttentionLayer(cast(CrossAttentionLayer, layer), index, self.generator)
             for index, layer in enumerate(trunk.layers)
         )
         self.intervention: str = "none"
+        self.corruption_seed = 42
 
     @property
     def encoder(self) -> nn.Module:
@@ -427,8 +491,8 @@ class V3_1TopoPrompt(nn.Module):
 
     @property
     def frozen_base(self) -> bool:
-        """Whether the base trunk is frozen (``trainable == "prompt"``)."""
-        return self.cfg.trainable == "prompt"
+        """Whether the encoder and cross-attention trunk are frozen."""
+        return self.cfg.trainable in ("prompt", "interface_head")
 
     def train(self, mode: bool = True) -> V3_1TopoPrompt:
         """Switch mode; a frozen base stays in eval mode regardless.
@@ -442,13 +506,17 @@ class V3_1TopoPrompt(nn.Module):
         super().train(mode)
         if self.frozen_base:
             self.base.eval()
+            if self.cfg.trainable == "interface_head":
+                self.base.output_head.train(mode)
         return self
 
     def trainable_parameters(self) -> list[nn.Parameter]:
         """Parameters the optimiser updates: the prompt path, or everything."""
-        if self.frozen_base:
-            return list(self.generator.parameters())
-        return list(self.parameters())
+        return [param for param in self.parameters() if param.requires_grad]
+
+    def set_corruption_step(self, step: int, seed: int = 42) -> None:
+        """Set reproducible perturbations for this global training step."""
+        self.corruption_seed = seed + step * 104729
 
     def _apply_intervention(self, z: torch.Tensor) -> tuple[torch.Tensor, float]:
         """Return the (possibly substituted) standardised coordinates and the gate scale.
@@ -535,6 +603,7 @@ class V3_1TopoPrompt(nn.Module):
                 coordinates are mis-shaped or unstandardisable.
         """
         z = self.generator.standardize(coords.to(encoded_a.device))
+        z = self.generator.training_corruption(z, seed=self.corruption_seed)
         z = self.generator.training_field_mask(z)
         return self.logits_from_standardized(encoded_a, encoded_b, lengths_a, lengths_b, z)
 
@@ -545,6 +614,8 @@ class V3_1TopoPrompt(nn.Module):
         lengths_a: torch.Tensor,
         lengths_b: torch.Tensor,
         z: torch.Tensor,
+        *,
+        return_pair_repr: bool = False,
     ) -> torch.Tensor:
         """Compute logits from encoded token states and *standardised* coordinates.
 
@@ -558,6 +629,7 @@ class V3_1TopoPrompt(nn.Module):
             lengths_a: True sequence lengths for A.
             lengths_b: True sequence lengths for B.
             z: Standardised coordinates ``(B, COORD_DIM)`` of the pairs ``(a, b)``.
+            return_pair_repr: Return the representation before the output head for KD.
 
         Returns:
             The pair logits.
@@ -581,6 +653,8 @@ class V3_1TopoPrompt(nn.Module):
                 encoded_b, encoded_a, lengths_b, lengths_a, prefixes_b, prefixes_a, gate_scale
             )
             pair_repr = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
+        if return_pair_repr:
+            return pair_repr
         return cast(torch.Tensor, self.base.output_head(pair_repr))
 
     def forward(

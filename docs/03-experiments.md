@@ -89,6 +89,10 @@ read, through a separately softmaxed and tanh-gated attention branch with zero-i
 gates, at all nine cross-attention sites of the trunk. At initialisation the model is exactly
 the base; the AB and BA passes receive mirrored prefixes, so the logit is swap-symmetric.
 
+The following records the completed **v1** implementation and its results. The approved v2
+training contract is [the two-stage specification](superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md)
+and §6 below; its studies have not been launched.
+
 **Stage I: teach the reader on true structure.** `topo_prompt_full` trains trunk and prompt
 from scratch under the base recipe with the true coordinates $s^*_{uv}$ of every training
 row and task BCE only; light field masking (probability 0.1) keeps it from keying on exact
@@ -342,17 +346,18 @@ gain is in which edges are admitted at RD ≈ 1, not in the shape of the admitte
 diagnostics measured every epoch (KD shown before its 0.1 weight). Dashed line: selected
 epoch. The frozen-reader lane is shown for contrast only.*
 
-- **$\mathcal L_{\mathrm{coord}}$** falls on the training rows throughout but on V_val bottoms
-  out at epoch 3 (1.33) and then rises (1.56 at the end; 1.25 → 2.01 in the frozen-reader lane).
-  Selection and stopping watch the task BCE, so the selected epoch (6) is past the fit
-  optimum: the generator overfits the training universe's structure.
+- **$\mathcal L_{\mathrm{coord}}$** on V_val bottoms out at epoch 3 (1.33) and then rises
+  (1.56 at the end; 1.25 → 2.01 in the frozen-reader lane). Only composite training loss
+  was logged, so a monotonic fall in training coordinate loss is unestablished. Early stopping
+  watches task BCE; checkpoint selection uses the five-metric V_val rank. Its selected epoch
+  (6) is past the coordinate-fit optimum; this does not identify the mechanism.
 - **$\mathcal L_{\mathrm{BCE}}$** of the student drops from 0.84 to 0.64 by epoch 2 and then
   oscillates between 0.68 and 0.87. The trunk alone is below the prompt-free recipe (it was
   trained to lean on the prompt, §3.5), and the task term teaches the generator coordinates
   that bring it back to the base level, not further.
 - **$\mathcal L_{\mathrm{KD}}$** falls from 0.83 to 0.56 by epoch 2 and stays at 0.59–0.86. The
   teacher, the same reader on true coordinates, is confident where the student cannot be; at
-  weight 0.1 the term neither helps nor hurts measurably. Separating the three terms' causal
+  weight 0.1 its causal contribution is unmeasured without a matched ablation. Separating the three terms' causal
   contributions needs matched task-only, task + coordinate and task + KD runs, which were not
   launched.
 
@@ -377,14 +382,12 @@ On training rows the generator learns what the endpoints' attributes support (de
 triangles, Jaccard, common neighbours, L3 paths at R² 0.4–0.6; global walk kernels near zero),
 and the endpoint order is verified (own target 0.24, swapped −0.05). On V_val, whose nodes it
 never saw, the same fields fall to R² ≤ 0.2 for relation and context and below zero for the
-endpoint fields. Each training node appears in thousands of rows with a constant endpoint
-target, so a head on frozen node states memorises node structure rather than an
-attribute-to-structure map; the earlier `kd_struct` descriptor R² of 0.6–0.7 predates the
-node-held-out split and is consistent with this reading. What survives to unseen nodes is
-region-level structure, the higher degrees and richer neighbourhoods of a denser region, which
-is exactly what raises the reader's logits where the test graph is denser (§3.5) and what the
-assembled-graph group rewards, while the pair-level relation that separates a positive from a
-negative among neighbours, which the edge group needs, does not survive.
+endpoint fields. The endpoint head is pair-conditioned and its targets remove the queried edge, so the
+endpoint targets are not per-node constants. Their repeated node-specific component and the
+train/V_val fit gap are consistent with poor head generalisation, but do not distinguish
+memorisation from universe shift. Coordinate interventions establish an effect on the assembled
+graph, not transferable regional density or a causal explanation of the edge cost. The standalone
+probe in §6 tests new-head generalisation separately from Stage II training.
 
 ### 5.4 Validation topology dynamics
 
@@ -400,7 +403,121 @@ single seed at a favourable checkpoint and needs replication before it is writte
 finding; the direction of the effect is nevertheless consistent across the ablation rows and
 across the two lanes (the frozen-reader lane moves the same way within the noise band).
 
-**Next.** Two more seeds of `coord_gen_full`; a node-held-out generator fit (refit the heads
-with held-out training nodes) to separate generalisation from the training-graph/V_val shift;
-and, if the topology gain replicates, Stages III/IV aimed at recovering the edge cost by
-unfreezing the readout and upper encoder under task BCE while keeping the prompt path.
+**Next.** The approved [two-stage v2 specification](superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md)
+places corruption and optional structural training inside Stage I, and interface/head adaptation,
+KD and structural supervision inside Stage II; Stages III/IV are retired. First inspect V_val
+admitted-set stability, run the standalone node-held-out probe, and profile one epoch of D before
+allocating the wave. These are implementation and future-run instructions; no v2 study has been
+launched. A strictly monotone logit rescaling cannot change the admitted set when its threshold
+is re-selected, so affine drift alone cannot explain the MMD swings. Test sensitivity on the
+selected epoch's neighbours is descriptive only after the method and selection rule are locked.
+
+## 6. Hyperparameters and search plan for the two-stage topology prompt
+
+Status: approved for implementation on 2026-09-13, following the reviewed
+[two-stage v2 specification](superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md).
+No study in this section has been launched. This section fixes names, defaults, boxes and search
+order. **For these studies only**, Optuna ask-and-tell uses constrained MO-TPE with GS (max)
+and geometric mean of the three V_val MMD ratios (min), with the soft constraint
+`abs(log(RD)) <= 0.05`. The general three-objective studies in §3.2 retain their contract.
+Each trial selects its checkpoint by the five-metric rank, runs `--skip-test`, and only the
+locked winner is tested. The additional T1/S1 selection filters below are specific to this
+study; they do not change the shared checkpoint selector or add runtime failure gates.
+
+### 6.1 What is fixed and never searched
+
+| Fixed | Value | Reason |
+|---|---|---|
+| split, negative stream, positive weight | split seed 42, dynamic 1:5, weight 5 | evaluation/training protocol; run seeds are separate |
+| coordinate spec | v1, 34 numbers, training-statistics standardisation; structural pairs use the full training table | semantics remain fixed; no sampled-subgraph recomputation |
+| coordinate reduction | Huber averaged over 30 continuous coordinates plus distance cross-entropy | equal coordinate weighting; field reweighting is an ablation |
+| prompt geometry | width 128, two slots per field, nine sites, zero-init gates | same established interface |
+| structural sampler | default 32 local + 8 background nodes; bfs/motif/bridge 0.5/0.25/0.25; one subgraph per step; subgraph BCE 1.0 | only total nodes, frequency and added-term scales vary below |
+| Stage I optimiser | lr 1e-4, weight decay 0.05, one-cycle 25 epochs, patience 10 on task BCE | base recipe |
+| Stage II budget | one-cycle 15 epochs, pct_start 0.1, final_div_factor 100; no early stopping; five-rank selection | every arm completes the annealing budget; non-finite state still fails closed |
+| Stage II encoder/cross-attention | frozen | compute choice; using true coordinates does not prove they are predictable |
+| Stage II supervision | every training row keeps coordinate, task and KD supervision | standalone probe measures new-head generalisation; no internal training fold |
+| true-coordinate field mask | 0.1 | retained Stage I regularisation |
+| corruption schedule | stationary | no severity-schedule knob |
+| KD form | pointwise soft-target BCE; anchor masked-softmax KL; immutable Stage I teacher on true coordinates | anchor temperature alone controls distribution shape |
+| representation KD and teacher-soft degree matching | zero in first wave | deferred matched ablations |
+
+### 6.2 The hyperparameters
+
+Boxes are log-uniform unless marked as a set or linear. Defaults are the first run and first
+enqueued prior. `topo_prompt.*` and `coord_gen.*` keys are nested under `model.config`;
+`struct` and `optim` are top-level. The chosen reader checkpoint must be supplied explicitly;
+the example Stage II configs name the default Stage I v2 output, not a selected winner.
+
+| Stage I parameter | Config key | Default | Box | Target observation |
+|---|---|---:|---|---|
+| corruption rate | `topo_prompt.corruption.prob` | 0.5 | {0.25, 0.5, 0.75} | brittle reader |
+| shrink floor | `topo_prompt.corruption.shrink_min` | 0.3 | [0.1, 0.7] | generator under-dispersion; same shrink softens distance towards training prior |
+| noise ceiling | `topo_prompt.corruption.sigma_max` | 0.5 | [0.1, 1.0] | continuous error beyond shrinkage |
+| subgraph nodes | `struct.nodes` | 40 | {20, 40, 60} | shape ratios rise with flat GS |
+| added structural weights | `struct.weights.{rank,degree,motif}` | 1.0 / 0.1 / 0.1 | rank [0.1, 3]; degree/motif [0.01, 1] | same; BCE remains 1.0 |
+
+| Stage II parameter | Config key | Default | Box | Target observation |
+|---|---|---:|---|---|
+| generator peak LR | `optim.groups.generator.max_lr` | 3e-4 | [1e-4, 1e-3] | unstable coordinates |
+| interface/head peak LR | `optim.groups.interface.max_lr` | 1e-4 | [3e-5, 3e-4] | slower reader adaptation |
+| coordinate weight | `coord_gen.w_coord` | 1.0 | [0.3, 3] | coordinate anchor against decision terms |
+| pointwise KD mixture | `coord_gen.kd_alpha` | 0.5 | linear [0, 0.7] | `(1-alpha) BCE(y) + alpha BCE(q_T)` keeps total classification weight 1 |
+| anchor KD weight | `coord_gen.w_anchor` | 1.0 | [0.1, 3] | which-neighbour signal |
+| anchor temperature | `coord_gen.anchor_temperature` | 1.0 | {0.5, 1, 2} | candidate concentration |
+| structural scale | `struct.scale` | 1.0 | [0.3, 3] | scales rank/degree/motif only; BCE remains 1.0 |
+| subgraph nodes | `struct.nodes` | 40 | {20, 40, 60} | reach versus cost |
+| subgraphs per epoch | `struct.subgraphs_per_epoch` | null (one per step) | {0.5 (half steps), null (steps)} | compute only; searched last after profiling |
+| endpoint input dropout | `coord_gen.endpoint_dropout` | 0.3 | {0.1, 0.3, 0.5} | selected by probe, not a training run |
+| endpoint weight decay | `coord_gen.endpoint_weight_decay` | 0.1 | {0.05, 0.1} | same |
+| endpoint width | `coord_gen.endpoint_hidden` | 256 | fixed | regularisation, not capacity search |
+| representation KD | `coord_gen.w_kd_rep` | 0 | ablation only {0.1, 0.5} | deferred |
+
+### 6.3 Search order and budgets
+
+Every study inherits the preceding winners through an explicit base config; no cross-stage
+joint search or guessed winner. Trials are single-seed; each stage's final winner is replicated
+with seeds 1–2 before downstream use. Every Stage II run has the full 15 epochs.
+
+| Study | Stage | Searched | Runs | Enqueued priors | Selection |
+|---|---|---|---:|---|---|
+| T1 corruption | I | rate, shrink, noise | 6 | default; hard (0.75, 0.1, 1.0); mild (0.25, 0.5, 0.25) | clean V_val five-rank; exclude noise-sensitivity p95 logit change >2 at sigma=0.5 |
+| T2 teacher structure | I | nodes and three added weights at T1 winner | 6 | 40/20/60 with 1.0/0.1/0.1 | clean five-rank and sensitivity rows; T1 without stream is comparator; record immutable chosen teacher |
+| P probe | — | dropout × decay, two feature sets | 6 × 2 head fits | none | held-out-endpoint R²; no Stage II training run |
+| S1 optimisation | II | two peak LRs on D | 4 | default; (1e-3,1e-4); (1e-4,3e-5); (3e-4,3e-4) | five-rank; exclude a run with any consecutive-epoch admitted-set Jaccard <0.7 |
+| F factorial | II | KD off/on × added structural terms off/on | 4 (+1 optional generator-only D) | A–D configs | contribution test, not search; compare edge and topology families on V_val |
+| S2 loss balance | II | coordinate, alpha, anchor, temperature, structural scale on D | 10 | default; KD-heavy (0.3,0.7,3,1,1); struct-heavy (1,0.5,1,1,3) | MO-TPE above plus val_cls AUPRC >= prefix_base -0.01 |
+| S3 subgraph size | II | nodes, then frequency, at S2 winner | 3 + 2 | 20/40/60; then full/half steps | five-rank with measured epoch cost |
+
+A Stage I run is approximately 3.5 h on four GPUs. Stage II structural-stream cost is
+**unmeasured**: one rank owns a subgraph per global step. Profile one D epoch before allocating
+the wave. Independent boxes can run T1/T2, P and S1 only once their prerequisite artifacts exist;
+F waits for S1, and S2–S3 are sequential. The ask-and-tell study utility is
+`src.experiments.topology_prompt_hpo`, with `--study T1|T2|S1|S2|S3_size|S3_frequency`,
+`--base-config` and `--sweep-dir`; S2 also requires `--prefix-base-auprc`. It does not
+authorize launching these studies.
+
+### 6.4 What every run records beyond the five numbers
+
+- Stage I fixed sensitivity: all rows at lambda=0.5, sigma=0.5, and both. Record val_cls
+  AUPRC/BCE/Brier, mean/p95 absolute topology-universe logit change, and all five topology
+  metrics at both the clean threshold and the perturbation's re-selected threshold.
+- Stage II consecutive-epoch stability on V_val: affine logit fit and residual, admitted-set
+  Jaccard at each epoch's own threshold, and per-node predicted-degree changes. A monotone
+  rescaling cannot move the re-selected admitted set; these rows identify actual set changes.
+- KD accounting uses the same rows and weighting as the loss: teacher Bernoulli entropy,
+  entropy-subtracted pointwise KD, teacher anchor entropy and anchor-term gradient norm.
+- Generator diagnostics: per-field V_val R² and distance accuracy; the probe's held-out-endpoint
+  R² under the chosen regularisation. The probe fits heads only on pairs touching no held-out
+  training node, reports in-fold/one-held-out/two-held-out/V_val separately, and measures endpoint
+  fit on held-out endpoints themselves. Stage I pooled features have prior encoder exposure to
+  those nodes; raw intrinsic F0 features provide the complementary unexposed feature set.
+- Winner result notes show the per-epoch spread of each MMD ratio beside the selected value.
+  Predeclared selected-epoch-neighbour sensitivity on test is descriptive after method and
+  selection lock and never selects anything.
+
+### 6.5 What this section does not authorise
+
+This fixes names, defaults and boxes. Launching a study, changing a fixed value in §6.1 or
+adding a parameter requires updating this section in the same change. Test results select
+nothing. No study has been launched by the implementation change.

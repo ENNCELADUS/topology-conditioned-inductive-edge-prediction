@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import cast
+
 import pytest
 import torch
 from src.data.struct_coords import COORD_DIM, FIELD_SLICES
@@ -35,13 +38,21 @@ def _model(seed: int = 0, **extra: object) -> V3_1CoordGen:
     torch.manual_seed(seed)
     model = V3_1CoordGen(
         reader=_reader_config(),
-        coord_gen={"hidden": 16, "layers": 1, "dropout": 0.0, **extra},
+        coord_gen={
+            "hidden": 16,
+            "layers": 1,
+            "dropout": 0.0,
+            "endpoint_dropout": 0.0,
+            "endpoint_hidden": 16,
+            **extra,
+        },
     )
     model.reader.generator.set_coord_stats(
         torch.linspace(-1.0, 1.0, COORD_DIM), torch.linspace(0.5, 2.0, COORD_DIM), 7
     )
     with torch.no_grad():
         model.reader.generator.gates.fill_(0.4)
+    model.initialize_teacher()
     model.eval()
     return model
 
@@ -74,14 +85,12 @@ def _swapped(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def test_config_validation_and_round_trip() -> None:
-    cfg = CoordGenConfig.from_mapping({"hidden": 32, "w_kd": 0.0})
+    cfg = CoordGenConfig.from_mapping({"hidden": 32, "kd_alpha": 0.0})
     assert CoordGenConfig.from_mapping(cfg.to_dict()) == cfg
     with pytest.raises(ValueError, match="unknown coord_gen keys"):
         CoordGenConfig.from_mapping({"width": 8})
     with pytest.raises(ValueError, match="non-negative"):
         CoordGenConfig.from_mapping({"w_coord": -1.0})
-    with pytest.raises(ValueError, match="at least one positive"):
-        CoordGenConfig.from_mapping({"w_coord": 0.0, "w_task": 0.0, "w_kd": 0.0})
     with pytest.raises(ValueError, match="dropout"):
         CoordGenConfig.from_mapping({"dropout": 1.0})
     with pytest.raises(ValueError, match="coord_spec"):
@@ -89,7 +98,7 @@ def test_config_validation_and_round_trip() -> None:
 
 
 def test_reader_is_frozen_and_only_the_generator_trains() -> None:
-    model = _model()
+    model = _model(trainable="generator")
     assert all(not param.requires_grad for param in model.reader.parameters())
     model.train()
     assert model.training and model.generator.training and not model.reader.training
@@ -177,13 +186,14 @@ def test_forward_scores_without_truth_and_supervises_with_it() -> None:
     # All-negative rows weigh 1, so the composite is the plain sum of the means.
     negatives = {**batch, "label": torch.zeros_like(batch["label"]), "struct_coords": coords}
     out = model(negatives)
-    expected = out["task_loss"] + out["coord_loss"] + 0.1 * out["kd_loss"]
+    expected = 0.5 * out["task_loss"] + out["coord_loss"] + 0.5 * out["kd_loss"]
     torch.testing.assert_close(out["loss"], expected, rtol=1e-5, atol=1e-6)
     assert float(out["loss_weight_sum"]) == float(batch["label"].numel())
     out["loss"].backward()
     assert all(param.grad is not None for param in model.generator.parameters())
-    assert all(param.grad is None for param in model.reader.parameters())
-    no_kd = _model(w_kd=0.0)
+    assert all(param.grad is None for param in model.teacher.parameters())
+    assert all(param.grad is None for param in model.encoder.parameters())
+    no_kd = _model(kd_alpha=0.0)
     out_no_kd = no_kd({**batch, "struct_coords": coords})
     assert "teacher_logits" not in out_no_kd and "kd_loss" not in out_no_kd
 
@@ -234,3 +244,27 @@ def test_state_dict_round_trip_keeps_reader_statistics() -> None:
     assert float(rebuilt.reader.generator.coord_count) == 7.0
     keys = list(model.state_dict())
     assert len(keys) == len(set(keys))
+
+
+def test_teacher_stays_bit_identical_while_interface_trains() -> None:
+    model = _model()
+    snapshot = {k: v.clone() for k, v in model.teacher.state_dict().items()}
+    model.train()
+    assert model.reader.generator.training and model.reader.base.output_head.training
+    assert not model.encoder.training and not model.reader.base.cross_attention.training
+    assert not model.teacher.training
+    groups = model.optimizer_parameter_groups(3e-4, 1e-4, 0.05)
+    assert [g["max_lr"] for g in groups] == [3e-4, 3e-4, 1e-4]
+    optimized = {
+        id(p) for group in groups for p in cast(Iterable[torch.nn.Parameter], group["params"])
+    }
+    assert not optimized.intersection(id(p) for p in model.teacher.parameters())
+    assert optimized == {id(p) for p in model.trainable_parameters()}
+    optimizer = torch.optim.AdamW(groups)
+    batch = _pair_batch()
+    output = model(batch | {"struct_coords": _true_coords(len(batch["label"]))})
+    output["loss"].backward()
+    optimizer.step()
+    for key, value in snapshot.items():
+        assert torch.equal(value, model.teacher.state_dict()[key])
+    torch.testing.assert_close(output["kd_loss"] - output["teacher_entropy"], output["kd_kl"])

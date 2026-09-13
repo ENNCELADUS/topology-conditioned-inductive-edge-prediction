@@ -92,16 +92,17 @@ def test_resolve_and_build_from_a_reader_checkpoint(tmp_path: Path) -> None:
     reader = cast(dict[str, object], kwargs["reader"])
     assert reader["base"] == _tiny_base_config()
     block = cast(dict[str, object], kwargs["coord_gen"])
-    assert block["reader_checkpoint_sha256"] is not None and block["w_kd"] == 0.1
+    assert block["reader_checkpoint_sha256"] is not None and block["kd_alpha"] == 0.5
     assert _base_loss_kwargs(cfg.model)["positive_weight"] == 5.0
     model = build_model(cfg)
     assert isinstance(model, V3_1CoordGen)
     assert float(model.reader.generator.coord_count) == 9.0
     assert float(model.reader.generator.gates.mean()) == pytest.approx(0.3)
-    assert all(not param.requires_grad for param in model.reader.parameters())
+    assert all(not param.requires_grad for param in model.teacher.parameters())
+    assert any(param.requires_grad for param in model.reader.parameters())
     optimizer = _build_optimizer(model, cfg)
     assert sum(len(group["params"]) for group in optimizer.param_groups) == len(
-        list(model.generator.parameters())
+        model.trainable_parameters()
     )
 
 
@@ -160,7 +161,7 @@ def test_run_metadata_records_the_reader_and_weights(tmp_path: Path) -> None:
     block = cast(dict[str, object], metadata["coord_gen"])
     assert block["reader_checkpoint"] == str(tmp_path / "reader.pt")
     assert block["sha256"] is not None
-    assert cast(dict[str, float], block["weights"])["kd"] == 0.1
+    assert cast(dict[str, float], block["weights"])["kd_alpha"] == 0.5
     assert "run_kind" not in metadata
     assert metadata["arm"] == COORD_GEN_FAMILY
     json.dumps(metadata)
@@ -215,7 +216,7 @@ def test_coordinate_fit_metrics_are_collective_and_bounded(tmp_path: Path) -> No
         _coordinate_fit_metrics(plain, val_batches, accelerator, attach=rows.attach_val)
 
 
-def test_ddp_loop_trains_only_the_generator_and_logs_the_fit(tmp_path: Path) -> None:
+def test_ddp_loop_preserves_teacher_and_logs_the_fit(tmp_path: Path) -> None:
     rows, batches, val_pairs = _rows_and_batches()
     model = build_model(load_config(_gen_yaml(tmp_path)))
     before = {key: value.detach().clone() for key, value in model.state_dict().items()}
@@ -248,7 +249,7 @@ def test_ddp_loop_trains_only_the_generator_and_logs_the_fit(tmp_path: Path) -> 
         topo_rows=rows,
     )
     after = model.state_dict()
-    assert all(torch.equal(before[key], after[key]) for key in before if key.startswith("reader."))
+    assert all(torch.equal(before[key], after[key]) for key in before if key.startswith("teacher."))
     assert any(
         not torch.equal(before[key], after[key]) for key in before if key.startswith("generator.")
     )

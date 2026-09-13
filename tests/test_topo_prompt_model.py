@@ -241,3 +241,30 @@ def test_state_dict_round_trip_keeps_statistics_and_has_no_duplicate_keys() -> N
         clone.generator.set_coord_stats(torch.zeros(COORD_DIM), torch.ones(COORD_DIM), 0)
     with pytest.raises(ValueError, match="positive scale"):
         clone.generator.set_coord_stats(torch.zeros(COORD_DIM), torch.zeros(COORD_DIM), 3)
+
+
+def test_corruption_is_seeded_swap_equivariant_and_keeps_distance_probabilities() -> None:
+    from src.model.egostitch.classifier.coord_gen import DISTANCE_INDEX
+    from src.model.egostitch.classifier.topo_prompt import TopoPromptConfig, TopoPromptGenerator
+
+    cfg = TopoPromptConfig.from_mapping({"corruption": {"prob": 1.0}})
+    generator = TopoPromptGenerator(8, 1, 2, cfg)
+    mean = torch.zeros(COORD_DIM)
+    mean[list(DISTANCE_INDEX)] = torch.tensor([0.2, 0.1, 0.2, 0.3])
+    generator.set_coord_stats(mean, torch.ones(COORD_DIM), 10)
+    coords = torch.randn(4, COORD_DIM)
+    coords[:, list(DISTANCE_INDEX)] = 0
+    coords[0, DISTANCE_INDEX[0]] = 1
+    z = generator.standardize(coords)
+    swapped = z.clone()
+    swapped[:, :9], swapped[:, 9:18] = z[:, 9:18], z[:, :9]
+    generator.train()
+    observed = generator.training_corruption(z, seed=123)
+    other = generator.training_corruption(swapped, seed=123)
+    torch.testing.assert_close(observed[:, :9], other[:, 9:18])
+    torch.testing.assert_close(observed[:, 9:18], other[:, :9])
+    torch.testing.assert_close(observed[:, 18:], other[:, 18:])
+    probabilities = observed[:, list(DISTANCE_INDEX)] + mean[list(DISTANCE_INDEX)]
+    assert (probabilities >= 0).all() and (probabilities.sum(1) <= 1).all()
+    generator.eval()
+    assert torch.equal(generator.training_corruption(z, seed=123), z)

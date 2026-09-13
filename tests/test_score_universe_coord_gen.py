@@ -39,6 +39,7 @@ def _tiny_coord_gen() -> V3_1CoordGen:
     model.reader.generator.set_coord_stats(torch.zeros(COORD_DIM), torch.ones(COORD_DIM), 5)
     with torch.no_grad():
         model.reader.generator.gates.fill_(0.4)
+    model.initialize_teacher()
     model.eval()
     return model
 
@@ -51,7 +52,10 @@ def test_model_builder_round_trips_the_checkpoint_config_and_statistics() -> Non
     rebuilt.load_state_dict(model.state_dict())
     assert isinstance(rebuilt, V3_1CoordGen)
     assert float(rebuilt.reader.generator.coord_count) == 5.0
-    assert all(not param.requires_grad for param in rebuilt.reader.parameters())
+    assert all(not param.requires_grad for param in rebuilt.teacher.parameters())
+    assert any(param.requires_grad for param in rebuilt.reader.parameters())
+    for key, value in model.teacher.state_dict().items():
+        assert torch.equal(value, rebuilt.teacher.state_dict()[key])
 
 
 def test_packed_and_unpacked_scoring_need_no_coordinates_and_agree(

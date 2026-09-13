@@ -45,15 +45,24 @@ selected method. Every piece of writing must explain how its context helps decid
   `--allow-oracle-diagnostic`; interventions `--prefix-intervention {gates_off,shuffle,mean,mean_endpoint,mean_relation,mean_context}`.
   Never a deployable arm; the deployable descendants (Stages II–IV) feed the prompt a generator's
   prediction from `(x_u,x_v)`.
-- Topology-prompt Stage II (`model.family: v3_1_coord_gen`, spec
+- Topology-prompt Stage II v1 (historical completed-run record; `model.family: v3_1_coord_gen`, spec
   `docs/superpowers/specs/2026-09-13-topology-prompt-stage2-design.md`): a coordinate generator
   (`src/model/egostitch/classifier/coord_gen.py`) predicts the standardised coordinates from the
   frozen Stage I reader's endpoint states, and that reader (`coord_gen.reader_checkpoint`, a
   published `topo_prompt_*` checkpoint) reads the prediction through the same prompt interface.
-  Only the generator trains: coordinate supervision + task BCE + light logit KD towards the reader
-  on true coordinates. Deployable (`(x_u,x_v)` only): formal runs `coord_gen_full` / `coord_gen_frozen`
+  In v1 only the generator trained: coordinate supervision + task BCE + light logit KD towards the reader
+  on true coordinates. Deployable (`(x_u,x_v)` only): completed formal runs `coord_gen_full` / `coord_gen_frozen`
   scored without any truth graph; read against `prefix_base` and against the row's own reader
   (its ceiling); interventions `gates_off` and `mean*` only (`shuffle` fails closed).
+- Topology-prompt v2 (spec `docs/superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md`):
+  Stage I `topo_prompt_full_v2` adds stationary coordinate corruption; `topo_prompt_full_struct`
+  also adds the structural stream using full-training-table coordinates. Both are ceiling diagnostics.
+  Stage II `coord_gen_v2_{a,b,c,d}` trains the generator, prompt interface and output head with
+  frozen encoder/cross-attention, an immutable Stage I teacher, and a full 15-epoch cycle without
+  early stopping. All four use coordinate/task/subgraph BCE; B/D add pointwise and anchor KD,
+  C/D add rank/degree/motif. `struct.scale` scales only those added terms, never subgraph BCE.
+  Study defaults and search order are `docs/03-experiments.md` §6; no v2 study has been launched.
+  The earlier Stage I/II configs remain v1 comparisons; Stages III/IV are retired.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

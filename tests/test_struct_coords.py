@@ -142,3 +142,27 @@ def test_coordinate_statistics_pool_endpoints_and_floor_constant_columns() -> No
     assert std[1] == 1.0
     with pytest.raises(ValueError):
         coordinate_statistics(coords[:0])
+
+
+def test_sampled_pair_coordinates_keep_full_graph_context_and_order() -> None:
+    graph = nx.Graph([("a", "b"), ("a", "c"), ("c", "d"), ("b", "d"), ("d", "e")])
+    table = StructCoordinateTable(graph)
+    pairs = [("a", "b"), ("b", "a"), ("a", "e"), ("e", "e"), ("a", "b")]
+    u = np.asarray([table.index[a] for a, _ in pairs])
+    v = np.asarray([table.index[b] for _, b in pairs])
+    actual = table.coords_for_pairs(u, v)
+    assert actual.dtype == np.float32
+    for row, (a, b) in enumerate(pairs):
+        np.testing.assert_allclose(
+            actual[row], reference_pair_coords(graph, a, b), atol=1e-6, rtol=1e-5
+        )
+    # Even when the sampled graph is just {a,b}, the removed-edge degree is one.
+    assert actual[0, 0] == pytest.approx(np.log(2))
+    np.testing.assert_allclose(
+        actual[0, FIELD_SLICES["endpoint_u"]], actual[1, FIELD_SLICES["endpoint_v"]]
+    )
+    assert table.coords_for_pairs(
+        np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    ).shape == (0, COORD_DIM)
+    with pytest.raises(ValueError, match="outside"):
+        table.coords_for_pairs(np.asarray([-1]), np.asarray([0]))

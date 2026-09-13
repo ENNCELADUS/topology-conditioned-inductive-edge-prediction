@@ -56,3 +56,32 @@ def test_rejects_illegal_blocks(mapping: dict[str, object], message: str) -> Non
 def test_kinds_and_weight_keys_are_frozen() -> None:
     assert KINDS == ("bfs", "motif", "bridge")
     assert WEIGHT_KEYS == ("bce", "gs", "rd", "deg_mmd", "rank", "degree", "motif")
+
+
+def test_scale_and_half_epoch_budget() -> None:
+    config = StructConfig.from_mapping(
+        {
+            "weights": {"bce": 1.0, "rank": 1.0, "degree": 0.1, "motif": 0.1},
+            "scale": 3.0,
+            "subgraphs_per_epoch": 0.5,
+        }
+    )
+    assert config.subgraphs_per_epoch == 0.5
+    assert config.active_weights == {
+        "bce": 1.0,
+        "rank": 3.0,
+        "degree": pytest.approx(0.3),
+        "motif": pytest.approx(0.3),
+    }
+    assert (
+        StructConfig.from_mapping(
+            {"weights": {"bce": 1.0}, "subgraphs_per_epoch": 3}
+        ).subgraphs_per_epoch
+        == 3
+    )
+
+
+@pytest.mark.parametrize("value", [-1, 0, 0.25, 1.5, float("nan"), float("inf")])
+def test_rejects_invalid_subgraph_budgets(value: float) -> None:
+    with pytest.raises(ValueError, match="subgraphs_per_epoch"):
+        StructConfig.from_mapping({"weights": {"bce": 1.0}, "subgraphs_per_epoch": value})

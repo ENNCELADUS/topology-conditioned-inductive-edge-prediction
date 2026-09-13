@@ -1,32 +1,14 @@
-"""Stage II of the topology-representation-transfer pipeline: predicted coordinates.
+"""Endpoint-only coordinate student with an adaptable interface and immutable teacher.
 
-`V3_1CoordGen` wraps a published Stage I reader (`V3_1TopoPrompt`: encoder,
-trunk, prompt interface, head and coordinate statistics, all frozen) and trains
-only a coordinate generator ``g`` that predicts the queried pair's *standardised*
-structural coordinates (`src.data.struct_coords`, spec ``v1``) from the frozen
-encoder's endpoint token states. The reader then reads the prediction through
-the same prompt interface it learned on true structure, so the deployable model
-is a function of ``(x_u, x_v)`` alone and is scored without any truth graph.
-
-The generator is swap-equivariant by construction: the endpoint head is applied
-as ``e(p_u, p_v)`` and ``e(p_v, p_u)``, and the pair head reads only symmetric
-combinations of the two pooled endpoints, so swapping the pair swaps the two
-endpoint fields and fixes the relation and context fields -- exactly the
-symmetry of the true coordinates.
-
-Training rows carry the true coordinates (measured on the training graph with
-the query edge removed) as ``batch["struct_coords"]``. The loss is a row-weighted
-mean (the base's positive weight, so the trainer's DDP scaling applies) of
-``w_task * BCE + w_kd * KD + w_coord * coordinate``: Huber on the 30 continuous
-standardised coordinates plus cross-entropy over the four shortest-path classes,
-and a soft-target logit KD towards the same frozen reader fed the true
-coordinates (the Stage I teacher copy, which shares every weight with the
-student's reader in this stage).
+The encoder and cross-attention remain frozen. The generator, prompt interface
+and output head train using the normalized task/KD mixture and coordinate loss;
+anchor KD and structural supervision are assembled by the training stream.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import cast
 
@@ -89,15 +71,21 @@ class CoordGenConfig:
 
     Attributes:
         reader_checkpoint: Path of the published Stage I ``v3_1_topo_prompt``
-            checkpoint whose frozen reader (and coordinate statistics) this
+            checkpoint whose reader (and coordinate statistics) this
             model wraps. Provenance only once embedded.
         reader_checkpoint_sha256: SHA-256 of that file (provenance only, never verified).
         hidden: Hidden width of the two generator heads.
         layers: Hidden layers per head.
         dropout: Dropout inside the heads.
         w_coord: Weight of the coordinate-supervision term.
-        w_task: Weight of the student task BCE.
-        w_kd: Weight of the logit KD towards the reader on true coordinates.
+        kd_alpha: Pointwise KD fraction of the normalized classification mixture.
+        w_anchor: Structural-stream anchor KL weight.
+        anchor_temperature: Candidate-softmax temperature.
+        w_kd_rep: Optional representation cosine KD weight.
+        endpoint_dropout: Input dropout of the endpoint head.
+        endpoint_weight_decay: Endpoint optimizer weight decay.
+        endpoint_hidden: Endpoint hidden width.
+        trainable: Generator-only or generator plus interface and output head.
         coord_spec: Coordinate specification the reader was trained on.
     """
 
@@ -107,8 +95,14 @@ class CoordGenConfig:
     layers: int = 2
     dropout: float = 0.1
     w_coord: float = 1.0
-    w_task: float = 1.0
-    w_kd: float = 0.1
+    kd_alpha: float = 0.5
+    w_anchor: float = 1.0
+    anchor_temperature: float = 1.0
+    w_kd_rep: float = 0.0
+    endpoint_dropout: float = 0.3
+    endpoint_weight_decay: float = 0.1
+    endpoint_hidden: int = 256
+    trainable: str = "interface_head"
     coord_spec: str = COORD_SPEC
 
     def __post_init__(self) -> None:
@@ -116,17 +110,27 @@ class CoordGenConfig:
 
         Raises:
             ValueError: On a non-positive size, an out-of-range dropout, a
-                negative or all-zero loss weight, or an unsupported spec.
+                negative loss weight, or an unsupported spec.
         """
         if self.hidden <= 0 or self.layers <= 0:
             raise ValueError("coord_gen.hidden and coord_gen.layers must be positive")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("coord_gen.dropout must lie in [0, 1)")
-        weights = (self.w_coord, self.w_task, self.w_kd)
-        if any(weight < 0.0 for weight in weights) or not any(weight > 0.0 for weight in weights):
-            raise ValueError(
-                "coord_gen loss weights must be non-negative with at least one positive"
-            )
+        if not 0 <= self.kd_alpha <= 1:
+            raise ValueError("coord_gen.kd_alpha must lie in [0, 1]")
+        if self.trainable not in ("generator", "interface_head"):
+            raise ValueError("coord_gen.trainable must be generator or interface_head")
+        if (
+            not 0 <= self.endpoint_dropout < 1
+            or self.endpoint_hidden <= 0
+            or self.endpoint_weight_decay < 0
+        ):
+            raise ValueError("invalid endpoint regularisation")
+        if self.anchor_temperature <= 0:
+            raise ValueError("anchor_temperature must be positive")
+        weights = (self.w_coord, self.w_anchor, self.w_kd_rep)
+        if any(weight < 0.0 for weight in weights):
+            raise ValueError("coord_gen loss weights must be non-negative")
         if self.coord_spec != COORD_SPEC:
             raise ValueError(
                 f"coord_gen.coord_spec {self.coord_spec!r} is not the supported {COORD_SPEC!r}"
@@ -157,8 +161,14 @@ class CoordGenConfig:
             layers=int(cast(int, raw.get("layers", 2))),
             dropout=float(cast(float, raw.get("dropout", 0.1))),
             w_coord=float(cast(float, raw.get("w_coord", 1.0))),
-            w_task=float(cast(float, raw.get("w_task", 1.0))),
-            w_kd=float(cast(float, raw.get("w_kd", 0.1))),
+            kd_alpha=float(cast(float, raw.get("kd_alpha", 0.5))),
+            w_anchor=float(cast(float, raw.get("w_anchor", 1.0))),
+            anchor_temperature=float(cast(float, raw.get("anchor_temperature", 1.0))),
+            w_kd_rep=float(cast(float, raw.get("w_kd_rep", 0.0))),
+            endpoint_dropout=float(cast(float, raw.get("endpoint_dropout", 0.3))),
+            endpoint_weight_decay=float(cast(float, raw.get("endpoint_weight_decay", 0.1))),
+            endpoint_hidden=int(cast(int, raw.get("endpoint_hidden", 256))),
+            trainable=str(raw.get("trainable", "interface_head")),
             coord_spec=str(raw.get("coord_spec", COORD_SPEC)),
         )
 
@@ -200,7 +210,10 @@ class CoordinateGenerator(nn.Module):
         super().__init__()
         self.cfg = cfg
         pooled = 2 * d_model
-        self.endpoint_head = _mlp(2 * pooled, cfg.hidden, cfg.layers, cfg.dropout, ENDPOINT_DIM)
+        self.endpoint_head = nn.Sequential(
+            nn.Dropout(cfg.endpoint_dropout),
+            _mlp(2 * pooled, cfg.endpoint_hidden, cfg.layers, cfg.dropout, ENDPOINT_DIM),
+        )
         self.pair_head = _mlp(
             3 * pooled,
             cfg.hidden,
@@ -246,7 +259,7 @@ class CoordinateGenerator(nn.Module):
 
 
 class V3_1CoordGen(nn.Module):
-    """A frozen Stage I reader driven by a trainable coordinate generator.
+    """A Stage I reader driven by predicted coordinates and an adaptable interface.
 
     ``generator`` is registered before ``reader`` so ``next(model.parameters())``
     is a trainable parameter. Every forward predicts the coordinates; when the
@@ -258,7 +271,7 @@ class V3_1CoordGen(nn.Module):
     name: str = "v3_1_coord_gen"
 
     def __init__(self, *, reader: Mapping[str, object], coord_gen: Mapping[str, object]) -> None:
-        """Build the frozen reader from its checkpointed config and the generator on top.
+        """Build a reader and teacher; initialize_teacher snapshots loaded Stage I weights.
 
         Args:
             reader: The Stage I checkpoint's ``model_config``
@@ -282,6 +295,53 @@ class V3_1CoordGen(nn.Module):
         for param in self.reader.parameters():
             param.requires_grad_(False)
         self.reader.eval()
+        self.teacher = deepcopy(self.reader).requires_grad_(False).eval()
+        if self.cfg.trainable == "interface_head":
+            self.reader.generator.requires_grad_(True)
+            self.reader.base.output_head.requires_grad_(True)
+
+    def initialize_teacher(self) -> None:
+        """Snapshot the loaded Stage I reader once, before training starts."""
+        self.teacher = deepcopy(self.reader).requires_grad_(False).eval()
+        self.teacher.intervention = "none"
+
+    def optimizer_parameter_groups(
+        self,
+        generator_lr: float,
+        interface_lr: float,
+        weight_decay: float,
+    ) -> list[dict[str, object]]:
+        """Separate endpoint regularisation while sharing the generator schedule."""
+        endpoint = list(self.generator.endpoint_head.parameters())
+        endpoint_ids = {id(p) for p in endpoint}
+        groups: list[dict[str, object]] = [
+            {
+                "name": "endpoint",
+                "params": endpoint,
+                "lr": generator_lr,
+                "max_lr": generator_lr,
+                "weight_decay": self.cfg.endpoint_weight_decay,
+            },
+            {
+                "name": "generator",
+                "params": [p for p in self.generator.parameters() if id(p) not in endpoint_ids],
+                "lr": generator_lr,
+                "max_lr": generator_lr,
+                "weight_decay": weight_decay,
+            },
+        ]
+        interface = [p for p in self.reader.parameters() if p.requires_grad]
+        if interface:
+            groups.append(
+                {
+                    "name": "interface",
+                    "params": interface,
+                    "lr": interface_lr,
+                    "max_lr": interface_lr,
+                    "weight_decay": weight_decay,
+                }
+            )
+        return groups
 
     @property
     def encoder(self) -> nn.Module:
@@ -298,7 +358,7 @@ class V3_1CoordGen(nn.Module):
         self.reader.intervention = value
 
     def train(self, mode: bool = True) -> V3_1CoordGen:
-        """Switch mode; the reader stays in eval mode regardless.
+        """Train the generator and interface while the frozen trunk and teacher stay in eval.
 
         Args:
             mode: Training mode for the generator.
@@ -308,11 +368,15 @@ class V3_1CoordGen(nn.Module):
         """
         super().train(mode)
         self.reader.eval()
+        if self.cfg.trainable == "interface_head":
+            self.reader.generator.train(mode)
+            self.reader.base.output_head.train(mode)
+        self.teacher.eval()
         return self
 
     def trainable_parameters(self) -> list[nn.Parameter]:
-        """Parameters the optimiser updates: the generator only."""
-        return list(self.generator.parameters())
+        """Parameters the optimiser updates: generator and configured reader interface."""
+        return [p for p in self.parameters() if p.requires_grad]
 
     def assemble(self, parts: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Assemble the head outputs into ``(B, COORD_DIM)`` standardised coordinates.
@@ -407,7 +471,7 @@ class V3_1CoordGen(nn.Module):
 
         Returns:
             ``logits``, ``predicted_coords`` (standardised) and ``distance_logits``;
-            with ``struct_coords`` also ``teacher_logits`` (unless ``w_kd == 0``),
+            with ``struct_coords`` also ``teacher_logits`` (unless ``kd_alpha == 0``),
             ``coord_loss``, ``coord_continuous_loss``, ``coord_distance_loss`` and
             ``kd_loss`` (detached means); with ``label`` too, the composite
             row-weighted ``loss``, its ``loss_weight_sum`` and the detached
@@ -444,10 +508,10 @@ class V3_1CoordGen(nn.Module):
         output["coord_distance_loss"] = distance_row.detach().mean()
         flat = logits.reshape(-1).float()
         kd_row: torch.Tensor | None = None
-        if self.cfg.w_kd > 0.0:
+        if self.cfg.kd_alpha > 0.0 or self.cfg.w_kd_rep > 0.0:
             with torch.no_grad():
-                z_star = self.reader.generator.standardize(coords.to(z_hat.device))
-                teacher = self.reader.logits_from_standardized(
+                z_star = self.teacher.generator.standardize(coords.to(z_hat.device))
+                teacher = self.teacher.logits_from_standardized(
                     encoded_a, encoded_b, lengths_a, lengths_b, z_star
                 )
             output["teacher_logits"] = teacher
@@ -464,9 +528,38 @@ class V3_1CoordGen(nn.Module):
         bce_row = F.binary_cross_entropy_with_logits(flat, targets, reduction="none")
         weights = 1.0 + (float(base.positive_weight) - 1.0) * labels
         weight_sum = weights.sum().detach()
-        total_row = self.cfg.w_task * bce_row + self.cfg.w_coord * coord_row
+        total_row = (1 - self.cfg.kd_alpha) * bce_row + self.cfg.w_coord * coord_row
         if kd_row is not None:
-            total_row = total_row + self.cfg.w_kd * kd_row
+            total_row = total_row + self.cfg.kd_alpha * kd_row
+            q = torch.sigmoid(output["teacher_logits"].reshape(-1).float())
+            entropy = F.binary_cross_entropy_with_logits(
+                output["teacher_logits"].reshape(-1).float(), q, reduction="none"
+            )
+            output["kd_loss"] = ((weights * kd_row).sum() / weight_sum).detach()
+            output["teacher_entropy"] = ((weights * entropy).sum() / weight_sum).detach()
+            output["kd_kl"] = ((weights * (kd_row - entropy)).sum() / weight_sum).detach()
+        if self.cfg.w_kd_rep > 0:
+            student_repr = self.reader.logits_from_standardized(
+                encoded_a, encoded_b, lengths_a, lengths_b, z_hat, return_pair_repr=True
+            )
+            with torch.no_grad():
+                teacher_repr = self.teacher.logits_from_standardized(
+                    encoded_a,
+                    encoded_b,
+                    lengths_a,
+                    lengths_b,
+                    self.teacher.generator.standardize(coords.to(z_hat.device)),
+                    return_pair_repr=True,
+                )
+            rep_row = 1 - F.cosine_similarity(student_repr.float(), teacher_repr.float(), dim=-1)
+            total_row = total_row + self.cfg.w_kd_rep * rep_row
+            output["kd_rep_loss"] = ((weights * rep_row).sum() / weight_sum).detach()
+        for name, rows in (
+            ("coord_loss", coord_row),
+            ("coord_continuous_loss", continuous_row),
+            ("coord_distance_loss", distance_row),
+        ):
+            output[name] = ((weights * rows).sum() / weight_sum).detach()
         output["loss"] = (weights * total_row).sum() / weight_sum
         output["loss_weight_sum"] = weight_sum
         output["task_loss"] = ((weights * bce_row).sum() / weight_sum).detach()

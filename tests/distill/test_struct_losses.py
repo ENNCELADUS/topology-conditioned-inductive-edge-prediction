@@ -8,6 +8,8 @@ import torch
 from src.distill.struct_config import StructConfig
 from src.distill.struct_losses import (
     hard_struct_errors,
+    struct_anchor_entropy,
+    struct_anchor_kl,
     struct_bce,
     struct_deg_mmd,
     struct_degree,
@@ -219,3 +221,80 @@ def test_hard_errors_are_zero_at_perfect_threshold_and_count_misses() -> None:
     missed = hard_struct_errors(logits, target, mask, threshold=10.0)
     assert missed["hard_degree_mae"] == pytest.approx(8.0 / 5.0)
     assert missed["hard_triangle_mae"] == pytest.approx(3.0 / 5.0)
+
+
+@pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
+def test_anchor_kl_matches_legal_candidate_reference_and_detaches_teacher(
+    temperature: float,
+) -> None:
+    student = torch.tensor(
+        [[2.0, -1.0, 99.0], [0.0, 1.0, 2.0], [1.0, 2.0, 3.0]], requires_grad=True
+    )
+    teacher = torch.tensor(
+        [[-2.0, 1.0, -99.0], [1.0, 2.0, 0.0], [3.0, 2.0, 1.0]], requires_grad=True
+    )
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1], [0, 0, 0]])
+    loss = struct_anchor_kl(student, teacher, mask, temperature)
+    expected = []
+    entropies = []
+    for row, legal in [(0, slice(0, 2)), (1, slice(0, 3))]:
+        lt = torch.log_softmax(teacher.detach()[row, legal] / temperature, dim=0)
+        ls = torch.log_softmax(student[row, legal] / temperature, dim=0)
+        expected.append((lt.exp() * (lt - ls)).sum())
+        entropies.append(-(lt.exp() * lt).sum())
+    torch.testing.assert_close(loss, torch.stack(expected).mean())
+    torch.testing.assert_close(
+        struct_anchor_entropy(teacher, mask, temperature), torch.stack(entropies).mean()
+    )
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert teacher.grad is None
+    assert student.grad is not None
+    assert torch.isfinite(student.grad).all()
+    assert student.grad[0, 2] == 0
+    assert student.grad[2].abs().sum() == 0
+    assert student.grad.abs().sum() > 0
+
+
+def test_anchor_kl_shift_invariance_and_zero_at_equality() -> None:
+    student = torch.randn(4, 4, generator=torch.Generator().manual_seed(14))
+    teacher = torch.randn(4, 4, generator=torch.Generator().manual_seed(15))
+    mask = 1 - torch.eye(4)
+    expected = struct_anchor_kl(student, teacher, mask)
+    shifted = struct_anchor_kl(
+        student + torch.arange(4.0)[:, None], teacher - 3 * torch.arange(4.0)[:, None], mask
+    )
+    torch.testing.assert_close(shifted, expected)
+    torch.testing.assert_close(struct_anchor_kl(teacher, teacher, mask), torch.tensor(0.0))
+
+
+def test_anchor_kl_empty_and_singleton_masks_are_zero() -> None:
+    student = torch.randn(3, 3, requires_grad=True)
+    teacher = torch.randn(3, 3)
+    for mask in (torch.zeros(3, 3), torch.eye(3)):
+        loss = struct_anchor_kl(student, teacher, mask)
+        assert loss.requires_grad
+        assert loss.item() == 0
+        loss.backward()  # type: ignore[no-untyped-call]
+        assert student.grad is not None
+        assert student.grad.abs().sum() == 0
+        assert struct_anchor_entropy(teacher, mask).item() == 0
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf")])
+def test_anchor_rejects_invalid_temperature(temperature: float) -> None:
+    with pytest.raises(ValueError, match="temperature"):
+        struct_anchor_kl(torch.zeros(2, 2), torch.zeros(2, 2), torch.ones(2, 2), temperature)
+
+
+def test_struct_scale_leaves_subgraph_bce_unchanged() -> None:
+    target, mask = _graph(4, [(0, 1), (1, 2)])
+    logits = torch.zeros(4, 4, requires_grad=True)
+    config = StructConfig.from_mapping(
+        {"scale": 3.0, "weights": {"bce": 1.0, "rank": 1.0, "degree": 0.1, "motif": 0.1}}
+    )
+    total, terms = struct_total(
+        logits, target, mask, config, positive_weight=5.0, label_smoothing=0.0
+    )
+    torch.testing.assert_close(
+        total, terms["bce"] + 3 * (terms["rank"] + 0.1 * terms["degree"] + 0.1 * terms["motif"])
+    )

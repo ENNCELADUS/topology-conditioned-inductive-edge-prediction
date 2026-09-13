@@ -9,6 +9,8 @@ Spec: ``docs/superpowers/specs/2026-09-07-structural-stream-topology-losses-desi
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch.nn import functional as F
 
@@ -158,6 +160,55 @@ def struct_motif(
     return torch.stack(means).mean()
 
 
+def _anchor_log_probs(
+    logits: torch.Tensor, mask: torch.Tensor, temperature: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("anchor temperature must be finite and positive")
+    if logits.ndim != 2 or logits.shape != mask.shape:
+        raise ValueError("anchor logits and mask must be aligned 2-D tensors")
+    legal = mask > 0
+    anchors = legal.any(dim=1)
+    legal = legal[anchors]
+    # Drop empty anchors before softmax; otherwise an all -inf row produces NaNs.
+    scaled = (logits[anchors] / temperature).masked_fill(~legal, -torch.inf)
+    return F.log_softmax(scaled, dim=1).masked_fill(~legal, 0.0), legal
+
+
+def struct_anchor_kl(
+    z_student: torch.Tensor,
+    z_teacher: torch.Tensor,
+    mask: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Mean anchor KL of teacher to student masked-softmax **logit** distributions.
+
+    Anchors without legal candidates do not enter the mean. The teacher is
+    detached, and empty masks yield a differentiable student zero. Temperature
+    changes the distribution only: no additional temperature-squared scale is
+    applied. Each anchor is invariant to an independent additive logit shift.
+    """
+    if z_student.shape != z_teacher.shape:
+        raise ValueError("student and teacher anchor logits must have the same shape")
+    log_s, legal = _anchor_log_probs(z_student, mask, temperature)
+    log_t, _ = _anchor_log_probs(z_teacher.detach(), mask, temperature)
+    if log_s.shape[0] == 0:
+        return _zero_like(z_student)
+    probability_t = log_t.exp() * legal
+    return (probability_t * (log_t - log_s)).sum(dim=1).mean()
+
+
+@torch.no_grad()
+def struct_anchor_entropy(
+    z_teacher: torch.Tensor, mask: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
+    """Teacher entropy with exactly the legal candidates and anchor mean used by KL."""
+    log_t, legal = _anchor_log_probs(z_teacher, mask, temperature)
+    if log_t.shape[0] == 0:
+        return _zero_like(z_teacher)
+    return -(log_t.exp() * legal * log_t).sum(dim=1).mean()
+
+
 def struct_total(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -232,6 +283,8 @@ def hard_struct_errors(
 __all__ = [
     "EPSILON",
     "hard_struct_errors",
+    "struct_anchor_entropy",
+    "struct_anchor_kl",
     "struct_bce",
     "struct_deg_mmd",
     "struct_degree",

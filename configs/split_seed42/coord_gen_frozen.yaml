@@ -1,3 +1,5 @@
+# HISTORICAL v1 run configuration: retained for result provenance, not runnable
+# with the v2 coordinate-generator objective. Use coord_gen_v2_{a,b,c,d}.yaml.
 # coord_gen_frozen: Stage II of the topology-representation-transfer pipeline.
 # A coordinate generator g(x_u, x_v) predicts the queried pair's standardised
 # structural coordinates from the frozen Stage I reader's endpoint states; the

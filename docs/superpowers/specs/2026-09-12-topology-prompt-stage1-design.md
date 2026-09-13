@@ -1,5 +1,7 @@
 # Topology Prompt, Stage I: a reader that uses true structure through a prefix
 
+The [two-stage v2 specification](2026-09-13-topology-prompt-two-stage-v2-design.md) supersedes the forward training plan. This document preserves the v1 implementation and completed-run record; Stages III/IV are retired.
+
 **Design spec and implementation record.** Date: 2026-09-12. Status: implemented
 (`model.family: v3_1_topo_prompt`); both diagnostic runs complete; results in
 `docs/results/topo_prompt_stage1.md` (§9 below summarises).

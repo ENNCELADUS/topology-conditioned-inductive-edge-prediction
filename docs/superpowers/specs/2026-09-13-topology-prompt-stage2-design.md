@@ -1,5 +1,7 @@
 # Topology Prompt, Stage II: a generator that predicts the coordinates from attributes
 
+The [two-stage v2 specification](2026-09-13-topology-prompt-two-stage-v2-design.md) supersedes the forward training plan. This document preserves the v1 implementation and completed-run record; Stages III/IV are retired.
+
 **Design spec and implementation record.** Date: 2026-09-13. Status: implemented
 (`model.family: v3_1_coord_gen`); both formal runs complete — result in
 `docs/results/topo_prompt_stage2.md` (§8 below summarises). Follows

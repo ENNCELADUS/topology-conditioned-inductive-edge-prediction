@@ -400,6 +400,18 @@ class StructCoordinateTable:
 
     # ------------------------------------------------------------------ public API
 
+    def coords_for_pairs(
+        self, u_idx: NDArray[np.int64], v_idx: NDArray[np.int64]
+    ) -> NDArray[np.float32]:
+        """Raw coordinates for sampled pairs using this table's full universe graph.
+
+        Indices address ``self.nodes``, not positions within a sampled subgraph.
+        Non-edges read the dense products; existing edges are measured after
+        removing the queried edge from the full graph. No subgraph-induced
+        degrees, distances or walk products enter the coordinate targets.
+        """
+        return self.coords_by_index(u_idx, v_idx)
+
     def coords_by_index(self, u: NDArray[np.int64], v: NDArray[np.int64]) -> NDArray[np.float32]:
         """Coordinates for index pairs; edges are recomputed on the edge-deleted graph.
 

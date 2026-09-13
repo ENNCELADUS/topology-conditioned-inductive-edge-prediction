@@ -5764,6 +5764,7 @@ def _train_e2e_stability_loop(
                 int(
                     topology_scope == "full"
                     and accelerator.is_main_process
+                    and cfg.eval.patience is not None
                     and evals_without_improvement >= cfg.eval.patience
                 ),
                 device=accelerator.device,

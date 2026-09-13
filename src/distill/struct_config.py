@@ -10,13 +10,14 @@ An absent block (``Config.struct is None``) leaves training bit-identical.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 
 WEIGHT_KEYS: tuple[str, ...] = ("bce", "gs", "rd", "deg_mmd", "rank", "degree", "motif")
 KINDS: tuple[str, ...] = ("bfs", "motif", "bridge")
 _INT_FIELDS = frozenset({"nodes", "background_nodes", "mmd_bins", "val_subgraphs"})
-_FLOAT_FIELDS = frozenset({"rank_margin", "rank_temperature", "huber_delta", "mmd_sigma"})
+_FLOAT_FIELDS = frozenset({"rank_margin", "rank_temperature", "huber_delta", "mmd_sigma", "scale"})
 
 
 def _default_mix() -> dict[str, float]:
@@ -36,8 +37,9 @@ class StructConfig:
         background_nodes: Uniformly drawn nodes appended to every subgraph.
         mix: Sampling share per subgraph kind (``bfs``, ``motif``, ``bridge``); sums to 1.
         subgraphs_per_epoch: Plan length; ``None`` means one subgraph per global
-            optimizer step.
+            optimizer step; ``0.5`` means half the global optimizer steps.
         weights: Non-negative weight per term key in ``WEIGHT_KEYS``; at least one nonzero.
+        scale: Multiplier on rank/degree/motif weights only; BCE is unscaled.
         rank_margin: Margin ``m`` of the neighbour-ranking term.
         rank_temperature: Temperature ``T`` of the neighbour-ranking term.
         huber_delta: SmoothL1 transition point shared by ``rd``, ``degree`` and ``motif``.
@@ -49,8 +51,9 @@ class StructConfig:
     nodes: int = 40
     background_nodes: int = 8
     mix: dict[str, float] = field(default_factory=_default_mix)
-    subgraphs_per_epoch: int | None = None
+    subgraphs_per_epoch: int | float | None = None
     weights: dict[str, float] = field(default_factory=_default_weights)
+    scale: float = 1.0
     rank_margin: float = 0.1
     rank_temperature: float = 1.0
     huber_delta: float = 1.0
@@ -75,8 +78,15 @@ class StructConfig:
         shares = {kind: float(self.mix[kind]) for kind in KINDS}
         if any(share < 0.0 for share in shares.values()) or abs(sum(shares.values()) - 1.0) > 1e-6:
             raise ValueError(f"struct.mix shares must be non-negative and sum to 1, got {self.mix}")
-        if self.subgraphs_per_epoch is not None and self.subgraphs_per_epoch < 1:
-            raise ValueError("struct.subgraphs_per_epoch must be positive or null")
+        count = self.subgraphs_per_epoch
+        if count is not None and (
+            isinstance(count, bool)
+            or not math.isfinite(count)
+            or (count != 0.5 and (count < 1 or count != int(count)))
+        ):
+            raise ValueError("struct.subgraphs_per_epoch must be a positive integer, 0.5 or null")
+        if not math.isfinite(self.scale) or self.scale < 0:
+            raise ValueError("struct.scale must be finite and non-negative")
         unknown = sorted(set(self.weights) - set(WEIGHT_KEYS))
         if unknown:
             raise ValueError(f"unknown struct weight keys: {unknown}")
@@ -104,9 +114,15 @@ class StructConfig:
 
     @property
     def active_weights(self) -> dict[str, float]:
-        """Nonzero weights in ``WEIGHT_KEYS`` order."""
+        """Effective nonzero weights; scale applies only to rank, degree and motif."""
         return {
-            key: float(self.weights[key]) for key in WEIGHT_KEYS if self.weights.get(key, 0.0) > 0.0
+            key: weight
+            for key in WEIGHT_KEYS
+            if (
+                weight := float(self.weights[key])
+                * (self.scale if key in {"rank", "degree", "motif"} else 1.0)
+            )
+            > 0.0
         }
 
     @property
@@ -138,8 +154,9 @@ class StructConfig:
                     for key, value in raw.items()
                 }
             elif spec.name == "subgraphs_per_epoch":
+                count = None if raw is None else _number(raw, "struct.subgraphs_per_epoch")
                 kwargs[spec.name] = (
-                    None if raw is None else int(_number(raw, "struct.subgraphs_per_epoch"))
+                    int(count) if count is not None and count.is_integer() else count
                 )
             elif spec.name in _INT_FIELDS:
                 kwargs[spec.name] = int(_number(raw, f"struct.{spec.name}"))

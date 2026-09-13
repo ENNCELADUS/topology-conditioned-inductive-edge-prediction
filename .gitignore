@@ -76,3 +76,6 @@ literature/**/*.pdf
 # macOS AppleDouble metadata
 ._*
 **/._*
+
+# draw.io skill work directory (spec sidecars, previews)
+.drawio-tmp/

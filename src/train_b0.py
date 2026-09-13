@@ -98,7 +98,12 @@ from src.distill.losses import (
     kd_struct_loss,
 )
 from src.distill.struct_config import StructConfig
-from src.distill.struct_losses import hard_struct_errors, struct_total
+from src.distill.struct_losses import (
+    hard_struct_errors,
+    struct_anchor_entropy,
+    struct_anchor_kl,
+    struct_total,
+)
 from src.distill.struct_targets import structural_row_targets
 from src.distill.validation import OracleValidationBank
 from src.e2_pipeline import ProbeResult
@@ -270,6 +275,7 @@ class OptimConfig:
     warmup_steps: int
     grad_clip: float
     scheduler: SchedulerConfig | None = None
+    groups: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -277,7 +283,8 @@ class EvalConfig:
     """The ``eval:`` config section.
 
     Attributes:
-        patience: Early stop after this many evals without a lower monitored loss.
+        patience: Early stop after this many evals without a lower monitored loss;
+            None runs the full epoch budget.
         early_stop_metric: Validation task BCE by default; ``val_total_loss`` adds
             weighted structural losses on fixed validation subgraphs every epoch.
         eval_every: Evaluate every N epochs.
@@ -288,7 +295,7 @@ class EvalConfig:
             by validation AUPRC alone. Patience is unaffected by this flag.
     """
 
-    patience: int
+    patience: int | None
     eval_every: int
     topology_every: int = 1
     classification_only: bool = False
@@ -573,7 +580,9 @@ def _build_scheduler(
     )
     max_lr: float | list[float] = scheduler_cfg.max_lr
     if len(optimizer.param_groups) > 1:
-        max_lr = [scheduler_cfg.max_lr] * len(optimizer.param_groups)
+        max_lr = [
+            float(group.get("max_lr", scheduler_cfg.max_lr)) for group in optimizer.param_groups
+        ]
     return torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=max_lr,
@@ -611,6 +620,11 @@ def _validate_topo_gen_distill_contract(
 def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
     """Build AdamW, separating the kd_gen core from base/fusion parameters."""
     raw_model = _unwrapped_model(model)
+    group_getter = getattr(raw_model, "optimizer_parameter_groups", None)
+    if callable(group_getter):
+        peaks = cfg.optim.groups or {"generator": cfg.optim.lr, "interface": cfg.optim.lr}
+        groups = group_getter(peaks["generator"], peaks["interface"], cfg.optim.weight_decay)
+        return torch.optim.AdamW(groups, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
     for getter_name in ("trainable_parameters", "prefix_parameters"):
         getter = getattr(raw_model, getter_name, None)
         if callable(getter):
@@ -798,9 +812,22 @@ def load_config(path: Path) -> Config:
     optim_raw = _as_mapping(_require(raw, "optim", ""), "optim")
     _check_no_unknown_keys(
         optim_raw,
-        ("lr", "weight_decay", "epochs", "warmup_steps", "grad_clip", "scheduler"),
+        ("lr", "weight_decay", "epochs", "warmup_steps", "grad_clip", "scheduler", "groups"),
         "optim",
     )
+    groups = None
+    if optim_raw.get("groups") is not None:
+        raw_groups = _as_mapping(optim_raw["groups"], "optim.groups")
+        if set(raw_groups) != {"generator", "interface"}:
+            raise ValueError("optim.groups must contain generator and interface")
+        groups = {}
+        for name, value in raw_groups.items():
+            block = _as_mapping(value, f"optim.groups.{name}")
+            _check_no_unknown_keys(block, ("max_lr",), f"optim.groups.{name}")
+            peak = _as_float(_require(block, "max_lr", f"optim.groups.{name}."), "max_lr")
+            if not math.isfinite(peak) or peak <= 0:
+                raise ValueError("optim group max_lr must be finite and positive")
+            groups[name] = peak
     optim = OptimConfig(
         lr=_as_float(_require(optim_raw, "lr", "optim."), "optim.lr"),
         weight_decay=_as_float(_require(optim_raw, "weight_decay", "optim."), "optim.weight_decay"),
@@ -808,6 +835,7 @@ def load_config(path: Path) -> Config:
         warmup_steps=_as_int(_require(optim_raw, "warmup_steps", "optim."), "optim.warmup_steps"),
         grad_clip=_as_float(_require(optim_raw, "grad_clip", "optim."), "optim.grad_clip"),
         scheduler=_parse_scheduler(optim_raw.get("scheduler")),
+        groups=groups,
     )
     if optim.epochs < 1:
         raise ValueError(f"optim.epochs must be >= 1, got {optim.epochs}")
@@ -819,7 +847,11 @@ def load_config(path: Path) -> Config:
         "eval",
     )
     eval_cfg = EvalConfig(
-        patience=_as_int(_require(eval_raw, "patience", "eval."), "eval.patience"),
+        patience=(
+            None
+            if _require(eval_raw, "patience", "eval.") is None
+            else _as_int(eval_raw["patience"], "eval.patience")
+        ),
         eval_every=_as_int(_require(eval_raw, "eval_every", "eval."), "eval.eval_every"),
         topology_every=_as_int(eval_raw.get("topology_every", 1), "eval.topology_every"),
         early_stop_metric=_as_str(
@@ -1062,6 +1094,10 @@ def config_to_dict(cfg: Config) -> dict[str, Any]:
         return value
 
     result = cast(dict[str, Any], convert(asdict(cfg)))
+    if cfg.optim.groups is not None:
+        result["optim"]["groups"] = {
+            name: {"max_lr": peak} for name, peak in cfg.optim.groups.items()
+        }
     # Keep the canonical config of existing task-BCE runs unchanged.
     if cfg.eval.early_stop_metric == "val_task_loss":
         result["eval"].pop("early_stop_metric")
@@ -1337,6 +1373,7 @@ def build_model(cfg: Config) -> nn.Module:
         )
         payload, _ = _load_reader_checkpoint(reader_path)
         gen_model.reader.load_state_dict(cast(Mapping[str, Any], payload["model_state"]))
+        gen_model.initialize_teacher()
         if float(gen_model.reader.generator.coord_count) <= 0.0:
             raise ValueError(f"{reader_path}: reader checkpoint carries no coordinate statistics")
         _validate_topo_gen_distill_contract(gen_model, cfg.distill)
@@ -1818,7 +1855,7 @@ def train_loop(
             )
             if on_eval is not None:
                 on_eval(entry, improved, metrics)
-            if evals_without_improvement >= cfg.eval.patience:
+            if cfg.eval.patience is not None and evals_without_improvement >= cfg.eval.patience:
                 stopped_early = True
                 logger.info(
                     "early stopping at epoch %d (%d evals without val-task-loss improvement)",
@@ -1937,8 +1974,8 @@ def _run_metadata(
             "coord_spec": gen_kwargs.get("coord_spec"),
             "weights": {
                 "coord": gen_kwargs.get("w_coord"),
-                "task": gen_kwargs.get("w_task"),
-                "kd": gen_kwargs.get("w_kd"),
+                "kd_alpha": gen_kwargs.get("kd_alpha"),
+                "anchor": gen_kwargs.get("w_anchor"),
             },
         }
     if cfg.run_kind is not None:
@@ -3004,6 +3041,7 @@ def _evaluate_val_universe(
     v_idx: np.ndarray,
     reference: ValTopologyReference,
     row_coords: torch.Tensor | None = None,
+    logits_sink: Callable[[np.ndarray], None] | None = None,
 ) -> ValTopologyResult:
     """Score the exact ball-union rows and select sampled-only topology threshold.
 
@@ -3030,6 +3068,7 @@ def _evaluate_val_universe(
         reference: The once-per-run `ValTopologyReference`.
         row_coords: Optional ``(n_rows, COORD_DIM)`` CPU structural coordinates
             of the universe rows (the topology-prompt arm), sliced per batch.
+        logits_sink: Optional recipient of gathered, ordered logits on every rank.
 
     Returns:
         The `ValTopologyResult`, identical on every rank.
@@ -3094,21 +3133,28 @@ def _evaluate_val_universe(
         logits=logits_np,
         expected_row_ids=np.arange(n_rows, dtype=np.int64),
     )
+    if logits_sink is not None:
+        logits_sink(logits_sorted.copy())
 
     payload: list[dict[str, Any] | None] = [None]
     if accelerator.is_main_process:
-        result = val_region_topology_metrics(
-            u_idx=u_idx,
-            v_idx=v_idx,
-            logits=logits_sorted.astype(np.float64),
-            reference=reference,
-        )
-        payload[0] = asdict(result)
+        try:
+            result = val_region_topology_metrics(
+                u_idx=u_idx,
+                v_idx=v_idx,
+                logits=logits_sorted.astype(np.float64),
+                reference=reference,
+            )
+            payload[0] = asdict(result)
+        except Exception as error:
+            payload[0] = {"error": f"{type(error).__name__}: {error}"}
 
     broadcast_object_list(payload, from_process=0)
     result_payload = payload[0]
     if result_payload is None:  # pragma: no cover - broadcast always populates rank>0
         raise RuntimeError("distributed V_val topology evaluation failed to broadcast metrics")
+    if "error" in result_payload:
+        raise RuntimeError(f"V_val topology evaluation failed: {result_payload['error']}")
     metrics_payload = cast(dict[str, Any], result_payload["metrics"])
     return ValTopologyResult(
         metrics=TopologyValidationMetrics(**metrics_payload),
@@ -3153,6 +3199,202 @@ def _evaluate_two_pass(
         task_loss=cls_outcome.task_loss,
         diagnostics=cls_outcome.diagnostics,
     )
+
+
+class PromptV2Validation:
+    """Clean selection plus per-epoch sensitivity or admitted-set stability diagnostics.
+
+    Perturbations are sampled once over the entire row universe with a fixed seed,
+    so changing validation batch sizes or rank count cannot change the noise rows.
+    Diagnostic metrics never replace the clean checkpoint-selection outcome.
+    """
+
+    def __init__(
+        self,
+        *,
+        cls_evaluate_fn: EvaluateFn,
+        topology_eval_fn: Callable[..., ValTopologyResult],
+        reference: ValTopologyReference,
+        u_idx: np.ndarray,
+        v_idx: np.ndarray,
+        rows: TopoPromptRows,
+        expected_row_ids: np.ndarray,
+        stage: int,
+    ) -> None:
+        self.cls_evaluate_fn = cls_evaluate_fn
+        self.topology_eval_fn = topology_eval_fn
+        self.reference = reference
+        self.pairs = [
+            (reference.nodes[int(u)], reference.nodes[int(v)])
+            for u, v in zip(u_idx, v_idx, strict=True)
+        ]
+        self.rows = rows
+        self.expected_row_ids = expected_row_ids
+        self.stage = stage
+        self.previous: tuple[np.ndarray, float] | None = None
+        self.completed_evaluations = 0
+
+    def state_dict(self) -> dict[str, object]:
+        """Save the last completed validation universe with the trainer snapshot."""
+        return {
+            "epoch": self.completed_evaluations,
+            "pairs": self.pairs,
+            "logits": None if self.previous is None else torch.from_numpy(self.previous[0]),
+            "threshold": None if self.previous is None else self.previous[1],
+        }
+
+    def load_state_dict(self, state: Mapping[str, object], *, completed_epoch: int) -> None:
+        """Restore only the matching completed epoch and exact row universe."""
+        if state.get("epoch") != completed_epoch or state.get("pairs") != self.pairs:
+            raise ValueError("prompt validation state does not match the resumed epoch/universe")
+        if self.stage == 2:
+            saved_logits = state.get("logits")
+            threshold = state.get("threshold")
+            if not isinstance(saved_logits, torch.Tensor) or not isinstance(
+                threshold, (float, int)
+            ):
+                raise ValueError("prompt validation state is missing logits or threshold")
+            logits = saved_logits.detach().cpu().numpy().copy()
+            if (
+                logits.shape != (len(self.pairs),)
+                or not np.isfinite(logits).all()
+                or not math.isfinite(threshold)
+            ):
+                raise ValueError("prompt validation state has invalid logits or threshold")
+            self.previous = (logits, float(threshold))
+        self.completed_evaluations = completed_epoch
+
+    @staticmethod
+    def _collect_metrics(
+        accelerator: Accelerator, calculate: Callable[[], dict[str, float]]
+    ) -> dict[str, float]:
+        payload: list[dict[str, Any] | None] = [None]
+        if accelerator.is_main_process:
+            try:
+                payload[0] = {"metrics": calculate()}
+            except Exception as error:
+                payload[0] = {"error": f"{type(error).__name__}: {error}"}
+        broadcast_object_list(payload, from_process=0)
+        result = payload[0]
+        if result is None:
+            raise RuntimeError("prompt diagnostics did not broadcast a result")
+        if "error" in result:
+            raise RuntimeError(f"prompt diagnostics failed: {result['error']}")
+        return cast(dict[str, float], result["metrics"])
+
+    @torch.no_grad()
+    def __call__(
+        self, model: nn.Module, val_loader: Iterable[Batch], accelerator: Accelerator
+    ) -> ValidationOutcome:
+        """Evaluate clean scores and append the current stage's diagnostic rows."""
+        cls = self.cls_evaluate_fn(model, val_loader, accelerator)
+        clean: list[np.ndarray] = []
+        topology = self.topology_eval_fn(model, accelerator, logits_sink=clean.append)
+        diagnostics = dict(cls.diagnostics or {})
+        if self.stage == 2:
+            if self.previous is not None:
+                from src.experiments.topo_prompt_diagnostics import score_stability
+
+                previous_logits, previous_threshold = self.previous
+
+                def stability_metrics() -> dict[str, float]:
+                    result = score_stability(
+                        self.pairs,
+                        previous_logits,
+                        clean[0],
+                        previous_threshold,
+                        topology.threshold,
+                    )
+                    changes = cast(dict[str, int], result.pop("degree_changes"))
+                    metrics = {key: float(cast(float, value)) for key, value in result.items()}
+                    metrics.update(
+                        {
+                            f"stability_degree_change_{node}": float(value)
+                            for node, value in changes.items()
+                        }
+                    )
+                    return metrics
+
+                diagnostics.update(self._collect_metrics(accelerator, stability_metrics))
+            self.previous = (clean[0].copy(), topology.threshold)
+        else:
+            raw_model = _unwrapped_model(model)
+            if not isinstance(raw_model, V3_1TopoPrompt):
+                raise TypeError("Stage I sensitivity requires a topology-prompt reader")
+            generator = raw_model.generator
+            for name, shrink, sigma in (
+                ("shrink", 0.5, 0.0),
+                ("noise", 1.0, 0.5),
+                ("both", 0.5, 0.5),
+            ):
+
+                def perturb(
+                    coords: torch.Tensor, *, shrink: float = shrink, sigma: float = sigma
+                ) -> torch.Tensor:
+                    z = generator.standardize(coords.to(accelerator.device))
+                    changed = generator.perturb_coordinates(z, shrink=shrink, sigma=sigma, seed=42)
+                    return (changed * generator.coord_std + generator.coord_mean).cpu()
+
+                cls_coords = perturb(self.rows.val_cls)
+                universe_coords = perturb(self.rows.universe)
+
+                def attach(batch: Batch, coords: torch.Tensor = cls_coords) -> None:
+                    row_ids = batch["_row_id"].detach().to("cpu", torch.int64)
+                    batch[COORDS_KEY] = coords.index_select(0, row_ids).to(accelerator.device)
+
+                perturbed_cls = _evaluate_distributed(
+                    model,
+                    val_loader,
+                    accelerator,
+                    expected_row_ids=self.expected_row_ids,
+                    attach=attach,
+                )
+                perturbed: list[np.ndarray] = []
+                reselected = self.topology_eval_fn(
+                    model, accelerator, row_coords=universe_coords, logits_sink=perturbed.append
+                )
+
+                def sensitivity_metrics(
+                    perturbed: list[np.ndarray] = perturbed,
+                    perturbed_cls: ValidationOutcome = perturbed_cls,
+                    reselected: ValTopologyResult = reselected,
+                    name: str = name,
+                ) -> dict[str, float]:
+                    from src.eval.fixed_threshold import evaluate_fixed_threshold
+                    from src.eval.graph_metrics import MMDConfig
+
+                    fixed, _ = evaluate_fixed_threshold(
+                        pairs=self.pairs,
+                        logits=perturbed[0].astype(np.float64),
+                        g_ref=self.reference.g_val,
+                        buckets=self.reference.buckets,
+                        threshold=topology.threshold,
+                        config=MMDConfig(),
+                    )
+                    change = np.abs(perturbed[0] - clean[0])
+                    values = {
+                        "cls_auprc": perturbed_cls.metrics.auprc,
+                        "cls_bce": float(cast(float, perturbed_cls.task_loss)),
+                        "cls_brier": perturbed_cls.metrics.brier,
+                        "logit_change_mean": float(change.mean()),
+                        "logit_change_p95": float(np.quantile(change, 0.95)),
+                        "fixed_threshold": topology.threshold,
+                        "fixed_gs": fixed.graph_similarity,
+                        "fixed_rd": fixed.relative_density,
+                        **{f"fixed_{key}_mmd": value for key, value in fixed.mmd_ratio.items()},
+                        "reselected_threshold": reselected.threshold,
+                        **{
+                            f"reselected_{key}": value
+                            for key, value in asdict(reselected.metrics).items()
+                        },
+                    }
+                    return {
+                        f"sensitivity_{name}_{key}": float(value) for key, value in values.items()
+                    }
+
+                diagnostics.update(self._collect_metrics(accelerator, sensitivity_metrics))
+        self.completed_evaluations += 1
+        return ValidationOutcome(cls.metrics, topology, cls.task_loss, diagnostics)
 
 
 def _topology_from_metrics_row(row: dict[str, object]) -> ValTopologyResult | None:
@@ -3582,7 +3824,7 @@ class TopoPromptRows:
         started = time.monotonic()
         train_table = StructCoordinateTable(train_graph)
         self.train = torch.from_numpy(train_table.coords(train_pairs))
-        del train_table
+        self.train_table = train_table
         mean, std = coordinate_statistics(self.train.numpy()[np.asarray(stats_rows)])
         self.coord_mean = torch.from_numpy(mean)
         self.coord_std = torch.from_numpy(std)
@@ -3590,7 +3832,7 @@ class TopoPromptRows:
         val_table = StructCoordinateTable(val_graph)
         self.val_cls = torch.from_numpy(val_table.coords(val_cls_pairs))
         self.universe = torch.from_numpy(val_table.coords(universe_pairs))
-        del val_table
+        self.val_table = val_table
         self._device = device
         self.build_seconds = time.monotonic() - started
 
@@ -3731,6 +3973,7 @@ class StructStream:
         label_smoothing: float,
         seed: int,
         val_sampler: StructSampler | None = None,
+        coordinates: TopoPromptRows | None = None,
     ) -> None:
         if token_budget < 1:
             raise ValueError(f"struct token budget must be positive, got {token_budget}")
@@ -3739,6 +3982,8 @@ class StructStream:
         self.config = config
         self._sampler = sampler
         self._val_sampler = val_sampler
+        self._coordinates = coordinates
+        self._teacher_logits: torch.Tensor | None = None
         self._table = table
         self._rank = rank
         self._world_size = world_size
@@ -3759,6 +4004,9 @@ class StructStream:
         count = self.config.subgraphs_per_epoch
         if count is None:
             count = steps
+        elif count == 0.5:
+            count = max(1, steps // 2)
+        count = int(count)
         if count > steps:
             raise ValueError(
                 f"struct.subgraphs_per_epoch ({count}) exceeds the epoch's {steps} optimizer steps"
@@ -3794,6 +4042,7 @@ class StructStream:
         sampler masks V_val-internal pairs, the validation sampler keeps them.
         """
         device = self._table.tokens.device
+        self._teacher_logits = None
         mask_np = sampler.legal_mask(subgraph)
         target = torch.from_numpy(sampler.adjacency(subgraph)).to(device)
         mask = torch.from_numpy(mask_np).to(device)
@@ -3815,8 +4064,25 @@ class StructStream:
             buckets[boundary].append(row)
         raw_model = _unwrapped_model(model)
         parts: list[torch.Tensor] = []
+        teacher_parts: list[torch.Tensor] = []
         rows_a: list[int] = []
         rows_b: list[int] = []
+
+        def coordinates_for(anchor: torch.Tensor, partner: torch.Tensor) -> torch.Tensor:
+            if self._coordinates is None:
+                raise RuntimeError("topology prompt structural stream requires coordinate tables")
+            coord_table = (
+                self._coordinates.train_table
+                if sampler is self._sampler
+                else self._coordinates.val_table
+            )
+            records = self._table.manifest.nodes
+            a = [coord_table.index[records[i].node_id] for i in anchor.cpu().tolist()]
+            b = [coord_table.index[records[i].node_id] for i in partner.cpu().tolist()]
+            return torch.from_numpy(coord_table.coords_for_pairs(np.asarray(a), np.asarray(b))).to(
+                device
+            )
+
         for boundary, rows in buckets.items():
             per_chunk = max(1, self._token_budget // boundary)
             for start in range(0, len(rows), per_chunk):
@@ -3835,10 +4101,10 @@ class StructStream:
                     # would recompute every chunk at the last bucket.
                     emb_a, len_a = self._table.gather_nodes(anchor, boundary)
                     emb_b, len_b = self._table.gather_nodes(partner, boundary)
-                    output = cast(
-                        dict[str, torch.Tensor],
-                        raw_model({"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}),
-                    )
+                    batch = {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
+                    if isinstance(raw_model, V3_1TopoPrompt):
+                        batch[COORDS_KEY] = coordinates_for(anchor, partner)
+                    output = cast(dict[str, torch.Tensor], raw_model(batch))
                     out = output["logits"]
                     if out.dim() > 1 and out.size(-1) == 1:
                         out = out.squeeze(-1)
@@ -3852,12 +4118,35 @@ class StructStream:
                 else:
                     chunk_logits = forward(anchor, partner, boundary)
                 parts.append(chunk_logits)
+                # The teacher pass feeds only the anchor KD; arms with w_anchor == 0
+                # (factorial A and C) skip it so the matched pairs cost the same.
+                if isinstance(raw_model, V3_1CoordGen) and raw_model.cfg.w_anchor > 0.0:
+                    with torch.no_grad():
+                        emb_a, len_a = self._table.gather_nodes(anchor, boundary)
+                        emb_b, len_b = self._table.gather_nodes(partner, boundary)
+                        teacher_output = raw_model.teacher(
+                            {
+                                "emb_a": emb_a,
+                                "emb_b": emb_b,
+                                "len_a": len_a,
+                                "len_b": len_b,
+                                COORDS_KEY: coordinates_for(anchor, partner),
+                            }
+                        )
+                        teacher_parts.append(teacher_output["logits"].reshape(-1).float())
                 rows_a.extend(pairs[r][0] for r in chunk)
                 rows_b.extend(pairs[r][1] for r in chunk)
         flat = torch.cat(parts)
         index_a = torch.as_tensor(rows_a, dtype=torch.int64, device=device)
         index_b = torch.as_tensor(rows_b, dtype=torch.int64, device=device)
         logits = logits.index_put((index_a, index_b), flat).index_put((index_b, index_a), flat)
+        if teacher_parts:
+            teacher_flat = torch.cat(teacher_parts)
+            self._teacher_logits = (
+                torch.zeros_like(logits)
+                .index_put((index_a, index_b), teacher_flat)
+                .index_put((index_b, index_a), teacher_flat)
+            )
         return logits, target, mask
 
     # ------------------------------------------------------------ training
@@ -3894,6 +4183,15 @@ class StructStream:
                 positive_weight=self._positive_weight,
                 label_smoothing=self._label_smoothing,
             )
+            raw_model = _unwrapped_model(model)
+            if isinstance(raw_model, V3_1CoordGen) and self._teacher_logits is not None:
+                temperature = raw_model.cfg.anchor_temperature
+                anchor = struct_anchor_kl(logits, self._teacher_logits, mask, temperature)
+                entropy = struct_anchor_entropy(self._teacher_logits, mask, temperature)
+                term_total = term_total + raw_model.cfg.w_anchor * anchor
+                terms["anchor"] = anchor
+                stats["sum_struct_anchor_entropy"] = float(entropy.item())
+                stats["sum_struct_anchor_loss"] = float(anchor.detach().item())
             total = total + term_total
             self.last_terms = terms
             stats["struct_pairs"] += pair_count
@@ -4586,6 +4884,11 @@ def train_ddp_loop(
                     f"snapshot={len(rng_by_rank)}, current={world_size}"
                 )
             accelerator.unwrap_model(model).load_state_dict(snapshot["model_state"])
+            if isinstance(evaluate_fn, PromptV2Validation):
+                evaluate_fn.load_state_dict(
+                    cast(dict[str, Any], snapshot["prompt_validation_state"]),
+                    completed_epoch=completed_epoch,
+                )
             optimizer.load_state_dict(snapshot["optimizer"])
             scheduler.load_state_dict(cast(dict[str, Any], snapshot["scheduler"]))
             scaler_state = snapshot.get("scaler")
@@ -4721,6 +5024,8 @@ def train_ddp_loop(
         epoch_kd_sums: dict[str, float] = {}
         epoch_struct_loss_sum = 0.0
         epoch_struct_sums: dict[str, float] = {}
+        epoch_online_sums: dict[str, float] = {}
+        epoch_online_weight = 0.0
         epoch_struct_seconds = 0.0
         grad_norm_struct: dict[str, float] = {}
         grad_norm_task = 0.0
@@ -4761,6 +5066,9 @@ def train_ddp_loop(
             if topo_rows is not None:
                 topo_rows.attach_train(batch)
 
+            raw_training_model = _unwrapped_model(model)
+            if isinstance(raw_training_model, V3_1TopoPrompt):
+                raw_training_model.set_corruption_step(global_step, seed=cfg.seed)
             start_event, end_event = _maybe_cuda_events(use_cuda)
             output = model(batch)
             local_mean_loss = output["loss"]
@@ -4777,6 +5085,13 @@ def train_ddp_loop(
                 global_weight = accelerator.reduce(effective_weight.detach(), reduction="sum")
                 batch_loss_weight = float(effective_weight.item())
                 loss = local_mean_loss * (world_size * effective_weight / global_weight)
+            if isinstance(_unwrapped_model(model), V3_1CoordGen):
+                epoch_online_weight += batch_loss_weight
+                for key in ("coord_loss", "task_loss", "kd_loss", "teacher_entropy", "kd_kl"):
+                    if key in output:
+                        epoch_online_sums[key] = epoch_online_sums.get(key, 0.0) + (
+                            float(output[key].detach().item()) * batch_loss_weight
+                        )
             kd_loss: torch.Tensor | None = None
             if kd_bank is not None:
                 kd_local, kd_stats = kd_bank.loss(
@@ -5011,6 +5326,8 @@ def train_ddp_loop(
             topology_every=cfg.eval.topology_every,
             classification_only=cfg.eval.classification_only,
         )
+        if isinstance(evaluate_fn, PromptV2Validation):
+            run_topology = True
         epoch_evaluate_fn = (
             evaluate_fn if run_topology or evaluate_cls_fn is None else evaluate_cls_fn
         )
@@ -5041,6 +5358,18 @@ def train_ddp_loop(
         if outcome.task_loss is not None:
             val_task_loss = outcome.task_loss
             entry["val_task_loss"] = outcome.task_loss
+        if epoch_online_sums:
+            online_keys = sorted(epoch_online_sums)
+            online_values = accelerator.reduce(
+                torch.tensor(
+                    [epoch_online_weight] + [epoch_online_sums[key] for key in online_keys],
+                    dtype=torch.float64,
+                    device=accelerator.device,
+                ),
+                reduction="sum",
+            )
+            for index, key in enumerate(online_keys, start=1):
+                entry[f"train_{key}"] = float(online_values[index] / online_values[0].clamp_min(1))
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
@@ -5117,7 +5446,8 @@ def train_ddp_loop(
             # the epoch training actually ended on. `classification_only` has no
             # topology candidates at all, so it stops immediately.
             if (
-                evals_without_improvement >= cfg.eval.patience
+                cfg.eval.patience is not None
+                and evals_without_improvement >= cfg.eval.patience
                 and stop_epoch is None
                 and (cfg.eval.classification_only or run_topology)
             ):
@@ -5222,6 +5552,11 @@ def train_ddp_loop(
                 _torch_save_atomic(
                     {
                         "resume_supported": True,
+                        "prompt_validation_state": (
+                            evaluate_fn.state_dict()
+                            if isinstance(evaluate_fn, PromptV2Validation)
+                            else None
+                        ),
                         "config": config_to_dict(cfg),
                         "world_size": world_size,
                         "warmup_steps": warmup_steps,
@@ -5782,10 +6117,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 "v3_1_topo_prompt reads V_val truth structure during validation; launch it "
                 "with --run-kind diagnostic (hpc/run.sh train <config> --run-kind diagnostic)"
             )
-        if cfg.struct is not None or (cfg.distill is not None and cfg.distill.active):
+        if cfg.distill is not None and cfg.distill.active:
             raise RuntimeError(
-                "v3_1_topo_prompt (Stage I) trains on task BCE only; struct/distill sections "
-                "are not supported for this family"
+                "v3_1_topo_prompt external distill sections are not supported for this family"
             )
         if cfg.eval.classification_only:
             raise RuntimeError("v3_1_topo_prompt requires the V_val topology pass")
@@ -5812,10 +6146,10 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         # legal) and V_val fit diagnostics; the model itself scores every row,
         # V_val universe and test included, from its own prediction, so this is
         # a formal, deployable run. The reader's published statistics stay.
-        if cfg.struct is not None or (cfg.distill is not None and cfg.distill.active):
+        if cfg.distill is not None and cfg.distill.active:
             raise RuntimeError(
                 "v3_1_coord_gen (Stage II) trains the generator on coordinate supervision, "
-                "task BCE and logit KD only; struct/distill sections are not supported"
+                "task BCE and online KD; external distill sections are not supported"
             )
         if cfg.eval.classification_only:
             raise RuntimeError("v3_1_coord_gen requires the V_val topology pass")
@@ -5930,6 +6264,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             label_smoothing=float(cast(float, struct_model_kwargs.get("label_smoothing", 0.0))),
             seed=cfg.seed,
             val_sampler=val_struct_sampler,
+            coordinates=topo_rows,
         )
         if accelerator.is_main_process:
             logger.info(
@@ -5946,7 +6281,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     )
     if accelerator.is_main_process:
         logger.info(
-            "early-stop monitor: %s (patience %d)",
+            "early-stop monitor: %s (patience %s)",
             cfg.eval.early_stop_metric,
             cfg.eval.patience,
         )
@@ -5984,40 +6319,46 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         lengths_by_node = {record.node_id: record.length for record in table.manifest.nodes}
         node_positions = np.array([node_index[node] for node in reference.nodes], dtype=np.int64)
         universe_boundary = max(lengths_by_node[node] for node in reference.nodes)
-        evaluate_fn = cast(
-            EvaluateFn,
-            functools.partial(
-                _evaluate_two_pass,
-                expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
-                topology_eval_fn=cast(
-                    TopologyEvalFn,
-                    functools.partial(
-                        _evaluate_val_universe,
-                        table=table,
-                        node_a_all=torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64),
-                        node_b_all=torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64),
-                        boundary=universe_boundary,
-                        # Every row pads to `universe_boundary`, so cap the no-grad
-                        # forward by the runtime token budget, not only by pairs.
-                        batch_pairs=max(
-                            1,
-                            min(
-                                runtime.max_pairs_per_rank,
-                                runtime.token_budget // (2 * universe_boundary),
-                            ),
-                        ),
-                        u_idx=u_idx,
-                        v_idx=v_idx,
-                        reference=reference,
-                        row_coords=universe_coords,
-                    ),
-                ),
-                label_smoothing=val_label_smoothing,
-                validation_bank=validation_bank,
-                attach=topo_rows.attach_val if topo_rows is not None else None,
-                diagnostics_fn=coord_fit_fn,
+        topology_evaluate_fn = functools.partial(
+            _evaluate_val_universe,
+            table=table,
+            node_a_all=torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64),
+            node_b_all=torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64),
+            boundary=universe_boundary,
+            batch_pairs=max(
+                1, min(runtime.max_pairs_per_rank, runtime.token_budget // (2 * universe_boundary))
             ),
+            u_idx=u_idx,
+            v_idx=v_idx,
+            reference=reference,
+            row_coords=universe_coords,
         )
+        if topo_rows is not None and cfg.model.family in {"v3_1_topo_prompt", "v3_1_coord_gen"}:
+            if cfg.eval.eval_every != 1 or cfg.eval.topology_every != 1:
+                raise ValueError("two-stage prompt diagnostics require eval_every=topology_every=1")
+            evaluate_fn = PromptV2Validation(
+                cls_evaluate_fn=cls_evaluate_fn,
+                topology_eval_fn=topology_evaluate_fn,
+                reference=reference,
+                u_idx=u_idx,
+                v_idx=v_idx,
+                rows=topo_rows,
+                expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+                stage=1 if cfg.model.family == "v3_1_topo_prompt" else 2,
+            )
+        else:
+            evaluate_fn = cast(
+                EvaluateFn,
+                functools.partial(
+                    _evaluate_two_pass,
+                    expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+                    topology_eval_fn=topology_evaluate_fn,
+                    label_smoothing=val_label_smoothing,
+                    validation_bank=validation_bank,
+                    attach=topo_rows.attach_val if topo_rows is not None else None,
+                    diagnostics_fn=coord_fit_fn,
+                ),
+            )
 
     if args.ddp_mode == "epoch-probe":
         one_epoch_cfg = replace(cfg, optim=replace(cfg.optim, epochs=1))
