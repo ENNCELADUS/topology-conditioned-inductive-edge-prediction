@@ -535,9 +535,10 @@ class V3_1CoordGen(nn.Module):
             entropy = F.binary_cross_entropy_with_logits(
                 output["teacher_logits"].reshape(-1).float(), q, reduction="none"
             )
-            output["kd_loss"] = ((weights * kd_row).sum() / weight_sum).detach()
-            output["teacher_entropy"] = ((weights * entropy).sum() / weight_sum).detach()
-            output["kd_kl"] = ((weights * (kd_row - entropy)).sum() / weight_sum).detach()
+            # Diagnostics are unweighted row means so `_coordinate_fit_metrics`
+            # can aggregate them by row count into batching-invariant dataset means.
+            output["teacher_entropy"] = entropy.detach().mean()
+            output["kd_kl"] = (kd_row - entropy).detach().mean()
         if self.cfg.w_kd_rep > 0:
             student_repr = self.reader.logits_from_standardized(
                 encoded_a, encoded_b, lengths_a, lengths_b, z_hat, return_pair_repr=True
@@ -553,13 +554,7 @@ class V3_1CoordGen(nn.Module):
                 )
             rep_row = 1 - F.cosine_similarity(student_repr.float(), teacher_repr.float(), dim=-1)
             total_row = total_row + self.cfg.w_kd_rep * rep_row
-            output["kd_rep_loss"] = ((weights * rep_row).sum() / weight_sum).detach()
-        for name, rows in (
-            ("coord_loss", coord_row),
-            ("coord_continuous_loss", continuous_row),
-            ("coord_distance_loss", distance_row),
-        ):
-            output[name] = ((weights * rows).sum() / weight_sum).detach()
+            output["kd_rep_loss"] = rep_row.detach().mean()
         output["loss"] = (weights * total_row).sum() / weight_sum
         output["loss_weight_sum"] = weight_sum
         output["task_loss"] = ((weights * bce_row).sum() / weight_sum).detach()

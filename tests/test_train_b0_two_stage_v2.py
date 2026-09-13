@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
@@ -231,3 +232,49 @@ def test_null_patience_runs_entire_budget_despite_worsening_loss(tmp_path: Path)
     assert result.last_epoch == 3
     assert not result.stopped_early
     assert [row["val_task_loss"] for row in result.history] == [1, 2, 3]
+
+
+def test_teacher_pass_runs_under_the_supplied_autocast() -> None:
+    """The teacher is a child module, outside Accelerate's forward wrapper."""
+    import contextlib
+
+    from src.train_b0 import StructStream
+
+    model, stream, _ = _fixture()
+    entered = 0
+
+    @contextlib.contextmanager
+    def counting() -> Iterator[None]:
+        nonlocal entered
+        entered += 1
+        yield
+
+    wrapped = StructStream(
+        stream.config,
+        stream._sampler,  # noqa: SLF001
+        stream._table,  # noqa: SLF001
+        rank=0,
+        world_size=1,
+        token_budget=128,
+        positive_weight=5.0,
+        label_smoothing=0.0,
+        seed=2,
+        coordinates=stream._coordinates,  # noqa: SLF001
+        autocast=counting,
+    )
+    model.train()
+    _, stats = wrapped.loss(model, epoch=1, step=0, steps=2)
+    assert entered > 0
+    assert stats["sum_struct_anchor_entropy"] > 0
+
+
+def test_coordinate_and_kd_diagnostics_are_unweighted_row_means() -> None:
+    """Row-count aggregation in `_coordinate_fit_metrics` needs label-free means."""
+    model, _, batch = _fixture()
+    model.eval()
+    with torch.no_grad():
+        mixed = model({**batch, "label": torch.tensor([1, 0, 1, 0])})
+        positive = model({**batch, "label": torch.tensor([1, 1, 1, 1])})
+    for key in ("coord_loss", "coord_continuous_loss", "coord_distance_loss", "kd_loss"):
+        torch.testing.assert_close(mixed[key], positive[key])
+    assert not torch.isclose(mixed["task_loss"], positive["task_loss"])

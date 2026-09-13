@@ -22,6 +22,7 @@ wires the real benchmark/feature data into them.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import hashlib
 import json
@@ -35,6 +36,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import cycle, islice
@@ -3974,6 +3976,7 @@ class StructStream:
         seed: int,
         val_sampler: StructSampler | None = None,
         coordinates: TopoPromptRows | None = None,
+        autocast: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         if token_budget < 1:
             raise ValueError(f"struct token budget must be positive, got {token_budget}")
@@ -3983,6 +3986,10 @@ class StructStream:
         self._sampler = sampler
         self._val_sampler = val_sampler
         self._coordinates = coordinates
+        # The teacher is called as a child module, outside the autocast wrapper
+        # Accelerate installs on the prepared model's forward; the caller passes
+        # `accelerator.autocast` so the pass sees the run's mixed precision.
+        self._autocast = autocast if autocast is not None else contextlib.nullcontext
         self._teacher_logits: torch.Tensor | None = None
         self._table = table
         self._rank = rank
@@ -4121,7 +4128,7 @@ class StructStream:
                 # The teacher pass feeds only the anchor KD; arms with w_anchor == 0
                 # (factorial A and C) skip it so the matched pairs cost the same.
                 if isinstance(raw_model, V3_1CoordGen) and raw_model.cfg.w_anchor > 0.0:
-                    with torch.no_grad():
+                    with torch.no_grad(), self._autocast():
                         emb_a, len_a = self._table.gather_nodes(anchor, boundary)
                         emb_b, len_b = self._table.gather_nodes(partner, boundary)
                         teacher_output = raw_model.teacher(
@@ -5086,11 +5093,14 @@ def train_ddp_loop(
                 batch_loss_weight = float(effective_weight.item())
                 loss = local_mean_loss * (world_size * effective_weight / global_weight)
             if isinstance(_unwrapped_model(model), V3_1CoordGen):
-                epoch_online_weight += batch_loss_weight
+                # These diagnostics are unweighted row means (see V3_1CoordGen.forward),
+                # so they aggregate by row count; `task_loss` alone is weight-normalised.
+                batch_rows = float(output["logits"].numel())
+                epoch_online_weight += batch_rows
                 for key in ("coord_loss", "task_loss", "kd_loss", "teacher_entropy", "kd_kl"):
                     if key in output:
                         epoch_online_sums[key] = epoch_online_sums.get(key, 0.0) + (
-                            float(output[key].detach().item()) * batch_loss_weight
+                            float(output[key].detach().item()) * batch_rows
                         )
             kd_loss: torch.Tensor | None = None
             if kd_bank is not None:
@@ -6265,6 +6275,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             seed=cfg.seed,
             val_sampler=val_struct_sampler,
             coordinates=topo_rows,
+            autocast=accelerator.autocast,
         )
         if accelerator.is_main_process:
             logger.info(
