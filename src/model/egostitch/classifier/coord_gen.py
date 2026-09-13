@@ -48,6 +48,10 @@ from src.model.egostitch.classifier.topo_prompt import COORDS_KEY, V3_1TopoPromp
 
 DISTANCE_NAMES: tuple[str, ...] = ("dist_2", "dist_3", "dist_4plus", "dist_inf")
 DISTANCE_INDEX: tuple[int, ...] = tuple(COORD_NAMES.index(name) for name in DISTANCE_NAMES)
+#: Distance classes the generator predicts: the four one-hot categories plus the
+#: all-zero case of a self-pair (``u == v`` carries no shortest-path category).
+DISTANCE_CLASSES: int = len(DISTANCE_NAMES) + 1
+SELF_DISTANCE_CLASS: int = len(DISTANCE_NAMES)
 CONTINUOUS_INDEX: tuple[int, ...] = tuple(
     index for index in range(COORD_DIM) if index not in DISTANCE_INDEX
 )
@@ -62,6 +66,21 @@ FIELD_CONTINUOUS_INDEX: dict[str, tuple[int, ...]] = {
     "relation": RELATION_CONTINUOUS_INDEX,
     "context": tuple(range(FIELD_SLICES["context"].start, FIELD_SLICES["context"].stop)),
 }
+
+
+def distance_class_targets(coords: torch.Tensor) -> torch.Tensor:
+    """Return the ``(B,)`` distance class of raw coordinates.
+
+    The four one-hot categories map to classes ``0..3``; an all-zero row (a
+    self-pair, which `StructCoordinateTable` gives no category) maps to
+    `SELF_DISTANCE_CLASS` rather than being coerced into ``dist_2``.
+    """
+    one_hot = coords[:, list(DISTANCE_INDEX)].float()
+    return torch.where(
+        one_hot.sum(dim=1) > 0.5,
+        one_hot.argmax(dim=1),
+        torch.full_like(one_hot[:, 0], SELF_DISTANCE_CLASS, dtype=torch.int64),
+    )
 
 
 @dataclass(frozen=True)
@@ -166,8 +185,9 @@ class CoordinateGenerator(nn.Module):
     tokens (``2 * d_model``). The endpoint head reads ``[self | partner]`` and is
     applied once per endpoint; the pair head reads
     ``[p_u + p_v | p_u * p_v | |p_u - p_v|]`` and emits the seven continuous
-    relation coordinates, four shortest-path class logits and the five context
-    coordinates.
+    relation coordinates, five shortest-path class logits (the four categories
+    plus the self-pair "no category" case) and the five context coordinates.
+    Every output is float32, whatever autocast the heads ran under.
     """
 
     def __init__(self, d_model: int, cfg: CoordGenConfig) -> None:
@@ -186,7 +206,7 @@ class CoordinateGenerator(nn.Module):
             cfg.hidden,
             cfg.layers,
             cfg.dropout,
-            len(RELATION_CONTINUOUS_INDEX) + len(DISTANCE_NAMES) + CONTEXT_DIM,
+            len(RELATION_CONTINUOUS_INDEX) + DISTANCE_CLASSES + CONTEXT_DIM,
         )
 
     @staticmethod
@@ -210,18 +230,18 @@ class CoordinateGenerator(nn.Module):
 
         Returns:
             ``endpoint_u`` / ``endpoint_v`` ``(B, 9)`` standardised, ``relation``
-            ``(B, 7)`` standardised, ``distance_logits`` ``(B, 4)`` and
-            ``context`` ``(B, 5)`` standardised.
+            ``(B, 7)`` standardised, ``distance_logits`` ``(B, 5)`` and
+            ``context`` ``(B, 5)`` standardised, all float32.
         """
         pair = self.pair_head(torch.cat([p_u + p_v, p_u * p_v, (p_u - p_v).abs()], dim=-1))
+        pair = pair.float()
         n_rel = len(RELATION_CONTINUOUS_INDEX)
-        n_dist = len(DISTANCE_NAMES)
         return {
-            "endpoint_u": self.endpoint_head(torch.cat([p_u, p_v], dim=-1)),
-            "endpoint_v": self.endpoint_head(torch.cat([p_v, p_u], dim=-1)),
+            "endpoint_u": self.endpoint_head(torch.cat([p_u, p_v], dim=-1)).float(),
+            "endpoint_v": self.endpoint_head(torch.cat([p_v, p_u], dim=-1)).float(),
             "relation": pair[:, :n_rel],
-            "distance_logits": pair[:, n_rel : n_rel + n_dist],
-            "context": pair[:, n_rel + n_dist :],
+            "distance_logits": pair[:, n_rel : n_rel + DISTANCE_CLASSES],
+            "context": pair[:, n_rel + DISTANCE_CLASSES :],
         }
 
 
@@ -297,20 +317,22 @@ class V3_1CoordGen(nn.Module):
     def assemble(self, parts: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """Assemble the head outputs into ``(B, COORD_DIM)`` standardised coordinates.
 
-        The four shortest-path classes enter as softmax probabilities standardised
-        with the reader's statistics, so the reader sees soft one-hots on the
-        scale it was trained on.
+        The four shortest-path one-hots enter as the softmax probabilities of
+        their classes standardised with the reader's statistics, so the reader
+        sees soft one-hots on the scale it was trained on; the probability mass
+        of the self-pair class leaves all four at zero, the true self-pair value.
+        Assembled in float32 regardless of autocast.
         """
         stats = self.reader.generator
         batch = parts["endpoint_u"].size(0)
-        z = parts["endpoint_u"].new_zeros((batch, COORD_DIM))
-        z[:, FIELD_SLICES["endpoint_u"]] = parts["endpoint_u"]
-        z[:, FIELD_SLICES["endpoint_v"]] = parts["endpoint_v"]
-        z[:, list(RELATION_CONTINUOUS_INDEX)] = parts["relation"]
-        z[:, FIELD_SLICES["context"]] = parts["context"]
+        z = torch.zeros((batch, COORD_DIM), dtype=torch.float32, device=parts["endpoint_u"].device)
+        z[:, FIELD_SLICES["endpoint_u"]] = parts["endpoint_u"].float()
+        z[:, FIELD_SLICES["endpoint_v"]] = parts["endpoint_v"].float()
+        z[:, list(RELATION_CONTINUOUS_INDEX)] = parts["relation"].float()
+        z[:, FIELD_SLICES["context"]] = parts["context"].float()
         dist = list(DISTANCE_INDEX)
-        probs = torch.softmax(parts["distance_logits"].float(), dim=-1)
-        z[:, dist] = (probs - stats.coord_mean[dist]) / stats.coord_std[dist]
+        probs = torch.softmax(parts["distance_logits"].float(), dim=-1)[:, : len(DISTANCE_NAMES)]
+        z[:, dist] = (probs - stats.coord_mean[dist].float()) / stats.coord_std[dist].float()
         return z
 
     def predict(
@@ -362,12 +384,13 @@ class V3_1CoordGen(nn.Module):
         Returns:
             ``(total, continuous, distance)`` per-row losses: their sum, the mean
             Huber over the 30 continuous standardised coordinates, and the
-            cross-entropy of the shortest-path class.
+            cross-entropy of the shortest-path class (`distance_class_targets`,
+            self-pairs as their own class).
         """
         z_star = self.reader.generator.standardize(coords.to(z_hat.device))
         cont = list(CONTINUOUS_INDEX)
         continuous = F.smooth_l1_loss(z_hat[:, cont], z_star[:, cont], reduction="none").mean(dim=1)
-        target = coords.to(z_hat.device)[:, list(DISTANCE_INDEX)].float().argmax(dim=1)
+        target = distance_class_targets(coords.to(z_hat.device))
         distance = F.cross_entropy(parts["distance_logits"].float(), target, reduction="none")
         return continuous + distance, continuous, distance
 
@@ -452,8 +475,11 @@ class V3_1CoordGen(nn.Module):
 
 __all__ = [
     "CONTINUOUS_INDEX",
+    "DISTANCE_CLASSES",
     "DISTANCE_INDEX",
     "DISTANCE_NAMES",
+    "SELF_DISTANCE_CLASS",
+    "distance_class_targets",
     "FIELD_CONTINUOUS_INDEX",
     "RELATION_CONTINUOUS_INDEX",
     "CoordGenConfig",

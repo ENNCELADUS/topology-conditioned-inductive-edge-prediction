@@ -117,10 +117,10 @@ from src.eval.val_topology import (
 )
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.coord_gen import (
-    DISTANCE_INDEX,
     FIELD_CONTINUOUS_INDEX,
     CoordGenConfig,
     V3_1CoordGen,
+    distance_class_targets,
 )
 from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
@@ -3661,7 +3661,6 @@ def _coordinate_fit_metrics(
     scalars = torch.zeros(4, dtype=torch.float64, device=device)
     was_training = raw_model.training
     raw_model.eval()
-    distance = list(DISTANCE_INDEX)
     with torch.no_grad():
         for batch in val_loader:
             batch = _to_device(batch, device)
@@ -3674,8 +3673,7 @@ def _coordinate_fit_metrics(
             squares += (z_star**2).sum(dim=0)
             rows = float(z_star.shape[0])
             correct = (
-                batch[COORDS_KEY][:, distance].argmax(dim=1)
-                == output["distance_logits"].argmax(dim=1)
+                distance_class_targets(batch[COORDS_KEY]) == output["distance_logits"].argmax(dim=1)
             ).sum()
             kd = output.get("kd_loss")
             scalars += torch.tensor(

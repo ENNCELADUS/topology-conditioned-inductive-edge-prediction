@@ -8,9 +8,12 @@ from src.data.struct_coords import COORD_DIM, FIELD_SLICES
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.coord_gen import (
     CONTINUOUS_INDEX,
+    DISTANCE_CLASSES,
     DISTANCE_INDEX,
+    SELF_DISTANCE_CLASS,
     CoordGenConfig,
     V3_1CoordGen,
+    distance_class_targets,
 )
 
 from tests.test_prefix_model import _pair_batch, _tiny_base_config
@@ -44,12 +47,23 @@ def _model(seed: int = 0, **extra: object) -> V3_1CoordGen:
 
 
 def _true_coords(n: int, seed: int = 0) -> torch.Tensor:
+    """Raw coordinates with a valid distance one-hot; the last row is a self-pair (all zero)."""
     gen = torch.Generator().manual_seed(seed)
     coords = torch.rand(n, COORD_DIM, generator=gen) * 3.0
     coords[:, list(DISTANCE_INDEX)] = 0.0
     classes = torch.randint(0, len(DISTANCE_INDEX), (n,), generator=gen)
-    coords[torch.arange(n), torch.tensor(DISTANCE_INDEX)[classes]] = 1.0
+    coords[torch.arange(n - 1), torch.tensor(DISTANCE_INDEX)[classes[:-1]]] = 1.0
     return coords
+
+
+def test_distance_class_targets_keep_self_pairs_as_their_own_class() -> None:
+    coords = _true_coords(6)
+    targets = distance_class_targets(coords)
+    assert targets.dtype == torch.int64 and targets.shape == (6,)
+    assert int(targets[-1]) == SELF_DISTANCE_CLASS
+    one_hot = coords[:-1, list(DISTANCE_INDEX)]
+    assert torch.equal(targets[:-1], one_hot.argmax(dim=1))
+    assert len(DISTANCE_INDEX) + 1 == DISTANCE_CLASSES
 
 
 def _swapped(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -107,12 +121,43 @@ def test_swapping_the_pair_swaps_endpoint_fields_and_fixes_the_rest() -> None:
 def test_distance_classes_enter_as_standardised_soft_one_hots() -> None:
     model = _model()
     with torch.no_grad():
-        z = model(_pair_batch())["predicted_coords"]
+        out = model(_pair_batch())
+    z = out["predicted_coords"]
+    assert z.dtype == torch.float32 and out["distance_logits"].shape[1] == DISTANCE_CLASSES
     stats = model.reader.generator
     dist = list(DISTANCE_INDEX)
     probs = z[:, dist] * stats.coord_std[dist] + stats.coord_mean[dist]
     assert (probs >= 0).all() and (probs <= 1).all()
-    torch.testing.assert_close(probs.sum(dim=1), torch.ones(z.size(0)))
+    assert (probs.sum(dim=1) <= 1.0 + 1e-6).all()
+    # A confident self-pair prediction reproduces the true all-zero one-hot.
+    parts = {
+        "endpoint_u": torch.zeros(2, 9),
+        "endpoint_v": torch.zeros(2, 9),
+        "relation": torch.zeros(2, 7),
+        "context": torch.zeros(2, 5),
+        "distance_logits": torch.full((2, DISTANCE_CLASSES), -40.0),
+    }
+    parts["distance_logits"][:, SELF_DISTANCE_CLASS] = 40.0
+    z_self = model.assemble(parts)
+    truth = torch.zeros(2, COORD_DIM)
+    torch.testing.assert_close(z_self[:, dist], stats.standardize(truth)[:, dist])
+
+
+def test_bf16_autocast_assembles_float32_coordinates_and_trains() -> None:
+    model = _model()
+    model.train()
+    batch = _pair_batch()
+    coords = _true_coords(batch["emb_a"].size(0))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model({**batch, "struct_coords": coords})
+    assert out["predicted_coords"].dtype == torch.float32
+    assert out["distance_logits"].dtype == torch.float32
+    assert torch.isfinite(out["loss"])
+    out["loss"].backward()
+    assert all(param.grad is not None for param in model.generator.parameters())
+    with torch.autocast("cpu", dtype=torch.bfloat16), torch.no_grad():
+        scored = model({key: value for key, value in batch.items() if key != "label"})
+    assert scored["predicted_coords"].dtype == torch.float32
 
 
 def test_forward_scores_without_truth_and_supervises_with_it() -> None:
@@ -147,8 +192,8 @@ def test_coordinate_loss_is_zero_at_the_truth() -> None:
     model = _model()
     coords = _true_coords(5)
     z_star = model.reader.generator.standardize(coords)
-    parts = {"distance_logits": torch.full((5, len(DISTANCE_INDEX)), -30.0)}
-    parts["distance_logits"][torch.arange(5), coords[:, list(DISTANCE_INDEX)].argmax(dim=1)] = 30.0
+    parts = {"distance_logits": torch.full((5, DISTANCE_CLASSES), -30.0)}
+    parts["distance_logits"][torch.arange(5), distance_class_targets(coords)] = 30.0
     total, continuous, distance = model.coordinate_loss_rows(parts, z_star, coords)
     assert float(continuous.abs().max()) == 0.0
     assert float(distance.max()) < 1e-6 and float(total.max()) < 1e-6
