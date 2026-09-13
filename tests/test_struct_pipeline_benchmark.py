@@ -13,11 +13,14 @@ from src.experiments.struct_pipeline_benchmark import (
     _Collector,
     _install_worker_hooks,
     _parse_args,
+    _seed_resume_prefix,
     _WorkerComplete,
 )
+from src.train_b0 import ValidationOutcome
 
 from tests.test_train_b0 import (
     _batch_of,
+    _constant_metrics,
     _make_synthetic_pair_dataset,
     _tiny_config,
     _TinyPairMLP,
@@ -123,28 +126,58 @@ def test_collector_excludes_warmup_and_stops_after_timed_update() -> None:
     assert collector.records[0].global_task_pairs == 4
 
 
-def test_hooks_bound_actual_production_loop_without_checkpoint(tmp_path: Path) -> None:
+def test_hooks_resume_real_epoch_snapshot_into_disposable_destination(tmp_path: Path) -> None:
+    cfg = _tiny_config(epochs=3)
+    batch = _batch_of(_make_synthetic_pair_dataset(4))
+    batch["_row_id"] = torch.arange(4)
+    batch["_local_pair_count"] = torch.tensor(4)
+    batch["_global_pair_count"] = torch.tensor(4)
+    prior = tmp_path / "prior"
+    evaluations = 0
+
+    def interrupt_after_one_epoch(*args: object) -> ValidationOutcome:
+        nonlocal evaluations
+        evaluations += 1
+        if evaluations == 2:
+            raise RuntimeError("interrupt after one complete epoch")
+        return ValidationOutcome(_constant_metrics(), None, task_loss=0.5)
+
+    with pytest.raises(RuntimeError, match="interrupt after one complete epoch"):
+        train_b0.train_ddp_loop(
+            _TinyPairMLP(input_dim=4, dropout=0.0),
+            lambda epoch: [batch],
+            [batch],
+            cfg,
+            Accelerator(cpu=True),
+            warmup_steps=0,
+            artifact_dir=prior,
+            evaluate_fn=interrupt_after_one_epoch,
+        )
+
     rank_output = tmp_path / "ranks"
+    artifact_dir = tmp_path / "disposable"
+    assert _seed_resume_prefix(prior, artifact_dir) == 1
+    assert not (artifact_dir / "training_state.pt").exists()
+    assert not (artifact_dir / "checkpoints" / "epoch-0001.pt").is_symlink()
     restore = _install_worker_hooks(
         warmup_steps=1,
         timed_steps=2,
         rank_output_dir=rank_output,
     )
-    batch = _batch_of(_make_synthetic_pair_dataset(4))
-    batch["_row_id"] = torch.arange(4)
-    batch["_local_pair_count"] = torch.tensor(4)
-    batch["_global_pair_count"] = torch.tensor(4)
-    artifact_dir = tmp_path / "attempt"
     try:
         with pytest.raises(_WorkerComplete):
             train_b0.train_ddp_loop(
                 _TinyPairMLP(input_dim=4, dropout=0.0),
                 lambda epoch: [batch, batch, batch, batch],
                 [batch],
-                _tiny_config(epochs=1),
+                cfg,
                 Accelerator(cpu=True),
                 warmup_steps=0,
                 artifact_dir=artifact_dir,
+                resume_attempt=prior,
+                evaluate_fn=lambda *args: ValidationOutcome(
+                    _constant_metrics(), None, task_loss=0.5
+                ),
             )
     finally:
         restore()

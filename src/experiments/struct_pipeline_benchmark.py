@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -234,6 +236,47 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def _seed_resume_prefix(resume_attempt: Path, artifact_dir: Path) -> int:
+    """Materialize the completed metrics/checkpoint prefix in a disposable attempt."""
+    state_path = resume_attempt / "training_state.pt"
+    snapshot = torch.load(state_path, map_location="cpu", weights_only=False, mmap=True)
+    if not isinstance(snapshot, dict) or snapshot.get("resume_supported") is not True:
+        raise ValueError("training_state.pt does not contain resumable state")
+    completed_epoch = snapshot.get("epoch")
+    if (
+        isinstance(completed_epoch, bool)
+        or not isinstance(completed_epoch, int)
+        or completed_epoch < 1
+    ):
+        raise ValueError("training_state.pt epoch is invalid")
+    del snapshot
+
+    metric_lines = (resume_attempt / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    if len(metric_lines) < completed_epoch:
+        raise ValueError("resume metrics.jsonl does not cover the completed epoch")
+    prefix = metric_lines[:completed_epoch]
+    for expected_epoch, line in enumerate(prefix, start=1):
+        row = json.loads(line)
+        if not isinstance(row, dict) or row.get("epoch") != expected_epoch:
+            raise ValueError("resume metrics.jsonl epoch sequence is invalid")
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "metrics.jsonl").write_text("\n".join(prefix) + "\n", encoding="utf-8")
+    destination = artifact_dir / "checkpoints"
+    destination.mkdir()
+    source = resume_attempt / "checkpoints"
+    for epoch in range(1, completed_epoch + 1):
+        checkpoint = source / f"epoch-{epoch:04d}.pt"
+        if not checkpoint.is_file():
+            raise ValueError(f"resume attempt is missing {checkpoint.name}")
+        target = destination / checkpoint.name
+        try:
+            os.link(checkpoint, target)
+        except OSError:
+            shutil.copy2(checkpoint, target)
+    return completed_epoch
 
 
 def _install_worker_hooks(
@@ -629,6 +672,7 @@ def _run_coordinator(args: argparse.Namespace) -> None:
         temporary = Path(tmp)
         artifact_dir = temporary / "attempt"
         rank_output_dir = temporary / "ranks"
+        completed_epoch = _seed_resume_prefix(args.resume_attempt.resolve(), artifact_dir)
         command = [
             str(accelerate),
             "launch",
@@ -681,6 +725,7 @@ def _run_coordinator(args: argparse.Namespace) -> None:
         "resume_attempt": str(args.resume_attempt.resolve()),
         "warmup_steps": args.warmup_steps,
         "timed_steps": args.timed_steps,
+        "resumed_completed_epoch": completed_epoch,
         "started_at_unix_seconds": started,
         "finished_at_unix_seconds": time.time(),
         "git": _git_revision(),
@@ -690,6 +735,9 @@ def _run_coordinator(args: argparse.Namespace) -> None:
         "timing_semantics": {
             "step_wall": "CUDA-synchronized slowest-rank wall time",
             "phase_seconds": "host-call elapsed time; phases may overlap and are not additive",
+            "coordinate_prepare_seconds": (
+                "CPU coords_for_pairs only; excludes tensor slicing and host-to-device copies"
+            ),
             "memory_allocated_reserved": "per-step CUDA peaks across ranks",
             "coordinate_calls": "sum over ranks, split by forward and checkpoint backward",
         },
