@@ -85,3 +85,11 @@ def test_scale_and_half_epoch_budget() -> None:
 def test_rejects_invalid_subgraph_budgets(value: float) -> None:
     with pytest.raises(ValueError, match="subgraphs_per_epoch"):
         StructConfig.from_mapping({"weights": {"bce": 1.0}, "subgraphs_per_epoch": value})
+
+
+def test_struct_token_budget_override_parses_and_validates() -> None:
+    assert StructConfig.from_mapping({"weights": {"bce": 1.0}}).token_budget is None
+    cfg = StructConfig.from_mapping({"weights": {"bce": 1.0}, "token_budget": 65536})
+    assert cfg.token_budget == 65536
+    with pytest.raises(ValueError, match="struct.token_budget"):
+        StructConfig.from_mapping({"weights": {"bce": 1.0}, "token_budget": 0})

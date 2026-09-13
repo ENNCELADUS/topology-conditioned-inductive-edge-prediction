@@ -46,6 +46,10 @@ class StructConfig:
         mmd_sigma: Gaussian width of the degree soft histogram and of its TV kernel.
         mmd_bins: Number of degree histogram centres on ``[0, n-1]``.
         val_subgraphs: Fixed V_val diagnostic subgraph count.
+        token_budget: Token budget per forwarded chunk of subgraph pairs; ``None``
+            uses ``data.token_budget``. A smaller chunk lowers the stream's peak
+            memory (the checkpointed chunk lives beside the task batch) without
+            touching the task stream's epoch plan.
     """
 
     nodes: int = 40
@@ -60,6 +64,7 @@ class StructConfig:
     mmd_sigma: float = 1.25
     mmd_bins: int = 48
     val_subgraphs: int = 32
+    token_budget: int | None = None
 
     def __post_init__(self) -> None:
         """Validate ranges, the kind mix, and the weight pattern.
@@ -87,6 +92,10 @@ class StructConfig:
             raise ValueError("struct.subgraphs_per_epoch must be a positive integer, 0.5 or null")
         if not math.isfinite(self.scale) or self.scale < 0:
             raise ValueError("struct.scale must be finite and non-negative")
+        if self.token_budget is not None and (
+            isinstance(self.token_budget, bool) or self.token_budget < 1
+        ):
+            raise ValueError("struct.token_budget must be a positive integer or null")
         unknown = sorted(set(self.weights) - set(WEIGHT_KEYS))
         if unknown:
             raise ValueError(f"unknown struct weight keys: {unknown}")
@@ -157,6 +166,10 @@ class StructConfig:
                 count = None if raw is None else _number(raw, "struct.subgraphs_per_epoch")
                 kwargs[spec.name] = (
                     int(count) if count is not None and count.is_integer() else count
+                )
+            elif spec.name == "token_budget":
+                kwargs[spec.name] = (
+                    None if raw is None else int(_number(raw, "struct.token_budget"))
                 )
             elif spec.name in _INT_FIELDS:
                 kwargs[spec.name] = int(_number(raw, f"struct.{spec.name}"))

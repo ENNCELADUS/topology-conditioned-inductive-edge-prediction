@@ -6269,7 +6269,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             table,
             rank=accelerator.process_index,
             world_size=accelerator.num_processes,
-            token_budget=cfg.data.token_budget,
+            token_budget=cfg.struct.token_budget or cfg.data.token_budget,
             positive_weight=float(cast(float, struct_model_kwargs.get("positive_weight", 1.0))),
             label_smoothing=float(cast(float, struct_model_kwargs.get("label_smoothing", 0.0))),
             seed=cfg.seed,
