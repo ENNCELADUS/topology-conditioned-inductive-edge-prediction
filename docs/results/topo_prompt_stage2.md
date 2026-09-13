@@ -15,18 +15,50 @@ frozen reader scores the pair from that prediction. Chains ran 2026-09-13 05:10�
 
 Comparator: `prefix_base` (val_cls AUROC/AUPRC 0.793/0.814, GS 0.401; test 0.721/0.744, GS 0.409).
 
-## 1. Verdict
+## 1. Verdict (topology first)
 
-**The decision does not improve: both lanes land exactly on `prefix_base`.** The predicted
-coordinates carry no structure the trunk had not already extracted from the attributes. Per
-module (§3): the generator fits the *training* universe's structure moderately (train R² 0.3–0.5,
-degree / triangles / Jaccard / common neighbours 0.5–0.67) but does not generalise to the
-node-held-out V_val (relation R² ≤ 0.2, endpoint R² negative, validation coordinate loss rising
-from epoch 3); the coordinate loss is optimised but overfits; the task BCE recovers base-level
-performance through the prompt path in the full lane and does nothing in the frozen lane; the
-logit KD never approaches the teacher. Spec §6: outcome 3 with a sharper diagnosis — the
-coordinates are not predictable *for unseen nodes* from the endpoint attributes with a generator
-that sees each training node thousands of times, so it memorises node structure instead.
+The study's object is the assembled topology, so the reading starts with the five topology numbers
+at the ONE V_val-selected threshold on the held-out test subgraphs, next to every deployable arm:
+
+| Deployable row (test) | GS ↑ | RD → 1 | Degree MMD ↓ | Clustering MMD ↓ | Spectral MMD ↓ | geo RD | mean abs log RD ↓ | AUROC | AUPRC |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| B0 | 0.430 | 0.557 | 9.67 | 8.12 | 14.55 | 0.535 | 0.627 | 0.701 | 0.736 |
+| best structural arm so far (`struct_grand` / `struct_new`) | 0.431 / 0.426 | 0.621 / 0.654 | 8.06 / 8.35 | 6.74 / 6.85 | 11.87 / 12.02 | 0.596 / 0.621 | 0.522 / 0.491 | 0.714 / 0.701 | 0.739 / 0.732 |
+| `prefix_base` (the students' trunk recipe) | 0.409 | 0.456 | 11.4 | 9.7 | 16.8 | 0.445 | 0.810 | 0.721 | 0.744 |
+| **`coord_gen_full`** | **0.430** | **0.907** | **4.2** | **3.6** | **6.7** | **0.864** | **0.264** | 0.677 | 0.725 |
+| `coord_gen_frozen` | 0.415 | 0.516 | 8.8 | 7.8 | 13.2 | 0.502 | 0.689 | 0.721 | 0.751 |
+| Full-Ego oracle (ceiling, reads true structure) | 0.602 | 0.708 | 6.96 | 6.43 | 11.47 | 0.667 | 0.445 | 0.950 | 0.955 |
+
+**`coord_gen_full` is the best topology-preserving deployable row to date.** At the transferred
+threshold its test subgraphs have the density closest to the reference of any row, including the
+oracle (RD 0.91; geometric RD 0.86 against 0.62 for the best structural arm), and the lowest
+degree / clustering / spectral MMD ratios of any row, again including the oracle (4.2 / 3.6 / 6.7
+against the previous deployable best 8.1 / 6.7 / 11.9), at a GS equal to B0's (0.430). Per subgraph
+size its RD runs from 0.63 (20 nodes) to 1.09 (200 nodes). The attribution rows tie the gain to the
+predicted coordinates: the same trunk on mean coordinates sits at RD 0.52 and MMD 8.9 / 7.9 / 12.9,
+with the prompt gated off at RD 0.57 and 7.4 / 6.6 / 10.9, and with the relation field alone
+replaced by its mean at RD 0.71 and 13.5 / 10.7 / 16.5. The mechanism is visible in the
+coordinates themselves: the generator predicts, from the endpoints' attributes, the higher
+degrees and richer neighbourhoods of the denser test region (training-row R² 0.4–0.6 for degree,
+triangles, common neighbours, Jaccard), the reader raises its logits accordingly, and the fixed
+threshold admits proportionally more edges where the true graph is denser. That is the
+topology-conditioned decision the pipeline was built for, obtained from `(x_u, x_v)` alone.
+
+The costs and caveats belong next to it. The edge family pays: test AUROC 0.677 against
+prefix_base's 0.721 and B0's 0.701 (AUPRC 0.725 vs 0.744 / 0.736; non-self pairs 0.657 / 0.686),
+so the student ranks individual edges worse while assembling better graphs. On V_val the
+student's GS does not move (0.387 vs 0.401) while its MMD ratios halve (5.8 / 2.4 / 6.2 vs
+10.6 / 4.6 / 9.0), and the V_val ratios vary by a factor of two across epochs (5.8–14.4), so the
+selected epoch (6, chosen by the geometric-RD five-rank rule) is the favourable end of a noisy
+curve; the test gain is a single seed and needs two more before it is written as a finding. The
+frozen-reader student moves the same way but only by noise-band amounts (RD 0.52 vs 0.46, MMD
+8.8 / 7.8 / 13.2 vs 11.4 / 9.7 / 16.8, GS 0.415).
+
+On the edge family alone the stage would read as a null (both students at or below the base), and
+the generator's fit diagnostics (§3) show why the *edge* signal is absent: the predicted
+coordinates carry the region-level structure the attributes support (density, neighbourhood
+size), not the pair-level relation that separates a positive from a negative among neighbours.
+That region-level signal is exactly what the topology family rewards.
 
 ## 2. Tables
 
@@ -63,19 +95,20 @@ V_val-selected threshold.
 | ↳ `mean` | 0.7104 | 0.7371 | 0.278 | 0.308 | 0.629 | 0.667 | 0.265 | 0.402 | 0.424 | 13.3 / 11.6 / 18.4 | 0.413 | 0.884 |
 | ↳ `mean_relation` | 0.7184 | 0.7459 | 0.272 | 0.300 | 0.642 | 0.665 | 0.286 | 0.406 | 0.464 | 11.2 / 9.9 / 16.4 | 0.452 | 0.795 |
 
-**Test-set assertion.** The held-out test confirms the V_val reading: the students are
-ineffective. The frozen-reader student equals `prefix_base` on every edge metric (AUROC 0.721 vs
+**Test-set reading.** On the edge family the students are ineffective; on the topology family
+the full-reader student is the best deployable row to date (§1). The frozen-reader student equals `prefix_base` on every edge metric (AUROC 0.721 vs
 0.721, AUPRC +0.007 inside the noise band, accuracy / F1 / MCC marginally lower) and its topology
 row is within the band except MMD ratios that move by the same amount the `mean` row moves the
 other way. The full-reader student is *worse* than the comparator on every edge metric (AUROC
 −0.044, AUPRC −0.019, MCC 0.167 vs 0.279; non-self pairs 0.657 / 0.686). Its topology row (RD
-0.91, MMD 4.2 / 3.6 / 6.7, GS +0.021 at the band's edge) is a density-transfer effect of the
-retrained trunk's calibration, not transmitted structure: the same trunk on mean coordinates
-already sits at RD 0.52, the student's V_val GS is unchanged (0.387), its V_val-selected
-threshold (1.36) is half every other row's, and the movement is bought with the worst edge ranking
-in the table. Under the claim rules (both families together) neither student is a working model;
-the test protocol carries no bootstrap intervals, so this reads against the project's single-seed
-noise band (±0.01 GS, ±0.5 MMD ratio).
+0.91, MMD 4.2 / 3.6 / 6.7, GS +0.021 at the band's edge) is a density-transfer effect driven by the
+predicted coordinates (the same trunk on mean coordinates sits at RD 0.52; §1); the student's
+V_val GS is unchanged (0.387), its V_val-selected threshold (1.36) is half every other row's,
+and the movement comes with the worst edge ranking
+in the table. Read under the claim rules (both families together): a topology-preserving
+student with an edge-ranking cost, single seed; the test protocol carries no bootstrap intervals,
+so the noise band (±0.01 GS, ±0.5 MMD ratio) governs, and the MMD and RD movements of the full
+student are far outside it while its GS movement is not.
 
 ### 2.3 Per-epoch curves (validation; `metrics.jsonl`)
 
@@ -169,12 +202,15 @@ within 0.014 of the base; `gates_off` is the base exactly). GS does not move in 
 
 ## 5. Implications and next experiments
 
-- Stages III/IV as specified (unfreezing the interface, readout and upper encoder on the *same*
-  predicted coordinates) will not recover the Stage I gain: the bottleneck is upstream, in what
-  the two endpoints' attributes reveal about unseen nodes' structure, not in the reader's tolerance
-  of prediction error. The user's own caveat from the design note applies: once the parameters are
-  fixed the composite is a function of `(x_u, x_v)` that a direct student can represent, and here
-  it represents exactly the base.
+- Replicate the topology result first: `coord_gen_full` with seeds 1 and 2 (about 3.5 h each on a
+  4-GPU container). If RD ≈ 0.9 and MMD ratios ≈ 4 / 4 / 7 hold, the Stage II student is the
+  project's topology row and Stage III/IV can be aimed at recovering the edge cost (unfreeze the
+  readout and upper encoder under task BCE while keeping the prompt path); if they do not, the
+  epoch-6 selection was a favourable draw of a noisy curve.
+- The *edge* signal is absent because the predicted coordinates carry region-level, not
+  pair-level, structure (§3); Stages III/IV on the same predictions will not recover the Stage I
+  edge gain. The pair-level part needs richer generator inputs or a generator that does not
+  memorise training nodes.
 - Cheapest decisive test of the memorisation reading (CPU/one GPU, hours): cache the frozen
   encoder's pooled states for every node, fit the same heads under a **node-held-out** split of
   the training nodes, and report R² on the held-out training nodes next to V_val. If held-out

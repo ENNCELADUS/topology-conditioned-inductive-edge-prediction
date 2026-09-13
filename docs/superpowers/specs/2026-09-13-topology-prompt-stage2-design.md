@@ -143,14 +143,13 @@ control that would attribute the gain between the representation and the prefix.
 
 ## 8. Result (2026-09-13)
 
-Both lanes land on `prefix_base` (val_cls AUPRC 0.806 / 0.812 vs 0.814; GS 0.387 / 0.400 vs 0.401)
-against reader ceilings of 0.961 / 0.940. Outcome 3 of §6 with a sharper diagnosis: the generator
-fits the training universe's structure (train R² 0.3–0.5; degree, triangles, Jaccard, common
-neighbours 0.5–0.67) but not held-out nodes (V_val relation R² ≤ 0.2, endpoint R² < 0, validation
-coordinate loss rising from epoch 2–3) — a head on frozen node states seen thousands of times
-memorises node structure rather than learning an attribute → structure map. The task BCE only
-repairs the retrained trunk back to base in the full lane and does nothing in the frozen lane; the
-logit KD never approaches the teacher. Stages III/IV on these predictions would not recover the
-Stage I gain; the next step is the node-held-out generator fit and richer generator inputs
-(`docs/results/topo_prompt_stage2.md` §5).
-
+Topology first: `coord_gen_full` is the best topology-preserving deployable row to date on the
+held-out test (RD 0.91, geometric RD 0.86, MMD 4.2 / 3.6 / 6.7 at GS 0.430; previous deployable
+best RD 0.65, MMD 8.1 / 6.7 / 11.9; the oracle 0.71, 7.0 / 6.4 / 11.5), attributable to the predicted
+coordinates (`mean` → RD 0.52, 8.9 / 7.9 / 12.9; `gates_off` → 0.57, 7.4 / 6.6 / 10.9). Single seed;
+V_val ratios vary by a factor of two across epochs. On the edge family both students sit at
+`prefix_base` (val_cls AUPRC 0.806 / 0.812 vs 0.814) and the full student pays on test (AUROC
+0.677 vs 0.721): the generator fits region-level structure (train R² 0.3–0.5 for degree,
+triangles, Jaccard, common neighbours) but not the pair-level relation on held-out nodes (V_val
+relation R² ≤ 0.2). Next: replicate with seeds 1–2, then aim Stage III/IV at the edge cost.
+Full account: `docs/results/topo_prompt_stage2.md`.

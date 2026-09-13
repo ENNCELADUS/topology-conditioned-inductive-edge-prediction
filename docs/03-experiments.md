@@ -84,9 +84,11 @@ prediction, so the model is a function of `(x_u,x_v)` alone and is scored formal
 without any truth graph. It is read against `prefix_base` and against its own
 reader on true coordinates (the ceiling); its `metrics.jsonl` also reports the
 per-field R² of the predicted coordinates on V_val. Result (2026-09-13,
-`docs/results/topo_prompt_stage2.md`): both lanes land on `prefix_base`; the
-generator fits training-universe structure but not held-out nodes, so the
-predicted coordinates carry nothing the trunk lacked.
+`docs/results/topo_prompt_stage2.md`): on the edge family both students sit at
+`prefix_base`; on the topology family `coord_gen_full` is the best deployable
+row to date (test RD 0.91, MMD 4.2 / 3.6 / 6.7 at GS 0.430, single seed), the
+gain attributable to the predicted coordinates through the `mean` and
+`gates_off` interventions, at an edge-ranking cost (AUROC 0.677).
 
 ## 2. Selection and evaluation
 
@@ -169,6 +171,8 @@ Only completed tests of validation-selected checkpoints receive numbers.
 | + Structural-stream BCE (`struct_bce`) | Additional subgraph BCE, no topology terms | — | — | — | — | — | — | — |
 | + GRAND (`struct_grand`) | Subgraph BCE, soft GS and RD losses | 0.7140 | 0.7392 | 0.4312 | 0.6210 | 8.063 | 6.740 | 11.872 |
 | + NEW (`struct_new`) | Subgraph BCE, neighbor rank, degree and motif losses | 0.7013 | 0.7324 | 0.4258 | 0.6540 | 8.348 | 6.846 | 12.021 |
+| + Topology prompt, Stage II (`coord_gen_full`, seed 0) | Predicted structural coordinates through the frozen Stage I reader | 0.6771 | 0.7251 | 0.4304 | 0.9068 | 4.216 | 3.601 | 6.723 |
+| + Topology prompt, Stage II (`coord_gen_frozen`, seed 0) | Same, frozen-prefix_base reader | 0.7206 | 0.7505 | 0.4151 | 0.5158 | 8.842 | 7.797 | 13.204 |
 
 Each arm uses its V_val-selected checkpoint, not the best held-out score. The completed
 KD grids select Logit weight 100, Rep weight 0.01 and Gram weight 100; Rank selects
@@ -219,6 +223,8 @@ the structural content are in `docs/results/topo_prompt_stage1.md`.
 | + Gram | 0.6228 | 0.6843 | 0.2667 | 0.1537 | 0.2429 | 0.5260 | 0.6447 |
 | + NEW | 0.6159 | 0.6695 | 0.2450 | 0.3168 | 0.3293 | 0.6211 | 0.4913 |
 | PMA1 oracle | 0.8762 | 0.8794 | 0.7534 | 0.0993 | 0.1130 | 0.6670 | 0.4451 |
+| + Topology prompt, Stage II (`coord_gen_full`) | 0.5752 | 0.6522 | 0.1670 | 0.2019 | 0.2733 | 0.8636 | 0.2643 |
+| + Topology prompt, Stage II (`coord_gen_frozen`) | 0.6318 | 0.6738 | 0.2734 | 0.2782 | 0.3054 | 0.5020 | 0.6893 |
 | Topology prompt, Stage I (ceiling) | 0.7909 | 0.7414 | 0.6299 | 0.0774 | 0.1151 | 0.3000 | 1.2042 |
 | Topology prompt, Stage I frozen trunk (ceiling) | 0.7688 | 0.7273 | 0.5642 | 0.1732 | 0.1994 | 0.3670 | 1.0025 |
 
