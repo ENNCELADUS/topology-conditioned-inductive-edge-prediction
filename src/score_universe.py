@@ -1306,6 +1306,13 @@ def _build_official_ppi(model_config: dict[str, object]) -> nn.Module:
     return build_official_ppi(model_config)
 
 
+def _build_l3ppi(model_config: dict[str, object]) -> nn.Module:
+    """Reconstruct the endpoint-only L3-PPI scorer from embedded configuration."""
+    from src.baselines.l3ppi import build_l3ppi
+
+    return build_l3ppi(model_config)
+
+
 MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1": _build_v3_1,
     "v3_1_prefix": _build_v3_1_prefix,
@@ -1314,6 +1321,7 @@ MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "egostitch_e2e": _build_egostitch_e2e,
     "cazi_mbn": _build_cazi_mbn,
     "official_ppi": _build_official_ppi,
+    "l3ppi": _build_l3ppi,
 }
 
 
@@ -3798,6 +3806,22 @@ def _run_score(args: argparse.Namespace) -> None:
             batch_pairs=args.batch_pairs,
             f0_cache=args.f0_cache,
         )
+    elif model_family == "l3ppi":
+        from src.baselines.l3ppi import L3PPI
+        from src.baselines.l3ppi_features import score_pairs as score_l3ppi_pairs
+
+        if args.pack_dir is None:
+            raise ValueError("l3ppi scoring requires --pack-dir")
+        assert isinstance(model, L3PPI)
+        logits = score_l3ppi_pairs(
+            model, args.pack_dir, list(row_pairs), device, batch_size=args.batch_pairs
+        )
+        meta_extra["score_precision"] = {
+            "encode_autocast": "off",
+            "pair_autocast": "off",
+            "pair_compute_dtype": "float32",
+            "logit_storage_dtype": "float32",
+        }
     elif model_family == "official_ppi":
         from src.baselines.official_ppi import OfficialPPI, PairFeatures, score_pairs
 

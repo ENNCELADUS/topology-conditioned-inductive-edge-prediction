@@ -561,6 +561,26 @@ fragmentation observed in rank trial 011, preserving its training configuration.
 
 ## Official PPI classifiers
 
+### L3-PPI paper reproduction
+
+L3-PPI has no vendored author model. The independent `src.train_l3ppi` worker
+implements surrogate pretraining, prompt-only convergence, then joint gate/prompt
+training on a frozen B0 encoder. [Method, assumptions and budget](../docs/results/l3ppi.md).
+
+```bash
+OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 .venv/bin/python -m src.experiments.l3ppi_study \
+  --config configs/split_seed42/l3ppi.yaml --output-dir outputs/l3ppi_seed0
+```
+
+The study invokes `hpc/run.sh train <generated-config> --worker-module src.train_l3ppi
+--stage surrogate|trial --skip-test`, then `hpc/run.sh test` for one V_val-selected
+winner. All visible GPUs share a global batch of 64. `--resume` restores an
+interrupted study and epoch-boundary worker states; `--prepare-only` only writes
+configs. Source B0 weights are reused, not retrained. A worker's `complete.json`
+means publication; study `status=tested` additionally requires the winner test report.
+
+### TUnA and PPITrans
+
 TUnA and PPITrans use vendored author model code under `src/baselines/vendor/`.
 These are feature-controlled adaptations: both read the existing 1536-dimensional
 frozen token pack (up to 1024 tokens), not newly generated ESM-2/ProtT5 embeddings.

@@ -1,0 +1,62 @@
+# Paper-based L3-PPI reproduction; existing B0 is the only baseline.
+model:
+  family: l3ppi
+  config:
+    backbone_config:
+      input_dim: 1536
+      d_model: 512
+      encoder_layers: 3
+      cross_attn_layers: 3
+      n_heads: 8
+      mlp_head:
+        hidden_dims:
+        - 512
+        - 256
+        - 128
+        dropout: 0.2
+        activation: gelu
+        norm: layernorm
+        spectral_norm: false
+      regularization:
+        dropout: 0.1
+        token_dropout: 0.1
+        cross_attention_dropout: 0.1
+        stochastic_depth: 0.1
+      rich_pooling:
+        components:
+        - mean
+        - attn
+        - max
+        - gated
+      pair_readout:
+        mode: pair_context_gated
+        order_aggregation: abba_max
+        spectral_norm: false
+      mixing:
+        mode: none
+      label_smoothing: 0.0
+      positive_weight: 5.0
+    k: 16
+    surrogate_hidden: 64
+    gate_hidden: 128
+    layers: 2
+    dropout: 0.1
+    max_length: 1024
+backbone_checkpoint: outputs/split_seed42_geometric_20260910/b0_v31/best.pt
+surrogate_checkpoint: outputs/l3ppi/surrogate/best.pt
+feature_cache: outputs/l3ppi/endpoint_features.pt
+data_root: data
+pack_dir: outputs/feature_packs/b0_v31_bf16
+output_dir: outputs/l3ppi/trial_k16_lr0p001
+seed: 0
+batch_size: 64
+encode_batch_size: 8
+optim:
+  lr: 0.001
+  surrogate_lr: 0.001
+  surrogate_epochs: 100
+  prompt_epochs: 100
+  joint_epochs: 25
+  patience: 10
+gamma: 3
+path_weight: 0.3

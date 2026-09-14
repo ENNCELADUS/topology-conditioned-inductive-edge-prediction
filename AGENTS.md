@@ -66,6 +66,11 @@ selected method. Every piece of writing must explain how its context helps decid
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.
+- L3-PPI reproduction (`model.family: l3ppi`): frozen published B0 encoder, real training-only
+  L3-union surrogate pretraining, then global virtual prompts and per-path gates. Independent
+  three-stage worker `src.train_l3ppi`; six-trial driver `src.experiments.l3ppi_study`.
+  Compare with the existing B0, never a newly trained MLP; details and declared paper
+  ambiguities are in `docs/results/l3ppi.md`. Inference remains endpoint-only.
 
 ## Execution and experiment boundaries
 

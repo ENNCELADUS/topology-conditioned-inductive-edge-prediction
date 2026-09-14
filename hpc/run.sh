@@ -39,6 +39,9 @@ through after the config path. The external CAZI-MBN reproduction is not an E2
 packed-feature worker; select its isolated runner with `--worker-module
 src.train_cazi_mbn`, which this branch runs to completion and then chains the
 same held-out test protocol against the checkpoint it publishes.
+L3-PPI uses `--worker-module src.train_l3ppi [--stage surrogate|trial]
+[--resume] [--skip-test]`. Surrogate pretraining never runs held-out testing;
+trial training chains the common test protocol unless --skip-test is supplied.
 
 The score command is a thin passthrough to `python -m src.score_fanout`, which
 auto-detects GPU count, pins --device cuda --amp bf16, launches one contiguous
@@ -134,6 +137,51 @@ case "${COMMAND}" in
     CONFIG_PATH="$1"
     shift
     [[ -f "${CONFIG_PATH}" ]] || fail "config not found: ${CONFIG_PATH}"
+    L3_WORKER=false
+    PREVIOUS_ARG=
+    for TRAIN_ARG in "$@"; do
+      if [[ "${PREVIOUS_ARG}" == --worker-module && "${TRAIN_ARG}" == src.train_l3ppi ]]; then
+        L3_WORKER=true
+      fi
+      PREVIOUS_ARG="${TRAIN_ARG}"
+    done
+    if [[ "${L3_WORKER}" == true ]]; then
+      L3_STAGE=trial
+      L3_SKIP_TEST=false
+      L3_ARGS=("${CONFIG_PATH}")
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --worker-module)
+            [[ $# -ge 2 && "$2" == src.train_l3ppi ]] || fail "invalid L3-PPI worker"
+            shift 2
+            ;;
+          --skip-test) L3_SKIP_TEST=true; shift ;;
+          --resume) L3_ARGS+=(--resume); shift ;;
+          --stage)
+            [[ $# -ge 2 ]] || fail "--stage requires surrogate or trial"
+            [[ "$2" == surrogate || "$2" == trial ]] || fail "invalid L3-PPI stage: $2"
+            L3_STAGE="$2"
+            shift 2
+            ;;
+          *) fail "unsupported L3-PPI training argument: $1" ;;
+        esac
+      done
+      "${PYTHON_BIN}" -m torch.distributed.run --standalone --nproc_per_node="${GPU_COUNT}" \
+        -m src.train_l3ppi "${L3_ARGS[@]}" --stage "${L3_STAGE}"
+      if [[ "${L3_STAGE}" == surrogate || "${L3_SKIP_TEST}" == true ]]; then
+        exit 0
+      fi
+      read -r L3_OUTPUT L3_PACK L3_SEED L3_DATA < <("${PYTHON_BIN}" -c '
+import sys, yaml
+with open(sys.argv[1]) as handle:
+    cfg = yaml.safe_load(handle)
+print(cfg["output_dir"], cfg["pack_dir"], cfg["seed"], cfg["data_root"])
+' "${CONFIG_PATH}")
+      exec "${PYTHON_BIN}" -m src.eval.test_protocol \
+        --checkpoint "${L3_OUTPUT}/best.pt" --output-dir "${L3_OUTPUT}" \
+        --pack-dir "${L3_PACK}" --data-root "${L3_DATA}" --strategy breadth_first \
+        --arm l3ppi --seed "${L3_SEED}"
+    fi
     if [[ $# -eq 2 && "$1" == "--worker-module" && "$2" == "src.train_official_ppi" ]]; then
       "${PYTHON_BIN}" -m torch.distributed.run --standalone --nproc_per_node="${GPU_COUNT}" \
         -m src.train_official_ppi "${CONFIG_PATH}"
