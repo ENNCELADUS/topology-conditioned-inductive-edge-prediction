@@ -17,6 +17,18 @@ rows, no truncation. The first surrogate epoch processed 221,142 pairs in 52.38 
 excluding allocator-reserved memory and CUDA runtime overhead. These describe this
 stage and sample only, not the cost of later K=64 trials or inference.
 
+Surrogate terminal verification: 11 epochs, convergence criterion met, selected
+epoch 11, published checkpoint retains the B0 epoch-8 source above. The study has
+advanced to `trial_000` (K=4, LR=1e-4); a verified snapshot reached prompt epoch 3
+with no failure artifacts. This does not establish completion of any trial.
+
+Report tooling is commit `aef53ec`, separately checked out at
+`/2023533015/l3ppi-report-20260914` so active training code stays fixed. A one-shot
+postprocessor (launch PID 62913) waits for this study's completion, then writes
+`outputs/l3ppi_seed0_20260914/report/`; its log is
+`outputs/logs/l3ppi_seed0_20260914_report.log`. The implemented model, data, lifecycle,
+DDP, reporting and shared scoring paths have 198 passing relevant tests in total.
+
 ## Question and comparator
 
 Does replacing the published B0 readout and MLP by the complete L3-PPI head improve
