@@ -106,3 +106,30 @@ Reproduce all figures and the full table:
 ```sh
 rtk proxy .venv/bin/python docs/results/topo_prompt_stage2_curves/plot.py
 ```
+
+## Paper figures (docs/03-experiments.md §5)
+
+- `stage2_full_curves.{png,svg,pdf}` (`plot_stage2_full.py`): the `coord_gen_full` lane only —
+  composite training loss, the three validation terms, and V_val AUPRC / GS / RD / MMD ratios
+  against `prefix_base`'s selected checkpoint. Same logged values as the audit figures above.
+- `generator_generalization.{png,svg,pdf}` (`plot_generalization.py`): the published
+  `coord_gen_full` generator's own predictions of all 34 structural coordinates against the true
+  values on label-balanced samples (3,000 + 3,000 rows) of training, V_val and test rows, each
+  on its own true graph with the queried edge removed. Pearson ρ per statistic, predicted-vs-true
+  scatter on test rows, distance-class confusion. Data: `coord_gen_full/coord_fit_universes.json`
+  (field / per-coordinate / per-label R², Pearson ρ, distance accuracy and majority baseline) and
+  `coord_fit_universes.npz` (raw and standardised predictions and truths, labels, distance
+  classes, the reader's coordinate statistics). Produced on H20 by `coord_fit_universes.py`
+  (copy of `outputs/logs/coord_fit_universes.py`, loader `score_coord_gen_v1_diagnostic`,
+  checkpoint `4a743373f0b9e4d0`, 2026-09-14):
+
+  ```sh
+  CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=. \
+    .venv/bin/python outputs/logs/coord_fit_universes.py --run coord_gen_full --per-label 3000 \
+    --output outputs/split_seed42/coord_gen_full/coord_fit_universes.json
+  ```
+
+  Training-row and V_val field R² reproduce the §2.4 probe and the logged epoch-6 diagnostics
+  (endpoint 0.27 / −0.30, relation 0.27 / 0.04, context 0.47 / 0.06); test rows give
+  −1.52 / −0.01 / −1.56 with moderate Pearson ρ, i.e. a level and spread shift rather than a
+  loss of ranking.

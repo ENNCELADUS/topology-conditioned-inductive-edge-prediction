@@ -1,0 +1,1447 @@
+{
+  "content_metadata": {
+    "checkpoint_id": "614003b9ba3a8d53",
+    "created_utc": "2026-09-14T04:57:27.666622+00:00",
+    "heldout": false,
+    "model_family": "v3_1",
+    "num_rows": 641011,
+    "pairs_source": "file:outputs/analysis/endpoint_content_20260914/score_pairs.tsv",
+    "prefix_intervention": "none",
+    "prefix_intervention_seed": 0,
+    "score_precision": {
+      "encode_autocast": "bf16",
+      "logit_storage_dtype": "float32",
+      "pair_autocast": "bf16"
+    },
+    "score_profile": {
+      "measurement": "max_concurrent_shard_compute_wall_seconds",
+      "rows": 641011,
+      "unique_nodes": 8070,
+      "wall_seconds": 196.6829036269337
+    },
+    "strategy": "breadth_first",
+    "topo_gen_control": null,
+    "torch_version": "2.10.0+cu128"
+  },
+  "fits": {
+    "main_fit": {
+      "content": {
+        "iterations": [
+          8
+        ],
+        "coefficient": [
+          [
+            2.962742499511717
+          ]
+        ],
+        "intercept": [
+          -2.404470026552289
+        ]
+      },
+      "content_degree": {
+        "iterations": [
+          9
+        ],
+        "coefficient": [
+          [
+            2.9516570309396153,
+            0.036187414331354924,
+            -0.0032642599639592985
+          ]
+        ],
+        "intercept": [
+          -2.3966339727209145
+        ]
+      },
+      "content_degree_triangles": {
+        "iterations": [
+          15
+        ],
+        "coefficient": [
+          [
+            2.9119279827100777,
+            -0.2042994411703201,
+            0.2322314247126192,
+            0.3858440544977123,
+            -0.35112101084615005
+          ]
+        ],
+        "intercept": [
+          -2.3923181215178806
+        ]
+      },
+      "content_degree_neighbor": {
+        "iterations": [
+          12
+        ],
+        "coefficient": [
+          [
+            2.9348108082773483,
+            -0.1328676863841994,
+            0.019899397134302006,
+            0.25519529446387434,
+            -0.09388427438219636
+          ]
+        ],
+        "intercept": [
+          -2.4161297893931586
+        ]
+      },
+      "content_degree_both": {
+        "iterations": [
+          15
+        ],
+        "coefficient": [
+          [
+            2.892992360277787,
+            -0.4429160500748865,
+            0.24273760391974197,
+            0.4345959699920165,
+            -0.3566271935982692,
+            0.2977317325597415,
+            -0.08434899089547702
+          ]
+        ],
+        "intercept": [
+          -2.4071186179677633
+        ]
+      },
+      "content_degree_both_roles": {
+        "iterations": [
+          34
+        ],
+        "coefficient": [
+          [
+            2.8897919974474346,
+            -1.0670936236340742,
+            -0.4826310772002433,
+            0.44785692434324353,
+            -0.15618713777830073,
+            0.1299563745622109,
+            -0.4472853272258493,
+            0.14100929260262754,
+            2.633880988196742,
+            -0.5895997692980832,
+            -0.7984201645278295
+          ]
+        ],
+        "intercept": [
+          -2.425657227797003
+        ]
+      },
+      "context_only": {
+        "iterations": [
+          61
+        ],
+        "coefficient": [
+          [
+            -1.04825820781349,
+            0.8094282773511683,
+            2.0516093302239105,
+            -0.7491713138022265,
+            0.8496794912623162,
+            -1.3871322250322313,
+            -2.633909591190652,
+            3.078868102159524,
+            -0.9598851169616419,
+            0.5406959119080321
+          ]
+        ],
+        "intercept": [
+          -0.8869335698124167
+        ]
+      }
+    },
+    "h1101_fit": {
+      "content": {
+        "iterations": [
+          8
+        ],
+        "coefficient": [
+          [
+            2.9568856438482
+          ]
+        ],
+        "intercept": [
+          -2.4822738190790163
+        ]
+      },
+      "content_degree": {
+        "iterations": [
+          8
+        ],
+        "coefficient": [
+          [
+            2.94573565943735,
+            0.029560313897069316,
+            0.003884921722538282
+          ]
+        ],
+        "intercept": [
+          -2.47206135516117
+        ]
+      },
+      "content_degree_triangles": {
+        "iterations": [
+          15
+        ],
+        "coefficient": [
+          [
+            2.9100718471641125,
+            -0.21392638165451064,
+            0.20766828357043363,
+            0.39454562874578913,
+            -0.32146925624899797
+          ]
+        ],
+        "intercept": [
+          -2.4673295794957273
+        ]
+      },
+      "content_degree_neighbor": {
+        "iterations": [
+          12
+        ],
+        "coefficient": [
+          [
+            2.929991241443741,
+            -0.15859135262616722,
+            0.025279561002688404,
+            0.27319809474325896,
+            -0.09252192480999703
+          ]
+        ],
+        "intercept": [
+          -2.4942331779850195
+        ]
+      },
+      "content_degree_both": {
+        "iterations": [
+          13
+        ],
+        "coefficient": [
+          [
+            2.8874936718600646,
+            -0.49416207207197527,
+            0.22468342009147246,
+            0.45734195139221195,
+            -0.33084449317407133,
+            0.3352389082078475,
+            -0.09731336250333089
+          ]
+        ],
+        "intercept": [
+          -2.4821352778768566
+        ]
+      },
+      "content_degree_both_roles": {
+        "iterations": [
+          40
+        ],
+        "coefficient": [
+          [
+            2.890236553942235,
+            -1.0516024566482784,
+            -0.4502959818066378,
+            0.4466816324558382,
+            -0.14511993406926915,
+            0.16275003356377865,
+            -0.44565788062881073,
+            0.037126119695677466,
+            2.53961643788372,
+            -0.6797320195656607,
+            -0.5814689415066362
+          ]
+        ],
+        "intercept": [
+          -2.4987650356582094
+        ]
+      },
+      "context_only": {
+        "iterations": [
+          66
+        ],
+        "coefficient": [
+          [
+            -1.0158273167232696,
+            0.8652526875212181,
+            1.960617218683566,
+            -0.8362087885006385,
+            0.9322474758046503,
+            -1.278452469836163,
+            -2.3415009737025616,
+            2.7487397090270074,
+            -0.9292939262538193,
+            0.45126822924724574
+          ]
+        ],
+        "intercept": [
+          -0.9044514602375949
+        ]
+      }
+    },
+    "h1102_fit": {
+      "content": {
+        "iterations": [
+          8
+        ],
+        "coefficient": [
+          [
+            2.947175096081165
+          ]
+        ],
+        "intercept": [
+          -2.4737453442335147
+        ]
+      },
+      "content_degree": {
+        "iterations": [
+          8
+        ],
+        "coefficient": [
+          [
+            2.9341281891918367,
+            0.030270648569286393,
+            0.008167853758063559
+          ]
+        ],
+        "intercept": [
+          -2.4619106818301826
+        ]
+      },
+      "content_degree_triangles": {
+        "iterations": [
+          15
+        ],
+        "coefficient": [
+          [
+            2.89628019772603,
+            -0.250889833338494,
+            0.22239999014921366,
+            0.4467966917388601,
+            -0.3422374232344229
+          ]
+        ],
+        "intercept": [
+          -2.4570837291631404
+        ]
+      },
+      "content_degree_neighbor": {
+        "iterations": [
+          12
+        ],
+        "coefficient": [
+          [
+            2.9215487803336284,
+            -0.13887673910599344,
+            0.023904396559616917,
+            0.2408879477209851,
+            -0.0754086380197164
+          ]
+        ],
+        "intercept": [
+          -2.4789772643037757
+        ]
+      },
+      "content_degree_both": {
+        "iterations": [
+          15
+        ],
+        "coefficient": [
+          [
+            2.8772844447506367,
+            -0.4939205011369095,
+            0.2324542669328077,
+            0.4831610101722866,
+            -0.34450389999432446,
+            0.2991444309238303,
+            -0.07548322755142213
+          ]
+        ],
+        "intercept": [
+          -2.4662351792333714
+        ]
+      },
+      "content_degree_both_roles": {
+        "iterations": [
+          38
+        ],
+        "coefficient": [
+          [
+            2.876706691807685,
+            -0.9771468419598417,
+            -0.375741292683113,
+            0.4614650253611265,
+            -0.2082153968892539,
+            0.14993486203142728,
+            -0.3558667875749786,
+            0.3047007520707272,
+            2.2233713300217937,
+            -0.7170844528690641,
+            -0.6353039649119135
+          ]
+        ],
+        "intercept": [
+          -2.480696009534606
+        ]
+      },
+      "context_only": {
+        "iterations": [
+          70
+        ],
+        "coefficient": [
+          [
+            -1.0210210574430392,
+            0.924660189625167,
+            2.0993921693007085,
+            -0.7652657583169684,
+            0.9030845703310872,
+            -1.2530990293679445,
+            -2.5779945249633944,
+            2.698671780595561,
+            -1.2223534198237973,
+            0.8030668140080874
+          ]
+        ],
+        "intercept": [
+          -0.90543250547766
+        ]
+      }
+    },
+    "h1103_fit": {
+      "content": {
+        "iterations": [
+          8
+        ],
+        "coefficient": [
+          [
+            2.929676053672168
+          ]
+        ],
+        "intercept": [
+          -2.4611338028707337
+        ]
+      },
+      "content_degree": {
+        "iterations": [
+          9
+        ],
+        "coefficient": [
+          [
+            2.917048593323049,
+            0.06961478091425796,
+            -0.05486542279273425
+          ]
+        ],
+        "intercept": [
+          -2.460167018170244
+        ]
+      },
+      "content_degree_triangles": {
+        "iterations": [
+          15
+        ],
+        "coefficient": [
+          [
+            2.8792664644327983,
+            -0.14788385492928408,
+            0.14799421334936438,
+            0.3624921024768925,
+            -0.3143000283676189
+          ]
+        ],
+        "intercept": [
+          -2.4547302521092753
+        ]
+      },
+      "content_degree_neighbor": {
+        "iterations": [
+          12
+        ],
+        "coefficient": [
+          [
+            2.9051703396273485,
+            -0.11236904326224276,
+            -0.08515670654357561,
+            0.2529250234367703,
+            -0.011860671901232505
+          ]
+        ],
+        "intercept": [
+          -2.471621810692082
+        ]
+      },
+      "content_degree_both": {
+        "iterations": [
+          14
+        ],
+        "coefficient": [
+          [
+            2.864644581043225,
+            -0.4050153524283675,
+            0.1289871559642624,
+            0.40887770502763776,
+            -0.33762437959760433,
+            0.303669108775735,
+            -0.010438810825806872
+          ]
+        ],
+        "intercept": [
+          -2.464799913183352
+        ]
+      },
+      "content_degree_both_roles": {
+        "iterations": [
+          38
+        ],
+        "coefficient": [
+          [
+            2.8722100397542416,
+            -0.9118427254038637,
+            -0.5362894659265521,
+            0.3672852070241183,
+            -0.14434062582557003,
+            0.13325985277843957,
+            -0.3787318454714305,
+            -0.19461646513265202,
+            2.4959939638058084,
+            -0.6352592998261463,
+            -0.3585875940522097
+          ]
+        ],
+        "intercept": [
+          -2.482622010742556
+        ]
+      },
+      "context_only": {
+        "iterations": [
+          51
+        ],
+        "coefficient": [
+          [
+            -0.9033490101906781,
+            0.9186249039665582,
+            1.4709196379490792,
+            -1.3826971665711973,
+            0.944479065530957,
+            -1.2998322647164902,
+            -1.386512243914831,
+            2.4777215571648217,
+            0.210293517010602,
+            -0.6080374137962511
+          ]
+        ],
+        "intercept": [
+          -0.9038788869150178
+        ]
+      }
+    }
+  },
+  "evaluations": {
+    "main_eval": {
+      "metrics": {
+        "raw_content": {
+          "balanced_bce": 1.1885551192765988,
+          "auroc": 0.7675484601178253,
+          "auprc": 0.45281280720909134
+        },
+        "content": {
+          "balanced_bce": 0.9330990862508519,
+          "auroc": 0.7675484601178253,
+          "auprc": 0.45281280720909134
+        },
+        "content_degree": {
+          "balanced_bce": 0.9279166332809454,
+          "auroc": 0.7688929723478835,
+          "auprc": 0.45487395282371595
+        },
+        "content_degree_triangles": {
+          "balanced_bce": 0.9002715683437759,
+          "auroc": 0.7816288868679822,
+          "auprc": 0.46616936367267303
+        },
+        "content_degree_neighbor": {
+          "balanced_bce": 0.919841944611559,
+          "auroc": 0.7637542478300894,
+          "auprc": 0.45109588852644483
+        },
+        "content_degree_both": {
+          "balanced_bce": 0.8897586504652293,
+          "auroc": 0.7759794518978205,
+          "auprc": 0.4629768876215087
+        },
+        "content_degree_both_roles": {
+          "balanced_bce": 0.9049764696413631,
+          "auroc": 0.7770498764325484,
+          "auprc": 0.46114062689912566
+        },
+        "context_only": {
+          "balanced_bce": 0.6131753129537435,
+          "auroc": 0.7448088420755767,
+          "auprc": 0.3048818760341853
+        }
+      },
+      "contrasts": {
+        "content": {
+          "target": "content",
+          "reference": "raw_content",
+          "balanced_bce_gain": 0.25545603302574693,
+          "auroc_gain": 0.0,
+          "auprc_gain": 0.0,
+          "node_interval": [
+            0.22752704950547745,
+            0.28293873721528023
+          ],
+          "community_interval": [
+            0.21296804718771917,
+            0.3055987056185763
+          ]
+        },
+        "content_degree": {
+          "target": "content_degree",
+          "reference": "content",
+          "balanced_bce_gain": 0.0051824529699064925,
+          "auroc_gain": 0.0013445122300581591,
+          "auprc_gain": 0.0020611456146246154,
+          "node_interval": [
+            0.004067130110658435,
+            0.0063699227766575856
+          ],
+          "community_interval": [
+            0.0027599603131866486,
+            0.007241675308182922
+          ]
+        },
+        "content_degree_triangles": {
+          "target": "content_degree_triangles",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.02764506493716956,
+          "auroc_gain": 0.012735914520098701,
+          "auprc_gain": 0.011295410848957077,
+          "node_interval": [
+            0.021995900486499038,
+            0.033300746455034204
+          ],
+          "community_interval": [
+            0.01940642085013243,
+            0.036806699297947956
+          ]
+        },
+        "content_degree_neighbor": {
+          "target": "content_degree_neighbor",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.008074688669386432,
+          "auroc_gain": -0.005138724517794069,
+          "auprc_gain": -0.003778064297271122,
+          "node_interval": [
+            0.0058323456295622245,
+            0.010476562413045018
+          ],
+          "community_interval": [
+            0.005469691068277181,
+            0.01017928408776483
+          ]
+        },
+        "content_degree_both": {
+          "target": "content_degree_both",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.03815798281571614,
+          "auroc_gain": 0.007086479549937019,
+          "auprc_gain": 0.008102934797792727,
+          "node_interval": [
+            0.03254767283940494,
+            0.04449261295100403
+          ],
+          "community_interval": [
+            0.028626788767691255,
+            0.04818568093042541
+          ]
+        },
+        "content_degree_both_roles": {
+          "target": "content_degree_both_roles",
+          "reference": "content_degree_both",
+          "balanced_bce_gain": -0.015217819176133851,
+          "auroc_gain": 0.0010704245347279429,
+          "auprc_gain": -0.0018362607223830207,
+          "node_interval": [
+            -0.02189683578505925,
+            -0.009778029178846395
+          ],
+          "community_interval": [
+            -0.02881009612366094,
+            -0.006307286924128168
+          ]
+        },
+        "context_only": {
+          "target": "context_only",
+          "reference": "content",
+          "balanced_bce_gain": 0.3199237732971084,
+          "auroc_gain": -0.022739618042248555,
+          "auprc_gain": -0.14793093117490602,
+          "node_interval": [
+            0.24505357202989544,
+            0.3934126494816939
+          ],
+          "community_interval": [
+            0.20687808892830148,
+            0.46800486167032507
+          ]
+        },
+        "both_vs_content": {
+          "target": "content_degree_both",
+          "reference": "content",
+          "balanced_bce_gain": 0.04334043578562263,
+          "auroc_gain": 0.008430991779995178,
+          "auprc_gain": 0.010164080412417342,
+          "node_interval": [
+            0.036994427513052666,
+            0.05060559865531081
+          ],
+          "community_interval": [
+            0.031855728259448664,
+            0.054870746125330834
+          ]
+        },
+        "roles_vs_content": {
+          "target": "content_degree_both_roles",
+          "reference": "content",
+          "balanced_bce_gain": 0.028122616609488782,
+          "auroc_gain": 0.009501416314723121,
+          "auprc_gain": 0.008327819690034322,
+          "node_interval": [
+            0.021660037050789192,
+            0.03556996673405837
+          ],
+          "community_interval": [
+            0.016650359583956213,
+            0.03948121013694162
+          ]
+        }
+      }
+    },
+    "official_eval": {
+      "metrics": {
+        "raw_content": {
+          "balanced_bce": 1.2172720778179562,
+          "auroc": 0.7641192421774083,
+          "auprc": 0.7480487724270374
+        },
+        "content": {
+          "balanced_bce": 0.9600079753462378,
+          "auroc": 0.7641192421774083,
+          "auprc": 0.7480487724270374
+        },
+        "content_degree": {
+          "balanced_bce": 0.9554751912390597,
+          "auroc": 0.7640650009875953,
+          "auprc": 0.7486618660285915
+        },
+        "content_degree_triangles": {
+          "balanced_bce": 0.9304617435384269,
+          "auroc": 0.771526166940146,
+          "auprc": 0.7539066457469341
+        },
+        "content_degree_neighbor": {
+          "balanced_bce": 0.9455663088958147,
+          "auroc": 0.7635406230920889,
+          "auprc": 0.7489477147544341
+        },
+        "content_degree_both": {
+          "balanced_bce": 0.9177424759713008,
+          "auroc": 0.7715652969480463,
+          "auprc": 0.7548756106180143
+        },
+        "content_degree_both_roles": {
+          "balanced_bce": 0.9324342112037578,
+          "auroc": 0.772749934077469,
+          "auprc": 0.7548016424524184
+        },
+        "context_only": {
+          "balanced_bce": 0.6941434896065923,
+          "auroc": 0.6617335285432928,
+          "auprc": 0.5877413814052264
+        }
+      },
+      "contrasts": {
+        "content": {
+          "target": "content",
+          "reference": "raw_content",
+          "balanced_bce_gain": 0.2572641024717184,
+          "auroc_gain": 0.0,
+          "auprc_gain": 0.0,
+          "node_interval": [
+            0.2298586710841491,
+            0.2842662760284534
+          ],
+          "community_interval": [
+            0.21525569949189627,
+            0.30647521223445084
+          ]
+        },
+        "content_degree": {
+          "target": "content_degree",
+          "reference": "content",
+          "balanced_bce_gain": 0.004532784107178167,
+          "auroc_gain": -5.424118981300907e-05,
+          "auprc_gain": 0.0006130936015541488,
+          "node_interval": [
+            0.0033495168051237436,
+            0.005758161941747035
+          ],
+          "community_interval": [
+            0.002024442240249078,
+            0.006754659351377647
+          ]
+        },
+        "content_degree_triangles": {
+          "target": "content_degree_triangles",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.02501344770063274,
+          "auroc_gain": 0.007461165952550641,
+          "auprc_gain": 0.005244779718342585,
+          "node_interval": [
+            0.01955213949469492,
+            0.0310639627815878
+          ],
+          "community_interval": [
+            0.01561738235104065,
+            0.03470581314272101
+          ]
+        },
+        "content_degree_neighbor": {
+          "target": "content_degree_neighbor",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.00990888234324494,
+          "auroc_gain": -0.0005243778955064116,
+          "auprc_gain": 0.0002858487258425857,
+          "node_interval": [
+            0.007433654962007333,
+            0.012308715172680576
+          ],
+          "community_interval": [
+            0.008267465428868803,
+            0.01184464010429336
+          ]
+        },
+        "content_degree_both": {
+          "target": "content_degree_both",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.0377327152677589,
+          "auroc_gain": 0.007500295960450987,
+          "auprc_gain": 0.006213744589422809,
+          "node_interval": [
+            0.03218764799684878,
+            0.044335855124214923
+          ],
+          "community_interval": [
+            0.02696812246349887,
+            0.048463716984829534
+          ]
+        },
+        "content_degree_both_roles": {
+          "target": "content_degree_both_roles",
+          "reference": "content_degree_both",
+          "balanced_bce_gain": -0.014691735232457037,
+          "auroc_gain": 0.0011846371294226277,
+          "auprc_gain": -7.396816559590569e-05,
+          "node_interval": [
+            -0.021341057284753676,
+            -0.009135635287016004
+          ],
+          "community_interval": [
+            -0.02855438141870219,
+            -0.0054382890586212795
+          ]
+        },
+        "context_only": {
+          "target": "context_only",
+          "reference": "content",
+          "balanced_bce_gain": 0.2658644857396455,
+          "auroc_gain": -0.10238571363411553,
+          "auprc_gain": -0.16030739102181102,
+          "node_interval": [
+            0.1931427877583517,
+            0.33910821789759865
+          ],
+          "community_interval": [
+            0.15902598153812586,
+            0.4172845921346827
+          ]
+        },
+        "both_vs_content": {
+          "target": "content_degree_both",
+          "reference": "content",
+          "balanced_bce_gain": 0.042265499374937066,
+          "auroc_gain": 0.007446054770637978,
+          "auprc_gain": 0.006826838190976958,
+          "node_interval": [
+            0.035657218296124026,
+            0.04969174539100717
+          ],
+          "community_interval": [
+            0.02926928102539956,
+            0.05474257888716105
+          ]
+        },
+        "roles_vs_content": {
+          "target": "content_degree_both_roles",
+          "reference": "content",
+          "balanced_bce_gain": 0.02757376414248003,
+          "auroc_gain": 0.008630691900060605,
+          "auprc_gain": 0.0067528700253810525,
+          "node_interval": [
+            0.02119460045754819,
+            0.03518056461680315
+          ],
+          "community_interval": [
+            0.01587581449218714,
+            0.03936208355312195
+          ]
+        }
+      }
+    },
+    "h1101_eval": {
+      "metrics": {
+        "raw_content": {
+          "balanced_bce": 0.2154112089199146,
+          "auroc": 0.9756002484666306,
+          "auprc": 0.8531210916785108
+        },
+        "content": {
+          "balanced_bce": 0.19779610522106272,
+          "auroc": 0.9756002484666306,
+          "auprc": 0.8531210916785108
+        },
+        "content_degree": {
+          "balanced_bce": 0.19837243369492386,
+          "auroc": 0.9755408575399636,
+          "auprc": 0.8540107195558757
+        },
+        "content_degree_triangles": {
+          "balanced_bce": 0.1964961028293942,
+          "auroc": 0.9757821722525257,
+          "auprc": 0.8558563742456863
+        },
+        "content_degree_neighbor": {
+          "balanced_bce": 0.19984427919987402,
+          "auroc": 0.9753459719448099,
+          "auprc": 0.8552482604116647
+        },
+        "content_degree_both": {
+          "balanced_bce": 0.19769426129199702,
+          "auroc": 0.9755946219577882,
+          "auprc": 0.8577746316409969
+        },
+        "content_degree_both_roles": {
+          "balanced_bce": 0.19848217931806,
+          "auroc": 0.9746703324274792,
+          "auprc": 0.8510670193274914
+        },
+        "context_only": {
+          "balanced_bce": 0.6435308003588602,
+          "auroc": 0.7534006202663348,
+          "auprc": 0.3264891320657626
+        }
+      },
+      "contrasts": {
+        "content": {
+          "target": "content",
+          "reference": "raw_content",
+          "balanced_bce_gain": 0.017615103698851886,
+          "auroc_gain": 0.0,
+          "auprc_gain": 0.0,
+          "node_interval": [
+            0.006705596345793838,
+            0.03033098957746049
+          ],
+          "community_interval": [
+            0.009914935861507395,
+            0.028519243378558157
+          ]
+        },
+        "content_degree": {
+          "target": "content_degree",
+          "reference": "content",
+          "balanced_bce_gain": -0.0005763284738611318,
+          "auroc_gain": -5.939092666706891e-05,
+          "auprc_gain": 0.0008896278773649069,
+          "node_interval": [
+            -0.0010970220986119294,
+            -0.0001346914672949185
+          ],
+          "community_interval": [
+            -0.0010278689288466564,
+            -0.0002624258395352139
+          ]
+        },
+        "content_degree_triangles": {
+          "target": "content_degree_triangles",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.0018763308655296573,
+          "auroc_gain": 0.0002413147125621684,
+          "auprc_gain": 0.001845654689810572,
+          "node_interval": [
+            0.00011902913488989252,
+            0.004052764956393412
+          ],
+          "community_interval": [
+            0.0004851443987662224,
+            0.003430049017931839
+          ]
+        },
+        "content_degree_neighbor": {
+          "target": "content_degree_neighbor",
+          "reference": "content_degree",
+          "balanced_bce_gain": -0.0014718455049501644,
+          "auroc_gain": -0.0001948855951536821,
+          "auprc_gain": 0.0012375408557889767,
+          "node_interval": [
+            -0.0033492387613876006,
+            -8.173234428290909e-05
+          ],
+          "community_interval": [
+            -0.002410184497971812,
+            -0.0004492281791042267
+          ]
+        },
+        "content_degree_both": {
+          "target": "content_degree_both",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.0006781724029268354,
+          "auroc_gain": 5.376441782467545e-05,
+          "auprc_gain": 0.0037639120851211683,
+          "node_interval": [
+            -0.0015265431516874033,
+            0.002656017516507991
+          ],
+          "community_interval": [
+            -0.0010185437954265348,
+            0.0026515547811135107
+          ]
+        },
+        "content_degree_both_roles": {
+          "target": "content_degree_both_roles",
+          "reference": "content_degree_both",
+          "balanced_bce_gain": -0.0007879180260629837,
+          "auroc_gain": -0.000924289530308986,
+          "auprc_gain": -0.006707612313505473,
+          "node_interval": [
+            -0.005726132914974613,
+            0.0052990914596133315
+          ],
+          "community_interval": [
+            -0.005084607958790073,
+            0.00302893729683968
+          ]
+        },
+        "context_only": {
+          "target": "context_only",
+          "reference": "content",
+          "balanced_bce_gain": -0.4457346951377975,
+          "auroc_gain": -0.22219962820029582,
+          "auprc_gain": -0.5266319596127482,
+          "node_interval": [
+            -0.49034874668154843,
+            -0.40685154818762065
+          ],
+          "community_interval": [
+            -0.48618220144581964,
+            -0.4125829319102178
+          ]
+        },
+        "both_vs_content": {
+          "target": "content_degree_both",
+          "reference": "content",
+          "balanced_bce_gain": 0.00010184392906570361,
+          "auroc_gain": -5.626508842393463e-06,
+          "auprc_gain": 0.004653539962486075,
+          "node_interval": [
+            -0.002114675391942726,
+            0.0019118415071856323
+          ],
+          "community_interval": [
+            -0.001545078365048799,
+            0.001966100684380607
+          ]
+        },
+        "roles_vs_content": {
+          "target": "content_degree_both_roles",
+          "reference": "content",
+          "balanced_bce_gain": -0.0006860740969972801,
+          "auroc_gain": -0.0009299160391513794,
+          "auprc_gain": -0.002054072351019398,
+          "node_interval": [
+            -0.006963143968035872,
+            0.0062945949922596995
+          ],
+          "community_interval": [
+            -0.005604067552166293,
+            0.004170997740425078
+          ]
+        }
+      }
+    },
+    "h1102_eval": {
+      "metrics": {
+        "raw_content": {
+          "balanced_bce": 0.19735797887483947,
+          "auroc": 0.9782283474423972,
+          "auprc": 0.8648936732878528
+        },
+        "content": {
+          "balanced_bce": 0.18648128057924213,
+          "auroc": 0.9782283474423972,
+          "auprc": 0.8648936732878528
+        },
+        "content_degree": {
+          "balanced_bce": 0.18684535987898235,
+          "auroc": 0.9782261408015114,
+          "auprc": 0.8655579127172808
+        },
+        "content_degree_triangles": {
+          "balanced_bce": 0.18612569158314862,
+          "auroc": 0.978422744017351,
+          "auprc": 0.8669966970164089
+        },
+        "content_degree_neighbor": {
+          "balanced_bce": 0.18699216283186026,
+          "auroc": 0.9782506684636645,
+          "auprc": 0.8669573038161205
+        },
+        "content_degree_both": {
+          "balanced_bce": 0.18592129032511215,
+          "auroc": 0.9785271351054075,
+          "auprc": 0.8689771010622018
+        },
+        "content_degree_both_roles": {
+          "balanced_bce": 0.1870140901741586,
+          "auroc": 0.9780680264949673,
+          "auprc": 0.868669163651867
+        },
+        "context_only": {
+          "balanced_bce": 0.6279328668205246,
+          "auroc": 0.75943769697983,
+          "auprc": 0.32075187286374696
+        }
+      },
+      "contrasts": {
+        "content": {
+          "target": "content",
+          "reference": "raw_content",
+          "balanced_bce_gain": 0.010876698295597342,
+          "auroc_gain": 0.0,
+          "auprc_gain": 0.0,
+          "node_interval": [
+            0.0015653431493646015,
+            0.022176906488821483
+          ],
+          "community_interval": [
+            0.0028000897075630793,
+            0.01968310176880083
+          ]
+        },
+        "content_degree": {
+          "target": "content_degree",
+          "reference": "content",
+          "balanced_bce_gain": -0.000364079299740222,
+          "auroc_gain": -2.206640885793476e-06,
+          "auprc_gain": 0.0006642394294279486,
+          "node_interval": [
+            -0.0009084622781701802,
+            0.00012634035778413968
+          ],
+          "community_interval": [
+            -0.0009109356283011518,
+            6.316527580038425e-05
+          ]
+        },
+        "content_degree_triangles": {
+          "target": "content_degree_triangles",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.0007196682958337253,
+          "auroc_gain": 0.00019660321583958584,
+          "auprc_gain": 0.0014387842991281374,
+          "node_interval": [
+            -0.001471493694178561,
+            0.0030914819368859053
+          ],
+          "community_interval": [
+            -0.0007193004058462335,
+            0.0026004188585452615
+          ]
+        },
+        "content_degree_neighbor": {
+          "target": "content_degree_neighbor",
+          "reference": "content_degree",
+          "balanced_bce_gain": -0.0001468029528779169,
+          "auroc_gain": 2.4527662153106533e-05,
+          "auprc_gain": 0.0013993910988396863,
+          "node_interval": [
+            -0.0014372012857173716,
+            0.0009519800372139418
+          ],
+          "community_interval": [
+            -0.0008015776729398074,
+            0.0006352858707242464
+          ]
+        },
+        "content_degree_both": {
+          "target": "content_degree_both",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.0009240695538701993,
+          "auroc_gain": 0.00030099430389607384,
+          "auprc_gain": 0.0034191883449210536,
+          "node_interval": [
+            -0.0013474350777214754,
+            0.003035800145547467
+          ],
+          "community_interval": [
+            -0.0005915523946120555,
+            0.002924924642342223
+          ]
+        },
+        "content_degree_both_roles": {
+          "target": "content_degree_both_roles",
+          "reference": "content_degree_both",
+          "balanced_bce_gain": -0.0010927998490464497,
+          "auroc_gain": -0.00045910861044018425,
+          "auprc_gain": -0.00030793741033485755,
+          "node_interval": [
+            -0.005269775474618925,
+            0.003575435830868447
+          ],
+          "community_interval": [
+            -0.00431900675966415,
+            0.0022326540869838274
+          ]
+        },
+        "context_only": {
+          "target": "context_only",
+          "reference": "content",
+          "balanced_bce_gain": -0.4414515862412825,
+          "auroc_gain": -0.21879065046256718,
+          "auprc_gain": -0.5441418004241059,
+          "node_interval": [
+            -0.4790066160932862,
+            -0.40398528461004846
+          ],
+          "community_interval": [
+            -0.4886227583807118,
+            -0.3973490761717567
+          ]
+        },
+        "both_vs_content": {
+          "target": "content_degree_both",
+          "reference": "content",
+          "balanced_bce_gain": 0.0005599902541299773,
+          "auroc_gain": 0.00029878766301028037,
+          "auprc_gain": 0.004083427774349002,
+          "node_interval": [
+            -0.0016423083084168388,
+            0.002593063235545861
+          ],
+          "community_interval": [
+            -0.0008679246047296299,
+            0.0023498526079929693
+          ]
+        },
+        "roles_vs_content": {
+          "target": "content_degree_both_roles",
+          "reference": "content",
+          "balanced_bce_gain": -0.0005328095949164724,
+          "auroc_gain": -0.00016032094742990388,
+          "auprc_gain": 0.0037754903640141446,
+          "node_interval": [
+            -0.00569507192565036,
+            0.005008554970896834
+          ],
+          "community_interval": [
+            -0.0045689276185664285,
+            0.003780506485351139
+          ]
+        }
+      }
+    },
+    "h1103_eval": {
+      "metrics": {
+        "raw_content": {
+          "balanced_bce": 0.19689818566613104,
+          "auroc": 0.9784421937524779,
+          "auprc": 0.8642782014293985
+        },
+        "content": {
+          "balanced_bce": 0.18433990125782806,
+          "auroc": 0.9784421937524779,
+          "auprc": 0.8642782014293985
+        },
+        "content_degree": {
+          "balanced_bce": 0.18461958069939688,
+          "auroc": 0.9783816623934615,
+          "auprc": 0.865236272842431
+        },
+        "content_degree_triangles": {
+          "balanced_bce": 0.18360807092176315,
+          "auroc": 0.978514282657097,
+          "auprc": 0.8682755729000426
+        },
+        "content_degree_neighbor": {
+          "balanced_bce": 0.18509598554593776,
+          "auroc": 0.9785816730936223,
+          "auprc": 0.8660139008256368
+        },
+        "content_degree_both": {
+          "balanced_bce": 0.18359487799662388,
+          "auroc": 0.978841735017374,
+          "auprc": 0.8699757379011375
+        },
+        "content_degree_both_roles": {
+          "balanced_bce": 0.1852195690620228,
+          "auroc": 0.9780626809939077,
+          "auprc": 0.8672893238062249
+        },
+        "context_only": {
+          "balanced_bce": 0.6203583475460651,
+          "auroc": 0.766658435773656,
+          "auprc": 0.31895926505868893
+        }
+      },
+      "contrasts": {
+        "content": {
+          "target": "content",
+          "reference": "raw_content",
+          "balanced_bce_gain": 0.012558284408302978,
+          "auroc_gain": 0.0,
+          "auprc_gain": 0.0,
+          "node_interval": [
+            0.0036844599392400488,
+            0.024713560637010898
+          ],
+          "community_interval": [
+            0.006365052171620934,
+            0.020848937926796828
+          ]
+        },
+        "content_degree": {
+          "target": "content_degree",
+          "reference": "content",
+          "balanced_bce_gain": -0.0002796794415688142,
+          "auroc_gain": -6.05313590164025e-05,
+          "auprc_gain": 0.0009580714130325019,
+          "node_interval": [
+            -0.0008681036173582525,
+            0.00024437685209085396
+          ],
+          "community_interval": [
+            -0.000828942359662505,
+            0.0002004496358739271
+          ]
+        },
+        "content_degree_triangles": {
+          "target": "content_degree_triangles",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.001011509777633729,
+          "auroc_gain": 0.00013262026363547452,
+          "auprc_gain": 0.0030393000576116602,
+          "node_interval": [
+            -0.0005736967637728867,
+            0.0029046217423219886
+          ],
+          "community_interval": [
+            -0.0004277628143912366,
+            0.002530813960980878
+          ]
+        },
+        "content_degree_neighbor": {
+          "target": "content_degree_neighbor",
+          "reference": "content_degree",
+          "balanced_bce_gain": -0.0004764048465408788,
+          "auroc_gain": 0.00020001070016084643,
+          "auprc_gain": 0.0007776279832057975,
+          "node_interval": [
+            -0.0023396591042957843,
+            0.0010615489949435013
+          ],
+          "community_interval": [
+            -0.0018367705449644934,
+            0.0004996430649708225
+          ]
+        },
+        "content_degree_both": {
+          "target": "content_degree_both",
+          "reference": "content_degree",
+          "balanced_bce_gain": 0.001024702702772995,
+          "auroc_gain": 0.0004600726239125663,
+          "auprc_gain": 0.004739465058706482,
+          "node_interval": [
+            -0.0010321262317960526,
+            0.002786473955830639
+          ],
+          "community_interval": [
+            -0.0005906836489114494,
+            0.002429040928199244
+          ]
+        },
+        "content_degree_both_roles": {
+          "target": "content_degree_both_roles",
+          "reference": "content_degree_both",
+          "balanced_bce_gain": -0.00162469106539892,
+          "auroc_gain": -0.0007790540234663412,
+          "auprc_gain": -0.002686414094912548,
+          "node_interval": [
+            -0.006615171964676593,
+            0.004743801068855539
+          ],
+          "community_interval": [
+            -0.005363053712146026,
+            0.002863143245712449
+          ]
+        },
+        "context_only": {
+          "target": "context_only",
+          "reference": "content",
+          "balanced_bce_gain": -0.43601844628823705,
+          "auroc_gain": -0.21178375797882187,
+          "auprc_gain": -0.5453189363707096,
+          "node_interval": [
+            -0.4817035822483269,
+            -0.3935662435488756
+          ],
+          "community_interval": [
+            -0.4906934976142279,
+            -0.4018643933441174
+          ]
+        },
+        "both_vs_content": {
+          "target": "content_degree_both",
+          "reference": "content",
+          "balanced_bce_gain": 0.0007450232612041807,
+          "auroc_gain": 0.0003995412648961638,
+          "auprc_gain": 0.005697536471738984,
+          "node_interval": [
+            -0.0012320819685668605,
+            0.002469028743569872
+          ],
+          "community_interval": [
+            -0.0007782743962652503,
+            0.0020063299310195165
+          ]
+        },
+        "roles_vs_content": {
+          "target": "content_degree_both_roles",
+          "reference": "content",
+          "balanced_bce_gain": -0.0008796678041947392,
+          "auroc_gain": -0.0003795127585701774,
+          "auprc_gain": 0.003011122376826436,
+          "node_interval": [
+            -0.005725017438082503,
+            0.004946270734225525
+          ],
+          "community_interval": [
+            -0.004873615646162576,
+            0.0031270486333536828
+          ]
+        }
+      }
+    }
+  }
+}

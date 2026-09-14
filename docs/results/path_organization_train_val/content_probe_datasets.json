@@ -1,0 +1,56 @@
+{
+  "main_fit": {
+    "nodes": 7203,
+    "rows": 215889,
+    "positives": 31623,
+    "communities": 984
+  },
+  "main_eval": {
+    "nodes": 869,
+    "rows": 31423,
+    "positives": 4703,
+    "communities": 13
+  },
+  "h1101_fit": {
+    "nodes": 5763,
+    "rows": 145658,
+    "positives": 20805,
+    "communities": 1026
+  },
+  "h1101_eval": {
+    "nodes": 1440,
+    "rows": 11953,
+    "positives": 1106,
+    "communities": 790
+  },
+  "h1102_fit": {
+    "nodes": 5763,
+    "rows": 145423,
+    "positives": 20735,
+    "communities": 1004
+  },
+  "h1102_eval": {
+    "nodes": 1440,
+    "rows": 11768,
+    "positives": 1105,
+    "communities": 785
+  },
+  "h1103_fit": {
+    "nodes": 5763,
+    "rows": 141240,
+    "positives": 20063,
+    "communities": 1032
+  },
+  "h1103_eval": {
+    "nodes": 1440,
+    "rows": 12839,
+    "positives": 1259,
+    "communities": 745
+  },
+  "official_eval": {
+    "nodes": 869,
+    "rows": 10050,
+    "positives": 4703,
+    "communities": 13
+  }
+}

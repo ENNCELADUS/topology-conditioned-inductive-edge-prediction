@@ -211,7 +211,6 @@ bootstrap intervals, so differences inside ±0.01 GS and ±0.5 MMD ratio are des
 Each arm is its V_val-selected checkpoint of its best HPO trial or grid point; variants that
 freeze part of a method (the frozen-reader Stage II lane, the frozen-trunk Stage I lane, the
 attribute-conditioned prefix arms) are not arms and appear only in §3.5 and the result notes.
-Assembled-graph group first.
 
 | Arm (test, V_val-frozen threshold) | GS ↑ | RD → 1 | Degree MMD ↓ | Clustering MMD ↓ | Spectral MMD ↓ | geo RD → 1 | mean abs log RD ↓ |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -221,8 +220,7 @@ Assembled-graph group first.
 | + Representation KD (`kd_rep`) | 0.4293 | 0.4863 | 13.818 | 11.569 | 20.370 | 0.4635 | 0.7698 |
 | + Rank + representation KD (`kd_rank_rep`) | 0.4217 | 0.4609 | 15.068 | 12.726 | 22.382 | 0.4385 | 0.8259 |
 | + Gram KD (`kd_gram`) | 0.4304 | 0.5524 | 11.631 | 9.516 | 16.227 | 0.5260 | 0.6447 |
-| + GRAND objectives (`struct_grand`) | 0.4312 | 0.6210 | 8.063 | 6.740 | 11.872 | 0.5956 | 0.5217 |
-| + NEW objectives (`struct_new`) | 0.4258 | 0.6540 | 8.348 | 6.846 | 12.021 | 0.6211 | 0.4913 |
+| + Objectives (BCE + RD + degree + motif) | 0.4279 | 0.7172 | 5.885 | 4.955 | 9.145 | 0.6882 | 0.3941 |
 | **+ Topology prompt (`coord_gen_full`)** | **0.4304** | **0.9068** | **4.216** | **3.601** | **6.723** | **0.8636** | **0.2643** |
 | TUnA (feature-controlled) | 0.3990 | 0.5690 | 9.433 | 8.200 | 14.741 | 0.5449 | 0.6105 |
 | PPITrans (feature-controlled) | 0.3953 | 0.5220 | 10.326 | 9.901 | 17.869 | 0.5011 | 0.6920 |
@@ -237,29 +235,25 @@ Assembled-graph group first.
 | + Representation KD | 0.7037 | 0.7365 | 0.6088 | 0.6736 | 0.2371 | 0.2150 | 0.2726 |
 | + Rank + representation KD | 0.7050 | 0.7364 | 0.6166 | 0.6692 | 0.2459 | 0.2232 | 0.2748 |
 | + Gram KD | 0.7175 | 0.7428 | 0.6228 | 0.6843 | 0.2667 | 0.1537 | 0.2429 |
-| + GRAND objectives | 0.7140 | 0.7392 | 0.6321 | 0.6794 | 0.2766 | 0.3092 | 0.3289 |
-| + NEW objectives | 0.7013 | 0.7324 | 0.6159 | 0.6695 | 0.2450 | 0.3168 | 0.3293 |
+| + Objectives (BCE + RD + degree + motif) | 0.7153 | 0.7386 | 0.6404 | 0.6751 | 0.2874 | 0.3231 | 0.3368 |
 | **+ Topology prompt (`coord_gen_full`)** | 0.6771 | 0.7251 | 0.5752 | 0.6522 | 0.1670 | 0.2019 | 0.2733 |
 | TUnA (feature-controlled) | 0.7132 | 0.7283 | 0.6444 | 0.6729 | 0.2932 | 0.1959 | 0.2625 |
 | PPITrans (feature-controlled) | 0.7238 | 0.7452 | 0.6543 | 0.6792 | 0.3124 | 0.2516 | 0.2865 |
 | *Ceiling: Full-Ego oracle (PMA1)* | 0.9498 | 0.9547 | 0.8762 | 0.8794 | 0.7534 | 0.0993 | 0.1130 |
 | *Ceiling: Stage I reader, true coordinates* | 0.9295 | 0.9392 | 0.7909 | 0.7414 | 0.6299 | 0.0774 | 0.1151 |
 
-**Reading.** On the assembled graph the topology prompt is the only arm that moves the
-density and shape of the test graphs decisively: RD 0.91 against 0.56 for B0 and 0.65 for the
-best structural objective, the three MMD ratios roughly halved (4.2 / 3.6 / 6.7 against
-8.1 / 6.7 / 11.9 for GRAND), and lower than the oracle's own 7.0 / 6.4 / 11.5, at a GS equal to
-B0's and GRAND's. Per subgraph size its RD rises from 0.63 at 20 nodes to 1.09 at 200. The KD
-arms trade in the other direction: Rank KD has the best edge AUPRC of any deployable arm and
-the worst topology (RD 0.38, MMD 20 / 16 / 28); Logit and Gram KD change the assembled graph
-within the noise band. The structural objectives improve RD and the MMD ratios modestly
-without moving GS. The feature-controlled external baselines match B0 on the edge group and
-are weaker on topology. The topology prompt pays on the edge group (AUROC 0.677 against 0.701
-for B0): it assembles better graphs from worse individual pair scores, and the ceiling rows
-show why the gap remains large, since the same reader on true coordinates reaches AUROC 0.93.
-The Stage I ceiling's own test topology is poor because its V_val-selected threshold transfers
-into the denser test region; that is a property of true-coordinate readers, not of the
-deployable student.
+**Reading.** Among the reported deployable arms, the topology prompt improves test RD
+(0.91 versus B0's 0.56) and the three MMD ratios (4.2 / 3.6 / 6.7 versus
+9.7 / 8.1 / 14.5), with similar GS. Its RD rises from 0.63 at 20 nodes to 1.09 at 200.
+The selected objective combination also improves density and shape over B0 (RD 0.717,
+MMD 5.9 / 5.0 / 9.1, GS 0.428), while the topology prompt retains lower MMD ratios
+and RD closer to one. The objective combination has higher edge AUROC/AUPRC than the
+prompt (0.715 / 0.739 versus 0.677 / 0.725), but worse ECE/Brier (0.323 / 0.337).
+Rank KD has the highest reported deployable edge AUPRC, but poorer topology
+(RD 0.38, MMD 20 / 16 / 28). The topology prompt has lower edge AUROC than B0
+(0.677 versus 0.701), despite its better density and shape metrics. The same reader on
+true coordinates reaches AUROC 0.93, but its V_val-frozen threshold yields poor test
+topology. These single-seed results do not establish statistical significance.
 
 ### 3.5 Ablation of the topology prompt (subtractive)
 
@@ -302,6 +296,7 @@ write their reports without the pipeline's completion marker. Raw reports under
 | Gram KD, `kd_gram_w100` / epoch 8 | `47fb1066898c95b8` | 0.863281 | [Gram](results/split_seed42_geometric_20260910/gram_w100_test_report.json) |
 | GRAND, trial 006 / epoch 14 | `47e62521e7491bee` | 0.992188 | [GRAND](results/split_seed42_geometric_20260910/grand_trial006_test_report.json) |
 | NEW, trial 009 / epoch 10 | `f3aa183d4a422f24` | -0.640625 | [NEW](results/split_seed42_geometric_20260910/new_trial009_test_report.json) |
+| Selected objectives, `degree_motif` trial 007 / epoch 14 | `f8102b8acf86885d` | -0.435547 | [BCE + RD + degree + motif](results/split_seed42_geometric_20260910/degree_motif_trial007_test_report.json) |
 | Topology prompt, `coord_gen_full` / epoch 6 | `4a743373f0b9e4d0` | 1.359375 | [coord_gen_full](results/topo_prompt_stage2_curves/coord_gen_full/test_report.json) |
 | TUnA (feature-controlled) | `bec8b0d2beeea4d0` | 1.502119 | H20 `outputs/official_ppi/tuna_seed0_20260912/test_report.json` |
 | PPITrans (feature-controlled) | `26143c38e4819edd` | 2.533686 | H20 `outputs/official_ppi/ppitrans_seed0_20260912/test_report.json` |
@@ -320,97 +315,70 @@ execution in the [HPC runbook](../hpc/README.md).
 
 ## 5. Learning curves and analysis of the topology prompt
 
-### 5.1 Stage I: does the reader use true structure?
+All curves are the v1 runs of §3.4 (`topo_prompt_full`, `coord_gen_full`), logged V_val
+values at each epoch's own selected threshold, no rescoring. The two-stage v2 wave
+(§6) was launched on 2026-09-13 and is still running (Stage I v2 teacher published;
+struct teacher, T1 study and the factorial A–D pending), so no v2 curve is shown.
+
+### 5.1 Stage I: the reader on true structure
 
 ![Stage I reader against the prompt-free recipe on V_val](results/topo_prompt_stage1_curves/stage1_curves.png)
 
-*Figure 3. Validation curves of `topo_prompt_full` (true coordinates) and `prefix_base` (the
-same recipe without a prompt); stars mark the selected checkpoints. Package and script:
-`results/topo_prompt_stage1_curves/`.*
+*Figure 3. V_val learning curves of `topo_prompt_full` (true coordinates) and `prefix_base`
+(the same recipe without a prompt); stars mark the V_val-selected checkpoints. Package and
+script: `results/topo_prompt_stage1_curves/`.*
 
-With true coordinates the reader separates from the prompt-free recipe within two epochs
-(V_val AUPRC 0.90 vs 0.77) and plateaus at 0.96 with GS 0.65–0.70, against 0.81 and 0.40; its
-validation task loss keeps a minimum of 0.34 where the base never drops below 0.60. Removing
-the structure at scoring time returns it to the base (`mean`: AUPRC 0.78, GS 0.38) and a
-universe-level shuffle of the coordinate bundles drives it below the base (AUROC 0.58 on
-`val_cls`): the interface transmits structure and the reader relies on it. Per field, the
-relation coordinates carry the most (GS 0.69 → 0.54 without them), the endpoint fields little,
-the context field nothing. The V_val MMD ratios do not improve with GS, so the true-structure
-gain is in which edges are admitted at RD ≈ 1, not in the shape of the admitted set.
+With true coordinates the reader separates from the prompt-free recipe within two epochs and
+plateaus at AUPRC 0.96 / GS 0.69 against 0.81 / 0.40, with RD at 1.0 and a task loss floor of
+0.34 against 0.60. The three MMD ratios do not improve with GS: the true-structure gain is in
+which edges are admitted at RD ≈ 1, not in the shape of the admitted set. The scoring-time
+interventions that return it to the base (`mean`, `gates_off`) and below it (`shuffle`) are in §3.5.
 
-### 5.2 Stage II: the three losses
+### 5.2 Stage II: the deployable student
 
-![Stage II training composite and the three validation loss terms per lane](results/topo_prompt_stage2_curves/loss_curves.png)
+![Stage II learning curves of coord_gen_full](results/topo_prompt_stage2_curves/stage2_full_curves.png)
 
-*Figure 4. Only the composite training loss is logged; the three terms are validation
-diagnostics measured every epoch (KD shown before its 0.1 weight). Dashed line: selected
-epoch. The frozen-reader lane is shown for contrast only.*
+*Figure 4. `coord_gen_full`. Top: the logged composite training loss and the three validation
+terms (KD before its 0.1 weight; triangles mark minima). Bottom: V_val edge and topology metrics,
+with `prefix_base`'s selected checkpoint dotted; the star is the five-rank-selected epoch 6.
+Script: `results/topo_prompt_stage2_curves/plot_stage2_full.py`.*
 
-- **$\mathcal L_{\mathrm{coord}}$** on V_val bottoms out at epoch 3 (1.33) and then rises
-  (1.56 at the end; 1.25 → 2.01 in the frozen-reader lane). Only composite training loss
-  was logged, so a monotonic fall in training coordinate loss is unestablished. Early stopping
-  watches task BCE; checkpoint selection uses the five-metric V_val rank. Its selected epoch
-  (6) is past the coordinate-fit optimum; this does not identify the mechanism.
-- **$\mathcal L_{\mathrm{BCE}}$** of the student drops from 0.84 to 0.64 by epoch 2 and then
-  oscillates between 0.68 and 0.87. The trunk alone is below the prompt-free recipe (it was
-  trained to lean on the prompt, §3.5), and the task term teaches the generator coordinates
-  that bring it back to the base level, not further.
-- **$\mathcal L_{\mathrm{KD}}$** falls from 0.83 to 0.56 by epoch 2 and stays at 0.59–0.86. The
-  teacher, the same reader on true coordinates, is confident where the student cannot be; at
-  weight 0.1 its causal contribution is unmeasured without a matched ablation. Separating the three terms' causal
-  contributions needs matched task-only, task + coordinate and task + KD runs, which were not
-  launched.
+Only the composite training loss was logged, and it falls monotonically while every validation
+term is non-monotone: the coordinate loss bottoms out at epoch 3 and rises, task BCE and KD
+bottom out at epoch 2. V_val AUPRC and GS never exceed the prompt-free base, whereas the MMD
+ratios swing by a factor of two across epochs and the selector took the favourable end. The
+test topology row of §3.4 is therefore a single seed at a favourable checkpoint; the direction
+is consistent across the §3.5 ablation rows. Because the threshold is re-selected per
+checkpoint, a monotone logit rescaling cannot move the admitted set, so the swings are
+admitted-set changes (consecutive-epoch admitted-edge Jaccard 0.35–0.75).
 
-### 5.3 What the generator predicts, and for whom
+### 5.3 Generalisation of the coordinate generator
 
-![Per-field validation R² and distance-class accuracy of the coordinate generator](results/topo_prompt_stage2_curves/generator_fit.png)
+![Predicted against true structural statistics of coord_gen_full on training, V_val and test rows](results/topo_prompt_stage2_curves/generator_generalization.png)
 
-*Figure 5. Field-level R² of the standardised prediction against V_val's true coordinates
-(node-held-out) and five-class shortest-path accuracy, per epoch.*
+*Figure 5. The published `coord_gen_full` generator's own predictions of the 34 structural
+statistics $s_{uv}$ (9 per endpoint, 11 relation, 5 context) against their true values on
+label-balanced samples (3,000 positives + 3,000 negatives) of training rows (training graph),
+V_val rows (V_val gold graph) and test rows (test graph); truth is measured with the queried
+edge removed and count statistics are log1p-transformed. Top: Pearson ρ per statistic (endpoint
+statistics pool u and v) and five-class distance accuracy (dotted: majority class). Grid:
+predicted against true on the unseen test rows, dashed identity, ρ for train | V_val | test in
+each title; the confusion matrices are the distance head on V_val and test rows (row-normalised).
+Data `coord_gen_full/coord_fit_universes.{json,npz}`; scripts
+`results/topo_prompt_stage2_curves/coord_fit_universes.py` (H20) and `plot_generalization.py`.*
 
-| Coordinate (training rows, published checkpoint, 4,000 rows) | R² |
-|---|---:|
-| endpoint field (pooled); against the *swapped* endpoint's target | 0.24; −0.05 |
-| log-degree · clustering · triangles · open wedges | 0.40 · 0.23 · 0.51 · 0.34 |
-| two-hop reach · mean neighbour degree · walk returns 2 / 3 / 4 | 0.19 · 0.24 · 0.06 / −0.03 / 0.01 |
-| relation field | 0.31 |
-| common neighbours · Jaccard · L3 paths · walks 2 / 3 / 4 / 5 | 0.38 · 0.61 · 0.48 · 0.39 / −0.03 / 0.14 / 0.12 |
-| context field | 0.41 |
-| distance class accuracy (five classes) | 0.66 |
-
-On training rows the generator learns what the endpoints' attributes support (degree,
-triangles, Jaccard, common neighbours, L3 paths at R² 0.4–0.6; global walk kernels near zero),
-and the endpoint order is verified (own target 0.24, swapped −0.05). On V_val, whose nodes it
-never saw, the same fields fall to R² ≤ 0.2 for relation and context and below zero for the
-endpoint fields. The endpoint head is pair-conditioned and its targets remove the queried edge, so the
-endpoint targets are not per-node constants. Their repeated node-specific component and the
-train/V_val fit gap are consistent with poor head generalisation, but do not distinguish
-memorisation from universe shift. Coordinate interventions establish an effect on the assembled
-graph, not transferable regional density or a causal explanation of the edge cost. The standalone
-probe in §6 tests new-head generalisation separately from Stage II training.
-
-### 5.4 Validation topology dynamics
-
-![Validation AUPRC, GS, RD and the three MMD ratios per epoch](results/topo_prompt_stage2_curves/validation_topology.png)
-
-*Figure 6. Every epoch at its own validation-selected threshold; stars mark the selected
-checkpoints.*
-
-The V_val edge and GS curves are flat at the base level from epoch 2 on, while the V_val MMD
-ratios swing by a factor of two across epochs (degree 5.8–14.4); the five-rank selector chose
-the favourable end of that swing (epoch 6). The test topology result of §3.4 is therefore a
-single seed at a favourable checkpoint and needs replication before it is written as a
-finding; the direction of the effect is nevertheless consistent across the ablation rows and
-across the two lanes (the frozen-reader lane moves the same way within the noise band).
-
-**Next.** The approved [two-stage v2 specification](superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md)
-places corruption and optional structural training inside Stage I, and interface/head adaptation,
-KD and structural supervision inside Stage II; Stages III/IV are retired. First inspect V_val
-admitted-set stability, run the standalone node-held-out probe, and profile one epoch of D before
-allocating the wave. These are implementation and future-run instructions; no v2 study has been
-launched. A strictly monotone logit rescaling cannot change the admitted set when its threshold
-is re-selected, so affine drift alone cannot explain the MMD swings. Test sensitivity on the
-selected epoch's neighbours is descriptive only after the method and selection rule are locked.
+Correlation partly transfers, level does not. On unseen rows the pair statistics that separate
+positives from negatives keep ρ ≈ 0.6–0.76 (Jaccard, walk 2, shell shared fraction; common
+neighbours and L3 paths on test), and endpoint degree, triangles and clustering keep ρ ≈ 0.5–0.65
+on test but fall to 0.1–0.3 on V_val. The scatter shows why the field R² is nevertheless negative
+on both unseen universes (endpoint −0.30 / −1.52, context 0.06 / −1.56 on V_val / test): the
+predictions are compressed towards the training mean (about half the true spread) and sit
+below the identity on the denser test graph (true statistics shifted by 0.9 standardised units,
+mean prediction bias 0.6), so ranking information survives while the absolute level and spread
+do not. The distance head collapses to the ≥ 4 class on unseen rows (accuracy 0.45 vs majority
+0.48 on V_val, 0.32 vs 0.65 on test) and never predicts distance 3 or ∞. Return probabilities
+and walk 3 are unpredictable even on training rows (ρ ≤ 0.2). Because rows are label-balanced,
+part of every relation ρ is label separation; per-label R² is recorded in the JSON.
 
 ## 6. Hyperparameters and search plan for the two-stage topology prompt
 

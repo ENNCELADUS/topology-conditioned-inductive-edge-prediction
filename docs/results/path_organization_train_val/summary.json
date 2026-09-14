@@ -1,0 +1,209 @@
+{
+  "source_head": "ecf78b378526f1cda5692b0a9c3f61d83161f310",
+  "seed": 42,
+  "train_nodes": 7203,
+  "val_nodes": 869,
+  "region_seeds": [
+    "node_007630"
+  ],
+  "features": {
+    "base": [
+      "degree_min",
+      "degree_max",
+      "common",
+      "l3",
+      "distance_category"
+    ],
+    "local": [
+      "triangles_min",
+      "triangles_max",
+      "neighbor_degree_min",
+      "neighbor_degree_max"
+    ],
+    "org": [
+      "internal_nodes",
+      "path_edges",
+      "cycle_rank",
+      "max_edge_share",
+      "max_node_share",
+      "disjoint_path_pair_fraction",
+      "used_neighbors_min",
+      "used_neighbors_max",
+      "unused_neighbors_min",
+      "unused_neighbors_max"
+    ]
+  },
+  "protocol": "Query-edge-deleted truth graphs; fixed benchmark training negatives; official val_cls negatives; self-pairs excluded; no test files read; fixed train-fitted probes, no validation tuning; oracle diagnostic only.",
+  "splits": {
+    "train": {
+      "rows": 65479,
+      "positives": 31623,
+      "l3_ge_2": 31380,
+      "self_positives_excluded": 5234,
+      "matched": {
+        "minimum_per_organization": 5,
+        "supported_strata": 0,
+        "rows_in_supported_strata": 0,
+        "weighted_rate_difference_no_shared_minus_shared": null
+      }
+    },
+    "val": {
+      "rows": 10050,
+      "positives": 4703,
+      "l3_ge_2": 6911,
+      "self_positives_excluded": 644,
+      "matched": {
+        "minimum_per_organization": 5,
+        "supported_strata": 0,
+        "rows_in_supported_strata": 0,
+        "weighted_rate_difference_no_shared_minus_shared": null
+      }
+    }
+  },
+  "metrics": [
+    {
+      "family": "logistic",
+      "features": "base",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9369129430096488,
+      "auprc": 0.9393175701643203,
+      "log_loss": 0.3835155967568149
+    },
+    {
+      "family": "logistic",
+      "features": "base",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.9367160211106811,
+      "auprc": 0.9617635502530537,
+      "log_loss": 0.4053137588746078
+    },
+    {
+      "family": "logistic",
+      "features": "base_local",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9548016595736237,
+      "auprc": 0.9545990482719026,
+      "log_loss": 0.32223654084752185
+    },
+    {
+      "family": "logistic",
+      "features": "base_local",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.9536785905553476,
+      "auprc": 0.971902669162114,
+      "log_loss": 0.352861334851777
+    },
+    {
+      "family": "logistic",
+      "features": "base_org",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9340024100744502,
+      "auprc": 0.9386286990527886,
+      "log_loss": 0.4107961583435787
+    },
+    {
+      "family": "logistic",
+      "features": "base_org",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.935538220375695,
+      "auprc": 0.961893033685217,
+      "log_loss": 0.4478327631091184
+    },
+    {
+      "family": "logistic",
+      "features": "base_local_org",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9527991098400397,
+      "auprc": 0.9529756723512369,
+      "log_loss": 0.3394843098680746
+    },
+    {
+      "family": "logistic",
+      "features": "base_local_org",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.954226933780537,
+      "auprc": 0.9717391897025052,
+      "log_loss": 0.37777780781932846
+    },
+    {
+      "family": "hist_gb",
+      "features": "base",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9297970874469385,
+      "auprc": 0.9357555869562489,
+      "log_loss": 0.4486888344924108
+    },
+    {
+      "family": "hist_gb",
+      "features": "base",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.933509608089182,
+      "auprc": 0.9604119778237772,
+      "log_loss": 0.4967576930719285
+    },
+    {
+      "family": "hist_gb",
+      "features": "base_local",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9542770828467764,
+      "auprc": 0.9538228225662883,
+      "log_loss": 0.358183188102693
+    },
+    {
+      "family": "hist_gb",
+      "features": "base_local",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.9559640943576796,
+      "auprc": 0.9722244300218386,
+      "log_loss": 0.4025066371561853
+    },
+    {
+      "family": "hist_gb",
+      "features": "base_org",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9342818675241653,
+      "auprc": 0.9395098082899587,
+      "log_loss": 0.45073292339121723
+    },
+    {
+      "family": "hist_gb",
+      "features": "base_org",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.9394690648064932,
+      "auprc": 0.9636983485218689,
+      "log_loss": 0.4989224053793672
+    },
+    {
+      "family": "hist_gb",
+      "features": "base_local_org",
+      "subset": "all",
+      "n": 10050,
+      "auroc": 0.9538601732910575,
+      "auprc": 0.953338468379993,
+      "log_loss": 0.36454777434543356
+    },
+    {
+      "family": "hist_gb",
+      "features": "base_local_org",
+      "subset": "l3_ge_2",
+      "n": 6911,
+      "auroc": 0.9556896562140295,
+      "auprc": 0.9720045014067775,
+      "log_loss": 0.4119776293401678
+    }
+  ]
+}

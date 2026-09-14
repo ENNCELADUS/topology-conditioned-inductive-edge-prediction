@@ -1,0 +1,226 @@
+{
+  "run": "coord_gen_full",
+  "checkpoint": "outputs/split_seed42/coord_gen_full/best.pt",
+  "checkpoint_id": "4a743373f0b9e4d0",
+  "per_label": 3000,
+  "seed": 0,
+  "protocol": "label-balanced sample per universe; true coordinates on each universe's own loopless graph with the queried edge removed; R2 of the standardised prediction (training statistics), per field = pooled SSE/SST over the field's continuous coordinates",
+  "universes": {
+    "train": {
+      "rows": 6000,
+      "positives": 3000,
+      "graph_nodes": 7203,
+      "graph_edges": 31623,
+      "field_r2": {
+        "endpoint": 0.27006455732694845,
+        "relation": 0.26530327047867663,
+        "context": 0.4658997949870317
+      },
+      "endpoint_swapped_r2": 0.0706147636866522,
+      "distance_accuracy": 0.6693333333333333,
+      "distance_majority_accuracy": 0.379,
+      "coordinate_r2": {
+        "endpoint.log1p_degree": 0.44804657229756406,
+        "endpoint.clustering": 0.24848692609514123,
+        "endpoint.log1p_triangles": 0.5529263158083633,
+        "endpoint.log1p_open_wedges": 0.36936809157823447,
+        "endpoint.log1p_two_hop": 0.24183397967078346,
+        "endpoint.log1p_mean_neighbor_degree": 0.3407863491806469,
+        "endpoint.return_2": 0.09661556216024403,
+        "endpoint.return_3": -0.02638682843187201,
+        "endpoint.return_4": 0.027369666320002373,
+        "relation.log1p_common": 0.5713712768591519,
+        "relation.jaccard": 0.5485265187657098,
+        "relation.log1p_l3": 0.6218351368452051,
+        "relation.walk_2": 0.3076987145447102,
+        "relation.walk_3": -0.1360368416841733,
+        "relation.walk_4": 0.0956785540721401,
+        "relation.walk_5": 0.06342959039830842,
+        "context.log1p_hop1_union": 0.5094145427968062,
+        "context.log1p_shell": 0.355364812086436,
+        "context.shell_shared_fraction": 0.5465234104934248,
+        "context.log1p_cross_ring": 0.514148171371855,
+        "context.l3_density": 0.3776457329062898
+      },
+      "coordinate_pearson": {
+        "endpoint.log1p_degree": 0.6748282209986537,
+        "endpoint.clustering": 0.5052649205012516,
+        "endpoint.log1p_triangles": 0.748258325458131,
+        "endpoint.log1p_open_wedges": 0.6289625121040511,
+        "endpoint.log1p_two_hop": 0.511144652387698,
+        "endpoint.log1p_mean_neighbor_degree": 0.6198470854493782,
+        "endpoint.return_2": 0.35945665343202987,
+        "endpoint.return_3": 0.20019795588853503,
+        "endpoint.return_4": 0.20748909215162203,
+        "relation.log1p_common": 0.7731642763345675,
+        "relation.jaccard": 0.7671239177951971,
+        "relation.log1p_l3": 0.7888438289718279,
+        "relation.walk_2": 0.5932249294244859,
+        "relation.walk_3": 0.020875666907068904,
+        "relation.walk_4": 0.4017710550202809,
+        "relation.walk_5": 0.3720637301755652,
+        "context.log1p_hop1_union": 0.7142311910649316,
+        "context.log1p_shell": 0.6016041284653992,
+        "context.shell_shared_fraction": 0.743909881045438,
+        "context.log1p_cross_ring": 0.7198102023343532,
+        "context.l3_density": 0.6670527547980032
+      },
+      "label_r2": {
+        "positive": {
+          "endpoint": 0.312273597737486,
+          "relation": 0.04461500458638834,
+          "context": 0.29260641480240157
+        },
+        "negative": {
+          "endpoint": 0.20160358382001886,
+          "relation": -1.3467853787781734,
+          "context": 0.1807589131467825
+        }
+      }
+    },
+    "val": {
+      "rows": 6000,
+      "positives": 3000,
+      "graph_nodes": 869,
+      "graph_edges": 4703,
+      "field_r2": {
+        "endpoint": -0.30048798336375504,
+        "relation": 0.036459799556073924,
+        "context": 0.057576256267925396
+      },
+      "endpoint_swapped_r2": -0.4143148659030713,
+      "distance_accuracy": 0.447,
+      "distance_majority_accuracy": 0.477,
+      "coordinate_r2": {
+        "endpoint.log1p_degree": -0.3528697205652127,
+        "endpoint.clustering": -0.2245179602185725,
+        "endpoint.log1p_triangles": -0.4310478884077633,
+        "endpoint.log1p_open_wedges": -0.28921024906291115,
+        "endpoint.log1p_two_hop": -0.10394303029206431,
+        "endpoint.log1p_mean_neighbor_degree": -0.5647101980023612,
+        "endpoint.return_2": -0.10309236480099693,
+        "endpoint.return_3": -0.35132668819671964,
+        "endpoint.return_4": -0.19237037423739345,
+        "relation.log1p_common": 0.1528090098021937,
+        "relation.jaccard": 0.46752042836255037,
+        "relation.log1p_l3": -0.09760225991510896,
+        "relation.walk_2": 0.3096733252219227,
+        "relation.walk_3": -0.2965236396080966,
+        "relation.walk_4": -0.17855924414690305,
+        "relation.walk_5": -0.07884877909801702,
+        "context.log1p_hop1_union": -0.11966454754735878,
+        "context.log1p_shell": -0.02034278803996914,
+        "context.shell_shared_fraction": 0.341665382431797,
+        "context.log1p_cross_ring": -0.22740171923808883,
+        "context.l3_density": -0.04241868383049674
+      },
+      "coordinate_pearson": {
+        "endpoint.log1p_degree": 0.24271467627868107,
+        "endpoint.clustering": 0.09759311711643034,
+        "endpoint.log1p_triangles": 0.2746847454531687,
+        "endpoint.log1p_open_wedges": 0.22248965724712955,
+        "endpoint.log1p_two_hop": 0.2628049761505787,
+        "endpoint.log1p_mean_neighbor_degree": 0.18383961009544939,
+        "endpoint.return_2": 0.17595569764992486,
+        "endpoint.return_3": 0.0634084102098598,
+        "endpoint.return_4": 0.13633564587500452,
+        "relation.log1p_common": 0.4659493177866821,
+        "relation.jaccard": 0.7538674567611995,
+        "relation.log1p_l3": 0.4414876008664307,
+        "relation.walk_2": 0.6205416397229871,
+        "relation.walk_3": -0.00464214732630394,
+        "relation.walk_4": 0.42663680855542346,
+        "relation.walk_5": 0.3519648256332019,
+        "context.log1p_hop1_union": 0.4540391813956464,
+        "context.log1p_shell": 0.399755635237942,
+        "context.shell_shared_fraction": 0.7123723230348527,
+        "context.log1p_cross_ring": 0.3841332720973592,
+        "context.l3_density": 0.35391204508824864
+      },
+      "label_r2": {
+        "positive": {
+          "endpoint": -0.2519920159379969,
+          "relation": -0.5161629998567432,
+          "context": -0.3376674708664642
+        },
+        "negative": {
+          "endpoint": -0.35764102900263595,
+          "relation": -0.25273361531954097,
+          "context": -0.15612838127141804
+        }
+      }
+    },
+    "test": {
+      "rows": 6000,
+      "positives": 3000,
+      "graph_nodes": 2018,
+      "graph_edges": 30128,
+      "field_r2": {
+        "endpoint": -1.5233643886136976,
+        "relation": -0.012032764534059659,
+        "context": -1.5559114859464565
+      },
+      "endpoint_swapped_r2": -2.0375412138698175,
+      "distance_accuracy": 0.32216666666666666,
+      "distance_majority_accuracy": 0.6458333333333334,
+      "coordinate_r2": {
+        "endpoint.log1p_degree": -1.3807804090536187,
+        "endpoint.clustering": 0.32492138887971755,
+        "endpoint.log1p_triangles": -0.26615064073664985,
+        "endpoint.log1p_open_wedges": -2.1831898534990866,
+        "endpoint.log1p_two_hop": -11.81302838290163,
+        "endpoint.log1p_mean_neighbor_degree": -4.421557830103866,
+        "endpoint.return_2": -7.978215251704592,
+        "endpoint.return_3": -0.8013780568931661,
+        "endpoint.return_4": -33.848829752325436,
+        "relation.log1p_common": 0.2324979306887507,
+        "relation.jaccard": 0.5072126792930096,
+        "relation.log1p_l3": -1.127013972977318,
+        "relation.walk_2": -1.1535064346371846,
+        "relation.walk_3": -0.10253340714875625,
+        "relation.walk_4": -3.400972060680389,
+        "relation.walk_5": 0.004652033147503398,
+        "context.log1p_hop1_union": -2.831261266507859,
+        "context.log1p_shell": -21.294196816322486,
+        "context.shell_shared_fraction": -0.5301237529356835,
+        "context.log1p_cross_ring": -3.6775797776412924,
+        "context.l3_density": 0.2912518451850139
+      },
+      "coordinate_pearson": {
+        "endpoint.log1p_degree": 0.4758931638159935,
+        "endpoint.clustering": 0.5801454295559331,
+        "endpoint.log1p_triangles": 0.6459111713965265,
+        "endpoint.log1p_open_wedges": 0.2963789184424099,
+        "endpoint.log1p_two_hop": 0.03682168185036582,
+        "endpoint.log1p_mean_neighbor_degree": 0.5616404217575789,
+        "endpoint.return_2": 0.42961227211131453,
+        "endpoint.return_3": 0.26481288645714235,
+        "endpoint.return_4": 0.0801227736449141,
+        "relation.log1p_common": 0.567443991835211,
+        "relation.jaccard": 0.7558356468902319,
+        "relation.log1p_l3": 0.5773728081198084,
+        "relation.walk_2": 0.5991832943522385,
+        "relation.walk_3": 0.11630322981000192,
+        "relation.walk_4": 0.35481400495838583,
+        "relation.walk_5": 0.43446998343677873,
+        "context.log1p_hop1_union": 0.4952947671338986,
+        "context.log1p_shell": 0.09491135474623229,
+        "context.shell_shared_fraction": 0.6863662044924099,
+        "context.log1p_cross_ring": 0.2192371412499509,
+        "context.l3_density": 0.59203046086827
+      },
+      "label_r2": {
+        "positive": {
+          "endpoint": -1.4572935234695392,
+          "relation": -0.3530526711732447,
+          "context": -1.3637559401630543
+        },
+        "negative": {
+          "endpoint": -1.6026052645384055,
+          "relation": -1.1612658058095335,
+          "context": -4.6164271280558
+        }
+      }
+    }
+  }
+}
