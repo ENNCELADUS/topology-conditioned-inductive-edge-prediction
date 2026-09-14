@@ -12,6 +12,7 @@ import networkx as nx
 import numpy as np
 import pytest
 import torch
+import yaml
 from src import train_l3ppi as training
 from src.baselines.l3ppi import build_l3ppi
 from src.data.l3_patterns import L3PatternCache
@@ -197,3 +198,18 @@ def test_convergence_and_temperature() -> None:
     assert not training.converged([0.1] * 9 + [0.2])
     assert training.temperature(1, 25) == 1
     assert training.temperature(25, 25) == pytest.approx(0.1)
+
+
+def test_duplicate_cli_does_not_mark_published_run_failed(
+    tiny_training: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tiny_training
+    training.run(cfg, "surrogate", False, 0, 1, torch.device("cpu"))
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr("sys.argv", ["train_l3ppi", str(path), "--stage", "surrogate"])
+    with pytest.raises(FileExistsError, match="completed output"):
+        training.main()
+    assert not (Path(cfg["output_dir"]) / "failure.json").exists()

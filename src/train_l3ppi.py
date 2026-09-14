@@ -635,9 +635,11 @@ def main() -> None:
     except Exception as exc:
         path = Path(config["output_dir"])
         path.mkdir(parents=True, exist_ok=True)
-        write_json(path / f"failure_rank{rank}.json", {"error": str(exc)})
-        if rank == 0:
-            write_json(path / "failure.json", {"error": str(exc)})
+        # Refusing a second launch must not poison an already published run.
+        if not (path / "complete.json").exists():
+            write_json(path / f"failure_rank{rank}.json", {"error": str(exc)})
+            if rank == 0:
+                write_json(path / "failure.json", {"error": str(exc)})
         raise
     finally:
         if world > 1:

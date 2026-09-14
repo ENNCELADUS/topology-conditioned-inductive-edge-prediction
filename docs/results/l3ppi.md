@@ -1,8 +1,21 @@
 # L3-PPI: paper-based reproduction on our benchmark
 
-Status: implementation verified locally; H20 reproduction pending. No experiment
-result is claimed yet. Model/data/lifecycle/scoring/study checks and shared scoring
-regressions pass, including a two-rank Gloo test with an empty final-rank batch.
+Status: running on H20 as `outputs/l3ppi_seed0_20260914`; no held-out result yet.
+Implementation commit `1de3a5f` passed 189 relevant tests, scoped MyPy and Ruff,
+including a two-rank Gloo check with an empty final-rank batch. Code was transferred
+directly through Git to the private H20 repository; no GitHub branch was published.
+
+The isolated checkout is `/2023533015/l3ppi-reproduction-20260914` on port 30838
+(launch host `a4uvdi75hfet1-0`). The study driver launched as PID 61943; logs are
+`outputs/logs/l3ppi_seed0_20260914.log` and the study's per-stage logs. These are
+launch-time identifiers, not continuing evidence of liveness.
+
+The initial 512-row training-only extraction profile took 0.608 s: mean 139.4 and
+maximum 5,850 simple L3 paths, maximum union 128 nodes / 3,466 edges, 364 zero-path
+rows, no truncation. The first surrogate epoch processed 221,142 pairs in 52.38 s
+(4,222 pairs/s); peak PyTorch-allocated memory was 0.293 GiB per rank maximum,
+excluding allocator-reserved memory and CUDA runtime overhead. These describe this
+stage and sample only, not the cost of later K=64 trials or inference.
 
 ## Question and comparator
 
@@ -106,6 +119,18 @@ Study artifacts: generated configs, `surrogate/`, six `trial_*/` directories,
 save `selection.json` and per-epoch checkpoints. Only the winner receives merged
 scores and `test_report.json`. Study status distinguishes `published` from `tested`;
 publication alone does not establish successful held-out evaluation.
+
+Generate phase-separated PNG/PDF curves and measured runtime summaries with:
+
+```bash
+.venv/bin/python -m src.experiments.l3ppi_report \
+  --study-dir outputs/l3ppi_seed0_20260914 --output-dir outputs/l3ppi_seed0_20260914/report
+```
+
+Partial runs produce observed curves only. A comparison CSV and README are emitted
+only once the winner's test report exists; the default comparator is the existing
+v8 B0 report. Its aggregate row/class/bucket counts are checked; exact pair/label
+identity additionally needs the score artifacts, not matching aggregate counts.
 
 First-wave claims are single-seed observations of complete-head replacement.
 They do not isolate the L3 prior from pooling/head adaptation, and do not establish
