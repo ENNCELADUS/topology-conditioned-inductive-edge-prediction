@@ -20,7 +20,11 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 from src.data.struct_coords import CONTEXT_NAMES, ENDPOINT_NAMES, FIELD_SLICES, RELATION_NAMES
-from src.model.egostitch.classifier.coord_gen import FIELD_CONTINUOUS_INDEX
+from src.model.egostitch.classifier.coord_gen import (
+    DISTANCE_INDEX,
+    FIELD_CONTINUOUS_INDEX,
+    SELF_DISTANCE_CLASS,
+)
 
 UNIVERSES = ("train", "val", "test")
 NAMES = (
@@ -31,7 +35,34 @@ NAMES = (
 DISTANCE_CLASSES = ("d=2", "d=3", "d>=4", "d=inf", "self")
 
 
-def stack(dump: np.lib.npyio.NpzFile, universe: str, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def self_mask(dump: np.lib.npyio.NpzFile, universe: str) -> np.ndarray:
+    """Return the ``u == v`` rows of one universe.
+
+    A self-pair is the distance head's own fifth class (`SELF_DISTANCE_CLASS`),
+    which `StructCoordinateTable` gives no shortest-path category, so its four
+    raw one-hot coordinates are all zero. Both definitions are checked against
+    each other here rather than trusting either alone.
+
+    Args:
+        dump: The loaded `coord_fit_universes.npz`.
+        universe: One of `train`, `val`, `test`.
+
+    Returns:
+        A boolean mask over the universe's rows.
+
+    Raises:
+        ValueError: If the two definitions disagree.
+    """
+    by_class = dump[f"{universe}_dist_true"].astype(int) == SELF_DISTANCE_CLASS
+    by_onehot = np.abs(dump[f"{universe}_true_raw"][:, list(DISTANCE_INDEX)]).sum(1) == 0
+    if not np.array_equal(by_class, by_onehot):
+        raise ValueError(f"{universe}: self-pair class and all-zero distance one-hot disagree")
+    return by_class
+
+
+def stack(
+    dump: np.lib.npyio.NpzFile, universe: str, name: str, stratum: str = "all"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return standardised (prediction, truth, label) columns for one statistic.
 
     Endpoint statistics pool the u and v columns, as the probe's own per-coordinate
@@ -41,12 +72,22 @@ def stack(dump: np.lib.npyio.NpzFile, universe: str, name: str) -> tuple[np.ndar
         dump: The loaded `coord_fit_universes.npz`.
         universe: One of `train`, `val`, `test`.
         name: A dotted statistic name from `NAMES`.
+        stratum: ``all``, ``self`` (``u == v``) or ``nonself``. Self-pairs make
+            several statistics true by construction -- Jaccard is one, the shared
+            shell fraction is one on a non-empty shell, the two-step walk kernel
+            becomes a return probability -- and they are nearly all positive, so
+            label centring does not remove their contribution. The nonself
+            stratum is the one that speaks to distinct-protein pairs.
 
     Returns:
         Prediction, truth and binary label arrays of equal length.
     """
     pred, true = dump[f"{universe}_pred_std"], dump[f"{universe}_true_std"]
     labels = dump[f"{universe}_labels"].astype(int)
+    if stratum != "all":
+        keep = self_mask(dump, universe)
+        keep = keep if stratum == "self" else ~keep
+        pred, true, labels = pred[keep], true[keep], labels[keep]
     field, stat = name.split(".", 1)
     if field == "endpoint":
         j = ENDPOINT_NAMES.index(stat)
@@ -109,21 +150,38 @@ def main() -> None:
         type=Path,
         default=Path("docs/results/topo_prompt_stage2_curves/coord_gen_full/coord_fit_universes.npz"),
     )
+    parser.add_argument(
+        "--stratum",
+        choices=("all", "self", "nonself"),
+        default="all",
+        help="row stratum: every row, only u == v, or only distinct endpoints",
+    )
     args = parser.parse_args()
     dump = np.load(args.npz)
+    stratum = args.stratum
 
-    print("## Correlation (within-label unless stated)\n")
+    print(f"# stratum: {stratum}\n")
+    print("| universe | rows | self rows | self rows positive |")
+    print("|---|---:|---:|---:|")
+    for universe in UNIVERSES:
+        mask = self_mask(dump, universe)
+        labels = dump[f"{universe}_labels"].astype(int)
+        print(
+            f"| {universe} | {len(mask)} | {int(mask.sum())} | {int(labels[mask].sum())} |"
+        )
+
+    print("\n## Correlation (within-label unless stated)\n")
     print("| statistic | rho train | rho val | rho test | within train | within val | within test "
-          "| pos test | neg test | rho^2 test |")
+          "| pos test | neg test | within rho^2 test |")
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for name in NAMES:
         cells = []
         within = {}
         for universe in UNIVERSES:
-            pred, true, labels = stack(dump, universe, name)
+            pred, true, labels = stack(dump, universe, name, stratum)
             cells.append(pearson(pred, true))
             within[universe] = pearson(label_centred(pred, labels), label_centred(true, labels))
-        pred, true, labels = stack(dump, "test", name)
+        pred, true, labels = stack(dump, "test", name, stratum)
         pos = pearson(pred[labels == 1], true[labels == 1])
         neg = pearson(pred[labels == 0], true[labels == 0])
         row = cells + [within[u] for u in UNIVERSES] + [pos, neg, within["test"] ** 2]
@@ -136,7 +194,7 @@ def main() -> None:
     for name in NAMES:
         sd_pred, sd_true, offset, r2 = [], [], {}, {}
         for universe in UNIVERSES:
-            pred, true, _ = stack(dump, universe, name)
+            pred, true, _ = stack(dump, universe, name, stratum)
             sd_pred.append(pred.std())
             sd_true.append(true.std())
             offset[universe] = pred.mean() - true.mean()
@@ -153,7 +211,7 @@ def main() -> None:
     for name in NAMES:
         cells = []
         for universe in ("val", "test"):
-            pred, true, labels = stack(dump, universe, name)
+            pred, true, labels = stack(dump, universe, name, stratum)
             cells += [
                 roc_auc_score(labels, true) if true.std() > 1e-12 else float("nan"),
                 roc_auc_score(labels, pred) if pred.std() > 1e-12 else float("nan"),
@@ -167,9 +225,13 @@ def main() -> None:
         FIELD_CONTINUOUS_INDEX["endpoint"] + FIELD_CONTINUOUS_INDEX["relation"] + FIELD_CONTINUOUS_INDEX["context"]
     )
     for universe in UNIVERSES:
-        labels = dump[f"{universe}_labels"].astype(int)
+        keep = np.ones(len(dump[f"{universe}_labels"]), dtype=bool)
+        if stratum != "all":
+            keep = self_mask(dump, universe)
+            keep = keep if stratum == "self" else ~keep
+        labels = dump[f"{universe}_labels"].astype(int)[keep]
         for source in ("pred", "true"):
-            matrix = dump[f"{universe}_{source}_std"][:, columns].astype(float)
+            matrix = dump[f"{universe}_{source}_std"][keep][:, columns].astype(float)
             spectrum, effective = effective_dimension(matrix)
             centred = matrix - matrix.mean(0)
             pc1 = centred @ np.linalg.svd(centred, full_matrices=False)[2][0]
@@ -183,8 +245,12 @@ def main() -> None:
           + " | rows per true class |")
     print("|---|---:|---:|" + "---:|" * (len(DISTANCE_CLASSES) + 1))
     for universe in UNIVERSES:
-        pred = dump[f"{universe}_dist_pred"].astype(int)
-        true = dump[f"{universe}_dist_true"].astype(int)
+        keep = np.ones(len(dump[f"{universe}_labels"]), dtype=bool)
+        if stratum != "all":
+            keep = self_mask(dump, universe)
+            keep = keep if stratum == "self" else ~keep
+        pred = dump[f"{universe}_dist_pred"].astype(int)[keep]
+        true = dump[f"{universe}_dist_true"].astype(int)[keep]
         counts = np.bincount(true, minlength=len(DISTANCE_CLASSES))
         recalls = [
             f"{float((pred[true == c] == c).mean()):.3f}" if counts[c] else "-"

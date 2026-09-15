@@ -17,13 +17,17 @@ Comparator: `prefix_base` (val_cls AUROC/AUPRC 0.793/0.814, GS 0.401; test 0.721
 
 ## 1. Verdict (topology first)
 
-> **Superseded in part (2026-09-15).** A causal decomposition of these same artifacts
-> ([`topo_prompt_stage2_verdict/`](topo_prompt_stage2_verdict/README.md)) shows the topology result below
-> is reproduced by one scalar per universe — the predicted coordinates depress V_val logits 0.66
-> nats more than test logits, which loosens the transferred threshold — and that at matched density
-> the shape advantage disappears (predicted 4.0 / 3.5 / 6.0 against `mean`'s 3.3 / 3.9 / 4.9). Read
-> the paragraphs below as the measured numbers they are; do not read their attribution to
-> "topology-conditioned decision", which the decomposition does not support.
+> **Attribution superseded (2026-09-15).** The measured numbers below stand; their attribution does
+> not. A causal decomposition and a per-statistic generalisation audit of these same artifacts —
+> [`topo_prompt_stage2_verdict/`](topo_prompt_stage2_verdict/README.md), revised after an independent
+> audit — find that the predicted coordinates depress V_val logits 0.66 nats more than test logits,
+> which loosens the transferred threshold, and that a single per-universe scalar reproduces the
+> density and the degree and spectral ratios (though not GS, clustering, or any ranking metric).
+> Between *distinct* proteins, zero of 21 coordinates meet the ≥ 0.5 within-label correlation bar on
+> both unseen universes; the ones that appeared to were carried by self-pairs, where Jaccard is one
+> by construction. Do not read the paragraphs below as establishing a "topology-conditioned
+> decision"; no diagnostic here compares shape against an independently trained baseline at a common
+> density, which is the missing evidence.
 
 The study's object is the assembled topology, so the reading starts with the five topology numbers
 at the ONE V_val-selected threshold on the held-out test subgraphs, next to every deployable arm:
