@@ -82,7 +82,7 @@ That was wrong, and the gate was removed on 2026-09-15: transplanting the *predi
 of another row of the universe is the marginal-preserving null that `mean` is not -- `mean` deletes
 the prediction's variance along with its content, while a transplant leaves the universe's
 distribution of predictions intact and destroys only the pairing. See
-`docs/results/topo_prompt_stage2_causal.md`.
+`docs/results/topo_prompt_stage2_verdict/`.
 
 ## 4. Validation and scoring
 

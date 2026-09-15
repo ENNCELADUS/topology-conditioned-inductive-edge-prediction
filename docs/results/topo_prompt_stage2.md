@@ -18,7 +18,7 @@ Comparator: `prefix_base` (val_cls AUROC/AUPRC 0.793/0.814, GS 0.401; test 0.721
 ## 1. Verdict (topology first)
 
 > **Superseded in part (2026-09-15).** A causal decomposition of these same artifacts
-> ([`topo_prompt_stage2_causal.md`](topo_prompt_stage2_causal.md)) shows the topology result below
+> ([`topo_prompt_stage2_verdict/`](topo_prompt_stage2_verdict/README.md)) shows the topology result below
 > is reproduced by one scalar per universe — the predicted coordinates depress V_val logits 0.66
 > nats more than test logits, which loosens the transferred threshold — and that at matched density
 > the shape advantage disappears (predicted 4.0 / 3.5 / 6.0 against `mean`'s 3.3 / 3.9 / 4.9). Read
@@ -234,3 +234,8 @@ within 0.014 of the base; `gates_off` is the base exactly). GS does not move in 
   prediction error through the frozen reader before any of the above is built.
 
 Single-seed differences inside ±0.01 GS / ±0.5 MMD ratio are not read.
+
+Combined verdict on the generator — what the predicted coordinates contain (per-statistic
+generalisation: which of §3's correlations are real, which are the label-balanced sample, and what
+the reader receives) and what they cause (decomposition of their effect on the assembled graph):
+[`topo_prompt_stage2_verdict/`](topo_prompt_stage2_verdict/README.md).
