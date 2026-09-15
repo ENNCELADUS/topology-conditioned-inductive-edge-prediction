@@ -268,3 +268,58 @@ def test_corruption_is_seeded_swap_equivariant_and_keeps_distance_probabilities(
     assert (probabilities >= 0).all() and (probabilities.sum(1) <= 1).all()
     generator.eval()
     assert torch.equal(generator.training_corruption(z, seed=123), z)
+
+
+def test_compact_reader_has_three_tokens_six_rows_and_round_trips() -> None:
+    model = V3_1TopoPrompt(base=_tiny_base_config(), topo_prompt={"coord_spec": "v2", "width": 16})
+    model.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
+    model.eval()
+    coords = torch.randn(6, 11)
+    view_u, view_v = model.generator.tokens(coords)
+    assert view_u.shape == view_v.shape == (6, 3, 16)
+    assert model.generator.prefix(0, view_u).shape == (6, 6, model.d_model)
+    batch = {**_pair_batch(), "struct_coords": coords}
+    with torch.no_grad():
+        expected = model(batch)["logits"]
+    clone = V3_1TopoPrompt(base=_tiny_base_config(), topo_prompt={"coord_spec": "v2", "width": 16})
+    clone.load_state_dict(model.state_dict(), strict=True)
+    clone.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(clone(batch)["logits"], expected, rtol=0, atol=0)
+    clone.intervention = "mean_context"
+    with pytest.raises(ValueError, match="context"):
+        clone(batch)
+
+
+def test_compact_corruption_and_reader_are_swap_equivariant() -> None:
+    model = V3_1TopoPrompt(
+        base=_tiny_base_config(),
+        topo_prompt={"coord_spec": "v2", "width": 16, "corruption": {"prob": 1.0}},
+    )
+    model.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
+    coords = torch.randn(6, 11)
+    coords[:, 8:] = 0
+    coords[0, 8] = 1
+    swapped = coords.clone()
+    swapped[:, :2], swapped[:, 2:4] = coords[:, 2:4], coords[:, :2]
+    noisy = model.generator.training_corruption(coords, seed=13)
+    reverse = model.generator.training_corruption(swapped, seed=13)
+    torch.testing.assert_close(noisy[:, :2], reverse[:, 2:4])
+    torch.testing.assert_close(noisy[:, 2:4], reverse[:, :2])
+    torch.testing.assert_close(noisy[:, 4:], reverse[:, 4:])
+    assert (noisy[:, 8:] >= 0).all() and (noisy[:, 8:].sum(1) <= 1).all()
+    _open_gates(model)
+    model.eval()
+    batch = _pair_batch()
+    with torch.no_grad():
+        original = model({**batch, "struct_coords": coords})["logits"]
+        other = model(
+            {
+                "emb_a": batch["emb_b"],
+                "emb_b": batch["emb_a"],
+                "len_a": batch["len_b"],
+                "len_b": batch["len_a"],
+                "struct_coords": swapped,
+            }
+        )["logits"]
+    torch.testing.assert_close(original, other, rtol=0, atol=1e-6)

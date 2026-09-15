@@ -166,3 +166,33 @@ def test_sampled_pair_coordinates_keep_full_graph_context_and_order() -> None:
     ).shape == (0, COORD_DIM)
     with pytest.raises(ValueError, match="outside"):
         table.coords_for_pairs(np.asarray([-1]), np.asarray([0]))
+
+
+def test_compact_spec_matches_v1_columns_and_merges_distant_classes() -> None:
+    from src.data.struct_coords import get_coord_spec
+
+    graph = _random_graph(21, n=12)
+    pairs = [(u, v) for u in graph for v in graph]
+    legacy = StructCoordinateTable(graph).coords(pairs)
+    compact = StructCoordinateTable(graph, spec="v2")
+    spec = get_coord_spec("v2")
+    actual = compact.coords(pairs)
+    assert spec.fields == ("endpoint_u", "endpoint_v", "relation")
+    assert actual.shape == (len(pairs), 11)
+    for index, name in enumerate(spec.coord_names):
+        expected = legacy[:, COORD_NAMES.index(name)]
+        if name == "dist_4plus":
+            expected = expected + legacy[:, COORD_NAMES.index("dist_inf")]
+        np.testing.assert_array_equal(actual[:, index], expected)
+    assert compact.coords([]).shape == (0, 11)
+    np.testing.assert_array_equal(StructCoordinateTable(graph, spec="v1").coords(pairs), legacy)
+
+
+def test_compact_statistics_pool_endpoint_roles() -> None:
+    coords = np.zeros((5, 11), dtype=np.float32)
+    coords[:, 0] = np.arange(5)
+    mean, std = coordinate_statistics(coords, spec="v2")
+    np.testing.assert_array_equal(mean[:2], mean[2:4])
+    np.testing.assert_array_equal(std[:2], std[2:4])
+    assert mean[0] == 1.0
+    assert std[0] == pytest.approx(np.sqrt(2.0))

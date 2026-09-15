@@ -74,7 +74,7 @@ from src.data.pairs import (
     collate_token_pairs,
 )
 from src.data.partition import build_g_struct
-from src.data.struct_coords import COORD_DIM, StructCoordinateTable, coordinate_statistics
+from src.data.struct_coords import StructCoordinateTable, coordinate_statistics
 from src.data.struct_sampler import StructEpochPlan, StructSampler, StructSubgraph
 from src.data.training_sampler import TrainingCorpus, build_training_corpus
 from src.data.val_region import (
@@ -125,8 +125,8 @@ from src.eval.val_topology import (
 )
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.coord_gen import (
-    FIELD_CONTINUOUS_INDEX,
     CoordGenConfig,
+    CoordinateGenerator,
     V3_1CoordGen,
     distance_class_targets,
 )
@@ -1981,6 +1981,8 @@ def _run_metadata(
                 "anchor": gen_kwargs.get("w_anchor"),
             },
         }
+    if "virtual_graph" in result.runtime_profile:
+        run_metadata["virtual_graph"] = result.runtime_profile["virtual_graph"]
     if cfg.run_kind is not None:
         # Same vocabulary as the EgoStitch worker so the test protocol and readers
         # classify the run identically; a diagnostic run consumed held-out truth.
@@ -2096,6 +2098,8 @@ def write_outputs(
         result.best_val_metrics,
         config_dict,
     )
+    if "virtual_graph" in result.runtime_profile:
+        best_payload["virtual_graph"] = result.runtime_profile["virtual_graph"]
     if result.val_threshold_transfer is not None:
         best_payload["val_threshold_transfer"] = asdict(result.val_threshold_transfer)
         best_payload["selection_rule"] = SELECTION_RULE
@@ -3812,6 +3816,7 @@ class TopoPromptRows:
         val_cls_pairs: Sequence[Pair],
         universe_pairs: Sequence[Pair],
         device: torch.device,
+        spec: str = "v1",
     ) -> None:
         """Measure every row once.
 
@@ -3823,21 +3828,23 @@ class TopoPromptRows:
             val_cls_pairs: The V_val classification rows in row-id order.
             universe_pairs: The V_val topology ball-union rows in row-id order.
             device: Device batches live on.
+            spec: Checkpoint-selected coordinate layout.
         """
         started = time.monotonic()
-        train_table = StructCoordinateTable(train_graph)
+        train_table = StructCoordinateTable(train_graph, spec=spec)
         self.train = torch.from_numpy(train_table.coords(train_pairs))
         self.train_table = train_table
-        mean, std = coordinate_statistics(self.train.numpy()[np.asarray(stats_rows)])
+        mean, std = coordinate_statistics(self.train.numpy()[np.asarray(stats_rows)], spec=spec)
         self.coord_mean = torch.from_numpy(mean)
         self.coord_std = torch.from_numpy(std)
         self.coord_count = int(len(stats_rows))
-        val_table = StructCoordinateTable(val_graph)
+        val_table = StructCoordinateTable(val_graph, spec=spec)
         self.val_cls = torch.from_numpy(val_table.coords(val_cls_pairs))
         self.universe = torch.from_numpy(val_table.coords(universe_pairs))
         self.val_table = val_table
         self._device = device
         self.build_seconds = time.monotonic() - started
+        self.virtual_metadata: dict[str, object] | None = None
 
     def install(self, model: nn.Module) -> None:
         """Copy the training statistics into the model's published buffers."""
@@ -3861,12 +3868,119 @@ class TopoPromptRows:
     def summary(self) -> dict[str, object]:
         """Provenance for logs and ``run_metadata.json``."""
         return {
+            "coord_spec": self.train_table.spec.name,
             "train_rows": int(self.train.shape[0]),
             "stats_rows": self.coord_count,
             "val_cls_rows": int(self.val_cls.shape[0]),
             "universe_rows": int(self.universe.shape[0]),
             "build_seconds": self.build_seconds,
         }
+
+
+@torch.no_grad()
+def initialise_virtual_graph(
+    model: V3_1CoordGen,
+    rows: TopoPromptRows,
+    table: PackedFeatureTable,
+    accelerator: Accelerator,
+    *,
+    seed: int,
+) -> dict[str, object]:
+    """Coarsen only the legal training graph once, then synchronise every rank."""
+    from sklearn.cluster import KMeans
+
+    from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
+
+    generator = model.generator
+    if not isinstance(generator, VirtualGraphGenerator):
+        raise TypeError("virtual initialisation needs a VirtualGraphGenerator")
+    payload: list[dict[str, Any] | None] = [None]
+    if accelerator.is_main_process:
+        was_training = model.training
+        model.eval()
+        try:
+            node_index = table.manifest.node_index()
+            legal_nodes = rows.train_table.nodes
+            included = [i for i, node in enumerate(legal_nodes) if node in node_index]
+            omitted = [node for node in legal_nodes if node not in node_index]
+            adjacency = rows.train_table.adjacency[included, :][:, included]
+            pooled = []
+            for node in (legal_nodes[i] for i in included):
+                index = node_index[node]
+                indices = torch.tensor([index], device=accelerator.device)
+                tokens, lengths = table.gather_nodes(indices, table.manifest.nodes[index].length)
+                with accelerator.autocast():
+                    encoded = model.encoder(tokens, lengths)
+                pooled.append(CoordinateGenerator.pool(encoded, lengths).float().cpu()[0])
+            states = torch.stack(pooled)
+            array = states.numpy()
+            standardised = (array - array.mean(axis=0)) / np.maximum(array.std(axis=0), 1e-6)
+            assignments = KMeans(n_clusters=generator.k, random_state=seed, n_init=10).fit_predict(
+                standardised
+            )
+            mean_degree = float(adjacency.sum() / len(included))
+            generator.initialise(
+                states.to(accelerator.device),
+                torch.from_numpy(assignments).to(accelerator.device),
+                adjacency,
+                mean_degree,
+            )
+            # Fit only the scalar attachment bias; retain no residue-state corpus.
+            attachment_logits = []
+            for node in (legal_nodes[i] for i in included):
+                index = node_index[node]
+                indices = torch.tensor([index], device=accelerator.device)
+                tokens, lengths = table.gather_nodes(indices, table.manifest.nodes[index].length)
+                with accelerator.autocast():
+                    encoded = model.encoder(tokens, lengths)
+                attachment_logits.append(
+                    (generator.attachment_logits(encoded, lengths) - generator.attachment.bias)
+                    .float()
+                    .cpu()
+                    .flatten()
+                )
+            logits = torch.cat(attachment_logits)
+            target = mean_degree / len(included)
+            lower, upper = -100.0 - float(logits.max()), 100.0 - float(logits.min())
+            for _ in range(64):
+                middle = (lower + upper) / 2.0
+                if float((logits + middle).sigmoid().mean()) < target:
+                    lower = middle
+                else:
+                    upper = middle
+            generator.attachment.bias.fill_((lower + upper) / 2.0)
+            initial_mean = float(
+                (logits + float(generator.attachment.bias.item())).sigmoid().mean()
+            )
+            payload[0] = {
+                "metadata": {
+                    "seed": seed,
+                    "train_nodes": len(included),
+                    "train_edges": int(adjacency.nnz // 2),
+                    "omitted_featureless_nodes": omitted,
+                    "omitted_featureless_count": len(omitted),
+                    "k": generator.k,
+                    "mean_degree": mean_degree,
+                    "initial_attachment_target": target,
+                    "initial_attachment_mean": initial_mean,
+                    "cluster_sizes": np.bincount(assignments, minlength=generator.k).tolist(),
+                    "initialisation": "standardised_encoder_pool_kmeans",
+                }
+            }
+        except Exception as error:
+            payload[0] = {"error": f"{type(error).__name__}: {error}"}
+        finally:
+            model.train(was_training)
+    if accelerator.num_processes > 1:
+        dist.broadcast_object_list(payload, src=0)
+    outcome = payload[0]
+    if outcome is None or "error" in outcome:
+        raise RuntimeError(f"virtual graph initialisation failed: {outcome}")
+    if accelerator.num_processes > 1:
+        for value in generator.state_dict().values():
+            torch.distributed.broadcast(value, src=0)
+    rows.virtual_metadata = cast(dict[str, object], outcome["metadata"])
+    return rows.virtual_metadata
 
 
 def _coordinate_fit_metrics(
@@ -3896,16 +4010,23 @@ def _coordinate_fit_metrics(
     Raises:
         TypeError: If the model is not a `V3_1CoordGen`.
     """
+    from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
+
     raw_model = _unwrapped_model(model)
     if not isinstance(raw_model, V3_1CoordGen):
         raise TypeError("coordinate-fit diagnostics need a V3_1CoordGen")
     device = accelerator.device
-    sse = torch.zeros(COORD_DIM, dtype=torch.float64, device=device)
-    total = torch.zeros(COORD_DIM, dtype=torch.float64, device=device)
-    squares = torch.zeros(COORD_DIM, dtype=torch.float64, device=device)
+    sse = torch.zeros(raw_model.spec.coord_dim, dtype=torch.float64, device=device)
+    total = torch.zeros(raw_model.spec.coord_dim, dtype=torch.float64, device=device)
+    squares = torch.zeros(raw_model.spec.coord_dim, dtype=torch.float64, device=device)
     scalars = torch.zeros(4, dtype=torch.float64, device=device)
     was_training = raw_model.training
     raw_model.eval()
+    virtual = (
+        raw_model.generator if isinstance(raw_model.generator, VirtualGraphGenerator) else None
+    )
+    if virtual is not None:
+        virtual.reset_telemetry()
     with torch.no_grad():
         for batch in val_loader:
             batch = _to_device(batch, device)
@@ -3918,7 +4039,8 @@ def _coordinate_fit_metrics(
             squares += (z_star**2).sum(dim=0)
             rows = float(z_star.shape[0])
             correct = (
-                distance_class_targets(batch[COORDS_KEY]) == output["distance_logits"].argmax(dim=1)
+                distance_class_targets(batch[COORDS_KEY], raw_model.spec.name)
+                == output["distance_logits"].argmax(dim=1)
             ).sum()
             kd = output.get("kd_loss")
             scalars += torch.tensor(
@@ -3940,8 +4062,14 @@ def _coordinate_fit_metrics(
     rows_total = max(float(scalars[0].item()), 1.0)
     sst = squares - total**2 / rows_total
     result: dict[str, float] = {}
-    for field_name, index in FIELD_CONTINUOUS_INDEX.items():
-        columns = list(index)
+    fields: dict[str, list[int]] = {"endpoint": [], "relation": []}
+    for field_name in raw_model.spec.fields:
+        key = "endpoint" if field_name.startswith("endpoint_") else field_name
+        block = raw_model.spec.field_slices[field_name]
+        fields.setdefault(key, []).extend(
+            i for i in raw_model.spec.continuous_indices if block.start <= i < block.stop
+        )
+    for field_name, columns in fields.items():
         denominator = float(sst[columns].sum().item())
         result[f"val_coord_r2_{field_name}"] = (
             1.0 - float(sse[columns].sum().item()) / denominator if denominator > 0.0 else 0.0
@@ -3949,6 +4077,21 @@ def _coordinate_fit_metrics(
     result["val_coord_dist_acc"] = float(scalars[1].item()) / rows_total
     result["val_coord_loss"] = float(scalars[2].item()) / rows_total
     result["val_kd_loss"] = float(scalars[3].item()) / rows_total
+    if virtual is not None:
+        telemetry = virtual.telemetry(reset=True)
+        result["val_virtual_adjacency_entropy"] = float(telemetry.pop("adjacency_entropy"))
+        reduced = {
+            key: accelerator.reduce(value, reduction="sum") for key, value in telemetry.items()
+        }
+        for prefix in ("attachment", "gate"):
+            count = max(float(reduced[f"{prefix}_count"]), 1.0)
+            result[f"val_virtual_{prefix}_mean"] = float(reduced[f"{prefix}_sum"].mean()) / count
+            entropy = reduced[f"{prefix}_entropy_sum"] / count
+            result[f"val_virtual_{prefix}_entropy"] = float(entropy.mean())
+            for slot, value in enumerate(entropy.tolist()):
+                result[f"val_virtual_{prefix}_entropy_{slot}"] = float(value)
+        for slot, value in enumerate(reduced["attachment_sum"].tolist()):
+            result[f"val_virtual_usage_{slot}"] = float(value)
     return result
 
 
@@ -5581,6 +5724,8 @@ def train_ddp_loop(
                     metrics,
                     config_to_dict(cfg),
                 )
+                if topo_rows is not None and topo_rows.virtual_metadata is not None:
+                    checkpoint["virtual_graph"] = topo_rows.virtual_metadata
                 checkpoint["selection_metrics"] = entry
                 _torch_save_atomic(checkpoint, checkpoint_path)
                 _append_jsonl_durable(artifact_dir / "metrics.jsonl", entry)
@@ -6167,6 +6312,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     num_val_rows = len(val_cls_pairs)
 
     topo_rows: TopoPromptRows | None = None
+    virtual_metadata: dict[str, object] | None = None
     reference: ValTopologyReference | None = None
     if isinstance(model, V3_1TopoPrompt):
         # The prompt reads true structure: training rows from the training graph
@@ -6197,6 +6343,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 for a, b in zip(universe.u_idx.tolist(), universe.v_idx.tolist(), strict=True)
             ],
             device=accelerator.device,
+            spec=model.generator.spec.name,
         )
         topo_rows.install(model)
         if accelerator.is_main_process:
@@ -6227,7 +6374,25 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 for a, b in zip(universe.u_idx.tolist(), universe.v_idx.tolist(), strict=True)
             ],
             device=accelerator.device,
+            spec=model.spec.name,
         )
+        model.install_coordinate_scale(topo_rows.train)
+        if model.cfg.generator == "virtual_graph":
+            virtual_metadata = initialise_virtual_graph(
+                model, topo_rows, table, accelerator, seed=cfg.seed
+            )
+            metadata_error: list[str | None] = [None]
+            if accelerator.is_main_process:
+                try:
+                    _write_json_atomic(
+                        cfg.output_dir / "run_metadata.json",
+                        {"virtual_graph": virtual_metadata, "status": "initialised"},
+                    )
+                except OSError as error:
+                    metadata_error[0] = str(error)
+            broadcast_object_list(metadata_error, from_process=0)
+            if metadata_error[0] is not None:
+                raise RuntimeError(f"virtual graph metadata write failed: {metadata_error[0]}")
         if accelerator.is_main_process:
             logger.info("coord_gen coordinate targets ready: %s", topo_rows.summary())
     # The prompt family reads true coordinates on the V_val universe; the
@@ -6514,6 +6679,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     finalization_error: list[str | None] = [None]
     if accelerator.is_main_process:
         try:
+            if virtual_metadata is not None:
+                result.runtime_profile["virtual_graph"] = virtual_metadata
             write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
             result.runtime_profile["status"] = "complete"
             _write_json_atomic(args.profile_output, result.runtime_profile)

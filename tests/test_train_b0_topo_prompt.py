@@ -338,3 +338,23 @@ def test_ddp_loop_fails_closed_without_coordinates(tmp_path: Path) -> None:
             artifact_dir=tmp_path,
             evaluate_fn=lambda m, loader, acc: ValidationOutcome(_constant_metrics(), None),
         )
+
+
+def test_topology_rows_use_checkpoint_coordinate_spec() -> None:
+    from src.data.struct_coords import get_coord_spec
+
+    train, val, nodes = _tiny_graph()
+    pairs = [(nodes[0], nodes[1]), (nodes[0], nodes[0])]
+    rows = TopoPromptRows(
+        train_graph=train,
+        train_pairs=pairs,
+        stats_rows=np.arange(2),
+        val_graph=val,
+        val_cls_pairs=[("v0", "v1")],
+        universe_pairs=[("v0", "v1")],
+        device=torch.device("cpu"),
+        spec="v2",
+    )
+    assert rows.train.shape == (2, get_coord_spec("v2").coord_dim)
+    assert rows.val_cls.shape[1] == rows.train.shape[1]
+    assert rows.summary()["coord_spec"] == "v2"

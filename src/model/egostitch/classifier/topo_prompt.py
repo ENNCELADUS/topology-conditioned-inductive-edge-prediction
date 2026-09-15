@@ -6,7 +6,7 @@ pair trunk of a bidirectional-cross `V3_1` reads, at every cross-attention
 site of every layer, a short prefix built from the queried pair's fixed-
 semantics structural coordinates (`src.data.struct_coords`): two endpoint
 tokens (self / partner roles relative to the attending stream), one relation
-token and one context token, each expanded to ``slots_per_field`` key/value
+token and, in spec v1, one context token, each expanded to ``slots_per_field`` key/value
 rows. The prefix branch is the separately-softmaxed, zero-init tanh-gated
 attention of `src.model.egostitch.classifier.prefix.prefix_branch`, so at
 initialisation the model computes exactly the base.
@@ -30,15 +30,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from src.data.struct_coords import (
-    CONTEXT_DIM,
-    COORD_DIM,
-    COORD_NAMES,
-    COORD_SPEC,
-    ENDPOINT_DIM,
-    FIELD_SLICES,
-    RELATION_DIM,
-)
+from src.data.struct_coords import COORD_SPEC, get_coord_spec
 from src.model.egostitch.classifier.b0_v31 import V3_1, unpack_pair_batch, weighted_pair_bce
 from src.model.egostitch.classifier.layers import CrossAttentionLayer, _build_padding_mask
 from src.model.egostitch.classifier.prefix import SITES, prefix_branch
@@ -71,7 +63,7 @@ class TopoPromptConfig:
         trainable: ``"all"``, ``"prompt"``, or ``"interface_head"``.
         corruption: Stationary training-coordinate corruption distribution.
         width: Token width of the prompt encoder.
-        slots_per_field: Prefix rows each of the four fields expands to, per layer.
+        slots_per_field: Prefix rows each field expands to, per layer.
         field_mask_prob: Training-time probability of replacing one field of one
             row by its training mean (standardised zero); ``0`` disables it.
         coord_spec: Coordinate specification the checkpoint was trained on.
@@ -105,10 +97,7 @@ class TopoPromptConfig:
             raise ValueError("topo_prompt.width and topo_prompt.slots_per_field must be positive")
         if not 0.0 <= self.field_mask_prob < 1.0:
             raise ValueError("topo_prompt.field_mask_prob must lie in [0, 1)")
-        if self.coord_spec != COORD_SPEC:
-            raise ValueError(
-                f"topo_prompt.coord_spec {self.coord_spec!r} is not the supported {COORD_SPEC!r}"
-            )
+        get_coord_spec(self.coord_spec)
         if self.trainable == "prompt" and not self.base_checkpoint:
             raise ValueError("topo_prompt.trainable 'prompt' requires topo_prompt.base_checkpoint")
 
@@ -155,7 +144,7 @@ class TopoPromptGenerator(nn.Module):
     ``LayerNorm(GELU(Linear(field)) + role)``; the two endpoint tokens carry
     *self* and *partner* roles relative to the attending stream, so the
     prefix a stream reads names its own endpoint. Per layer, one linear map
-    expands the four tokens to ``4 * slots_per_field`` prefix rows plus a
+    expands the field tokens to ``n_fields * slots_per_field`` prefix rows plus a
     learned static offset ``p0``. Gates ``(n_layers, SITES, n_heads)`` start at
     zero: the only zero factor.
     """
@@ -175,17 +164,20 @@ class TopoPromptGenerator(nn.Module):
         """
         super().__init__()
         self.cfg = cfg
+        self.spec = get_coord_spec(cfg.coord_spec)
         self.d_model = d_model
         self.n_layers = n_layers
         self.n_heads = n_heads
-        self.slots = len(FIELD_ORDER) * cfg.slots_per_field
-        self.register_buffer("coord_mean", torch.zeros(COORD_DIM))
-        self.register_buffer("coord_std", torch.ones(COORD_DIM))
+        self.slots = len(self.spec.fields) * cfg.slots_per_field
+        self.register_buffer("coord_mean", torch.zeros(self.spec.coord_dim))
+        self.register_buffer("coord_std", torch.ones(self.spec.coord_dim))
         self.register_buffer("coord_count", torch.zeros(()))
-        self.endpoint_proj = nn.Linear(ENDPOINT_DIM, cfg.width)
-        self.relation_proj = nn.Linear(RELATION_DIM, cfg.width)
-        self.context_proj = nn.Linear(CONTEXT_DIM, cfg.width)
-        self.role_embed = nn.Parameter(torch.randn(len(FIELD_ORDER), cfg.width) * 0.02)
+        self.endpoint_proj = nn.Linear(self.spec.endpoint_dim, cfg.width)
+        self.relation_proj = nn.Linear(self.spec.relation_dim, cfg.width)
+        self.context_proj = (
+            nn.Linear(self.spec.context_dim, cfg.width) if self.spec.context_dim else None
+        )
+        self.role_embed = nn.Parameter(torch.randn(len(self.spec.fields), cfg.width) * 0.02)
         self.token_norm = nn.LayerNorm(cfg.width)
         self.layer_proj = nn.ModuleList(
             nn.Linear(cfg.width, cfg.slots_per_field * d_model) for _ in range(n_layers)
@@ -200,16 +192,18 @@ class TopoPromptGenerator(nn.Module):
         """Install the training-row standardisation statistics.
 
         Args:
-            mean: ``(COORD_DIM,)`` per-coordinate mean.
-            std: ``(COORD_DIM,)`` per-coordinate scale (already floored).
+            mean: ``(self.spec.coord_dim,)`` per-coordinate mean.
+            std: ``(self.spec.coord_dim,)`` per-coordinate scale (already floored).
             count: Number of rows the statistics were taken over.
 
         Raises:
             ValueError: On a shape mismatch, a non-positive count, or a non-finite
                 or non-positive scale.
         """
-        if tuple(mean.shape) != (COORD_DIM,) or tuple(std.shape) != (COORD_DIM,):
-            raise ValueError(f"coordinate statistics must have shape ({COORD_DIM},)")
+        if tuple(mean.shape) != (self.spec.coord_dim,) or tuple(std.shape) != (
+            self.spec.coord_dim,
+        ):
+            raise ValueError(f"coordinate statistics must have shape ({self.spec.coord_dim},)")
         if count <= 0:
             raise ValueError("coordinate statistics need a positive row count")
         if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or (std <= 0).any():
@@ -223,27 +217,28 @@ class TopoPromptGenerator(nn.Module):
 
         Raises:
             ValueError: If the statistics were never set, or ``coords`` is not
-                ``(B, COORD_DIM)``.
+                ``(B, self.spec.coord_dim)``.
         """
         if float(self.coord_count) <= 0.0:
             raise ValueError(
                 "topo_prompt coordinate statistics were never set (coord_count == 0); "
                 "the trainer installs them at startup and the checkpoint carries them"
             )
-        if coords.dim() != 2 or coords.size(-1) != COORD_DIM:
+        if coords.dim() != 2 or coords.size(-1) != self.spec.coord_dim:
             raise ValueError(
-                f"struct_coords must have shape (B, {COORD_DIM}), got {tuple(coords.shape)}"
+                f"struct_coords must have shape (B, {self.spec.coord_dim}), "
+                f"got {tuple(coords.shape)}"
             )
         return (coords.float() - self.coord_mean) / self.coord_std
 
     def mask_fields(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Zero (= training mean) every field whose ``(B, 4)`` mask entry is True."""
+        """Zero each field whose ``(B, n_fields)`` mask entry is True."""
         out = z.clone()
-        for field_index, field in enumerate(FIELD_ORDER):
-            out[:, FIELD_SLICES[field]] = torch.where(
+        for field_index, field in enumerate(self.spec.fields):
+            out[:, self.spec.field_slices[field]] = torch.where(
                 mask[:, field_index : field_index + 1],
-                torch.zeros_like(out[:, FIELD_SLICES[field]]),
-                out[:, FIELD_SLICES[field]],
+                torch.zeros_like(out[:, self.spec.field_slices[field]]),
+                out[:, self.spec.field_slices[field]],
             )
         return out
 
@@ -251,7 +246,9 @@ class TopoPromptGenerator(nn.Module):
         """Apply the Bernoulli field masking regulariser (training mode only)."""
         if not self.training or self.cfg.field_mask_prob <= 0.0:
             return z
-        mask = torch.rand(z.size(0), len(FIELD_ORDER), device=z.device) < self.cfg.field_mask_prob
+        mask = (
+            torch.rand(z.size(0), len(self.spec.fields), device=z.device) < self.cfg.field_mask_prob
+        )
         return self.mask_fields(z, mask)
 
     def perturb_coordinates(
@@ -265,11 +262,11 @@ class TopoPromptGenerator(nn.Module):
         """Perturb continuous coordinates and soften distance toward its training prior.
 
         Endpoint noise follows canonical coordinate order, preserving swap
-        equivariance for the same seed. The fifth class is the remaining probability.
+        equivariance for the same seed. The self class is the remaining probability.
         """
         rng = torch.Generator(device=z.device).manual_seed(seed)
         noise = torch.randn(z.shape, device=z.device, generator=rng)
-        u, v = FIELD_SLICES["endpoint_u"], FIELD_SLICES["endpoint_v"]
+        u, v = self.spec.field_slices["endpoint_u"], self.spec.field_slices["endpoint_v"]
         delta = z[:, u] - z[:, v]
         first = (delta != 0).to(torch.int64).argmax(dim=1, keepdim=True)
         reverse = delta.gather(1, first) > 0
@@ -279,7 +276,7 @@ class TopoPromptGenerator(nn.Module):
         # Identical endpoint targets have no orientation to distinguish.
         noise[:, v] = torch.where((delta == 0).all(dim=1, keepdim=True), noise[:, u], noise[:, v])
         out = z * shrink + noise * sigma
-        dist = [COORD_NAMES.index(name) for name in ("dist_2", "dist_3", "dist_4plus", "dist_inf")]
+        dist = list(self.spec.distance_indices)
         # Mixing raw one-hots with their mean prior is exactly shrinkage in z-space.
         out[:, dist] = (z * shrink)[:, dist]
         return out
@@ -300,31 +297,34 @@ class TopoPromptGenerator(nn.Module):
         )
 
     def tokens(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the ``(B, 4, width)`` token stacks for the two stream views.
+        """Return the ``(B, n_fields, width)`` token stacks for the two stream views.
 
         The first stack names endpoint ``u`` as *self* (the view of the stream
         encoding ``u``); the second names ``v`` as *self*. Relation and context
         tokens are shared.
         """
-        e_u = F.gelu(self.endpoint_proj(z[:, FIELD_SLICES["endpoint_u"]]))
-        e_v = F.gelu(self.endpoint_proj(z[:, FIELD_SLICES["endpoint_v"]]))
+        e_u = F.gelu(self.endpoint_proj(z[:, self.spec.field_slices["endpoint_u"]]))
+        e_v = F.gelu(self.endpoint_proj(z[:, self.spec.field_slices["endpoint_v"]]))
         rel = (
-            F.gelu(self.relation_proj(z[:, FIELD_SLICES["relation"]]))
+            F.gelu(self.relation_proj(z[:, self.spec.field_slices["relation"]]))
             + self.role_embed[ROLE_RELATION]
         )
-        ctx = (
-            F.gelu(self.context_proj(z[:, FIELD_SLICES["context"]])) + self.role_embed[ROLE_CONTEXT]
-        )
+        shared = [rel]
+        if self.context_proj is not None:
+            shared.append(
+                F.gelu(self.context_proj(z[:, self.spec.field_slices["context"]]))
+                + self.role_embed[ROLE_CONTEXT]
+            )
         view_u = torch.stack(
-            [e_u + self.role_embed[ROLE_SELF], e_v + self.role_embed[ROLE_PARTNER], rel, ctx], dim=1
+            [e_u + self.role_embed[ROLE_SELF], e_v + self.role_embed[ROLE_PARTNER], *shared], dim=1
         )
         view_v = torch.stack(
-            [e_v + self.role_embed[ROLE_SELF], e_u + self.role_embed[ROLE_PARTNER], rel, ctx], dim=1
+            [e_v + self.role_embed[ROLE_SELF], e_u + self.role_embed[ROLE_PARTNER], *shared], dim=1
         )
         return self.token_norm(view_u), self.token_norm(view_v)
 
     def prefix(self, layer_index: int, tokens: torch.Tensor) -> torch.Tensor:
-        """Expand ``(B, 4, width)`` tokens to this layer's ``(B, slots, d_model)`` prefix."""
+        """Expand ``(B, n_fields, width)`` tokens to this layer's ``(B, slots, d_model)`` prefix."""
         proj = cast(nn.Linear, self.layer_proj[layer_index])
         rows = proj(tokens).view(tokens.size(0), self.slots, self.d_model)
         p0: torch.Tensor = self.p0[layer_index]
@@ -530,15 +530,19 @@ class V3_1TopoPrompt(nn.Module):
             return z, 1.0
         if self.intervention == "gates_off":
             return z, 0.0
+        if self.intervention == "mean_context" and not self.generator.spec.context_dim:
+            raise ValueError("mean_context is unavailable: coord_spec v2 has no context field")
         fields = {
-            "mean": FIELD_ORDER,
+            "mean": self.generator.spec.fields,
             "mean_endpoint": ("endpoint_u", "endpoint_v"),
             "mean_relation": ("relation",),
             "mean_context": ("context",),
         }[self.intervention]
-        mask = torch.zeros(z.size(0), len(FIELD_ORDER), dtype=torch.bool, device=z.device)
+        mask = torch.zeros(
+            z.size(0), len(self.generator.spec.fields), dtype=torch.bool, device=z.device
+        )
         for field in fields:
-            mask[:, FIELD_ORDER.index(field)] = True
+            mask[:, self.generator.spec.fields.index(field)] = True
         return self.generator.mask_fields(z, mask), 1.0
 
     def _trunk(

@@ -12,7 +12,7 @@ from src import score_universe
 from src.data.distributed_pairs import CompactPairBatch
 from src.data.features import FeatureStore
 from src.data.packed_features import PackedFeatureTable
-from src.data.struct_coords import COORD_DIM
+from src.data.struct_coords import COORD_DIM, get_coord_spec
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
@@ -20,13 +20,20 @@ from tests.test_prefix_model import _tiny_base_config
 from tests.test_score_universe import _build_prefix_packed_fixture
 
 
-def _tiny_topo_prompt(*, gates: float = 0.4) -> V3_1TopoPrompt:
+def _tiny_topo_prompt(*, gates: float = 0.4, spec: str = "v1") -> V3_1TopoPrompt:
     torch.manual_seed(0)
     model = V3_1TopoPrompt(
         base=_tiny_base_config(),
-        topo_prompt={"trainable": "all", "width": 8, "slots_per_field": 1, "field_mask_prob": 0.0},
+        topo_prompt={
+            "trainable": "all",
+            "width": 8,
+            "slots_per_field": 1,
+            "field_mask_prob": 0.0,
+            "coord_spec": spec,
+        },
     )
-    model.generator.set_coord_stats(torch.zeros(COORD_DIM), torch.ones(COORD_DIM), 5)
+    dim = get_coord_spec(spec).coord_dim
+    model.generator.set_coord_stats(torch.zeros(dim), torch.ones(dim), 5)
     with torch.no_grad():
         model.generator.gates.fill_(gates)
     model.eval()
@@ -50,13 +57,14 @@ def test_shuffle_source_rows_is_a_seeded_permutation_of_the_whole_universe() -> 
         score_universe._check_row_coords(_coords(6), 7)
 
 
+@pytest.mark.parametrize("spec", ["v1", "v2"])
 def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spec: str
 ) -> None:
-    model = _tiny_topo_prompt()
+    model = _tiny_topo_prompt(spec=spec)
     pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
     store = FeatureStore(tmp_path / "features")
-    coords = _coords(len(pairs))
+    coords = _coords(len(pairs))[:, : get_coord_spec(spec).coord_dim]
     device = torch.device("cpu")
 
     def unpacked(row_coords: torch.Tensor) -> NDArray[np.float32]:
@@ -117,7 +125,7 @@ def test_unpacked_and_packed_scoring_agree_and_respond_to_coordinates(
         device=device,
         amp="off",
         token_budget=512,
-        row_coords=_coords(len(pairs), seed=9),
+        row_coords=_coords(len(pairs), seed=9)[:, : get_coord_spec(spec).coord_dim],
     )
     assert not np.allclose(baseline, other_coords)
 

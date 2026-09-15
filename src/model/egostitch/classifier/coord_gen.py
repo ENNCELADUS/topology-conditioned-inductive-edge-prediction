@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import cast
 
 import torch
@@ -17,16 +17,17 @@ from torch import nn
 from torch.nn import functional as F
 
 from src.data.struct_coords import (
-    CONTEXT_DIM,
     COORD_DIM,
     COORD_NAMES,
     COORD_SPEC,
     ENDPOINT_DIM,
     FIELD_SLICES,
+    get_coord_spec,
 )
 from src.model.egostitch.classifier.b0_v31 import unpack_pair_batch
 from src.model.egostitch.classifier.layers import _build_padding_mask, masked_max, masked_mean
 from src.model.egostitch.classifier.topo_prompt import COORDS_KEY, V3_1TopoPrompt
+from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
 
 DISTANCE_NAMES: tuple[str, ...] = ("dist_2", "dist_3", "dist_4plus", "dist_inf")
 DISTANCE_INDEX: tuple[int, ...] = tuple(COORD_NAMES.index(name) for name in DISTANCE_NAMES)
@@ -50,19 +51,34 @@ FIELD_CONTINUOUS_INDEX: dict[str, tuple[int, ...]] = {
 }
 
 
-def distance_class_targets(coords: torch.Tensor) -> torch.Tensor:
+def distance_class_targets(coords: torch.Tensor, spec: str = COORD_SPEC) -> torch.Tensor:
     """Return the ``(B,)`` distance class of raw coordinates.
 
     The four one-hot categories map to classes ``0..3``; an all-zero row (a
     self-pair, which `StructCoordinateTable` gives no category) maps to
     `SELF_DISTANCE_CLASS` rather than being coerced into ``dist_2``.
     """
-    one_hot = coords[:, list(DISTANCE_INDEX)].float()
+    layout = get_coord_spec(spec)
+    one_hot = coords[:, list(layout.distance_indices)].float()
     return torch.where(
         one_hot.sum(dim=1) > 0.5,
         one_hot.argmax(dim=1),
-        torch.full_like(one_hot[:, 0], SELF_DISTANCE_CLASS, dtype=torch.int64),
+        torch.full_like(one_hot[:, 0], layout.self_distance_class, dtype=torch.int64),
     )
+
+
+@dataclass(frozen=True)
+class VirtualGraphConfig:
+    """Fixed size and attention choices of the coarse graph."""
+
+    k: int = 64
+    d_z: int = 128
+    heads: int = 4
+    gate_bias: float = 3.0
+
+    def __post_init__(self) -> None:
+        if self.k <= 0 or self.d_z <= 0 or self.heads <= 0 or self.d_z % self.heads:
+            raise ValueError("virtual_graph sizes must be positive and d_z divisible by heads")
 
 
 @dataclass(frozen=True)
@@ -104,6 +120,8 @@ class CoordGenConfig:
     endpoint_hidden: int = 256
     trainable: str = "interface_head"
     coord_spec: str = COORD_SPEC
+    generator: str = "mlp"
+    virtual_graph: VirtualGraphConfig = field(default_factory=VirtualGraphConfig)
 
     def __post_init__(self) -> None:
         """Validate ranges.
@@ -131,10 +149,11 @@ class CoordGenConfig:
         weights = (self.w_coord, self.w_anchor, self.w_kd_rep)
         if any(weight < 0.0 for weight in weights):
             raise ValueError("coord_gen loss weights must be non-negative")
-        if self.coord_spec != COORD_SPEC:
-            raise ValueError(
-                f"coord_gen.coord_spec {self.coord_spec!r} is not the supported {COORD_SPEC!r}"
-            )
+        get_coord_spec(self.coord_spec)
+        if self.generator not in ("mlp", "virtual_graph"):
+            raise ValueError("coord_gen.generator must be mlp or virtual_graph")
+        if self.generator == "virtual_graph" and self.coord_spec != "v2":
+            raise ValueError("virtual_graph requires coord_spec v2")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> CoordGenConfig:
@@ -153,6 +172,18 @@ class CoordGenConfig:
         unknown = sorted(set(raw) - allowed)
         if unknown:
             raise ValueError(f"unknown coord_gen keys: {unknown}")
+        graph = raw.get("virtual_graph", {})
+        if not isinstance(graph, Mapping):
+            raise ValueError("coord_gen.virtual_graph must be a mapping")
+        unknown_graph = set(graph) - set(VirtualGraphConfig.__dataclass_fields__)
+        if unknown_graph:
+            raise ValueError(f"unknown virtual_graph keys: {sorted(unknown_graph)}")
+        graph_cfg = VirtualGraphConfig(
+            k=int(graph.get("k", 64)),
+            d_z=int(graph.get("d_z", 128)),
+            heads=int(graph.get("heads", 4)),
+            gate_bias=float(graph.get("gate_bias", 3.0)),
+        )
         sha = raw.get("reader_checkpoint_sha256")
         return cls(
             reader_checkpoint=str(raw.get("reader_checkpoint", "")),
@@ -170,6 +201,8 @@ class CoordGenConfig:
             endpoint_hidden=int(cast(int, raw.get("endpoint_hidden", 256))),
             trainable=str(raw.get("trainable", "interface_head")),
             coord_spec=str(raw.get("coord_spec", COORD_SPEC)),
+            generator=str(raw.get("generator", "mlp")),
+            virtual_graph=graph_cfg,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -209,17 +242,20 @@ class CoordinateGenerator(nn.Module):
         """
         super().__init__()
         self.cfg = cfg
+        self.spec = get_coord_spec(cfg.coord_spec)
+        self.n_rel = self.spec.relation_dim - len(self.spec.distance_indices)
+        self.distance_classes = self.spec.self_distance_class + 1
         pooled = 2 * d_model
         self.endpoint_head = nn.Sequential(
             nn.Dropout(cfg.endpoint_dropout),
-            _mlp(2 * pooled, cfg.endpoint_hidden, cfg.layers, cfg.dropout, ENDPOINT_DIM),
+            _mlp(2 * pooled, cfg.endpoint_hidden, cfg.layers, cfg.dropout, self.spec.endpoint_dim),
         )
         self.pair_head = _mlp(
             3 * pooled,
             cfg.hidden,
             cfg.layers,
             cfg.dropout,
-            len(RELATION_CONTINUOUS_INDEX) + DISTANCE_CLASSES + CONTEXT_DIM,
+            self.n_rel + self.distance_classes + self.spec.context_dim,
         )
 
     @staticmethod
@@ -248,13 +284,13 @@ class CoordinateGenerator(nn.Module):
         """
         pair = self.pair_head(torch.cat([p_u + p_v, p_u * p_v, (p_u - p_v).abs()], dim=-1))
         pair = pair.float()
-        n_rel = len(RELATION_CONTINUOUS_INDEX)
+        n_rel = self.n_rel
         return {
             "endpoint_u": self.endpoint_head(torch.cat([p_u, p_v], dim=-1)).float(),
             "endpoint_v": self.endpoint_head(torch.cat([p_v, p_u], dim=-1)).float(),
             "relation": pair[:, :n_rel],
-            "distance_logits": pair[:, n_rel : n_rel + DISTANCE_CLASSES],
-            "context": pair[:, n_rel + DISTANCE_CLASSES :],
+            "distance_logits": pair[:, n_rel : n_rel + self.distance_classes],
+            "context": pair[:, n_rel + self.distance_classes :],
         }
 
 
@@ -269,6 +305,7 @@ class V3_1CoordGen(nn.Module):
     """
 
     name: str = "v3_1_coord_gen"
+    coordinate_scale: torch.Tensor
 
     def __init__(self, *, reader: Mapping[str, object], coord_gen: Mapping[str, object]) -> None:
         """Build a reader and teacher; initialize_teacher snapshots loaded Stage I weights.
@@ -280,17 +317,37 @@ class V3_1CoordGen(nn.Module):
         """
         super().__init__()
         self.cfg = CoordGenConfig.from_mapping(coord_gen)
+        self.spec = get_coord_spec(self.cfg.coord_spec)
         self.reader_config: dict[str, object] = dict(reader)
         reader_model = V3_1TopoPrompt(
             base=cast(Mapping[str, object], self.reader_config["base"]),
             topo_prompt=cast(Mapping[str, object], self.reader_config["topo_prompt"]),
         )
+        if reader_model.cfg.coord_spec != self.cfg.coord_spec:
+            raise ValueError("coord_gen and reader coord_spec must match")
         self.d_model = int(reader_model.d_model)
         self.input_dim = int(reader_model.input_dim)
         self.kd_rep_head = None
         self.kd_struct_head = None
         self.topo_gen = None
-        self.generator = CoordinateGenerator(self.d_model, self.cfg)
+        self.generator: CoordinateGenerator | VirtualGraphGenerator
+        if self.cfg.generator == "virtual_graph":
+            graph_cfg = self.cfg.virtual_graph
+            self.generator = VirtualGraphGenerator(
+                self.d_model,
+                k=graph_cfg.k,
+                d_z=graph_cfg.d_z,
+                heads=graph_cfg.heads,
+                gate_bias=graph_cfg.gate_bias,
+            )
+        else:
+            self.generator = CoordinateGenerator(self.d_model, self.cfg)
+        # Historical v1 checkpoints have no loss-scale state. Persist it once
+        # training installs the nonself statistics; inference does not need it.
+        self.register_buffer(
+            "coordinate_scale", torch.ones(len(self.spec.continuous_indices)), persistent=False
+        )
+        self.register_load_state_dict_pre_hook(self._restore_coordinate_scale)  # type: ignore[no-untyped-call]
         self.reader = reader_model
         for param in self.reader.parameters():
             param.requires_grad_(False)
@@ -300,10 +357,35 @@ class V3_1CoordGen(nn.Module):
             self.reader.generator.requires_grad_(True)
             self.reader.base.output_head.requires_grad_(True)
 
+    def _restore_coordinate_scale(
+        self, module: nn.Module, state: Mapping[str, torch.Tensor], prefix: str, *args: object
+    ) -> None:
+        if prefix + "coordinate_scale" in state:
+            self._non_persistent_buffers_set.discard("coordinate_scale")
+
+    def install_coordinate_scale(self, coords: torch.Tensor) -> None:
+        """Measure continuous residuals in nonself training standard deviations."""
+        nonself = (
+            distance_class_targets(coords, self.cfg.coord_spec) != self.spec.self_distance_class
+        )
+        if not nonself.any():
+            raise ValueError("coordinate scale requires nonself training rows")
+        stats = self.reader.generator
+        cont = list(self.spec.continuous_indices)
+        values = coords[nonself][:, cont].float().to(stats.coord_std.device)
+        scale = values.std(dim=0, correction=0) / stats.coord_std[cont].float()
+        if not torch.isfinite(scale).all():
+            raise ValueError("non-finite nonself coordinate scale")
+        self.coordinate_scale.copy_(scale.clamp_min(1e-6))
+        self._non_persistent_buffers_set.discard("coordinate_scale")
+
     def initialize_teacher(self) -> None:
         """Snapshot the loaded Stage I reader once, before training starts."""
         self.teacher = deepcopy(self.reader).requires_grad_(False).eval()
         self.teacher.intervention = "none"
+        if isinstance(self.generator, VirtualGraphGenerator):
+            self.generator.coord_mean.copy_(self.reader.generator.coord_mean)
+            self.generator.coord_std.copy_(self.reader.generator.coord_std)
 
     def optimizer_parameter_groups(
         self,
@@ -312,7 +394,11 @@ class V3_1CoordGen(nn.Module):
         weight_decay: float,
     ) -> list[dict[str, object]]:
         """Separate endpoint regularisation while sharing the generator schedule."""
-        endpoint = list(self.generator.endpoint_head.parameters())
+        endpoint = (
+            list(self.generator.endpoint_head.parameters())
+            if isinstance(self.generator, CoordinateGenerator)
+            else []
+        )
         endpoint_ids = {id(p) for p in endpoint}
         groups: list[dict[str, object]] = [
             {
@@ -330,6 +416,7 @@ class V3_1CoordGen(nn.Module):
                 "weight_decay": weight_decay,
             },
         ]
+        groups = [group for group in groups if group["params"]]
         interface = [p for p in self.reader.parameters() if p.requires_grad]
         if interface:
             groups.append(
@@ -351,11 +438,26 @@ class V3_1CoordGen(nn.Module):
     @property
     def intervention(self) -> str:
         """The reader's scoring-time intervention (applied to the predicted coordinates)."""
+        if (
+            isinstance(self.generator, VirtualGraphGenerator)
+            and self.generator.intervention != "none"
+        ):
+            return self.generator.intervention
         return self.reader.intervention
 
     @intervention.setter
     def intervention(self, value: str) -> None:
-        self.reader.intervention = value
+        if value == "slot_gates_open":
+            if not isinstance(self.generator, VirtualGraphGenerator):
+                raise ValueError("slot_gates_open requires a virtual_graph checkpoint")
+            self.generator.intervention = value
+            self.reader.intervention = "none"
+        else:
+            if value == "mean_context" and not self.spec.context_dim:
+                raise ValueError("mean_context is unavailable for coord_spec v2")
+            if isinstance(self.generator, VirtualGraphGenerator):
+                self.generator.intervention = "none"
+            self.reader.intervention = value
 
     def train(self, mode: bool = True) -> V3_1CoordGen:
         """Train the generator and interface while the frozen trunk and teacher stay in eval.
@@ -389,13 +491,22 @@ class V3_1CoordGen(nn.Module):
         """
         stats = self.reader.generator
         batch = parts["endpoint_u"].size(0)
-        z = torch.zeros((batch, COORD_DIM), dtype=torch.float32, device=parts["endpoint_u"].device)
-        z[:, FIELD_SLICES["endpoint_u"]] = parts["endpoint_u"].float()
-        z[:, FIELD_SLICES["endpoint_v"]] = parts["endpoint_v"].float()
-        z[:, list(RELATION_CONTINUOUS_INDEX)] = parts["relation"].float()
-        z[:, FIELD_SLICES["context"]] = parts["context"].float()
-        dist = list(DISTANCE_INDEX)
-        probs = torch.softmax(parts["distance_logits"].float(), dim=-1)[:, : len(DISTANCE_NAMES)]
+        z = torch.zeros(
+            (batch, self.spec.coord_dim), dtype=torch.float32, device=parts["endpoint_u"].device
+        )
+        z[:, self.spec.field_slices["endpoint_u"]] = parts["endpoint_u"].float()
+        z[:, self.spec.field_slices["endpoint_v"]] = parts["endpoint_v"].float()
+        relation = self.spec.field_slices["relation"]
+        rel_cont = [
+            i for i in range(relation.start, relation.stop) if i not in self.spec.distance_indices
+        ]
+        z[:, rel_cont] = parts["relation"].float()
+        if self.spec.context_dim:
+            z[:, self.spec.field_slices["context"]] = parts["context"].float()
+        dist = list(self.spec.distance_indices)
+        probs = torch.softmax(parts["distance_logits"].float(), dim=-1)[
+            :, : len(self.spec.distance_names)
+        ]
         z[:, dist] = (probs - stats.coord_mean[dist].float()) / stats.coord_std[dist].float()
         return z
 
@@ -407,9 +518,14 @@ class V3_1CoordGen(nn.Module):
         lengths_b: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return ``(z_hat, parts)`` for encoded pairs (``a`` as endpoint ``u``)."""
-        p_a = CoordinateGenerator.pool(encoded_a, lengths_a)
-        p_b = CoordinateGenerator.pool(encoded_b, lengths_b)
-        parts = self.generator(p_a, p_b)
+        if self.intervention != "none" and self.training:
+            raise ValueError("coordinate interventions are scoring-time only; call eval() first")
+        if isinstance(self.generator, VirtualGraphGenerator):
+            parts = self.generator(encoded_a, encoded_b, lengths_a, lengths_b)
+        else:
+            p_a = CoordinateGenerator.pool(encoded_a, lengths_a)
+            p_b = CoordinateGenerator.pool(encoded_b, lengths_b)
+            parts = self.generator(p_a, p_b)
         return self.assemble(parts), parts
 
     def logits_from_encoded(
@@ -452,10 +568,16 @@ class V3_1CoordGen(nn.Module):
             self-pairs as their own class).
         """
         z_star = self.reader.generator.standardize(coords.to(z_hat.device))
-        cont = list(CONTINUOUS_INDEX)
-        continuous = F.smooth_l1_loss(z_hat[:, cont], z_star[:, cont], reduction="none").mean(dim=1)
-        target = distance_class_targets(coords.to(z_hat.device))
+        cont = list(self.spec.continuous_indices)
+        residual = (z_hat[:, cont] - z_star[:, cont]) / self.coordinate_scale
+        continuous = F.smooth_l1_loss(residual, torch.zeros_like(residual), reduction="none").mean(
+            dim=1
+        )
+        target = distance_class_targets(coords.to(z_hat.device), self.cfg.coord_spec)
         distance = F.cross_entropy(parts["distance_logits"].float(), target, reduction="none")
+        nonself = target != self.spec.self_distance_class
+        continuous = continuous * nonself
+        distance = distance * nonself
         return continuous + distance, continuous, distance
 
     def forward(

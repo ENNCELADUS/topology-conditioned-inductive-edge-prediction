@@ -137,6 +137,7 @@ PREFIX_INTERVENTIONS: tuple[str, ...] = (
     "mean_endpoint",
     "mean_relation",
     "mean_context",
+    "slot_gates_open",
 )
 #: `derive_val_region_split`'s parameters for `_load_val_region_split`'s
 #: production re-derivation; the test seam a small monkeypatched value lets
@@ -2034,6 +2035,7 @@ def _coord_gen_source_coords(
     predict_batch: Callable[[Sequence[int]], torch.Tensor],
     *,
     num_rows: int,
+    coord_dim: int,
 ) -> torch.Tensor:
     """Build the ``--prefix-intervention shuffle`` coordinate bank of a ``v3_1_coord_gen`` process.
 
@@ -2054,15 +2056,14 @@ def _coord_gen_source_coords(
         source_batches: Batch index lists over the source pairs; an index is a
             row position, since source ``i`` serves row ``i``.
         predict_batch: Encodes one batch of source pairs and returns its
-            standardised ``(B, COORD_DIM)`` prediction.
+            standardised ``(B, coord_dim)`` prediction.
         num_rows: Rows this process scores.
+        coord_dim: Coordinate width from the checkpoint specification.
 
     Returns:
-        The row-aligned ``(num_rows, COORD_DIM)`` fp32 CPU coordinate bank.
+        The row-aligned ``(num_rows, coord_dim)`` fp32 CPU coordinate bank.
     """
-    from src.data.struct_coords import COORD_DIM
-
-    bank = torch.zeros((num_rows, COORD_DIM), dtype=torch.float32)
+    bank = torch.zeros((num_rows, coord_dim), dtype=torch.float32)
     for batch_indices in source_batches:
         predicted = predict_batch(batch_indices)
         bank[torch.as_tensor(list(batch_indices), dtype=torch.int64)] = (
@@ -2175,7 +2176,9 @@ def _score_v3_1(
                 with torch.inference_mode(), _autocast_context(device, amp):
                     return coord_model.predict(encoded_a, encoded_b, len_a, len_b)[0]
 
-            coord_bank = _coord_gen_source_coords(source_batches, _coords, num_rows=len(pairs))
+            coord_bank = _coord_gen_source_coords(
+                source_batches, _coords, num_rows=len(pairs), coord_dim=coord_model.spec.coord_dim
+            )
 
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
@@ -2392,7 +2395,9 @@ def _score_v3_1_packed(
                         *_gather(batch_indices, source_a, source_b, source_lengths)
                     )[0]
 
-            coord_bank = _coord_gen_source_coords(source_batches, _coords, num_rows=len(pairs))
+            coord_bank = _coord_gen_source_coords(
+                source_batches, _coords, num_rows=len(pairs), coord_dim=coord_model.spec.coord_dim
+            )
 
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
@@ -3842,12 +3847,15 @@ def _run_score(args: argparse.Namespace) -> None:
             meta_extra["prefix_shuffle_scope"] = "universe"
         if is_topo_prompt:
             from src.data.struct_coords import StructCoordinateTable
+            from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
             assert oracle_truth_graph is not None  # gated above
             coords_started = perf_counter()
             coordinate_pairs = row_pairs if shuffle_sources is None else shuffle_sources
             row_coords = torch.from_numpy(
-                StructCoordinateTable(oracle_truth_graph).coords(coordinate_pairs)
+                StructCoordinateTable(
+                    oracle_truth_graph, spec=cast(V3_1TopoPrompt, model).generator.spec.name
+                ).coords(coordinate_pairs)
             )
             logger.info(
                 "measured structural coordinates for %d rows%s on the %s truth graph in %.1fs",

@@ -11,7 +11,7 @@ from src import score_universe
 from src.data.distributed_pairs import CompactPairBatch
 from src.data.features import FeatureStore
 from src.data.packed_features import PackedFeatureTable
-from src.data.struct_coords import COORD_DIM
+from src.data.struct_coords import get_coord_spec
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
 
@@ -19,7 +19,7 @@ from tests.test_prefix_model import _tiny_base_config
 from tests.test_score_universe import _build_prefix_packed_fixture
 
 
-def _reader_config() -> dict[str, object]:
+def _reader_config(spec: str = "v1") -> dict[str, object]:
     return {
         "base": _tiny_base_config(),
         "topo_prompt": {
@@ -27,16 +27,27 @@ def _reader_config() -> dict[str, object]:
             "width": 8,
             "slots_per_field": 1,
             "field_mask_prob": 0.0,
+            "coord_spec": spec,
         },
     }
 
 
-def _tiny_coord_gen() -> V3_1CoordGen:
+def _tiny_coord_gen(generator: str = "mlp") -> V3_1CoordGen:
     torch.manual_seed(0)
+    spec = "v2" if generator == "virtual_graph" else "v1"
     model = V3_1CoordGen(
-        reader=_reader_config(), coord_gen={"hidden": 16, "layers": 1, "dropout": 0.0}
+        reader=_reader_config(spec),
+        coord_gen={
+            "hidden": 16,
+            "layers": 1,
+            "dropout": 0.0,
+            "generator": generator,
+            "coord_spec": spec,
+            "virtual_graph": {"k": 4, "d_z": 8, "heads": 2},
+        },
     )
-    model.reader.generator.set_coord_stats(torch.zeros(COORD_DIM), torch.ones(COORD_DIM), 5)
+    dim = get_coord_spec(spec).coord_dim
+    model.reader.generator.set_coord_stats(torch.zeros(dim), torch.ones(dim), 5)
     with torch.no_grad():
         model.reader.generator.gates.fill_(0.4)
     model.initialize_teacher()
@@ -44,10 +55,11 @@ def _tiny_coord_gen() -> V3_1CoordGen:
     return model
 
 
-def test_model_builder_round_trips_the_checkpoint_config_and_statistics() -> None:
-    model = _tiny_coord_gen()
+@pytest.mark.parametrize("generator", ["mlp", "virtual_graph"])
+def test_model_builder_round_trips_the_checkpoint_config_and_statistics(generator: str) -> None:
+    model = _tiny_coord_gen(generator)
     rebuilt = score_universe.MODEL_BUILDERS["v3_1_coord_gen"](
-        {"reader": _reader_config(), "coord_gen": model.cfg.to_dict()}
+        {"reader": _reader_config(model.cfg.coord_spec), "coord_gen": model.cfg.to_dict()}
     )
     rebuilt.load_state_dict(model.state_dict())
     assert isinstance(rebuilt, V3_1CoordGen)
@@ -58,10 +70,11 @@ def test_model_builder_round_trips_the_checkpoint_config_and_statistics() -> Non
         assert torch.equal(value, rebuilt.teacher.state_dict()[key])
 
 
+@pytest.mark.parametrize("generator", ["mlp", "virtual_graph"])
 def test_packed_and_unpacked_scoring_need_no_coordinates_and_agree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator: str
 ) -> None:
-    model = _tiny_coord_gen()
+    model = _tiny_coord_gen(generator)
     pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
     store = FeatureStore(tmp_path / "features")
     device = torch.device("cpu")
@@ -127,11 +140,12 @@ def _encoded_pairs(
     return encoded_a, encoded_b, batch["len_a"], batch["len_b"]
 
 
+@pytest.mark.parametrize("generator", ["mlp", "virtual_graph"])
 def test_coordinate_transplant_substitutes_the_source_pair_prediction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator: str
 ) -> None:
     """`shuffle` on a coord_gen checkpoint scores own endpoints under another row's coordinates."""
-    model = _tiny_coord_gen()
+    model = _tiny_coord_gen(generator)
     pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
     store = FeatureStore(tmp_path / "features")
     device = torch.device("cpu")
@@ -170,3 +184,34 @@ def test_coordinate_transplant_substitutes_the_source_pair_prediction(
         shuffle_sources=sources,
     )
     np.testing.assert_allclose(packed, reference.numpy().reshape(-1), rtol=0.0, atol=1e-5)
+
+
+def test_cli_accepts_virtual_graph_slot_gate_intervention() -> None:
+    args = score_universe.build_parser().parse_args(
+        [
+            "score",
+            "--checkpoint",
+            "virtual.pt",
+            "--pairs",
+            "val_cls",
+            "--output",
+            "scores.npz",
+            "--prefix-intervention",
+            "slot_gates_open",
+        ]
+    )
+    assert args.prefix_intervention == "slot_gates_open"
+
+
+def test_shuffle_bank_preserves_compact_coordinates_and_row_order() -> None:
+    predictions = torch.arange(44, dtype=torch.float32).reshape(4, 11)
+    bank = score_universe._coord_gen_source_coords(
+        [[2, 0], [3, 1]], lambda rows: predictions[rows], num_rows=4, coord_dim=11
+    )
+    torch.testing.assert_close(bank, predictions)
+
+
+def test_slot_gate_intervention_refuses_mlp_checkpoint() -> None:
+    model = _tiny_coord_gen()
+    with pytest.raises(ValueError, match="virtual_graph"):
+        model.intervention = "slot_gates_open"

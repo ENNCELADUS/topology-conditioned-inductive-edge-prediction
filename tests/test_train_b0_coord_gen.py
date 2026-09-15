@@ -255,3 +255,231 @@ def test_ddp_loop_preserves_teacher_and_logs_the_fit(tmp_path: Path) -> None:
     )
     last = result.history[-1]
     assert last["epoch"] == 1 and "val_coord_r2_relation" in last and "val_kd_loss" in last
+
+
+@pytest.mark.parametrize("generator", ["mlp", "virtual_graph"])
+def test_compact_coordinate_fit_reports_only_present_fields(generator: str) -> None:
+    from src.data.struct_coords import get_coord_spec
+
+    train, val, nodes = _tiny_graph()
+    pairs = [(nodes[0], nodes[1]), (nodes[0], nodes[0])]
+    rows = TopoPromptRows(
+        train_graph=train,
+        train_pairs=pairs,
+        stats_rows=np.arange(2),
+        val_graph=val,
+        val_cls_pairs=[("v0", "v1"), ("v0", "v3")],
+        universe_pairs=[],
+        device=torch.device("cpu"),
+        spec="v2",
+    )
+    reader_config = {
+        "base": _tiny_base_config(),
+        "topo_prompt": {
+            "trainable": "all",
+            "width": 8,
+            "slots_per_field": 1,
+            "field_mask_prob": 0.0,
+            "coord_spec": "v2",
+        },
+    }
+    model = V3_1CoordGen(
+        reader=reader_config,
+        coord_gen={
+            "coord_spec": "v2",
+            "hidden": 16,
+            "generator": generator,
+            "virtual_graph": {"k": 2, "d_z": 8, "heads": 2},
+        },
+    )
+    model.reader.generator.set_coord_stats(
+        torch.zeros(get_coord_spec("v2").coord_dim), torch.ones(get_coord_spec("v2").coord_dim), 2
+    )
+    model.initialize_teacher()
+    metrics = _coordinate_fit_metrics(
+        model, _prompt_batches(1, 2), Accelerator(cpu=True), attach=rows.attach_val
+    )
+    if generator == "virtual_graph":
+        assert 0 <= metrics["val_virtual_attachment_mean"] <= 1
+        assert metrics["val_virtual_usage_0"] >= 0
+        assert 0 <= metrics["val_virtual_gate_mean"] <= 1
+    assert "val_coord_r2_context" not in metrics
+    assert "val_coord_r2_endpoint" in metrics and "val_coord_r2_relation" in metrics
+    assert all(np.isfinite(value) for value in metrics.values())
+
+
+def _virtual_initialisation_fixture() -> tuple[TopoPromptRows, object, V3_1CoordGen]:
+    from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable, PackedNodeRecord
+
+    train, val, nodes = _tiny_graph()
+    rows = TopoPromptRows(
+        train_graph=train,
+        train_pairs=[(nodes[0], nodes[1]), (nodes[1], nodes[2])],
+        stats_rows=np.arange(2),
+        val_graph=val,
+        val_cls_pairs=[],
+        universe_pairs=[],
+        device=torch.device("cpu"),
+        spec="v2",
+    )
+    node_ids = [*rows.train_table.nodes, "held_out"]
+    manifest = PackedFeatureManifest(
+        format="bf16_flat_shards_v1",
+        input_dim=4,
+        dtype="float32",
+        source_metadata_sha256="",
+        source_index_sha256="",
+        nodes=tuple(PackedNodeRecord(n, 0, i * 3, i * 3, 3) for i, n in enumerate(node_ids)),
+        shards=(),
+        pack_workers=1,
+        build_seconds=0.0,
+    )
+    table = PackedFeatureTable(
+        torch.randn(len(node_ids) * 3, 4),
+        torch.arange(len(node_ids)) * 3,
+        torch.full((len(node_ids),), 3),
+        manifest,
+    )
+    model = V3_1CoordGen(
+        reader={
+            "base": _tiny_base_config(),
+            "topo_prompt": {"trainable": "all", "coord_spec": "v2"},
+        },
+        coord_gen={
+            "coord_spec": "v2",
+            "generator": "virtual_graph",
+            "virtual_graph": {"k": 2, "d_z": 8, "heads": 2},
+        },
+    )
+    return rows, table, model
+
+
+def test_virtual_initialisation_uses_only_legal_training_nodes() -> None:
+    from src.data.packed_features import PackedFeatureTable
+    from src.train_b0 import initialise_virtual_graph
+
+    rows, packed, model = _virtual_initialisation_fixture()
+    table = cast(PackedFeatureTable, packed)
+    encoder_before = {k: v.clone() for k, v in model.encoder.state_dict().items()}
+    metadata = initialise_virtual_graph(model, rows, table, Accelerator(cpu=True), seed=13)
+    assert metadata["train_nodes"] == len(rows.train_table.nodes)
+    assert sum(cast(list[int], metadata["cluster_sizes"])) == len(rows.train_table.nodes)
+    assert metadata["seed"] == 13
+    assert all(torch.equal(v, model.encoder.state_dict()[k]) for k, v in encoder_before.items())
+
+
+def _virtual_initialisation_worker(rank: int, root: str) -> None:
+    import contextlib
+    import os
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from src.data.packed_features import PackedFeatureTable
+    from src.train_b0 import initialise_virtual_graph
+
+    torch.set_num_threads(1)
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo0" if os.uname().sysname == "Darwin" else "lo"
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{root}/init",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=90),
+    )
+    try:
+        torch.manual_seed(13 + rank)
+        rows, table, model = _virtual_initialisation_fixture()
+        model.reader.generator.set_coord_stats(rows.coord_mean, rows.coord_std, rows.coord_count)
+        model.initialize_teacher()
+        model.install_coordinate_scale(rows.train)
+        accelerator = cast(
+            Accelerator,
+            SimpleNamespace(
+                is_main_process=rank == 0,
+                num_processes=2,
+                device=torch.device("cpu"),
+                autocast=contextlib.nullcontext,
+            ),
+        )
+        metadata = initialise_virtual_graph(
+            model, rows, cast(PackedFeatureTable, table), accelerator, seed=13
+        )
+        torch.save(
+            {"state": model.state_dict(), "metadata": metadata}, Path(root) / f"rank-{rank}.pt"
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_virtual_initialisation_broadcast_and_checkpoint_round_trip(tmp_path: Path) -> None:
+    from torch.multiprocessing.spawn import spawn
+
+    spawn(_virtual_initialisation_worker, args=(str(tmp_path),), nprocs=2, join=True)  # type: ignore[no-untyped-call]
+    left = torch.load(tmp_path / "rank-0.pt", weights_only=True)
+    right = torch.load(tmp_path / "rank-1.pt", weights_only=True)
+    assert left["metadata"] == right["metadata"]
+    for key, value in left["state"].items():
+        if key.startswith("generator.") or key == "coordinate_scale":
+            torch.testing.assert_close(value, right["state"][key], rtol=0, atol=0)
+    _, _, restored = _virtual_initialisation_fixture()
+    restored.load_state_dict(left["state"])
+    for key, value in left["state"].items():
+        torch.testing.assert_close(value, restored.state_dict()[key], rtol=0, atol=0)
+
+
+def test_virtual_initialisation_omits_featureless_nodes_without_changing_targets() -> None:
+    from src.data.packed_features import PackedFeatureTable
+    from src.train_b0 import initialise_virtual_graph
+
+    rows, packed, model = _virtual_initialisation_fixture()
+    table = cast(PackedFeatureTable, packed)
+    omitted = rows.train_table.nodes[0]
+    table.manifest = replace(
+        table.manifest, nodes=tuple(n for n in table.manifest.nodes if n.node_id != omitted)
+    )
+    # Rebuild lookup arrays in manifest order; token offsets still reference the original table.
+    table.offsets = torch.tensor([n.global_offset for n in table.manifest.nodes])
+    table.lengths = torch.tensor([n.length for n in table.manifest.nodes])
+    original_adjacency = rows.train_table.adjacency.copy()
+    original_targets = rows.train.clone()
+    metadata = initialise_virtual_graph(model, rows, table, Accelerator(cpu=True), seed=13)
+    assert metadata["omitted_featureless_nodes"] == [omitted]
+    assert metadata["omitted_featureless_count"] == 1
+    assert metadata["train_nodes"] == len(rows.train_table.nodes) - 1
+    assert sum(cast(list[int], metadata["cluster_sizes"])) == len(rows.train_table.nodes) - 1
+    expected_edges = int(original_adjacency[1:, 1:].nnz // 2)
+    assert metadata["train_edges"] == expected_edges
+    assert metadata["mean_degree"] == pytest.approx(
+        2 * expected_edges / (len(rows.train_table.nodes) - 1)
+    )
+    assert (rows.train_table.adjacency != original_adjacency).nnz == 0
+    assert torch.equal(rows.train, original_targets)
+
+
+def test_virtual_initial_attachment_mean_matches_training_density() -> None:
+    from src.data.packed_features import PackedFeatureTable
+    from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
+    from src.train_b0 import initialise_virtual_graph
+
+    torch.manual_seed(91)
+    rows, packed, model = _virtual_initialisation_fixture()
+    table = cast(PackedFeatureTable, packed)
+    generator = cast(VirtualGraphGenerator, model.generator)
+    weight_before = generator.attachment.weight.detach().clone()
+    metadata = initialise_virtual_graph(model, rows, table, Accelerator(cpu=True), seed=13)
+    model.eval()
+    attachments = []
+    with torch.no_grad():
+        for node in rows.train_table.nodes:
+            index = table.manifest.node_index()[node]
+            tokens, lengths = table.gather_nodes(
+                torch.tensor([index]), table.manifest.nodes[index].length
+            )
+            attachments.append(generator.attach(model.encoder(tokens, lengths), lengths))
+    observed = float(torch.cat(attachments).mean())
+    target = float(rows.train_table.degree.mean()) / len(rows.train_table.nodes)
+    assert observed == pytest.approx(target, abs=1e-7)
+    assert metadata["initial_attachment_mean"] == pytest.approx(target, abs=1e-7)
+    assert metadata["initial_attachment_target"] == pytest.approx(target)
+    assert torch.equal(generator.attachment.weight, weight_before)

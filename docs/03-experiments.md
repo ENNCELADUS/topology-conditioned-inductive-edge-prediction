@@ -397,18 +397,26 @@ study; they do not change the shared checkpoint selector or add runtime failure 
 | Fixed | Value | Reason |
 |---|---|---|
 | split, negative stream, positive weight | split seed 42, dynamic 1:5, weight 5 | evaluation/training protocol; run seeds are separate |
-| coordinate spec | v1, 34 numbers, training-statistics standardisation; structural pairs use the full training table | semantics remain fixed; no sampled-subgraph recomputation |
-| coordinate reduction | Huber averaged over 30 continuous coordinates plus distance cross-entropy | equal coordinate weighting; field reweighting is an ablation |
+| coordinate spec / generator | v1 (34 columns), MLP for the v2 factorial; v2 (8 continuous + 3 distance indicators), virtual graph for `virtual_prompt_d`; training-statistics standardisation | fixed per arm, never searched; structural pairs use the full training table |
+| coordinate reduction | Huber in nonself training-standard-deviation units, averaged over continuous coordinates, plus distance cross-entropy; self rows excluded | reader units unchanged; self rows retain task/KD supervision |
 | prompt geometry | width 128, two slots per field, nine sites, zero-init gates | same established interface |
 | structural sampler | default 32 local + 8 background nodes; bfs/motif/bridge 0.5/0.25/0.25; one subgraph per step; subgraph BCE 1.0 | only total nodes, frequency and added-term scales vary below |
 | Stage I optimiser | lr 1e-4, weight decay 0.05, one-cycle 25 epochs, patience 10 on task BCE | base recipe |
 | Stage II budget | one-cycle 15 epochs, pct_start 0.1, final_div_factor 100; no early stopping; five-rank selection | every arm completes the annealing budget; non-finite state still fails closed |
 | Stage II encoder/cross-attention | frozen | compute choice; using true coordinates does not prove they are predictable |
-| Stage II supervision | every training row keeps coordinate, task and KD supervision | standalone probe measures new-head generalisation; no internal training fold |
+| Stage II supervision | nonself training rows keep coordinate, task and KD supervision; self rows keep task/KD | standalone probe measures new-head generalisation; no internal training fold |
 | true-coordinate field mask | 0.1 | retained Stage I regularisation |
 | corruption schedule | stationary | no severity-schedule knob |
 | KD form | pointwise soft-target BCE; anchor masked-softmax KL; immutable Stage I teacher on true coordinates | anchor temperature alone controls distribution shape |
 | representation KD and teacher-soft degree matching | zero in first wave | deferred matched ablations |
+
+The [virtual topology design](superpowers/specs/2026-09-15-virtual-topology-prompt-design.md)
+adds the fixed two-run chain `topo_prompt_full_v3` (compact true-coordinate ceiling) →
+`virtual_prompt_d` (endpoint-only student, D objective). The compact reader uses three
+fields and six prefix rows at each of nine sites. The student learns 64 coarse nodes,
+residue-attention attachments and symmetric pair gates, initialized from the legal training
+graph. `slot_gates_open` disables only its coarse-node gates; `mean_context` is unavailable
+on the compact spec. Neither coordinate semantics nor generator type is a search dimension.
 
 ### 6.2 The hyperparameters
 

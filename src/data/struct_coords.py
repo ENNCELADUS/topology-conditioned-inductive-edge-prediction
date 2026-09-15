@@ -25,6 +25,11 @@ zero. The queried edge is removed **before** anything is measured, so a
 positive pair never sees itself; with the edge gone and the graph loopless,
 ``(A^3)_uv`` counts exactly the simple ``u-a-b-v`` paths.
 
+Spec ``v2`` keeps degree and clustering per endpoint, common neighbours,
+Jaccard, L3 and L3 density, and merges the distant/disconnected indicator.
+Its three fields occupy eleven columns (eight continuous, three indicators);
+it does not compute the dropped walk and shell products.
+
 Non-edges are read from dense all-pairs products; edges are recomputed exactly
 on the edge-deleted graph (`StructCoordinateTable._exact_pair`), which is also
 the reference implementation the tests compare the dense path against.
@@ -33,6 +38,7 @@ the reference implementation the tests compare the dense path against.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import networkx as nx
 import numpy as np
@@ -89,6 +95,100 @@ COORD_NAMES: tuple[str, ...] = (
     *RELATION_NAMES,
     *CONTEXT_NAMES,
 )
+
+
+@dataclass(frozen=True)
+class CoordinateSpec:
+    """Checkpoint-selected layout of fixed-semantics structural coordinates."""
+
+    name: str
+    endpoint_names: tuple[str, ...]
+    relation_names: tuple[str, ...]
+    context_names: tuple[str, ...]
+
+    @property
+    def endpoint_dim(self) -> int:
+        """Width of one endpoint field."""
+        return len(self.endpoint_names)
+
+    @property
+    def relation_dim(self) -> int:
+        """Width of the relation field, including distance indicators."""
+        return len(self.relation_names)
+
+    @property
+    def context_dim(self) -> int:
+        """Width of the optional context field."""
+        return len(self.context_names)
+
+    @property
+    def coord_names(self) -> tuple[str, ...]:
+        """Names in their checkpoint column order."""
+        return (
+            *(f"u_{n}" for n in self.endpoint_names),
+            *(f"v_{n}" for n in self.endpoint_names),
+            *self.relation_names,
+            *self.context_names,
+        )
+
+    @property
+    def coord_dim(self) -> int:
+        """Total numeric coordinate width."""
+        return len(self.coord_names)
+
+    @property
+    def fields(self) -> tuple[str, ...]:
+        """Prompt fields in token order."""
+        return FIELDS if self.context_names else FIELDS[:3]
+
+    @property
+    def field_slices(self) -> dict[str, slice]:
+        """Column ranges for each prompt field."""
+        e, r = self.endpoint_dim, self.relation_dim
+        slices = {
+            "endpoint_u": slice(0, e),
+            "endpoint_v": slice(e, 2 * e),
+            "relation": slice(2 * e, 2 * e + r),
+        }
+        if self.context_names:
+            slices["context"] = slice(2 * e + r, self.coord_dim)
+        return slices
+
+    @property
+    def distance_names(self) -> tuple[str, ...]:
+        """Distance indicators in class order, excluding self."""
+        return tuple(n for n in self.relation_names if n.startswith("dist_"))
+
+    @property
+    def distance_indices(self) -> tuple[int, ...]:
+        """Coordinate positions occupied by distance indicators."""
+        return tuple(self.coord_names.index(n) for n in self.distance_names)
+
+    @property
+    def self_distance_class(self) -> int:
+        """Class index reserved for self-pairs."""
+        return len(self.distance_names)
+
+    @property
+    def continuous_indices(self) -> tuple[int, ...]:
+        """Positions supervised by the continuous coordinate loss."""
+        return tuple(i for i in range(self.coord_dim) if i not in self.distance_indices)
+
+
+def get_coord_spec(name: str = COORD_SPEC) -> CoordinateSpec:
+    """Resolve a supported coordinate layout, preserving v1 defaults."""
+    if name == "v1":
+        return CoordinateSpec(name, ENDPOINT_NAMES, RELATION_NAMES, CONTEXT_NAMES)
+    if name == "v2":
+        return CoordinateSpec(
+            name,
+            ENDPOINT_NAMES[:2],
+            ("log1p_common", "jaccard", "log1p_l3", "l3_density", "dist_2", "dist_3", "dist_4plus"),
+            (),
+        )
+    raise ValueError(f"unsupported coord_spec {name!r}")
+
+
 _MAX_WALK = 5
 
 
@@ -129,15 +229,22 @@ class StructCoordinateTable:
     matrices); the largest universe in this project has 7,203 nodes.
     """
 
-    def __init__(self, graph: nx.Graph) -> None:
+    _common: NDArray[np.float32]
+    _l3: NDArray[np.float32]
+    _distance: NDArray[np.float32]
+    _triangles: NDArray[np.float64]
+
+    def __init__(self, graph: nx.Graph, spec: str = COORD_SPEC) -> None:
         """Precompute the dense products.
 
         Args:
             graph: A simple, loopless `networkx.Graph`; isolated nodes are kept.
+            spec: Checkpoint coordinate layout (v1 or compact v2).
 
         Raises:
             ValueError: If the graph has a self-loop or no nodes.
         """
+        self.spec = get_coord_spec(spec)
         if graph.number_of_nodes() == 0:
             raise ValueError("struct coordinates need a non-empty graph")
         if nx.number_of_selfloops(graph) > 0:
@@ -160,6 +267,14 @@ class StructCoordinateTable:
         self.degree: NDArray[np.float64] = (
             np.asarray(adjacency.sum(axis=1)).reshape(-1).astype(np.float64)
         )
+        if self.spec.name == "v2":
+            self._common = (adjacency @ adjacency).toarray().astype(np.float32)
+            self._l3 = np.asarray(self._common @ adjacency, dtype=np.float32)
+            self._triangles = np.diagonal(self._l3).astype(np.float64) / 2.0
+            self._distance = np.asarray(
+                shortest_path(adjacency, directed=False, unweighted=True), dtype=np.float32
+            )
+            return
         self._inv_sqrt_degree = _safe_divide(np.ones(n), np.sqrt(self.degree))
         scale = sp.diags(self._inv_sqrt_degree.astype(np.float32))
         normalised = (scale @ adjacency @ scale).tocsr()
@@ -172,11 +287,11 @@ class StructCoordinateTable:
             power = np.asarray(power @ normalised, dtype=np.float32)
             self._walks.append(power)
         common = (adjacency @ adjacency).toarray().astype(np.float32)
-        self._common: NDArray[np.float32] = common
-        self._l3: NDArray[np.float32] = np.asarray(common @ adjacency, dtype=np.float32)
+        self._common = common
+        self._l3 = np.asarray(common @ adjacency, dtype=np.float32)
 
         distances = shortest_path(adjacency, directed=False, unweighted=True)
-        self._distance: NDArray[np.float32] = np.asarray(distances, dtype=np.float32)
+        self._distance = np.asarray(distances, dtype=np.float32)
         two_hop_mask = (self._distance == 2.0).astype(np.float32)
         self._two_hop_count: NDArray[np.float64] = two_hop_mask.sum(axis=1).astype(np.float64)
         self._shell_shared: NDArray[np.float32] = np.asarray(
@@ -187,7 +302,7 @@ class StructCoordinateTable:
         )
         del two_hop_mask
 
-        self._triangles: NDArray[np.float64] = np.diagonal(self._l3).astype(np.float64) / 2.0
+        self._triangles = np.diagonal(self._l3).astype(np.float64) / 2.0
         neighbour_degree_sum = np.asarray(adjacency @ self.degree.astype(np.float32)).reshape(-1)
         self._mean_neighbour_degree = _safe_divide(neighbour_degree_sum, self.degree)
         self._returns: NDArray[np.float64] = np.stack(
@@ -230,6 +345,59 @@ class StructCoordinateTable:
             axis=1,
         )
 
+    def _compact(
+        self,
+        degree_u: NDArray[np.float64],
+        degree_v: NDArray[np.float64],
+        triangles_u: NDArray[np.float64],
+        triangles_v: NDArray[np.float64],
+        common: NDArray[np.float64],
+        l3: NDArray[np.float64],
+        distance: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Assemble compact counts with the same numerical conventions as v1."""
+        return np.stack(
+            [
+                _log1p(degree_u),
+                _safe_divide(2 * triangles_u, degree_u * (degree_u - 1)),
+                _log1p(degree_v),
+                _safe_divide(2 * triangles_v, degree_v * (degree_v - 1)),
+                _log1p(common),
+                _safe_divide(common, degree_u + degree_v - common),
+                _log1p(l3),
+                _safe_divide(l3, degree_u * degree_v),
+                (distance == 2).astype(np.float64),
+                (distance == 3).astype(np.float64),
+                (distance >= 4).astype(np.float64),
+            ],
+            axis=1,
+        )
+
+    def _compact_exact_pair(self, u: int, v: int) -> NDArray[np.float64]:
+        adjacency = self.adjacency.copy()
+        if u != v and self.is_edge(u, v):
+            adjacency[u, v] = adjacency[v, u] = 0.0
+            adjacency.eliminate_zeros()
+        roots = adjacency[[u, v]].toarray().astype(np.float64)
+        degrees = roots.sum(axis=1)
+        propagated = np.asarray(adjacency @ roots.T).T
+        triangles = (roots * propagated).sum(axis=1) / 2
+        common = (roots[0] * roots[1]).sum()
+        l3 = (roots[0] * propagated[1]).sum()
+        distance = shortest_path(adjacency, directed=False, unweighted=True, indices=u)[v]
+        return np.asarray(
+            self._compact(
+                degrees[:1],
+                degrees[1:],
+                triangles[:1],
+                triangles[1:],
+                np.asarray([common]),
+                np.asarray([l3]),
+                np.asarray([distance]),
+            )[0],
+            dtype=np.float64,
+        )
+
     # ------------------------------------------------------------------ dense path
 
     def _bulk(self, u: NDArray[np.int64], v: NDArray[np.int64]) -> NDArray[np.float64]:
@@ -240,6 +408,10 @@ class StructCoordinateTable:
         union = degree_u + degree_v - common
         l3 = self._l3[u, v].astype(np.float64)
         distance = self._distance[u, v].astype(np.float64)
+        if self.spec.name == "v2":
+            return self._compact(
+                degree_u, degree_v, self._triangles[u], self._triangles[v], common, l3, distance
+            )
         shared = self._shell_shared[u, v].astype(np.float64)
         cross = self._cross_ring[u, v].astype(np.float64) + self._cross_ring[v, u].astype(
             np.float64
@@ -302,6 +474,8 @@ class StructCoordinateTable:
         Also correct for non-edges (nothing is removed), which is how the tests
         pin the dense path to this reference.
         """
+        if self.spec.name == "v2":
+            return self._compact_exact_pair(u, v)
         n = self.size
         adjacency = self.adjacency
         removed = u != v and self.is_edge(u, v)
@@ -431,7 +605,7 @@ class StructCoordinateTable:
             raise ValueError("u and v must be aligned 1-D index arrays")
         if len(u) and (u.min() < 0 or v.min() < 0 or u.max() >= self.size or v.max() >= self.size):
             raise ValueError("pair index outside the coordinate table")
-        out = self._bulk(u, v) if len(u) else np.zeros((0, COORD_DIM))
+        out = self._bulk(u, v) if len(u) else np.zeros((0, self.spec.coord_dim))
         if len(u):
             edge_rows = np.nonzero((u != v) & (np.asarray(self.adjacency[u, v]).reshape(-1) != 0))[
                 0
@@ -447,14 +621,14 @@ class StructCoordinateTable:
             KeyError: If a pair names a node outside the universe graph.
         """
         if not pairs:
-            return np.zeros((0, COORD_DIM), dtype=np.float32)
+            return np.zeros((0, self.spec.coord_dim), dtype=np.float32)
         u = np.fromiter((self.index[str(a)] for a, _ in pairs), dtype=np.int64, count=len(pairs))
         v = np.fromiter((self.index[str(b)] for _, b in pairs), dtype=np.int64, count=len(pairs))
         return self.coords_by_index(u, v)
 
 
 def coordinate_statistics(
-    coords: NDArray[np.floating], *, std_floor: float = 1e-6
+    coords: NDArray[np.floating], *, std_floor: float = 1e-6, spec: str = COORD_SPEC
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Per-coordinate mean and standard deviation for standardisation.
 
@@ -468,6 +642,7 @@ def coordinate_statistics(
     Args:
         coords: ``(n, COORD_DIM)`` raw coordinates of the reference rows.
         std_floor: Standard deviations at or below this become ``1.0``.
+        spec: Coordinate layout of the input rows.
 
     Returns:
         ``(mean, std)`` float32 vectors of length ``COORD_DIM``; the
@@ -476,12 +651,13 @@ def coordinate_statistics(
     Raises:
         ValueError: On an empty or mis-shaped input.
     """
+    layout = get_coord_spec(spec)
     array = np.asarray(coords, dtype=np.float64)
-    if array.ndim != 2 or array.shape[1] != COORD_DIM or array.shape[0] == 0:
-        raise ValueError(f"expected a non-empty (n, {COORD_DIM}) coordinate matrix")
+    if array.ndim != 2 or array.shape[1] != layout.coord_dim or array.shape[0] == 0:
+        raise ValueError(f"expected a non-empty (n, {layout.coord_dim}) coordinate matrix")
     mean = array.mean(axis=0)
     std = array.std(axis=0)
-    u_slice, v_slice = FIELD_SLICES["endpoint_u"], FIELD_SLICES["endpoint_v"]
+    u_slice, v_slice = layout.field_slices["endpoint_u"], layout.field_slices["endpoint_v"]
     pooled = np.concatenate([array[:, u_slice], array[:, v_slice]], axis=0)
     mean[u_slice] = mean[v_slice] = pooled.mean(axis=0)
     std[u_slice] = std[v_slice] = pooled.std(axis=0)
@@ -575,6 +751,8 @@ def reference_pair_coords(graph: nx.Graph, u: str, v: str) -> NDArray[np.float64
 
 
 __all__ = [
+    "CoordinateSpec",
+    "get_coord_spec",
     "CONTEXT_NAMES",
     "COORD_DIM",
     "COORD_NAMES",

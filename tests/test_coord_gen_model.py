@@ -210,6 +210,88 @@ def test_coordinate_loss_is_zero_at_the_truth() -> None:
     assert len(CONTINUOUS_INDEX) == COORD_DIM - len(DISTANCE_INDEX)
 
 
+def test_coordinate_supervision_ignores_self_rows_but_keeps_nonself_distance() -> None:
+    model = _model()
+    coords = _true_coords(4)
+    z = model.reader.generator.standardize(coords) + 2.0
+    parts = {"distance_logits": torch.zeros(4, DISTANCE_CLASSES)}
+    total, continuous, distance = model.coordinate_loss_rows(parts, z, coords)
+    assert total[-1] == 0 and continuous[-1] == 0 and distance[-1] == 0
+    assert (continuous[:-1] > 0).all()
+    torch.testing.assert_close(distance[:-1], torch.full((3,), float(torch.log(torch.tensor(5.0)))))
+
+
+def test_coordinate_loss_uses_nonself_training_units_and_saves_scale() -> None:
+    model = _model()
+    coords = _true_coords(4)
+    coords[:3, list(CONTINUOUS_INDEX)] = torch.tensor([0.0, 1.0, 2.0])[:, None]
+    coords[-1, list(CONTINUOUS_INDEX)] = 1000
+    model.install_coordinate_scale(coords)
+    z = model.reader.generator.standardize(coords)
+    prediction = z.clone()
+    prediction[:, list(CONTINUOUS_INDEX)] += model.coordinate_scale
+    parts = {"distance_logits": torch.zeros(4, DISTANCE_CLASSES)}
+    _, continuous, _ = model.coordinate_loss_rows(parts, prediction, coords)
+    torch.testing.assert_close(continuous[:3], torch.full((3,), 0.5))
+    rebuilt = _model()
+    rebuilt.load_state_dict(model.state_dict())
+    torch.testing.assert_close(rebuilt.coordinate_scale, model.coordinate_scale)
+
+
+def test_compact_student_scores_with_three_fields_and_four_distance_classes() -> None:
+    reader = _reader_config()
+    reader["topo_prompt"] = {**cast(dict[str, object], reader["topo_prompt"]), "coord_spec": "v2"}
+    model = V3_1CoordGen(reader=reader, coord_gen={"coord_spec": "v2", "hidden": 16, "layers": 1})
+    model.reader.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
+    model.initialize_teacher()
+    model.eval()
+    out = model(_pair_batch())
+    assert out["predicted_coords"].shape == (len(_pair_batch()["label"]), 11)
+    assert out["distance_logits"].shape[1] == 4
+    assert "loss" not in out
+
+
+def test_virtual_student_round_trip_and_training_keep_teacher_frozen() -> None:
+    reader = _reader_config()
+    reader["topo_prompt"] = {**cast(dict[str, object], reader["topo_prompt"]), "coord_spec": "v2"}
+    config = {
+        "coord_spec": "v2",
+        "generator": "virtual_graph",
+        "virtual_graph": {"k": 3, "d_z": 8, "heads": 2},
+    }
+    model = V3_1CoordGen(reader=reader, coord_gen=config)
+    model.reader.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
+    model.initialize_teacher()
+    with torch.no_grad():
+        model.reader.generator.gates.fill_(0.2)
+    batch = _pair_batch()
+    coords = torch.rand(len(batch["label"]), 11)
+    coords[:, 8:] = 0
+    coords[:, 8] = 1
+    model.install_coordinate_scale(coords)
+    model.train()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = model(batch | {"struct_coords": coords})
+    output["loss"].backward()
+    assert all(
+        p.grad is not None and torch.isfinite(p.grad).all() for p in model.generator.parameters()
+    )
+    assert all(p.grad is None for p in model.teacher.parameters())
+    groups = model.optimizer_parameter_groups(3e-4, 1e-4, 0.05)
+    optimized = {id(p) for g in groups for p in cast(Iterable[torch.nn.Parameter], g["params"])}
+    assert optimized == {id(p) for p in model.trainable_parameters()}
+    rebuilt = V3_1CoordGen(reader=reader, coord_gen=config)
+    rebuilt.load_state_dict(model.state_dict())
+    model.eval()
+    rebuilt.eval()
+    torch.testing.assert_close(model(batch)["logits"], rebuilt(batch)["logits"])
+    model.intervention = "slot_gates_open"
+    assert model.intervention == "slot_gates_open"
+    assert torch.isfinite(model(batch)["logits"]).all()
+    with pytest.raises(ValueError, match="virtual"):
+        _model().intervention = "slot_gates_open"
+
+
 def test_logits_from_encoded_matches_forward_and_gates_off_is_the_reader_base() -> None:
     model = _model()
     batch = _pair_batch()
