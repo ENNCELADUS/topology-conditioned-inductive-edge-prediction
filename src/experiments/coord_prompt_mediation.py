@@ -41,7 +41,11 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsqr
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from src.eval.fixed_threshold import evaluate_fixed_threshold, select_fixed_threshold
+from src.eval.fixed_threshold import (
+    density_diagnostics,
+    evaluate_fixed_threshold,
+    select_fixed_threshold,
+)
 from src.eval.graph_metrics import MMDConfig
 from src.experiments.g1_hardened_e2 import load_test_graph, load_test_node_buckets
 from src.score_universe import (
@@ -71,7 +75,8 @@ class UniverseDecomposition:
         offset: ``mean(delta)`` on this universe.
         node: Mean-centred symmetric node-additive component, row-aligned.
         pair: The least-squares residual, row-aligned.
-        additive_r2: Fraction of ``delta``'s variance the node fit explains.
+        additive_r2: Fraction of ``delta``'s variance the node fit explains, or
+            ``None`` when ``delta`` is constant and there is no variance to explain.
         node_effect: The per-node coefficient ``a``, indexed like ``node_ids``.
         delta: The measured per-row effect itself.
     """
@@ -79,7 +84,7 @@ class UniverseDecomposition:
     offset: float
     node: NDArray[np.float64]
     pair: NDArray[np.float64]
-    additive_r2: float
+    additive_r2: float | None
     node_effect: NDArray[np.float64]
     delta: NDArray[np.float64]
 
@@ -170,7 +175,10 @@ def decompose(
         offset=float(delta.mean()),
         node=fitted - float(fitted.mean()),
         pair=residual,
-        additive_r2=1.0 - float((residual**2).sum()) / total,
+        # A constant effect (an intervention that only shifts every logit, or none
+        # at all) has nothing to explain: report an undefined R² rather than
+        # dividing by zero, and keep the decomposition, which is still exact.
+        additive_r2=None if total == 0.0 else 1.0 - float((residual**2).sum()) / total,
         node_effect=solution[:num_nodes],
         delta=delta,
     )
@@ -187,7 +195,7 @@ def topology_operating_point(  # noqa: PLR0913
     test_graph: nx.Graph,
     test_buckets: dict[int, list[set[str]]],
     config: MMDConfig,
-) -> dict[str, float]:
+) -> dict[str, object]:
     """Select one threshold on V_val and replay it on every test subgraph.
 
     Args:
@@ -221,6 +229,10 @@ def topology_operating_point(  # noqa: PLR0913
     )
     ratios = cast(dict[str, float], report["mmd_ratio"])
     density = cast(dict[str, float], report["relative_density"])["bfs_macro"]
+    # Geometric RD and mean |log RD| are per-subgraph aggregates, not functions of
+    # the macro mean: take them from the protocol's own diagnostics rather than
+    # recomputing them from `density`, which would be a different quantity.
+    diagnostics = cast(dict[str, object], report["density_diagnostics"])
     return {
         "threshold": float(selection.logit_threshold),
         "graph_similarity": float(cast(dict[str, float], report["graph_similarity"])["bfs_macro"]),
@@ -228,7 +240,8 @@ def topology_operating_point(  # noqa: PLR0913
         "degree_mmd_ratio": float(ratios["degree"]),
         "clustering_mmd_ratio": float(ratios["clustering"]),
         "spectral_mmd_ratio": float(ratios["spectral"]),
-        "geometric_rd": float(np.exp(-abs(np.log(max(density, 1e-12))))),
+        "geometric_rd": cast(float, diagnostics["geometric_mean"]),
+        "mean_abs_log_rd": cast("float | None", diagnostics["mean_abs_log"]),
     }
 
 
@@ -239,7 +252,7 @@ def matched_density_point(
     test_graph: nx.Graph,
     test_buckets: dict[int, list[set[str]]],
     config: MMDConfig,
-) -> dict[str, float]:
+) -> dict[str, object]:
     """Re-select the threshold on the test universe itself, removing the transfer.
 
     Test-informed and therefore a diagnostic only: it never selects anything and
@@ -265,6 +278,7 @@ def matched_density_point(
         config=config,
     )
     metrics = selection.metrics
+    diagnostics = density_diagnostics(metrics.per_size_relative_density)
     return {
         "threshold": float(selection.logit_threshold),
         "graph_similarity": float(metrics.graph_similarity),
@@ -272,6 +286,8 @@ def matched_density_point(
         "degree_mmd_ratio": float(metrics.mmd_ratio["degree"]),
         "clustering_mmd_ratio": float(metrics.mmd_ratio["clustering"]),
         "spectral_mmd_ratio": float(metrics.mmd_ratio["spectral"]),
+        "geometric_rd": cast(float, diagnostics["geometric_mean"]),
+        "mean_abs_log_rd": cast("float | None", diagnostics["mean_abs_log"]),
     }
 
 

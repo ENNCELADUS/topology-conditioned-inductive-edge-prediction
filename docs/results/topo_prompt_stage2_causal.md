@@ -25,8 +25,15 @@ per universe**: the mean logit shift it induces. Two controls carry the finding.
    than test logits. Since the reported operating point selects one threshold on V_val and replays
    it on test, that differential alone loosens the transferred threshold. Feeding
    `logit_mean + mean(Δ)` — no node structure, no pair structure, a constant on each universe —
-   through the ordinary protocol gives RD **1.089** and MMD **3.3 / 4.0 / 4.8**: a better density and
-   better degree and spectral ratios than the real prediction achieves.
+   through the ordinary protocol gives RD **1.089** (geometric RD **1.027**) and MMD
+   **3.3 / 4.0 / 4.8**: a better density and better degree and spectral ratios than the real
+   prediction achieves (0.907, geometric 0.864, 4.2 / 3.6 / 6.7).
+   The surrogate is a *constant* added to `mean`, so it leaves `mean`'s ranking of pairs
+   completely intact: the two rows admit edges in exactly the same order and differ only in where
+   the transferred threshold lands. The matched-density column confirms it — `offset only` and
+   `mean` are numerically identical there (GS 0.399, RD 1.061, MMD 3.28 / 3.86 / 4.86). **All of the
+   published RD and MMD movement is threshold placement, not a change in which edges the model
+   prefers.**
 2. **Matched density.** MMD ratios move strongly with density, so two rows at RD 0.52 and RD 0.91
    are not comparable. Re-selecting each row's threshold on the test universe itself (test-informed,
    a diagnostic only) puts every row at RD ≈ 1.06, and the published shape advantage disappears:
@@ -78,16 +85,20 @@ diagnostic on the right. Edge metrics are on the held-out 1:1 `test` list and ar
 so a constant offset leaves them unchanged (visible in the `offset only` row, which reproduces
 `mean`'s AUROC exactly — a consistency check on the pipeline).
 
-| Row | thr | GS ↑ | RD → 1 | MMD d/c/s ↓ | AUROC | matched GS | matched RD | matched MMD d/c/s |
-|---|---:|---:|---:|---|---:|---:|---:|---|
-| predicted (no intervention) | +1.359 | 0.430 | 0.907 | 4.2 / 3.6 / 6.7 | 0.677 | 0.428 | 1.058 | 4.0 / 3.5 / 6.0 |
-| mean coordinates | +2.188 | 0.390 | 0.520 | 8.9 / 7.9 / 12.9 | 0.665 | 0.399 | 1.061 | 3.3 / 3.9 / 4.9 |
-| gates off | +1.742 | 0.385 | 0.570 | 7.4 / 6.6 / 10.9 | 0.647 | 0.392 | 1.075 | 3.3 / 3.9 / 4.8 |
-| mean relation field | +3.031 | 0.433 | 0.713 | 13.5 / 10.7 / 16.5 | 0.669 | 0.436 | 1.085 | 7.8 / 6.4 / 9.5 |
-| **offset only** | −0.716 | 0.399 | **1.089** | **3.3 / 4.0 / 4.8** | 0.665 | 0.399 | 1.061 | 3.3 / 3.9 / 4.9 |
-| offset + node | −0.368 | 0.386 | 1.734 | 11.8 / 9.9 / 9.9 | 0.623 | 0.387 | 1.104 | 11.5 / 9.4 / 11.8 |
-| offset + pair | +1.179 | 0.376 | 0.656 | 6.2 / 5.4 / 9.7 | **0.693** | 0.390 | 1.097 | **3.4 / 3.4 / 4.4** |
-| offset + permuted structure | +0.396 | 0.333 | 1.220 | 7.8 / 17.3 / 5.1 | 0.606 | 0.332 | 1.092 | 6.1 / 16.3 / 5.0 |
+| Row | thr | GS ↑ | RD → 1 | geo RD | mean abs log RD ↓ | MMD d/c/s ↓ | AUROC | matched GS | matched RD | matched MMD d/c/s |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
+| predicted (no intervention) | +1.359 | 0.430 | 0.907 | 0.864 | 0.264 | 4.2 / 3.6 / 6.7 | 0.677 | 0.428 | 1.058 | 4.0 / 3.5 / 6.0 |
+| mean coordinates | +2.188 | 0.390 | 0.520 | 0.502 | 0.688 | 8.9 / 7.9 / 12.9 | 0.665 | 0.399 | 1.061 | 3.3 / 3.9 / 4.9 |
+| gates off | +1.742 | 0.385 | 0.570 | 0.543 | 0.611 | 7.4 / 6.6 / 10.9 | 0.647 | 0.392 | 1.075 | 3.3 / 3.9 / 4.8 |
+| mean relation field | +3.031 | 0.433 | 0.713 | 0.658 | 0.476 | 13.5 / 10.7 / 16.5 | 0.669 | 0.436 | 1.085 | 7.8 / 6.4 / 9.5 |
+| **offset only** | −0.716 | 0.399 | **1.089** | **1.027** | 0.289 | **3.3 / 4.0 / 4.8** | 0.665 | 0.399 | 1.061 | 3.3 / 3.9 / 4.9 |
+| offset + node | −0.368 | 0.386 | 1.734 | 1.551 | 0.562 | 11.8 / 9.9 / 9.9 | 0.623 | 0.387 | 1.104 | 11.5 / 9.4 / 11.8 |
+| offset + pair | +1.179 | 0.376 | 0.656 | 0.595 | 0.556 | 6.2 / 5.4 / 9.7 | **0.693** | 0.390 | 1.097 | **3.4 / 3.4 / 4.4** |
+| offset + permuted structure | +0.396 | 0.333 | 1.220 | 1.109 | 0.387 | 7.8 / 17.3 / 5.1 | 0.606 | 0.332 | 1.092 | 6.1 / 16.3 / 5.0 |
+
+The four measured rows reproduce `topo_prompt_stage2.md` §2.2 exactly (`predicted` geo RD 0.864 /
+mean abs log RD 0.264; `mean` 0.502 / 0.688), which is the check that this pipeline is the
+protocol and not a re-implementation of it.
 
 Reading:
 
