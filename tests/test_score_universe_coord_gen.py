@@ -103,13 +103,70 @@ def test_packed_and_unpacked_scoring_need_no_coordinates_and_agree(
     )
     np.testing.assert_allclose(gated_off, base_scores, rtol=0.0, atol=1e-5)
     model.intervention = "none"
-    with pytest.raises(SystemExit, match="v3_1_prefix"):
-        score_universe._score_v3_1(
-            model,
-            pairs,
-            store,
-            device=device,
-            amp="off",
-            token_budget=512,
-            shuffle_sources=list(pairs),
-        )
+
+
+def _encoded_pairs(
+    model: V3_1CoordGen,
+    table: PackedFeatureTable,
+    node_index: dict[str, int],
+    pairs: list[tuple[str, str]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode one pair list end to end through the reader's frozen encoder."""
+    compact = CompactPairBatch(
+        row_ids=torch.arange(len(pairs)),
+        node_a=torch.tensor([node_index[u] for u, _ in pairs]),
+        node_b=torch.tensor([node_index[v] for _, v in pairs]),
+        labels=torch.zeros(len(pairs)),
+        bucket_boundary=128,
+        global_pair_count=len(pairs),
+    )
+    batch = table.assemble(compact)
+    with torch.inference_mode():
+        encoded_a = model.reader.encoder(batch["emb_a"].float(), batch["len_a"])
+        encoded_b = model.reader.encoder(batch["emb_b"].float(), batch["len_b"])
+    return encoded_a, encoded_b, batch["len_a"], batch["len_b"]
+
+
+def test_coordinate_transplant_substitutes_the_source_pair_prediction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`shuffle` on a coord_gen checkpoint scores own endpoints under another row's coordinates."""
+    model = _tiny_coord_gen()
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=5)
+    store = FeatureStore(tmp_path / "features")
+    device = torch.device("cpu")
+    sources = list(reversed(pairs))
+
+    identity = score_universe._score_v3_1(
+        model, pairs, store, device=device, amp="off", token_budget=512, shuffle_sources=list(pairs)
+    )
+    plain = score_universe._score_v3_1(
+        model, pairs, store, device=device, amp="off", token_budget=512
+    )
+    # Transplanting each row's own prediction is the identity intervention.
+    np.testing.assert_allclose(identity, plain, rtol=0.0, atol=1e-4)
+
+    transplanted = score_universe._score_v3_1(
+        model, pairs, store, device=device, amp="off", token_budget=512, shuffle_sources=sources
+    )
+    assert not np.allclose(transplanted, plain, atol=1e-3)
+
+    table = PackedFeatureTable.from_pack(pack_root, device)
+    node_index = table.manifest.node_index()
+    own = _encoded_pairs(model, table, node_index, pairs)
+    source = _encoded_pairs(model, table, node_index, sources)
+    with torch.inference_mode():
+        source_coords, _ = model.predict(*source)
+        reference = model.reader.logits_from_standardized(*own, source_coords)
+    np.testing.assert_allclose(transplanted, reference.numpy().reshape(-1), rtol=0.0, atol=5e-3)
+
+    packed = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=device,
+        amp="off",
+        token_budget=512,
+        shuffle_sources=sources,
+    )
+    np.testing.assert_allclose(packed, reference.numpy().reshape(-1), rtol=0.0, atol=1e-5)

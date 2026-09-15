@@ -53,7 +53,9 @@ selected method. Every piece of writing must explain how its context helps decid
   In v1 only the generator trained: coordinate supervision + task BCE + light logit KD towards the reader
   on true coordinates. Deployable (`(x_u,x_v)` only): completed formal runs `coord_gen_full` / `coord_gen_frozen`
   scored without any truth graph; read against `prefix_base` and against the row's own reader
-  (its ceiling); interventions `gates_off` and `mean*` only (`shuffle` fails closed).
+  (its ceiling); interventions `gates_off`, `mean*` and `shuffle` -- the last transplants the
+  *predicted* coordinates of another row of the universe onto this row's endpoints, the
+  marginal-preserving null `mean` is not.
 - Topology-prompt v2 (spec `docs/superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md`):
   Stage I `topo_prompt_full_v2` adds stationary coordinate corruption; `topo_prompt_full_struct`
   also adds the structural stream using full-training-table coordinates. Both are ceiling diagnostics.

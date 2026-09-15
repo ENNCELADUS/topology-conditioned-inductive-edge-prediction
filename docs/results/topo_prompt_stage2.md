@@ -17,6 +17,14 @@ Comparator: `prefix_base` (val_cls AUROC/AUPRC 0.793/0.814, GS 0.401; test 0.721
 
 ## 1. Verdict (topology first)
 
+> **Superseded in part (2026-09-15).** A causal decomposition of these same artifacts
+> ([`topo_prompt_stage2_causal.md`](topo_prompt_stage2_causal.md)) shows the topology result below
+> is reproduced by one scalar per universe — the predicted coordinates depress V_val logits 0.66
+> nats more than test logits, which loosens the transferred threshold — and that at matched density
+> the shape advantage disappears (predicted 4.0 / 3.5 / 6.0 against `mean`'s 3.3 / 3.9 / 4.9). Read
+> the paragraphs below as the measured numbers they are; do not read their attribution to
+> "topology-conditioned decision", which the decomposition does not support.
+
 The study's object is the assembled topology, so the reading starts with the five topology numbers
 at the ONE V_val-selected threshold on the held-out test subgraphs, next to every deployable arm:
 

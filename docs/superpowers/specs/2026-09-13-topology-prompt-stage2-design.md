@@ -76,8 +76,13 @@ weight `w_i` so the trainer's DDP scaling applies unchanged:
 
 Field masking is not applied to predictions; the reader's scoring-time interventions
 (`gates_off`, `mean`, `mean_endpoint`, `mean_relation`, `mean_context`) apply to the
-predicted coordinates as they did to the true ones. `shuffle` has no null here (the model
-predicts its own coordinates) and fails closed.
+predicted coordinates as they did to the true ones. `shuffle` was originally declared to have no
+null here, on the reading that a model predicting its own coordinates has nothing to substitute.
+That was wrong, and the gate was removed on 2026-09-15: transplanting the *predicted* coordinates
+of another row of the universe is the marginal-preserving null that `mean` is not -- `mean` deletes
+the prediction's variance along with its content, while a transplant leaves the universe's
+distribution of predictions intact and destroys only the pairing. See
+`docs/results/topo_prompt_stage2_causal.md`.
 
 ## 4. Validation and scoring
 

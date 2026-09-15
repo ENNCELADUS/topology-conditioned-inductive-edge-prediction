@@ -56,7 +56,9 @@ selected method. Every piece of writing must explain how its context helps decid
   Only the generator trains: coordinate supervision + task BCE + light logit KD towards the reader
   on true coordinates. Deployable (`(x_u,x_v)` only): formal runs `coord_gen_full` / `coord_gen_frozen`
   scored without any truth graph; read against `prefix_base` and against the row's own reader
-  (its ceiling); interventions `gates_off` and `mean*` only (`shuffle` fails closed).
+  (its ceiling); interventions `gates_off`, `mean*` and `shuffle` -- the last transplants the
+  *predicted* coordinates of another row of the universe onto this row's endpoints, the
+  marginal-preserving null `mean` is not.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

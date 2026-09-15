@@ -1,0 +1,189 @@
+{
+  "run_dir": "outputs/split_seed42/coord_gen_full",
+  "checkpoint_id": "4a743373f0b9e4d0",
+  "seed": 0,
+  "decomposition": {
+    "val_topology": {
+      "rows": 297209,
+      "nodes": 869,
+      "offset": -2.90390526297986,
+      "delta_sd": 1.925321298315368,
+      "node_sd": 1.0966628703869772,
+      "pair_sd": 1.5824641071639427,
+      "additive_r2": 0.32444407649204676
+    },
+    "test_topology": {
+      "rows": 943685,
+      "nodes": 2018,
+      "offset": -2.243130219789712,
+      "delta_sd": 2.01441147400309,
+      "node_sd": 1.4385169627000238,
+      "pair_sd": 1.4101498270101736,
+      "additive_r2": 0.5099570518794222
+    }
+  },
+  "offset_gap_val_minus_test": -0.660775043190148,
+  "test_node_effect_vs_log_degree_r": 0.23939149437679424,
+  "rows": [
+    {
+      "row": "predicted (no intervention)",
+      "threshold": 1.359375,
+      "graph_similarity": 0.430037080329937,
+      "relative_density": 0.9065680885085715,
+      "degree_mmd_ratio": 4.225594205040073,
+      "clustering_mmd_ratio": 3.564078203441697,
+      "spectral_mmd_ratio": 6.70831923808321,
+      "geometric_rd": 0.9065680885085715,
+      "auroc": 0.6771204234615213,
+      "auprc": 0.7251086456129102,
+      "matched_density": {
+        "threshold": 1.1796875,
+        "graph_similarity": 0.42764037119760756,
+        "relative_density": 1.0578785797008896,
+        "degree_mmd_ratio": 4.0301203308365885,
+        "clustering_mmd_ratio": 3.4734638968387492,
+        "spectral_mmd_ratio": 5.957749511844217
+      }
+    },
+    {
+      "row": "mean coordinates",
+      "threshold": 2.1875,
+      "graph_similarity": 0.3903903225337247,
+      "relative_density": 0.5195559384665871,
+      "degree_mmd_ratio": 8.889288927776423,
+      "clustering_mmd_ratio": 7.8601643686191105,
+      "spectral_mmd_ratio": 12.853887748840316,
+      "geometric_rd": 0.5195559384665871,
+      "auroc": 0.6650885744106848,
+      "auprc": 0.7070353425165867,
+      "matched_density": {
+        "threshold": 1.5546875,
+        "graph_similarity": 0.39909814145484773,
+        "relative_density": 1.0611687349586858,
+        "degree_mmd_ratio": 3.2781981351577216,
+        "clustering_mmd_ratio": 3.856268071709076,
+        "spectral_mmd_ratio": 4.861559786241239
+      }
+    },
+    {
+      "row": "gates off",
+      "threshold": 1.7421875,
+      "graph_similarity": 0.3845521149006194,
+      "relative_density": 0.5697307893521076,
+      "degree_mmd_ratio": 7.42298536992949,
+      "clustering_mmd_ratio": 6.6011084200758035,
+      "spectral_mmd_ratio": 10.888915357311506,
+      "geometric_rd": 0.5697307893521076,
+      "auroc": 0.6466795641588479,
+      "auprc": 0.6952024817093356,
+      "matched_density": {
+        "threshold": 1.09375,
+        "graph_similarity": 0.3916114457712278,
+        "relative_density": 1.07515058716345,
+        "degree_mmd_ratio": 3.2552061682846194,
+        "clustering_mmd_ratio": 3.930221491647278,
+        "spectral_mmd_ratio": 4.811836994100588
+      }
+    },
+    {
+      "row": "mean relation field",
+      "threshold": 3.03125,
+      "graph_similarity": 0.4330026036394059,
+      "relative_density": 0.7128847917146339,
+      "degree_mmd_ratio": 13.483817039045107,
+      "clustering_mmd_ratio": 10.702820328273543,
+      "spectral_mmd_ratio": 16.4761695432361,
+      "geometric_rd": 0.7128847917146339,
+      "auroc": 0.6687305866161455,
+      "auprc": 0.7092699129803152,
+      "matched_density": {
+        "threshold": 2.40625,
+        "graph_similarity": 0.43640086318369686,
+        "relative_density": 1.084743765784961,
+        "degree_mmd_ratio": 7.774460055416534,
+        "clustering_mmd_ratio": 6.393060213245739,
+        "spectral_mmd_ratio": 9.539502832320531
+      }
+    },
+    {
+      "row": "offset only",
+      "threshold": -0.7164052629798601,
+      "graph_similarity": 0.39907293544836886,
+      "relative_density": 1.08949483593468,
+      "degree_mmd_ratio": 3.305609754339981,
+      "clustering_mmd_ratio": 3.9736967533705005,
+      "spectral_mmd_ratio": 4.765320744202781,
+      "geometric_rd": 0.9178565762930834,
+      "auroc": 0.6650885744106848,
+      "auprc": 0.7070353425165867,
+      "matched_density": {
+        "threshold": -0.688442719789712,
+        "graph_similarity": 0.39909814145484773,
+        "relative_density": 1.0611687349586858,
+        "degree_mmd_ratio": 3.2781981351577216,
+        "clustering_mmd_ratio": 3.856268071709076,
+        "spectral_mmd_ratio": 4.861559786241239
+      }
+    },
+    {
+      "row": "offset + node",
+      "threshold": -0.3684779819125956,
+      "graph_similarity": 0.3862845770624284,
+      "relative_density": 1.7338545046866485,
+      "degree_mmd_ratio": 11.833502870306805,
+      "clustering_mmd_ratio": 9.86192383133034,
+      "spectral_mmd_ratio": 9.933522250263394,
+      "geometric_rd": 0.5767496622680721,
+      "auroc": 0.6230672337075588,
+      "auprc": 0.6624765165418204,
+      "matched_density": {
+        "threshold": 0.32033714423799653,
+        "graph_similarity": 0.3874286903987165,
+        "relative_density": 1.1039391898447422,
+        "degree_mmd_ratio": 11.479928899170634,
+        "clustering_mmd_ratio": 9.438934431557437,
+        "spectral_mmd_ratio": 11.805223013736597
+      }
+    },
+    {
+      "row": "offset + pair",
+      "threshold": 1.1791778960042771,
+      "graph_similarity": 0.37619492239381636,
+      "relative_density": 0.6555041229747383,
+      "degree_mmd_ratio": 6.184503256097486,
+      "clustering_mmd_ratio": 5.385508756553253,
+      "spectral_mmd_ratio": 9.704782798200005,
+      "geometric_rd": 0.6555041229747383,
+      "auroc": 0.6932706129530838,
+      "auprc": 0.7264777207771504,
+      "matched_density": {
+        "threshold": 0.38577777499587285,
+        "graph_similarity": 0.39006426355636586,
+        "relative_density": 1.0972382196045691,
+        "degree_mmd_ratio": 3.3681683400146083,
+        "clustering_mmd_ratio": 3.406807406657699,
+        "spectral_mmd_ratio": 4.405552427343561
+      }
+    },
+    {
+      "row": "offset + permuted structure",
+      "threshold": 0.3955078124668572,
+      "graph_similarity": 0.33295201865573915,
+      "relative_density": 1.2197927723392545,
+      "degree_mmd_ratio": 7.782878715320539,
+      "clustering_mmd_ratio": 17.314400865749327,
+      "spectral_mmd_ratio": 5.065852801098738,
+      "geometric_rd": 0.8198113832747611,
+      "auroc": 0.6057708432337434,
+      "auprc": 0.6426879959218101,
+      "matched_density": {
+        "threshold": 0.5380859374971143,
+        "graph_similarity": 0.3323379802082286,
+        "relative_density": 1.0923920004884937,
+        "degree_mmd_ratio": 6.057237843038581,
+        "clustering_mmd_ratio": 16.34404568022491,
+        "spectral_mmd_ratio": 5.006625106996887
+      }
+    }
+  ]
+}

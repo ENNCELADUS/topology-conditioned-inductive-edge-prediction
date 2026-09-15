@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     # modules) so merely importing `score_universe` never pays that cost. This
     # import is erased at runtime (`from __future__ import annotations` makes
     # every annotation a string), so it exists for mypy only.
+    from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
     from src.model.egostitch.classifier.prefix import V3_1Prefix
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
     from src.model.egostitch.generator.full_oracle import FullEgoGraph
@@ -2028,6 +2029,48 @@ def _prefix_source_conditions(
     return z_bank
 
 
+def _coord_gen_source_coords(
+    source_batches: Sequence[Sequence[int]],
+    predict_batch: Callable[[Sequence[int]], torch.Tensor],
+    *,
+    num_rows: int,
+) -> torch.Tensor:
+    """Build the ``--prefix-intervention shuffle`` coordinate bank of a ``v3_1_coord_gen`` process.
+
+    The `V3_1Prefix` counterpart is `_prefix_source_conditions`; this is the same
+    two-pass substitution one node down the graph. Pass 1 runs the *generator*
+    over the source pairs and keeps its standardised prediction; pass 2 scores
+    each row's own endpoints while the frozen reader reads another row's
+    predicted coordinates.
+
+    This is the marginal-preserving null the `mean` intervention is not: `mean`
+    deletes the prediction's variance along with its content, while a transplant
+    leaves the universe's distribution of predicted coordinates intact and
+    destroys only the pairing between a row and its own prediction. The two
+    together separate "the generator's output carries pair-specific structure"
+    from "the reader responds to the distribution of predictions".
+
+    Args:
+        source_batches: Batch index lists over the source pairs; an index is a
+            row position, since source ``i`` serves row ``i``.
+        predict_batch: Encodes one batch of source pairs and returns its
+            standardised ``(B, COORD_DIM)`` prediction.
+        num_rows: Rows this process scores.
+
+    Returns:
+        The row-aligned ``(num_rows, COORD_DIM)`` fp32 CPU coordinate bank.
+    """
+    from src.data.struct_coords import COORD_DIM
+
+    bank = torch.zeros((num_rows, COORD_DIM), dtype=torch.float32)
+    for batch_indices in source_batches:
+        predicted = predict_batch(batch_indices)
+        bank[torch.as_tensor(list(batch_indices), dtype=torch.int64)] = (
+            predicted.detach().to(torch.float32).cpu()
+        )
+    return bank
+
+
 def _score_v3_1(
     model: nn.Module,
     pairs: Sequence[tuple[str, str]],
@@ -2053,14 +2096,16 @@ def _score_v3_1(
         amp: ``off`` or ``bf16``.
         token_budget: Approximate per-batch token budget for the bucketed sampler.
         shuffle_sources: ``--prefix-intervention shuffle`` for a pair-conditioned
-            ``v3_1_prefix`` checkpoint: one source pair per row, so row ``i`` is
-            scored on its own endpoints under the condition of
+            ``v3_1_prefix`` or a ``v3_1_coord_gen`` checkpoint: one source pair
+            per row, so row ``i`` is scored on its own endpoints under the
+            condition (prefix) or predicted coordinates (coord_gen) of
             ``shuffle_sources[i]`` (`_shuffle_source_rows` draws the map over the
             whole universe, so it is the same under fan-out). Two passes: the
             first encodes the source pairs and collects their conditions
-            (`_prefix_source_conditions`), the second scores the rows against
-            that bank. A ``v3_1_topo_prompt`` checkpoint is shuffled by the
-            caller substituting ``row_coords`` instead.
+            (`_prefix_source_conditions`) or predictions
+            (`_coord_gen_source_coords`), the second scores the rows against that
+            bank. A ``v3_1_topo_prompt`` checkpoint is shuffled by the caller
+            substituting ``row_coords`` instead.
         row_coords: ``(len(pairs), COORD_DIM)`` structural coordinates of the rows
             (``v3_1_topo_prompt`` only), attached to each batch as ``struct_coords``.
 
@@ -2073,55 +2118,69 @@ def _score_v3_1(
     batches = [list(batch) for batch in sampler]
     _check_row_coords(row_coords, len(pairs))
 
-    prefix_model: V3_1Prefix | None = None
+    shuffle_model: V3_1Prefix | V3_1CoordGen | None = None
 
     def _encode(
         source: TokenPairDataset, batch_indices: Sequence[int]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the frozen encoder over one batch of `source` (shuffle path only)."""
-        assert prefix_model is not None
+        assert shuffle_model is not None
         batch = collate_token_pairs([source[i] for i in batch_indices])
         batch = {key: tensor.to(device) for key, tensor in batch.items()}
         with torch.inference_mode(), _autocast_context(device, amp):
-            encoded_a = prefix_model.encoder(batch["emb_a"], batch["len_a"])
-            encoded_b = prefix_model.encoder(batch["emb_b"], batch["len_b"])
+            encoded_a = shuffle_model.encoder(batch["emb_a"], batch["len_a"])
+            encoded_b = shuffle_model.encoder(batch["emb_b"], batch["len_b"])
         return encoded_a, encoded_b, batch["len_a"], batch["len_b"]
 
     z_bank: torch.Tensor | None = None
+    coord_bank: torch.Tensor | None = None
     if shuffle_sources is not None:
+        from src.model.egostitch.classifier.coord_gen import V3_1CoordGen as _V3_1CoordGen
         from src.model.egostitch.classifier.prefix import V3_1Prefix as _V3_1Prefix
 
-        if not isinstance(model, _V3_1Prefix):
-            raise SystemExit("--prefix-intervention shuffle requires a v3_1_prefix checkpoint")
+        if not isinstance(model, (_V3_1Prefix, _V3_1CoordGen)):
+            raise SystemExit(
+                "--prefix-intervention shuffle requires a v3_1_prefix or v3_1_coord_gen checkpoint"
+            )
         if len(shuffle_sources) != len(pairs):
             raise SystemExit(
                 f"shuffle sources cover {len(shuffle_sources)} rows, expected {len(pairs)}"
             )
-        prefix_model = model
+        shuffle_model = model
         source_lengths = probe_lengths(store, shuffle_sources)
         source_dataset = TokenPairDataset(shuffle_sources, None, store, lengths=source_lengths)
         source_sampler = LengthBucketedBatchSampler(
             source_lengths, token_budget=token_budget, shuffle=False
         )
+        source_batches = [list(batch) for batch in source_sampler]
 
-        def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
-            """Pass 1: the raw pair conditions of one batch of source pairs."""
-            assert prefix_model is not None
-            encoded_a, encoded_b, len_a, len_b = _encode(source_dataset, batch_indices)
-            with torch.inference_mode(), _autocast_context(device, amp):
-                return prefix_model.condition_from_encoded(encoded_a, encoded_b, len_a, len_b)
+        if isinstance(model, _V3_1Prefix):
+            prefix_model = model
 
-        z_bank = _prefix_source_conditions(
-            prefix_model,
-            [list(batch) for batch in source_sampler],
-            _condition,
-            num_rows=len(pairs),
-        )
+            def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
+                """Pass 1: the raw pair conditions of one batch of source pairs."""
+                encoded_a, encoded_b, len_a, len_b = _encode(source_dataset, batch_indices)
+                with torch.inference_mode(), _autocast_context(device, amp):
+                    return prefix_model.condition_from_encoded(encoded_a, encoded_b, len_a, len_b)
+
+            z_bank = _prefix_source_conditions(
+                prefix_model, source_batches, _condition, num_rows=len(pairs)
+            )
+        else:
+            coord_model = model
+
+            def _coords(batch_indices: Sequence[int]) -> torch.Tensor:
+                """Pass 1: the generator's prediction for one batch of source pairs."""
+                encoded_a, encoded_b, len_a, len_b = _encode(source_dataset, batch_indices)
+                with torch.inference_mode(), _autocast_context(device, amp):
+                    return coord_model.predict(encoded_a, encoded_b, len_a, len_b)[0]
+
+            coord_bank = _coord_gen_source_coords(source_batches, _coords, num_rows=len(pairs))
 
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
     for batch_indices in batches:
-        if z_bank is None:
+        if z_bank is None and coord_bank is None:
             batch = collate_token_pairs([dataset[i] for i in batch_indices])
             batch = {key: tensor.to(device) for key, tensor in batch.items()}
             if row_coords is not None:
@@ -2131,15 +2190,27 @@ def _score_v3_1(
             with torch.inference_mode(), _autocast_context(device, amp):
                 logits = cast(torch.Tensor, model(batch)["logits"])
         else:
-            assert prefix_model is not None
+            assert shuffle_model is not None
             encoded_a, encoded_b, len_a, len_b = _encode(dataset, batch_indices)
-            z_rows = z_bank[torch.as_tensor(batch_indices, dtype=torch.int64)].to(
-                device=encoded_a.device, dtype=encoded_a.dtype
-            )
+            rows = torch.as_tensor(batch_indices, dtype=torch.int64)
             with torch.inference_mode(), _autocast_context(device, amp):
-                logits = prefix_model.logits_from_encoded(
-                    encoded_a, encoded_b, len_a, len_b, z=z_rows
-                )
+                if z_bank is not None:
+                    logits = cast("V3_1Prefix", shuffle_model).logits_from_encoded(
+                        encoded_a,
+                        encoded_b,
+                        len_a,
+                        len_b,
+                        z=z_bank[rows].to(device=encoded_a.device, dtype=encoded_a.dtype),
+                    )
+                else:
+                    assert coord_bank is not None
+                    logits = cast("V3_1CoordGen", shuffle_model).reader.logits_from_standardized(
+                        encoded_a,
+                        encoded_b,
+                        len_a,
+                        len_b,
+                        coord_bank[rows].to(device=encoded_a.device),
+                    )
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
         )
@@ -2163,10 +2234,11 @@ def _score_v3_1_packed(
     """Score V3.1 pairs with packed features and cached per-node encodings.
 
     ``shuffle_sources`` runs the same two-pass, universe-level substitution as
-    `_score_v3_1` (`_prefix_source_conditions`), reading both passes out of the
-    per-node encoding cache built here, which therefore also covers the source
-    pairs' nodes; a ``v3_1_topo_prompt`` checkpoint is shuffled by the caller
-    substituting ``row_coords`` instead.
+    `_score_v3_1` (`_prefix_source_conditions` for ``v3_1_prefix``,
+    `_coord_gen_source_coords` for ``v3_1_coord_gen``), reading both passes out
+    of the per-node encoding cache built here, which therefore also covers the
+    source pairs' nodes; a ``v3_1_topo_prompt`` checkpoint is shuffled by the
+    caller substituting ``row_coords`` instead.
     """
     from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
     from src.model.egostitch.classifier.prefix import V3_1Prefix
@@ -2286,27 +2358,41 @@ def _score_v3_1_packed(
         )
 
     z_bank: torch.Tensor | None = None
+    coord_bank: torch.Tensor | None = None
     if shuffle_sources is not None:
-        if not isinstance(model, V3_1Prefix):
-            raise SystemExit("--prefix-intervention shuffle requires a v3_1_prefix checkpoint")
-        prefix_model = model
+        if not isinstance(model, (V3_1Prefix, V3_1CoordGen)):
+            raise SystemExit(
+                "--prefix-intervention shuffle requires a v3_1_prefix or v3_1_coord_gen checkpoint"
+            )
         source_sampler = LengthBucketedBatchSampler(
             source_lengths, token_budget=token_budget, shuffle=False
         )
+        source_batches = [list(batch) for batch in source_sampler]
 
-        def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
-            """Pass 1: the raw pair conditions of one batch of source pairs."""
-            with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
-                return prefix_model.condition_from_encoded(
-                    *_gather(batch_indices, source_a, source_b, source_lengths)
-                )
+        if isinstance(model, V3_1Prefix):
+            prefix_model = model
 
-        z_bank = _prefix_source_conditions(
-            prefix_model,
-            [list(batch) for batch in source_sampler],
-            _condition,
-            num_rows=len(pairs),
-        )
+            def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
+                """Pass 1: the raw pair conditions of one batch of source pairs."""
+                with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
+                    return prefix_model.condition_from_encoded(
+                        *_gather(batch_indices, source_a, source_b, source_lengths)
+                    )
+
+            z_bank = _prefix_source_conditions(
+                prefix_model, source_batches, _condition, num_rows=len(pairs)
+            )
+        else:
+            coord_model = model
+
+            def _coords(batch_indices: Sequence[int]) -> torch.Tensor:
+                """Pass 1: the generator's prediction for one batch of source pairs."""
+                with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
+                    return coord_model.predict(
+                        *_gather(batch_indices, source_a, source_b, source_lengths)
+                    )[0]
+
+            coord_bank = _coord_gen_source_coords(source_batches, _coords, num_rows=len(pairs))
 
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
@@ -2314,13 +2400,7 @@ def _score_v3_1_packed(
     score_started = perf_counter()
     for batch_indices in batches:
         encoded_a, encoded_b, len_a, len_b = _gather(batch_indices, node_a, node_b, lengths)
-        z_rows = (
-            None
-            if z_bank is None
-            else z_bank[torch.as_tensor(batch_indices, dtype=torch.int64)].to(
-                device=encoded_a.device, dtype=encoded_a.dtype
-            )
-        )
+        rows = torch.as_tensor(batch_indices, dtype=torch.int64)
         with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
             if row_coords is not None:
                 logits = cast(V3_1TopoPrompt, model).logits_from_encoded(
@@ -2328,15 +2408,23 @@ def _score_v3_1_packed(
                     encoded_b,
                     len_a,
                     len_b,
-                    coords=row_coords[torch.as_tensor(batch_indices, dtype=torch.int64)].to(device),
+                    coords=row_coords[rows].to(device),
                 )
-            elif z_rows is None:
+            elif coord_bank is not None:
+                logits = cast(V3_1CoordGen, model).reader.logits_from_standardized(
+                    encoded_a, encoded_b, len_a, len_b, coord_bank[rows].to(device)
+                )
+            elif z_bank is None:
                 logits = cast(V3_1 | V3_1Prefix, model).logits_from_encoded(
                     encoded_a, encoded_b, len_a, len_b
                 )
             else:
                 logits = cast(V3_1Prefix, model).logits_from_encoded(
-                    encoded_a, encoded_b, len_a, len_b, z=z_rows
+                    encoded_a,
+                    encoded_b,
+                    len_a,
+                    len_b,
+                    z=z_bank[rows].to(device=encoded_a.device, dtype=encoded_a.dtype),
                 )
         out[np.asarray(batch_indices, dtype=np.int64)] = (
             logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
@@ -3559,17 +3647,14 @@ def _run_score(args: argparse.Namespace) -> None:
                 "--prefix-intervention requires a v3_1_prefix, v3_1_topo_prompt or "
                 "v3_1_coord_gen checkpoint"
             )
-        if isinstance(model, V3_1CoordGen) and args.prefix_intervention == "shuffle":
-            raise SystemExit(
-                "--prefix-intervention shuffle has no null for v3_1_coord_gen: the model "
-                "predicts its own coordinates; use gates_off or the mean interventions"
-            )
         # `shuffle` is not a model-level mode: it gives every row the condition
         # or coordinates of another row of the whole universe, which only the
         # scoring branch below can see (`_shuffle_source_rows`; the prefix arm
         # reads the source pair's condition through `_prefix_source_conditions`,
-        # the topology prompt the source pair's coordinates). The model stays
-        # on `"none"`; the artifact meta below still records the request.
+        # the topology prompt the source pair's true coordinates, and
+        # `v3_1_coord_gen` the source pair's *predicted* coordinates through
+        # `_coord_gen_source_coords`). The model stays on `"none"`; the artifact
+        # meta below still records the request.
         if args.prefix_intervention != "shuffle":
             model.intervention = args.prefix_intervention
 
