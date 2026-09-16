@@ -11,12 +11,14 @@ from src.model.egostitch.classifier.motif_prompt import (
     MotifCountHead,
     MotifGenerator,
     MotifGritReader,
+    MotifPromptAdapter,
     MotifPromptConfig,
     ReaderConfig,
     dense_adjacency,
     motif_rrwp,
     typed_adjacency,
 )
+from src.model.egostitch.classifier.prefix import prefix_branch
 from src.model.egostitch.encoder.grit_gmt import dense_rrwp
 
 
@@ -225,7 +227,7 @@ def test_output_biases_start_at_the_clipped_training_mean_in_logit_space() -> No
     generator.init_biases(mean)
     h_u, len_u = _states(seed=1)
     h_v, len_v = _states(seed=2)
-    weights = generator(h_u, h_v, len_u, len_v)
+    weights = generator(h_u, h_v, len_u, len_v).detach()
     # Clipped to [0.01, 0.99] before the logit, so nothing saturates.
     assert float(weights[:, :16].mean()) < 0.2
     assert 0.2 < float(weights[:, 16:32].mean()) < 0.8
@@ -235,12 +237,12 @@ def test_per_type_and_mean_graph_gate_modes_realise_their_controls() -> None:
     per_type = _generator(gate_mode="per_type")
     h_u, len_u = _states(seed=1)
     h_v, len_v = _states(seed=2)
-    weights = per_type(h_u, h_v, len_u, len_v)
+    weights = per_type(h_u, h_v, len_u, len_v).detach()
     for block in (slice(0, 16), slice(16, 32), slice(32, 96)):
         assert float(weights[:, block].std(dim=1).abs().max()) == pytest.approx(0.0, abs=1e-6)
     mean_graph = _generator(gate_mode="mean_graph")
     mean_graph.init_biases(torch.full((96,), 0.3))
-    fixed = mean_graph(h_u, h_v, len_u, len_v)
+    fixed = mean_graph(h_u, h_v, len_u, len_v).detach()
     assert float(fixed.std(dim=0).abs().max()) == pytest.approx(0.0, abs=1e-6)
     assert float(fixed.mean()) == pytest.approx(0.3, abs=1e-6)
 
@@ -259,3 +261,72 @@ def test_gradients_reach_every_generator_parameter_on_a_non_degenerate_batch() -
     assert all(
         p.grad is not None and torch.isfinite(p.grad).all() for _, p in generator.named_parameters()
     )
+
+
+def _adapter(fields: tuple[str, ...] = FIELD_ORDER, seed: int = 0) -> MotifPromptAdapter:
+    torch.manual_seed(seed)
+    cfg = MotifPromptConfig.from_mapping(
+        {"stage": "one", "base_checkpoint": "b.pt", "width": 16, "fields": list(fields)}
+    )
+    return MotifPromptAdapter(d_model=32, n_layers=3, n_heads=4, cfg=cfg)
+
+
+def _tokens(n: int = 4, width: int = 16, seed: int = 5) -> dict[str, torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    return {
+        name: torch.randn(n, width, generator=gen)
+        for name in ("topo_u", "topo_v", "topo_rel", "topo_cnt")
+    }
+
+
+def test_gates_start_at_zero_and_have_one_entry_per_layer_site_head() -> None:
+    adapter = _adapter()
+    assert adapter.gates.shape == (3, 3, 4)
+    assert float(adapter.gates.abs().sum()) == 0.0
+
+
+def test_the_two_views_swap_only_the_endpoint_fields() -> None:
+    adapter = _adapter()
+    tokens = _tokens()
+    view_u, view_v = adapter.views(tokens)
+    assert view_u.shape == (4, 4, 16)
+    # `topo_rel` and `topo_cnt` are swap-invariant, so both views carry them
+    # unchanged; only the two endpoint fields exchange their contents. The role
+    # embedding marks the *slot* (self / partner), never the endpoint identity:
+    # prefix rows are order-invariant inside the branch softmax, so a role tied
+    # to u/v would make the two views the same set of rows and erase the
+    # self/partner distinction the AB/BA symmetrisation exists to carry.
+    torch.testing.assert_close(view_u[:, 2], view_v[:, 2])
+    torch.testing.assert_close(view_u[:, 3], view_v[:, 3])
+    exchanged = dict(tokens)
+    exchanged["topo_u"], exchanged["topo_v"] = tokens["topo_v"], tokens["topo_u"]
+    swapped_u, swapped_v = adapter.views(exchanged)
+    torch.testing.assert_close(swapped_u, view_v)
+    torch.testing.assert_close(swapped_v, view_u)
+
+
+def test_per_field_masking_removes_rows_rather_than_zeroing_values() -> None:
+    full = _adapter()
+    tokens = _tokens()
+    rows = full.prefix(0, full.views(tokens)[0])
+    assert rows.shape == (4, 8, 32)
+    trimmed = _adapter(fields=("topo_self", "topo_partner", "topo_rel"))
+    trimmed.load_state_dict(full.state_dict(), strict=False)
+    kept = trimmed.prefix(0, trimmed.views(tokens)[0])
+    assert kept.shape == (4, 6, 32)
+    torch.testing.assert_close(kept, rows[:, list(trimmed.active_rows)], rtol=1e-6, atol=1e-6)
+
+
+def test_masking_a_field_renormalises_the_branch_over_the_remaining_rows() -> None:
+    torch.manual_seed(3)
+    mha = torch.nn.MultiheadAttention(32, 4, batch_first=True)
+    query = torch.randn(2, 5, 32)
+    prefix = torch.randn(2, 8, 32)
+    gate = torch.randn(4)
+    zeroed = prefix.clone()
+    zeroed[:, 6:] = 0.0
+    removed = prefix[:, :6]
+    branch_zeroed = prefix_branch(mha, query, zeroed, gate, 1.0)
+    branch_removed = prefix_branch(mha, query, removed, gate, 1.0)
+    # Zeroing the values leaves the keys in the denominator; removing the rows does not.
+    assert not torch.allclose(branch_zeroed, branch_removed, rtol=1e-4, atol=1e-4)

@@ -29,10 +29,12 @@ from src.data.motif_template import (
     count_statistics,
 )
 from src.model.egostitch.classifier.layers import (
+    CrossAttentionLayer,
     _build_padding_mask,
     inner_token_mask,
     masked_mean,
 )
+from src.model.egostitch.classifier.prefix import SITES, prefix_branch
 from src.model.egostitch.encoder.grit_gmt import _grit_layer_cfg, _GritBatch, dense_rrwp
 from src.vendor.grit_official import GritTransformerLayer
 
@@ -633,3 +635,209 @@ class MotifGenerator(nn.Module):
             else:
                 logits[:, mask] = head(block).squeeze(-1)
         return torch.sigmoid(logits)
+
+
+_FIELD_TO_TOKEN = {
+    "topo_self": ("topo_u", "topo_v"),
+    "topo_partner": ("topo_v", "topo_u"),
+    "topo_rel": ("topo_rel", "topo_rel"),
+    "topo_cnt": ("topo_cnt", "topo_cnt"),
+}
+
+
+class MotifPromptAdapter(nn.Module):
+    """The four-token gated KV prefix at all nine cross-attention sites (spec section 6).
+
+    Fields are laid out in the canonical `FIELD_ORDER`; ``cfg.fields`` selects
+    which of them survive, and an unselected field's rows are *removed* from the
+    prefix so the separately-softmaxed branch renormalises over the remainder.
+    Zeroing a field's values would leave its keys in the denominator, which is
+    not the same model -- the count-only and GRIT-only arms of section 8 are
+    therefore separately trained, not inference ablations.
+
+    Gates are shaped ``(n_layers, SITES, n_heads)``: per head, never per field,
+    because one softmax covers all prefix rows jointly. They start at exactly
+    zero, so the composed model reproduces the frozen base bit for bit.
+
+    The role embedding marks the prefix *slot* -- self, partner, relation, count
+    -- and not the endpoint identity. Prefix rows carry no positional signal
+    inside the branch softmax, so a role tied to ``u``/``v`` would leave the two
+    stream views holding the same set of rows and erase the self/partner
+    distinction that the AB/BA symmetrisation exists to carry.
+    """
+
+    def __init__(self, d_model: int, n_layers: int, n_heads: int, cfg: MotifPromptConfig) -> None:
+        """Build the role embeddings, per-layer expansions, offsets and gates.
+
+        Args:
+            d_model: Trunk width.
+            n_layers: Number of cross-attention layers.
+            n_heads: Heads per attention site.
+            cfg: The motif-prompt block.
+        """
+        super().__init__()
+        self.cfg = cfg
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.slots = len(FIELD_ORDER) * cfg.slots_per_field
+        self.active_rows: tuple[int, ...] = tuple(
+            field_index * cfg.slots_per_field + offset
+            for field_index, name in enumerate(FIELD_ORDER)
+            if name in cfg.fields
+            for offset in range(cfg.slots_per_field)
+        )
+        self.role_embed = nn.Parameter(torch.randn(len(FIELD_ORDER), cfg.width) * 0.02)
+        self.token_norm = nn.LayerNorm(cfg.width)
+        self.layer_proj = nn.ModuleList(
+            nn.Linear(cfg.width, cfg.slots_per_field * d_model) for _ in range(n_layers)
+        )
+        self.p0 = nn.ParameterList(
+            nn.Parameter(torch.randn(self.slots, d_model) * 0.02) for _ in range(n_layers)
+        )
+        self.gates = nn.Parameter(torch.zeros(n_layers, SITES, n_heads))
+
+    def views(self, tokens: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the ``(B, 4, width)`` field stacks of the two stream views.
+
+        Args:
+            tokens: ``topo_u``, ``topo_v``, ``topo_rel`` and ``topo_cnt``.
+
+        Returns:
+            ``(view_u, view_v)``; ``view_u`` names ``u`` as *self*. Exchanging
+            ``topo_u`` and ``topo_v`` exchanges the two views, and ``topo_rel``
+            and ``topo_cnt`` are identical in both because both are
+            swap-invariant.
+        """
+        stacks: list[list[torch.Tensor]] = [[], []]
+        for index, name in enumerate(FIELD_ORDER):
+            first, second = _FIELD_TO_TOKEN[name]
+            stacks[0].append(tokens[first] + self.role_embed[index])
+            stacks[1].append(tokens[second] + self.role_embed[index])
+        return (
+            self.token_norm(torch.stack(stacks[0], dim=1)),
+            self.token_norm(torch.stack(stacks[1], dim=1)),
+        )
+
+    def prefix(self, layer_index: int, view: torch.Tensor) -> torch.Tensor:
+        """Expand a field stack to this layer's active prefix rows.
+
+        Args:
+            layer_index: Which frozen layer.
+            view: ``(B, 4, width)`` field stack.
+
+        Returns:
+            ``(B, len(active_rows), d_model)`` prefix rows.
+        """
+        proj = cast(nn.Linear, self.layer_proj[layer_index])
+        rows: torch.Tensor = proj(view).view(view.size(0), self.slots, self.d_model)
+        p0: torch.Tensor = self.p0[layer_index]
+        return (rows + p0.unsqueeze(0))[:, list(self.active_rows)]
+
+    def gate(self, layer_index: int, site: int) -> torch.Tensor:
+        """Return the raw (pre-tanh) per-head gate for one site.
+
+        Args:
+            layer_index: Which frozen layer.
+            site: ``0`` for ``A<-B``, ``1`` for ``B<-A``, ``2`` for the CLS site.
+
+        Returns:
+            The ``(n_heads,)`` raw gate.
+        """
+        return self.gates[layer_index, site]
+
+
+class MotifPromptCrossAttentionLayer(nn.Module):
+    """Re-drive one frozen `CrossAttentionLayer` with the role-aware motif prefix.
+
+    Site ``A<-B`` and the CLS site read the view whose *self* endpoint is the A
+    stream's node; site ``B<-A`` reads the other view. The wrapped layer and the
+    adapter are plain references, exactly as the prefix and topology-prompt arms
+    do, so their state-dict keys are not duplicated.
+    """
+
+    layer: CrossAttentionLayer
+    adapter: MotifPromptAdapter
+
+    def __init__(
+        self, layer: CrossAttentionLayer, layer_index: int, adapter: MotifPromptAdapter
+    ) -> None:
+        """Wrap a frozen layer.
+
+        Args:
+            layer: The trunk's `CrossAttentionLayer` (registered under ``base``).
+            layer_index: Its index in the trunk.
+            adapter: The shared prompt parameters (registered under ``adapter``).
+        """
+        super().__init__()
+        object.__setattr__(self, "layer", layer)
+        object.__setattr__(self, "adapter", adapter)
+        self.layer_index = layer_index
+
+    def _attend(
+        self,
+        site: int,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        key_padding_mask: torch.Tensor | None,
+        prefix: torch.Tensor,
+        gate_scale: float,
+    ) -> torch.Tensor:
+        """Run one site's frozen attention and add the gated prefix branch."""
+        layer = self.layer
+        query_norm = layer.norm_attn(query)
+        attn_out, _ = layer.attn(
+            query_norm, key_value, key_value, key_padding_mask=key_padding_mask, need_weights=False
+        )
+        branch = prefix_branch(
+            layer.attn, query_norm, prefix, self.adapter.gate(self.layer_index, site), gate_scale
+        )
+        return query + cast(torch.Tensor, layer.drop_attn(attn_out)) + branch
+
+    def forward(
+        self,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        cls_token: torch.Tensor,
+        mask_a: torch.Tensor | None,
+        mask_b: torch.Tensor | None,
+        prefix_a: torch.Tensor,
+        prefix_b: torch.Tensor,
+        gate_scale: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One bidirectional block plus the gated prefix branch at all three sites.
+
+        Args:
+            h_a: Item A hidden states.
+            h_b: Item B hidden states.
+            cls_token: CLS state ``(B, 1, d_model)``.
+            mask_a: Padding mask for A (True = PAD) or ``None``.
+            mask_b: Padding mask for B (True = PAD) or ``None``.
+            prefix_a: This layer's prefix in the A stream's view.
+            prefix_b: This layer's prefix in the B stream's view.
+            gate_scale: ``0.0`` realises the gates-off intervention.
+
+        Returns:
+            Updated ``(h_a, h_b, cls_token)``.
+        """
+        layer = self.layer
+        h_a = self._attend(0, h_a, h_b, mask_b, prefix_a, gate_scale)
+        h_a = layer._ffn(h_a)  # noqa: SLF001
+        h_b = self._attend(1, h_b, h_a, mask_a, prefix_b, gate_scale)
+        h_b = layer._ffn(h_b)  # noqa: SLF001
+
+        combined = torch.cat([h_a, h_b], dim=1)
+        combined_mask = (
+            torch.cat([mask_a, mask_b], dim=1)
+            if mask_a is not None and mask_b is not None
+            else None
+        )
+        cls_norm = layer.norm_cls_attn(cls_token)
+        attn_cls, _ = layer.attn_cls(
+            cls_norm, combined, combined, key_padding_mask=combined_mask, need_weights=False
+        )
+        branch = prefix_branch(
+            layer.attn_cls, cls_norm, prefix_a, self.adapter.gate(self.layer_index, 2), gate_scale
+        )
+        cls_token = cls_token + layer.drop_cls_attn(attn_cls) + branch
+        cls_token = cls_token + layer.drop_cls_ffn(layer.ff_cls(layer.norm_cls_ffn(cls_token)))
+        return h_a, h_b, cls_token
