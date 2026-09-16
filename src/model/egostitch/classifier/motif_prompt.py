@@ -20,10 +20,15 @@ from src.data.motif_template import (
     EDGE_ENDPOINTS,
     EDGE_TYPES,
     N_EDGE_TYPES,
+    N_ROLES,
     N_SLOTS,
+    SLOT_ROLES,
+    SLOT_U,
+    SLOT_V,
     count_statistics,
 )
-from src.model.egostitch.encoder.grit_gmt import dense_rrwp
+from src.model.egostitch.encoder.grit_gmt import _grit_layer_cfg, _GritBatch, dense_rrwp
+from src.vendor.grit_official import GritTransformerLayer
 
 FIELD_ORDER = ("topo_self", "topo_partner", "topo_rel", "topo_cnt")
 TEMPLATE_KEY = "motif_weights"
@@ -300,3 +305,111 @@ def motif_rrwp(adj: torch.Tensor, k: int) -> torch.Tensor:
     """
     with torch.autocast(device_type=adj.device.type, enabled=False):
         return dense_rrwp(adj.float(), k).float()
+
+
+_ROLE_IDS = torch.as_tensor(SLOT_ROLES, dtype=torch.long)
+_ROLE_WIDTH = 16
+
+
+class MotifGritReader(nn.Module):
+    """Vendored GRIT over the 26-slot motif graph, exposing node and pair states.
+
+    The node channel sees role embeddings and the RRWP diagonal only; the edge
+    channel sees the RRWP stack and the typed raw weights; the degree input is
+    the weighted degree, since walk normalisation alone discards edge scale.
+    Neither residue states nor generator hidden states nor slot-index embeddings
+    reach it, so an unrestricted pair-feature vector cannot enter disguised as a
+    node feature (spec sections 2 and 5.2).
+
+    Every layer is constructed with ``O_e=True`` and ``norm_e=True`` so the final
+    layer's edge state is projected and normalised before it is read; the
+    vendored layer already writes it to ``batch.edge_attr`` because
+    ``cfg["update_e"]`` is set, so ``src/vendor/`` is not edited. Upstream's
+    `get_log_deg` is decorated ``@torch.no_grad``, so the degree input carries
+    scale but no gradient; the generator is reached through the edge embedding
+    and the RRWP stack instead.
+
+    The shared ``node_proj`` and the per-role embedding are what make the
+    endpoints exchange under ``u<->v, L<->R``; ``topo_rel`` symmetrises the two
+    directed edge states, and the per-token `LayerNorm` keeps every token
+    batch-independent.
+    """
+
+    def __init__(self, cfg: ReaderConfig, width: int) -> None:
+        """Build the RRWP embeddings, the GRIT stack and the token projections.
+
+        Args:
+            cfg: The reader block.
+            width: Output token width.
+        """
+        super().__init__()
+        self.cfg = cfg
+        self.role_embed = nn.Embedding(N_ROLES, _ROLE_WIDTH)
+        self.node_embed = nn.Linear(_ROLE_WIDTH + cfg.rrwp_k, cfg.dim)
+        self.edge_embed = nn.Linear(cfg.rrwp_k + N_EDGE_TYPES, cfg.dim)
+        layer_cfg = _grit_layer_cfg()
+        self.layers = nn.ModuleList(
+            GritTransformerLayer(  # type: ignore[no-untyped-call]
+                in_dim=cfg.dim,
+                out_dim=cfg.dim,
+                num_heads=cfg.heads,
+                dropout=0.0,
+                attn_dropout=0.0,
+                layer_norm=True,
+                batch_norm=False,
+                residual=True,
+                act="relu",
+                norm_e=True,
+                O_e=True,
+                cfg=layer_cfg,
+            )
+            for _ in range(cfg.layers)
+        )
+        self.node_proj = nn.Linear(cfg.dim, width)
+        self.pair_proj = nn.Linear(cfg.dim, width)
+        self.token_norm = nn.LayerNorm(width)
+
+    def _flat_batch(self, weights: torch.Tensor, adj: torch.Tensor) -> _GritBatch:
+        """Flatten one batch of motif graphs into the layout GRIT's layer reads."""
+        batch = weights.size(0)
+        device = weights.device
+        stack = motif_rrwp(adj, self.cfg.rrwp_k)
+        diagonal = torch.diagonal(stack, dim1=1, dim2=2).transpose(1, 2)
+        roles = self.role_embed(_ROLE_IDS.to(device)).unsqueeze(0).expand(batch, -1, -1)
+        node_input = torch.cat((roles, diagonal.to(roles.dtype)), dim=-1)
+        pair_input = torch.cat((stack, typed_adjacency(weights)), dim=-1)
+
+        grid = torch.arange(N_SLOTS, device=device)
+        src = grid.repeat_interleave(N_SLOTS).repeat(batch)
+        dst = grid.repeat(N_SLOTS).repeat(batch)
+        offsets = (torch.arange(batch, device=device) * N_SLOTS).repeat_interleave(N_SLOTS**2)
+        edge_index = torch.stack((src + offsets, dst + offsets))
+
+        flat_x = self.node_embed(node_input.reshape(batch * N_SLOTS, -1))
+        edge_attr = self.edge_embed(pair_input.reshape(batch * N_SLOTS**2, -1).to(flat_x.dtype))
+        weighted_degree = adj.sum(dim=-1).reshape(batch * N_SLOTS, 1)
+        log_deg = torch.log(weighted_degree.float() + 1.0).to(flat_x.dtype)
+        return _GritBatch(flat_x, edge_index, edge_attr, log_deg)
+
+    def forward(self, weights: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Read one batch of motif graphs.
+
+        Args:
+            weights: ``(B, 96)`` edge weights.
+
+        Returns:
+            ``topo_u``, ``topo_v`` and the swap-invariant ``topo_rel``.
+        """
+        batch = weights.size(0)
+        adj = dense_adjacency(weights)
+        flat = self._flat_batch(weights, adj)
+        for layer in self.layers:
+            flat = layer(flat)
+        nodes = flat.x.view(batch, N_SLOTS, -1)
+        edges = flat.edge_attr.view(batch, N_SLOTS, N_SLOTS, -1)
+        relation = 0.5 * (edges[:, SLOT_U, SLOT_V] + edges[:, SLOT_V, SLOT_U])
+        return {
+            "topo_u": self.token_norm(self.node_proj(nodes[:, SLOT_U])),
+            "topo_v": self.token_norm(self.node_proj(nodes[:, SLOT_V])),
+            "topo_rel": self.token_norm(self.pair_proj(relation)),
+        }

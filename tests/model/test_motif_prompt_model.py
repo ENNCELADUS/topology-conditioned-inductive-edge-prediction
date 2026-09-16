@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-from src.data.motif_template import SWAP_PERM
+from src.data.motif_template import SWAP_PERM, role_permutation
 from src.model.egostitch.classifier.motif_prompt import (
     FIELD_ORDER,
     GATE_MODES,
     MotifCountHead,
+    MotifGritReader,
     MotifPromptConfig,
     ReaderConfig,
     dense_adjacency,
@@ -131,3 +132,55 @@ def test_rrwp_is_finite_at_a_zero_adjacency_and_keeps_the_gradient_connection() 
     assert torch.isfinite(stack).all()
     stack.sum().backward()  # type: ignore[no-untyped-call]
     assert weights.grad is not None and torch.isfinite(weights.grad).all()
+
+
+def _reader(seed: int = 0) -> MotifGritReader:
+    torch.manual_seed(seed)
+    return MotifGritReader(ReaderConfig(layers=2, dim=16, heads=4, rrwp_k=4), width=16).eval()
+
+
+def test_reader_emits_three_tokens_and_a_swap_exchanges_only_the_endpoints() -> None:
+    reader = _reader()
+    weights = _weights()
+    out = reader(weights)
+    assert set(out) == {"topo_u", "topo_v", "topo_rel"}
+    assert out["topo_u"].shape == (4, 16)
+    swapped = reader(weights[:, list(SWAP_PERM)])
+    torch.testing.assert_close(swapped["topo_u"], out["topo_v"], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(swapped["topo_v"], out["topo_u"], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(swapped["topo_rel"], out["topo_rel"], rtol=1e-5, atol=1e-5)
+
+
+def test_reader_is_invariant_to_a_within_role_slot_permutation() -> None:
+    reader = _reader()
+    weights = _weights()
+    perm = torch.as_tensor(
+        role_permutation(
+            (3, 1, 0, 2, 5, 4, 7, 6), (1, 2, 3, 4, 5, 6, 7, 0), (7, 0, 1, 2, 3, 4, 5, 6)
+        )
+    )
+    shuffled = torch.zeros_like(weights)
+    shuffled[:, perm] = weights
+    out, permuted = reader(weights), reader(shuffled)
+    for key in ("topo_u", "topo_v", "topo_rel"):
+        torch.testing.assert_close(permuted[key], out[key], rtol=1e-4, atol=1e-4)
+
+
+def test_reader_predictions_are_batch_independent() -> None:
+    reader = _reader()
+    weights = _weights(n=6, seed=3)
+    whole = reader(weights)
+    halves = {key: torch.cat([reader(weights[:2])[key], reader(weights[2:])[key]]) for key in whole}
+    for key, value in whole.items():
+        torch.testing.assert_close(halves[key], value, rtol=1e-5, atol=1e-5)
+
+
+def test_final_layer_edge_parameters_receive_gradient() -> None:
+    torch.manual_seed(1)
+    reader = MotifGritReader(ReaderConfig(layers=2, dim=16, heads=4, rrwp_k=4), width=16)
+    out = reader(_weights())
+    (out["topo_rel"].sum() + out["topo_u"].sum()).backward()
+    params = dict(reader.named_parameters())
+    o_e = params[f"layers.{len(reader.layers) - 1}.O_e.weight"]
+    assert o_e.grad is not None and float(o_e.grad.abs().sum()) > 0.0
+    assert reader.pair_proj.weight.grad is not None
