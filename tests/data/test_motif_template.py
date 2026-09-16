@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import networkx as nx
 import numpy as np
+import pytest
 from src.data.motif_template import (
     ATTACH_L,
     ATTACH_R,
@@ -23,6 +25,7 @@ from src.data.motif_template import (
     TYPE_ATTACH,
     TYPE_CLOSURE,
     TYPE_INTERIOR,
+    MotifTemplateTable,
     role_permutation,
 )
 
@@ -83,3 +86,77 @@ def test_role_permutation_relabels_blocks_consistently() -> None:
     assert perm[32 + 8 * 0 + 4] == 32 + 8 * 7 + 4
     # Slot roles are unchanged by a within-role relabelling.
     assert SLOT_ROLES[SLOT_U] == SLOT_ROLES[SLOT_V]
+
+
+def _wedge_graph() -> nx.Graph:
+    """Nodes u and v share witnesses w1 (degree 2) and w2 (degree 4); u-v is an edge."""
+    graph = nx.Graph()
+    graph.add_edges_from(
+        [
+            ("u", "v"),
+            ("u", "w1"),
+            ("w1", "v"),
+            ("u", "w2"),
+            ("w2", "v"),
+            ("w2", "x1"),
+            ("w2", "x2"),
+        ]
+    )
+    return graph
+
+
+def test_queried_edge_is_removed_before_neighbourhoods_and_weights() -> None:
+    table = MotifTemplateTable(_wedge_graph())
+    row = table.compile_row("u", "v")
+    # v is never a witness of (u, v) even though it is a neighbour of u.
+    assert set(row.closure) == {"w1", "w2"}
+    # Witness weights are 1/sqrt(d(w)) on the edge-deleted graph: d(w1)=2, d(w2)=4.
+    order = {node: i for i, node in enumerate(row.closure)}
+    assert row.weights[order["w1"]] == pytest.approx(2.0**-0.5)
+    assert row.weights[8 + order["w1"]] == pytest.approx(2.0**-0.5)
+    assert row.weights[order["w2"]] == pytest.approx(4.0**-0.5)
+    # Witnesses come first by descending 1/d(w), i.e. ascending degree.
+    assert row.closure[0] == "w1"
+
+
+def test_endpoint_degrees_are_decremented_by_the_removed_edge() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from([("u", "v"), ("u", "a"), ("a", "b"), ("b", "v")])
+    table = MotifTemplateTable(graph)
+    row = table.compile_row("u", "v")
+    assert row.closure == ()
+    assert row.left == ("a",) and row.right == ("b",)
+    # d(a) = 2 and d(b) = 2 on the edge-deleted graph.
+    assert row.weights[16] == pytest.approx(2.0**-0.5)
+    assert row.weights[24] == pytest.approx(2.0**-0.5)
+    assert row.weights[32] == pytest.approx(1.0)
+
+
+def test_only_at_most_eight_witnesses_survive_truncation() -> None:
+    graph = nx.Graph()
+    graph.add_edge("u", "v")
+    for i in range(12):
+        graph.add_edges_from([("u", f"w{i}"), (f"w{i}", "v")])
+        for j in range(i):
+            graph.add_edge(f"w{i}", f"pad{i}_{j}")
+    table = MotifTemplateTable(graph)
+    row = table.compile_row("u", "v")
+    assert len(row.closure) == 8
+    assert row.closure == tuple(f"w{i}" for i in range(8))
+    assert float(row.weights[8:16].sum()) > 0.0
+
+
+def test_swapping_endpoints_permutes_the_weight_vector_by_swap_perm() -> None:
+    table = MotifTemplateTable(_wedge_graph())
+    forward = table.compile_row("u", "v")
+    reverse = table.compile_row("v", "u")
+    np.testing.assert_allclose(reverse.weights, forward.weights[list(SWAP_PERM)], atol=0)
+    assert reverse.closure == forward.closure
+    assert reverse.left == forward.right and reverse.right == forward.left
+
+
+def test_self_rows_get_an_explicit_empty_template() -> None:
+    table = MotifTemplateTable(_wedge_graph())
+    row = table.compile_row("u", "u")
+    assert not row.weights.any()
+    assert (row.closure, row.left, row.right) == ((), (), ())
