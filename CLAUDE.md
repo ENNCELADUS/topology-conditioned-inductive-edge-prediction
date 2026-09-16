@@ -58,7 +58,12 @@ selected method. Every piece of writing must explain how its context helps decid
   scored without any truth graph; read against `prefix_base` and against the row's own reader
   (its ceiling); interventions `gates_off`, `mean*` and `shuffle` -- the last transplants the
   *predicted* coordinates of another row of the universe onto this row's endpoints, the
-  marginal-preserving null `mean` is not.
+  marginal-preserving null `mean` is not. The virtual-graph student
+  (`coord_gen.generator: virtual_graph`, spec
+  `docs/superpowers/specs/2026-09-15-virtual-topology-prompt-design.md`) is at v0.6 as
+  `configs/split_seed42/virtual_prompt_d_rev1.yaml`: per-coarse-node attachment readouts, a
+  seeded/tied attachment attention, a frozen coarse graph, and direct per-block attachment
+  supervision (`virtual_graph.w_attach`) on training rows only.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

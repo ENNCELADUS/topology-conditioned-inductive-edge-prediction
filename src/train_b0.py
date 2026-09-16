@@ -45,6 +45,7 @@ from typing import Any, Literal, NamedTuple, TypeVar, cast
 
 import networkx as nx
 import numpy as np
+import scipy.sparse as sp
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -125,6 +126,9 @@ from src.eval.val_topology import (
 )
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.coord_gen import (
+    ATTACH_KEY,
+    ATTACH_MASK_KEY,
+    LOSS_TERM_NAMES,
     CoordGenConfig,
     CoordinateGenerator,
     V3_1CoordGen,
@@ -3832,6 +3836,7 @@ class TopoPromptRows:
         """
         started = time.monotonic()
         train_table = StructCoordinateTable(train_graph, spec=spec)
+        self.train_pairs: list[Pair] = list(train_pairs)
         self.train = torch.from_numpy(train_table.coords(train_pairs))
         self.train_table = train_table
         mean, std = coordinate_statistics(self.train.numpy()[np.asarray(stats_rows)], spec=spec)
@@ -3845,6 +3850,8 @@ class TopoPromptRows:
         self._device = device
         self.build_seconds = time.monotonic() - started
         self.virtual_metadata: dict[str, object] | None = None
+        self.attach_train_targets: torch.Tensor | None = None
+        self.attach_train_mask: torch.Tensor | None = None
 
     def install(self, model: nn.Module) -> None:
         """Copy the training statistics into the model's published buffers."""
@@ -3857,9 +3864,70 @@ class TopoPromptRows:
         rows = batch["_row_id"].detach().to("cpu", torch.int64)
         batch[COORDS_KEY] = table.index_select(0, rows).to(self._device, non_blocking=True)
 
+    def install_attachment_targets(
+        self, *, assignments: np.ndarray, omitted: Sequence[str], k: int
+    ) -> None:
+        r"""Measure each training row's per-block neighbour counts once, on every rank.
+
+        Row ``r``'s endpoint ``x`` gets ``|N(x) \ {partner} ^ C_j|`` over the
+        coarsened training graph: the queried edge is removed exactly as the
+        coordinate targets remove it. Rows touching a node the pack has no
+        features for get zero counts and a zero mask, because such a node has no
+        cluster. Stored on the CPU as ``int16`` and sliced per batch by
+        ``_row_id``.
+
+        Args:
+            assignments: Cluster label per coarsened node, in the order of the
+                training table's nodes with ``omitted`` removed.
+            omitted: Featureless training nodes left out of the coarsening.
+            k: Number of coarse nodes.
+
+        Raises:
+            ValueError: If the assignment vector does not cover the clustered nodes.
+        """
+        legal = self.train_table.nodes
+        dropped = set(omitted)
+        included = [i for i, node in enumerate(legal) if node not in dropped]
+        if len(included) != len(assignments):
+            raise ValueError("attachment targets need one assignment per clustered node")
+        adjacency = self.train_table.adjacency[included, :][:, included]
+        position = {legal[node]: slot for slot, node in enumerate(included)}
+        one_hot = sp.csr_matrix(
+            (
+                np.ones(len(included), dtype=np.float32),
+                (np.arange(len(included)), assignments.astype(np.int64)),
+            ),
+            shape=(len(included), k),
+        )
+        counts = np.asarray((adjacency @ one_hot).todense(), dtype=np.int32)
+        left = np.array([position.get(u, -1) for u, _ in self.train_pairs], dtype=np.int64)
+        right = np.array([position.get(v, -1) for _, v in self.train_pairs], dtype=np.int64)
+        valid = (left >= 0) & (right >= 0)
+        targets = np.zeros((len(self.train_pairs), 2, k), dtype=np.int16)
+        targets[valid, 0] = counts[left[valid]]
+        targets[valid, 1] = counts[right[valid]]
+        rows = np.nonzero(valid)[0]
+        if rows.size:
+            linked = np.asarray(adjacency[left[rows], right[rows]]).reshape(-1) > 0
+            edges = rows[linked]
+            targets[edges, 0, assignments[right[edges]]] -= 1
+            targets[edges, 1, assignments[left[edges]]] -= 1
+        self.attach_train_targets = torch.from_numpy(targets)
+        self.attach_train_mask = torch.from_numpy(valid.astype(np.float32))
+
     def attach_train(self, batch: Batch) -> None:
-        """Inject this training batch's coordinates by ``_row_id``."""
+        """Inject this training batch's coordinates, and attachment targets when installed."""
         self._attach(batch, self.train)
+        targets, mask = self.attach_train_targets, self.attach_train_mask
+        if targets is None or mask is None:
+            return
+        rows = batch["_row_id"].detach().to("cpu", torch.int64)
+        batch[ATTACH_KEY] = targets.index_select(0, rows).to(
+            self._device, torch.float32, non_blocking=True
+        )
+        batch[ATTACH_MASK_KEY] = mask.index_select(0, rows).to(
+            self._device, torch.float32, non_blocking=True
+        )
 
     def attach_val(self, batch: Batch) -> None:
         """Inject this V_val classification batch's coordinates by ``_row_id``."""
@@ -3886,7 +3954,13 @@ def initialise_virtual_graph(
     *,
     seed: int,
 ) -> dict[str, object]:
-    """Coarsen only the legal training graph once, then synchronise every rank."""
+    """Coarsen only the legal training graph once, then synchronise every rank.
+
+    One encoding pass over the clustered nodes serves both the k-means over
+    pooled states and the per-cluster mean residue state that seeds the coarse
+    queries. Every rank then measures the same attachment target table from the
+    broadcast assignments, so the supervision needs no further collective.
+    """
     from sklearn.cluster import KMeans
 
     from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
@@ -3918,39 +3992,19 @@ def initialise_virtual_graph(
             assignments = KMeans(n_clusters=generator.k, random_state=seed, n_init=10).fit_predict(
                 standardised
             )
+            labels = torch.from_numpy(assignments).long()
+            # `pool` is [masked mean | masked max]; the mean half is the node's
+            # mean residue state, the space the attachment keys live in.
+            means = states[:, : states.size(1) // 2]
+            sizes = torch.bincount(labels, minlength=generator.k).float()
+            cluster_means = torch.zeros(generator.k, means.size(1))
+            cluster_means.index_add_(0, labels, means)
+            cluster_means = cluster_means / sizes[:, None].clamp_min(1.0)
             mean_degree = float(adjacency.sum() / len(included))
             generator.initialise(
-                states.to(accelerator.device),
-                torch.from_numpy(assignments).to(accelerator.device),
+                labels.to(accelerator.device),
                 adjacency,
-                mean_degree,
-            )
-            # Fit only the scalar attachment bias; retain no residue-state corpus.
-            attachment_logits = []
-            for node in (legal_nodes[i] for i in included):
-                index = node_index[node]
-                indices = torch.tensor([index], device=accelerator.device)
-                tokens, lengths = table.gather_nodes(indices, table.manifest.nodes[index].length)
-                with accelerator.autocast():
-                    encoded = model.encoder(tokens, lengths)
-                attachment_logits.append(
-                    (generator.attachment_logits(encoded, lengths) - generator.attachment.bias)
-                    .float()
-                    .cpu()
-                    .flatten()
-                )
-            logits = torch.cat(attachment_logits)
-            target = mean_degree / len(included)
-            lower, upper = -100.0 - float(logits.max()), 100.0 - float(logits.min())
-            for _ in range(64):
-                middle = (lower + upper) / 2.0
-                if float((logits + middle).sigmoid().mean()) < target:
-                    lower = middle
-                else:
-                    upper = middle
-            generator.attachment.bias.fill_((lower + upper) / 2.0)
-            initial_mean = float(
-                (logits + float(generator.attachment.bias.item())).sigmoid().mean()
+                cluster_means.to(accelerator.device),
             )
             payload[0] = {
                 "metadata": {
@@ -3961,9 +4015,12 @@ def initialise_virtual_graph(
                     "omitted_featureless_count": len(omitted),
                     "k": generator.k,
                     "mean_degree": mean_degree,
-                    "initial_attachment_target": target,
-                    "initial_attachment_mean": initial_mean,
+                    "initial_attachment_mean": generator.readout_bias.sigmoid()
+                    .float()
+                    .cpu()
+                    .tolist(),
                     "cluster_sizes": np.bincount(assignments, minlength=generator.k).tolist(),
+                    "assignments": [int(label) for label in assignments],
                     "initialisation": "standardised_encoder_pool_kmeans",
                 }
             }
@@ -3979,8 +4036,15 @@ def initialise_virtual_graph(
     if accelerator.num_processes > 1:
         for value in generator.state_dict().values():
             torch.distributed.broadcast(value, src=0)
-    rows.virtual_metadata = cast(dict[str, object], outcome["metadata"])
-    return rows.virtual_metadata
+    generator.freeze_coarse_graph()
+    metadata = cast(dict[str, object], outcome["metadata"])
+    rows.virtual_metadata = metadata
+    rows.install_attachment_targets(
+        assignments=np.asarray(metadata["assignments"], dtype=np.int64),
+        omitted=cast(list[str], metadata["omitted_featureless_nodes"]),
+        k=generator.k,
+    )
+    return metadata
 
 
 def _coordinate_fit_metrics(
@@ -4092,6 +4156,17 @@ def _coordinate_fit_metrics(
                 result[f"val_virtual_{prefix}_entropy_{slot}"] = float(value)
         for slot, value in enumerate(reduced["attachment_sum"].tolist()):
             result[f"val_virtual_usage_{slot}"] = float(value)
+        # Selectivity: the share of attachment-logit variance that lives within
+        # a protein, across coarse nodes. A per-protein scalar scores 0; the
+        # diagnosis measured 0.0002 at epoch 1 and 0.037 at epoch 8.
+        observations = max(float(reduced["attachment_count"]), 1.0)
+        entries = observations * float(virtual.k)
+        logit_mean = float(reduced["attachment_logit_sum"].sum()) / entries
+        logit_var = float(reduced["attachment_logit_sq_sum"].sum()) / entries - logit_mean**2
+        within = float(reduced["attachment_within_var_sum"]) / observations
+        result["val_virtual_attachment_selectivity"] = (
+            within / logit_var if logit_var > 0.0 else 0.0
+        )
     return result
 
 
@@ -4885,6 +4960,89 @@ def _grad_norm(term: torch.Tensor, model: nn.Module) -> float:
     return float(torch.stack(squares).sum().sqrt().item())
 
 
+#: Generator parameter groups the per-epoch virtual probe attributes terms to.
+VIRTUAL_GRAD_GROUPS: tuple[str, ...] = (
+    "attention_path",
+    "gate",
+    "cal",
+    "distance_head",
+    "interface_head",
+)
+
+
+def _virtual_grad_norm_keys() -> list[str]:
+    """Every ``grad_norm_{term}_{group}`` key, so the reduction is rank-symmetric."""
+    return [
+        f"grad_norm_{term}_{group}" for term in LOSS_TERM_NAMES for group in VIRTUAL_GRAD_GROUPS
+    ]
+
+
+def _virtual_term_group_grad_norms(
+    output: Mapping[str, torch.Tensor], model: V3_1CoordGen
+) -> dict[str, float]:
+    """Per-epoch diagnostic: which loss term moves which generator group.
+
+    The v0.5 diagnosis needed exactly this table and had to reconstruct it from
+    checkpoints. One `torch.autograd.grad` per weighted loss term over every
+    group's parameters at once, on one step per epoch, on every rank; as in
+    `_term_grad_norms`, this never runs DDP's reducer hooks and
+    ``retain_graph=True`` leaves the shared backward's graph intact. Frozen
+    parameters are excluded, so the frozen coarse graph reports no norm rather
+    than a misleading zero-gradient one.
+
+    Args:
+        output: The `V3_1CoordGen` forward output, read for ``loss_term_*``.
+        model: The unwrapped student.
+
+    Returns:
+        One norm per ``(term, group)``; a term with no graph reports 0.0.
+
+    Raises:
+        TypeError: If the student does not carry a virtual generator.
+    """
+    from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
+
+    generator = model.generator
+    if not isinstance(generator, VirtualGraphGenerator):
+        raise TypeError("the virtual gradient probe needs a VirtualGraphGenerator")
+    members: dict[str, list[nn.Parameter]] = {
+        "attention_path": [
+            *generator.residue_projection.parameters(),
+            *generator.attention.parameters(),
+            generator.readout_bias,
+            generator.P,
+        ],
+        "gate": [*generator.W.parameters(), *generator.phi.parameters()],
+        "cal": [generator.cal_scale, generator.cal_shift],
+        "distance_head": list(generator.distance_head.parameters()),
+        "interface_head": [p for p in model.reader.parameters() if p.requires_grad],
+    }
+    flat: list[nn.Parameter] = []
+    positions: dict[str, list[int]] = {}
+    for name, params in members.items():
+        positions[name] = []
+        for param in params:
+            if not param.requires_grad:
+                continue
+            positions[name].append(len(flat))
+            flat.append(param)
+    result = dict.fromkeys(_virtual_grad_norm_keys(), 0.0)
+    if not flat:
+        return result
+    for term_name in LOSS_TERM_NAMES:
+        term = output.get(f"loss_term_{term_name}")
+        if term is None or not term.requires_grad:
+            continue
+        grads = torch.autograd.grad(term, flat, retain_graph=True, allow_unused=True)
+        for name, slots in positions.items():
+            squares = [grads[i].float().pow(2).sum() for i in slots if grads[i] is not None]
+            if squares:
+                result[f"grad_norm_{term_name}_{name}"] = float(
+                    torch.stack(squares).sum().sqrt().item()
+                )
+    return result
+
+
 def _struct_grad_norm(term: torch.Tensor, model: nn.Module, world_size: int) -> float:
     """Norm of the global structural gradient, before loss weights and clipping.
 
@@ -4993,6 +5151,10 @@ def train_ddp_loop(
     """
     if cfg.eval.early_stop_metric == "val_total_loss" and struct_stream is None:
         raise ValueError("val_total_loss requires a structural stream")
+    unwrapped = _unwrapped_model(model)
+    virtual_probe = (
+        isinstance(unwrapped, V3_1CoordGen) and unwrapped.cfg.generator == "virtual_graph"
+    )
     optimizer = _build_optimizer(model, cfg)
     model, optimizer = accelerator.prepare(model, optimizer)
     scheduler = _build_scheduler(
@@ -5228,6 +5390,7 @@ def train_ddp_loop(
         epoch_online_weight = 0.0
         epoch_struct_seconds = 0.0
         grad_norm_struct: dict[str, float] = {}
+        grad_norm_terms: dict[str, float] = {}
         grad_norm_task = 0.0
         grad_norm_kd = 0.0
         epoch_steps = 0
@@ -5290,11 +5453,25 @@ def train_ddp_loop(
                 # so they aggregate by row count; `task_loss` alone is weight-normalised.
                 batch_rows = float(output["logits"].numel())
                 epoch_online_weight += batch_rows
-                for key in ("coord_loss", "task_loss", "kd_loss", "teacher_entropy", "kd_kl"):
+                for key in (
+                    "coord_loss",
+                    "task_loss",
+                    "kd_loss",
+                    "teacher_entropy",
+                    "kd_kl",
+                    "attach_loss",
+                    "attach_sse",
+                    "attach_target_sum",
+                    "attach_target_sq",
+                ):
                     if key in output:
                         epoch_online_sums[key] = epoch_online_sums.get(key, 0.0) + (
                             float(output[key].detach().item()) * batch_rows
                         )
+                if virtual_probe and epoch_steps == 0:
+                    grad_norm_terms = _virtual_term_group_grad_norms(
+                        output, cast(V3_1CoordGen, raw_training_model)
+                    )
             kd_loss: torch.Tensor | None = None
             if kd_bank is not None:
                 kd_local, kd_stats = kd_bank.loss(
@@ -5573,6 +5750,16 @@ def train_ddp_loop(
             )
             for index, key in enumerate(online_keys, start=1):
                 entry[f"train_{key}"] = float(online_values[index] / online_values[0].clamp_min(1))
+            if "train_attach_sse" in entry:
+                # R^2 of log1p predicted against log1p true per-block counts,
+                # over every training endpoint the epoch presented.
+                mean = cast(float, entry["train_attach_target_sum"])
+                variance = cast(float, entry["train_attach_target_sq"]) - mean**2
+                entry["train_attach_r2"] = (
+                    1.0 - cast(float, entry["train_attach_sse"]) / variance
+                    if variance > 0.0
+                    else 0.0
+                )
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
@@ -5606,6 +5793,18 @@ def train_ddp_loop(
         if outcome.diagnostics is not None:
             entry.update(outcome.diagnostics)
             entry["val_kd_truth_source"] = "validation_structure"
+        if virtual_probe:
+            probe_keys = _virtual_grad_norm_keys()
+            probe_norms = accelerator.reduce(
+                torch.tensor(
+                    [grad_norm_terms.get(key, 0.0) for key in probe_keys],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                ),
+                reduction="mean",
+            )
+            for index, key in enumerate(probe_keys):
+                entry[key] = float(probe_norms[index].item())
         if kd_bank is not None or kd_context_stream is not None:
             grad_norm_tensor = accelerator.reduce(
                 torch.tensor(

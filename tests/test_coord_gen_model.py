@@ -13,6 +13,7 @@ from src.model.egostitch.classifier.coord_gen import (
     CONTINUOUS_INDEX,
     DISTANCE_CLASSES,
     DISTANCE_INDEX,
+    LOSS_TERM_NAMES,
     SELF_DISTANCE_CLASS,
     CoordGenConfig,
     V3_1CoordGen,
@@ -251,30 +252,61 @@ def test_compact_student_scores_with_three_fields_and_four_distance_classes() ->
     assert "loss" not in out
 
 
-def test_virtual_student_round_trip_and_training_keep_teacher_frozen() -> None:
-    reader = _reader_config()
-    reader["topo_prompt"] = {**cast(dict[str, object], reader["topo_prompt"]), "coord_spec": "v2"}
-    config = {
+def _virtual_config(**graph: object) -> dict[str, object]:
+    return {
         "coord_spec": "v2",
         "generator": "virtual_graph",
-        "virtual_graph": {"k": 3, "d_z": 8, "heads": 2},
+        "virtual_graph": {"k": 3, "d_z": 8, "heads": 2, **graph},
     }
+
+
+def _virtual_reader() -> dict[str, object]:
+    reader = _reader_config()
+    reader["topo_prompt"] = {**cast(dict[str, object], reader["topo_prompt"]), "coord_spec": "v2"}
+    return reader
+
+
+def _coarsen(model: V3_1CoordGen) -> None:
+    """Install a tiny training-graph coarsening, which freezes ``B`` and ``m``."""
+    from scipy.sparse import csr_matrix
+    from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
+
+    generator = cast(VirtualGraphGenerator, model.generator)
+    adjacency = torch.zeros(5, 5)
+    adjacency[0, 2] = adjacency[2, 0] = 1.0
+    generator.initialise(
+        torch.tensor([0, 0, 1, 1, 2]),
+        csr_matrix(adjacency.numpy()),
+        torch.randn(3, model.d_model),
+    )
+
+
+def _virtual_coords(rows: int) -> torch.Tensor:
+    coords = torch.rand(rows, 11)
+    coords[:, 8:] = 0
+    coords[:, 8] = 1
+    return coords
+
+
+def test_virtual_student_round_trip_and_training_keep_teacher_frozen() -> None:
+    reader, config = _virtual_reader(), _virtual_config()
     model = V3_1CoordGen(reader=reader, coord_gen=config)
     model.reader.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
     model.initialize_teacher()
     with torch.no_grad():
         model.reader.generator.gates.fill_(0.2)
     batch = _pair_batch()
-    coords = torch.rand(len(batch["label"]), 11)
-    coords[:, 8:] = 0
-    coords[:, 8] = 1
+    coords = _virtual_coords(len(batch["label"]))
     model.install_coordinate_scale(coords)
+    _coarsen(model)
     model.train()
     with torch.autocast("cpu", dtype=torch.bfloat16):
         output = model(batch | {"struct_coords": coords})
     output["loss"].backward()
     assert all(
-        p.grad is not None and torch.isfinite(p.grad).all() for p in model.generator.parameters()
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in model.generator.parameters()
+        if p.requires_grad
     )
     assert all(p.grad is None for p in model.teacher.parameters())
     groups = model.optimizer_parameter_groups(3e-4, 1e-4, 0.05)
@@ -290,6 +322,66 @@ def test_virtual_student_round_trip_and_training_keep_teacher_frozen() -> None:
     assert torch.isfinite(model(batch)["logits"]).all()
     with pytest.raises(ValueError, match="virtual"):
         _model().intervention = "slot_gates_open"
+
+
+def test_attachment_supervision_fires_only_when_targets_ride_along() -> None:
+    model = V3_1CoordGen(reader=_virtual_reader(), coord_gen=_virtual_config(w_attach=2.0))
+    model.reader.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
+    model.initialize_teacher()
+    batch = _pair_batch()
+    coords = _virtual_coords(len(batch["label"]))
+    model.install_coordinate_scale(coords)
+    _coarsen(model)
+    model.train()
+    supervised = batch | {"struct_coords": coords}
+    # The struct stream's inner forward and the throughput probe carry no targets.
+    assert "attach_loss" not in model(supervised)
+    targets = torch.randint(0, 3, (len(batch["label"]), 2, 3)).float()
+    with_targets = model(supervised | {"attach_targets": targets})
+    assert float(with_targets["attach_loss"]) > 0.0
+    assert {"attach_sse", "attach_target_sum", "attach_target_sq"} <= set(with_targets)
+    assert float(with_targets["loss"].detach()) > float(model(supervised)["loss"].detach())
+    # Self rows keep task and KD supervision but no attachment target.
+    self_coords = coords.clone()
+    self_coords[:, 8] = 0
+    self_only = model(batch | {"struct_coords": self_coords, "attach_targets": targets})
+    assert float(self_only["attach_loss"]) == 0.0
+
+
+def test_weighted_loss_terms_decompose_the_composite_objective() -> None:
+    config = _virtual_config(w_attach=0.5) | {"w_kd_rep": 0.25}
+    model = V3_1CoordGen(reader=_virtual_reader(), coord_gen=config)
+    model.reader.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
+    model.initialize_teacher()
+    batch = _pair_batch()
+    coords = _virtual_coords(len(batch["label"]))
+    model.install_coordinate_scale(coords)
+    _coarsen(model)
+    model.train()
+    targets = torch.randint(0, 3, (len(batch["label"]), 2, 3)).float()
+    output = model(batch | {"struct_coords": coords, "attach_targets": targets})
+    terms = {name: output[f"loss_term_{name}"] for name in LOSS_TERM_NAMES}
+    torch.testing.assert_close(sum(terms.values()), output["loss"])
+    for name, term in terms.items():
+        assert term.requires_grad, name
+        grads = torch.autograd.grad(
+            term, model.trainable_parameters(), retain_graph=True, allow_unused=True
+        )
+        assert any(g is not None and float(g.abs().sum()) > 0 for g in grads), name
+
+
+def test_attachment_weight_is_validated() -> None:
+    with pytest.raises(ValueError, match="w_attach"):
+        CoordGenConfig.from_mapping(_virtual_config(w_attach=-1.0))
+    parsed = CoordGenConfig.from_mapping(_virtual_config())
+    assert parsed.virtual_graph.w_attach == 1.0
+    assert parsed.to_dict()["virtual_graph"] == {
+        "k": 3,
+        "d_z": 8,
+        "heads": 2,
+        "gate_bias": 3.0,
+        "w_attach": 1.0,
+    }
 
 
 def test_logits_from_encoded_matches_forward_and_gates_off_is_the_reader_base() -> None:

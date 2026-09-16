@@ -1,8 +1,9 @@
 # Virtual topology prompt: a coarsened-graph generator behind the v1 coordinate interface
 
 **Date:** 2026-09-15
-**Version:** v0.5 (supersedes v0.4 of the same day; change log in §12)
-**Status:** implemented and reviewed on 2026-09-15; approved two-run launch chain. No scientific results yet.
+**Version:** v0.6 (supersedes v0.5 of 2026-09-15; change log in §12)
+**Status:** v0.5 ran and was diagnosed at epoch 8 (`docs/tmp/2026-09-16-virtual-prompt-diagnosis-and-revision.md`);
+v0.6 implements that note's point-1 fix (A-E) and relaunches as `virtual_prompt_d_rev1`. No scientific results yet.
 **Reads on:** `docs/superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md` (the v2 recipe this design plugs into),
 `docs/results/topo_prompt_stage2_verdict/README.md` (the Stage II verdict), `docs/results/topo_prompt_stage2_curves/` (the probe dump).
 
@@ -84,10 +85,17 @@ head). Spec `v1` and its checkpoints stay loadable and untouched.
   `B_jj` is the within-node density. `sigmoid` of a symmetric logit parameter.
 - **Attachment attention** (pooling by multihead attention with the coarse nodes as seeds, the Set Transformer PMA
   pattern): queries `P` (`d_z`), keys and values a linear map of the residue states `H_u` (`d_model -> d_z`), four
-  heads, padded residues masked, one layer, then `a_uj = sigmoid(w . o_uj + b_0)` with `o_uj` the attended output of
-  coarse node `j` over protein `u`. Attachment is a per-protein function. This implementation recomputes it for each pair occurrence;
+  heads, padded residues masked, one layer, then `a_uj = sigmoid(s_uj)` with
+  `s_uj = b_j + <P_j, o_uj> / sqrt(d_z)` and `o_uj` the attended output of coarse node `j` over protein `u`
+  (**v0.6**, change B: one bias and one query direction per coarse node). A readout shared across coarse nodes,
+  as in v0.5, makes `a_u` a per-protein scalar times a near-constant vector however the attention behaves: the
+  measured interaction variance fraction was 0.0001 at epoch 1 and 0.025 at epoch 8. Attachment is a per-protein
+  function. This implementation recomputes it for each pair occurrence;
   it does not yet cache trainable attachments across pairs. Cost per
   protein `K x L` attention scores, the same order as one cross-attention layer of the trunk over a single sequence.
+- **`m` and `B` are frozen** at their training-graph values (**v0.6**, change E). They are measurements of the
+  observed graph, not parameters, and under the coordinate loss alone they received gradients three to four
+  orders of magnitude below every other group. `P` stays trainable.
 - `W`: linear `2 d_model -> d_z` on masked mean and max pooled frozen encoder states (`CoordinateGenerator.pool`),
   the gate's input only.
 - `phi`: shared MLP `[z_u + z_v; |z_u - z_v|; z_u * z_v; p_j] -> 1`, so `g_j(u, v) = sigmoid(phi(...))`, symmetric in
@@ -131,9 +139,8 @@ For fractional multiplicities, within-block distinct-pair counts use `max(m_j(m_
 Clustering is zero at expected degree ≤ 1 and clipped to [0, 1] above it; the raw ratio
 can otherwise be negative or exceed one for fractional degrees. Binary lifted graphs
 retain exact counts. The compact vector has 11 columns (8 continuous + 3 indicators).
-After coarsening, a second streaming encoder/attachment pass calibrates the scalar attachment
-bias so its empirical mean equals `mean_degree / sum(m)` without changing the random attention
-weights. Only per-node attachment logits are retained for the scalar solve.
+Each coarse node's readout bias is set in closed form from the coarsening itself (§3.3), so v0.6 needs no
+second encoder pass and no scalar bisection.
 
 ### 3.3 Initialisation from the training graph
 
@@ -143,14 +150,25 @@ checkpoint:
 1. Encode every node of the training universe with the frozen reader encoder and pool (the `coord_probe` loop);
    7,203 nodes, under a minute on one GPU.
 2. k-means with `K = 64` on the pooled states (standardised per dimension), seed from the run seed.
-3. `P_j = W centroid_j` with `W` at its random initialisation, `m_j = |cluster j|`,
+3. `P_j = residue_projection(mean residue state of cluster j)` (**v0.6**, change C): the queries are seeded in
+   the same space the keys live in, and the attention's query projection is tied to its key projection
+   (`in_proj_weight[:d_z] = in_proj_weight[d_z:2 d_z]`, both biases zero), so a score is a similarity in one
+   random projection instead of a dot product of two unrelated random maps. With v0.5's `P = W centroid_j` against
+   keys `residue_projection(H)` every coarse node attended uniformly (entropy 0.9997) and received the same output
+   (cross-node cosine 0.99997). `m_j = |cluster j|`,
    `B_jl = edges_train(j, l) / N_jl` clamped to `[1e-4, 1 - 1e-4]` before the logit, using the feature-present induced subgraph of the loopless legal
-   training graph already built for `TopoPromptRows` (`StructCoordinateTable.adjacency`).
+   training graph already built for `TopoPromptRows` (`StructCoordinateTable.adjacency`). Both are then frozen,
+   on every rank (only the main process coarsens; the others receive the state by broadcast), so the optimizer
+   groups and DDP agree.
    Featureless training nodes are recorded as excluded from coarsening; coordinate targets
    retain the full legal training graph.
-4. The attachment attention and `phi` at default initialisation except the gate bias; the attachment bias `b_0` is
-   set so the mean initial attachment equals the training mean degree divided by `sum_j m_j`, which puts `deg_u` at
-   the right order of magnitude before the first step.
+4. `phi` at default initialisation except the gate bias; `b_j = logit(mean_u n*_uj / m_j)`, the mean training
+   attachment of block `j`, where `n*_uj = |N(u) ^ C_j|`. This reproduces the training mean degree per block
+   exactly in expectation at step zero, replacing v0.5's scalar bisection over a second encoder pass.
+5. The k-means assignment vector is recorded in `run_metadata["virtual_graph"]["assignments"]` (one label per
+   clustered node, in the training table's node order with the featureless nodes removed), so the clustering and
+   the attachment targets are reproducible from the run's own metadata.
+6. Every rank then measures the attachment target table of §5.1 from those assignments; no further collective.
 
 The coarse graph is therefore a real coarsening of the observed training structure at step zero, and remains a
 parameter set at inference: no retrieval, no node identities, no training-graph access when scoring.
@@ -161,17 +179,31 @@ Per epoch, on V_val rows: mean attachment, attachment entropy per node, coarse-n
 and gate entropy, entropy of `B`, and the per-field coordinate R² already logged. Collapse (all `a_uj` near a
 constant, or one coarse node absorbing every attachment) is read from these, not blocked.
 
+**v0.6** adds the three numbers the diagnosis had to reconstruct from checkpoints:
+
+- `val_virtual_attachment_selectivity`: the share of attachment-logit variance that is within a protein, across
+  coarse nodes (mean within-protein variance / total variance). A per-protein scalar scores 0; v0.5 measured
+  0.0002 at epoch 1 and 0.037 at epoch 8, and the pass mark is > 0.2.
+- `train_attach_loss` and `train_attach_r2`: the attachment term and the R² of `log1p n_hat` against
+  `log1p n*` over every training endpoint the epoch presented (the linear pilot's in-sample floor is 0.40).
+- `grad_norm_{term}_{group}`: one `torch.autograd.grad` per weighted loss term (`task`, `kd`, `coord`, `attach`,
+  `rep`) over five parameter groups (`attention_path` = residue projection + attention + readout bias + `P`,
+  `gate` = `W` + `phi`, `cal`, `distance_head`, `interface_head`), on one step per epoch, on every rank. This is
+  the per-term per-group table §3.1 of the diagnosis needed; it costs five extra backwards per epoch.
+
+All of it is telemetry. Nothing blocks a run.
+
 ## 4. Where it plugs in
 
 | Location | Change |
 |---|---|
 | `src/data/struct_coords.py` | Spec `v2` (§3.0) beside `v1`: names, field slices, dims and the table's per-spec measurement; `StructCoordinateTable(graph, spec=...)`. `v1` output bit-identical. |
 | `topo_prompt.py` | Field order, slices and token count follow the checkpoint's `coord_spec`; `mean_context` is refused on spec `v2` (no field). Everything else unchanged. |
-| `src/model/egostitch/classifier/virtual_graph.py` (new) | `VirtualGraphGenerator`: `attach(encoded, lengths) -> a` (per protein, attention over residues), `forward(encoded_a, encoded_b, lengths_a, lengths_b) -> parts` (`endpoint_u`, `endpoint_v`, `relation`, `distance_logits`, all standardised float32) plus `telemetry()`; the closed-form counting; `initialise(pooled_states, assignments, adjacency, mean_degree)`. |
-| `coord_gen.py` | `CoordGenConfig.generator: "mlp" \| "virtual_graph"`, `virtual_graph: {k: 64, d_z: 128, heads: 4, gate_bias: 3.0}`; head widths and distance classes from the spec; `V3_1CoordGen.predict` passes residue states and lengths to the virtual generator (the MLP generator keeps its pooled input); parameter groups unchanged in shape (generator, interface). The MLP path on spec `v1` stays byte-identical for the v2 factorial. |
-| `train_b0.py` | `TopoPromptRows` built on the checkpoint's spec. After it is built for a `V3_1CoordGen` with the virtual generator: encode training nodes, k-means, block adjacency, call `initialise`, broadcast the state to all ranks before DDP wrap. Coordinate-loss nonself scale (§6) installed from the training targets next to it. Telemetry into `metrics.jsonl`. |
+| `src/model/egostitch/classifier/virtual_graph.py` (new) | `VirtualGraphGenerator`: `attach(encoded, lengths) -> a` (per protein, attention over residues), `forward(encoded_a, encoded_b, lengths_a, lengths_b) -> parts` (`endpoint_u`, `endpoint_v`, `relation`, `distance_logits`, plus `attach_a` / `attach_b`, all standardised float32) plus `telemetry()`; the closed-form counting; `attachment_loss_rows(parts, targets)` (§5.1); `initialise(assignments, adjacency, cluster_mean_states)`. |
+| `coord_gen.py` | `CoordGenConfig.generator: "mlp" \| "virtual_graph"`, `virtual_graph: {k: 64, d_z: 128, heads: 4, gate_bias: 3.0, w_attach: 1.0}`; the attachment term when `attach_targets` rides along, and `loss_term_*` for the gradient probe; head widths and distance classes from the spec; `V3_1CoordGen.predict` passes residue states and lengths to the virtual generator (the MLP generator keeps its pooled input); parameter groups unchanged in shape (generator, interface). The MLP path on spec `v1` stays byte-identical for the v2 factorial. |
+| `train_b0.py` | `TopoPromptRows` built on the checkpoint's spec. After it is built for a `V3_1CoordGen` with the virtual generator: encode training nodes once, k-means, per-cluster mean residue state, block adjacency, call `initialise`, broadcast the state to all ranks before DDP wrap, then build the attachment target table (§5.1) on every rank. Coordinate-loss nonself scale (§6) installed from the training targets next to it. Telemetry into `metrics.jsonl` (§3.4). |
 | `score_universe.py` | Nothing structural: the generator and spec are inside the checkpoint. One new `--prefix-intervention slot_gates_open` (`g := 1`), applied inside the generator, fails closed on an MLP checkpoint. |
-| Configs | `configs/split_seed42/topo_prompt_full_v3.yaml`: `topo_prompt_full_v2.yaml` with `coord_spec: v2`, `output_dir: outputs/split_seed42/topo_prompt_full_v3`. `configs/split_seed42/virtual_prompt_d.yaml`: `coord_gen_v2_d.yaml` with `generator: virtual_graph`, `coord_spec: v2`, `reader_checkpoint: outputs/split_seed42/topo_prompt_full_v3/best.pt`, `output_dir: outputs/split_seed42/virtual_prompt_d`. |
+| Configs | `configs/split_seed42/topo_prompt_full_v3.yaml`: `topo_prompt_full_v2.yaml` with `coord_spec: v2`, `output_dir: outputs/split_seed42/topo_prompt_full_v3`. `configs/split_seed42/virtual_prompt_d.yaml`: `coord_gen_v2_d.yaml` with `generator: virtual_graph`, `coord_spec: v2`, `reader_checkpoint: outputs/split_seed42/topo_prompt_full_v3/best.pt`, `output_dir: outputs/split_seed42/virtual_prompt_d`. `configs/split_seed42/virtual_prompt_d_rev1.yaml` (**v0.6**): the same file with `virtual_graph.w_attach: 1.0` and `output_dir: outputs/split_seed42/virtual_prompt_d_rev1`; v0.5 checkpoints do not load into the revised generator and are not meant to. |
 | Docs | `CLAUDE.md`/`AGENTS.md` active set, `docs/03-experiments.md` §6.1 (coordinate spec and generator are fixed choices per arm, not searched), this spec. |
 
 ## 5. Training: the v2 Stage II recipe, unchanged
@@ -186,13 +218,41 @@ file is self-contained.
 - Teacher: immutable eval-mode copy of that published reader, fed true spec-`v2` coordinates. No structural-stream
   teacher variant is launched for v3.
 - Objective: `L = (1 - alpha) BCE(l_S, y) + alpha BCE(l_S, sigmoid(l_T))` with `alpha = 0.5` and positive weight 5;
-  `+ 1.0 L_coord` (§6); structural stream on one sampled 40-node subgraph per step with
-  `{bce 1.0, rank 1.0, degree 0.1, motif 0.1}`; anchor KL weight 1, temperature 1. Representation KD 0.
+  `+ 1.0 L_coord` (§6) `+ w_attach L_attach` (§5.1, `w_attach = 1`); structural stream on one sampled 40-node
+  subgraph per step with `{bce 1.0, rank 1.0, degree 0.1, motif 0.1}`; anchor KL weight 1, temperature 1.
+  Representation KD 0.
 - Schedule: 15-epoch one-cycle, `pct_start 0.1`, `div_factor 25`, `final_div_factor 100`, grad clip 1,
   `eval.patience: null`. Groups: generator peak `3e-4` (all of §3.1 plus `Cal`), interface and head `1e-4`,
   weight decay 0.05.
 - Runtime: `token_budget 196608`, `max_pairs_per_rank 1536`, `memory_limit_gib 85`, bf16, world size auto.
 - Selection: `geometric_rd_five_rank_v1` on V_val after the full schedule.
+
+### 5.1 Attachment supervision (v0.6)
+
+Eight aggregate counts spread over `K x 2` attachments cannot deliver a per-node signal: the measured gradient
+reaching an attachment logit under the v0.5 objective was 1e-5 per element, and predicted counts far below one
+flattened it by a further 0.01-0.06 through `log1p`. v0.6 supervises the attachments directly, in count space:
+
+```
+n_hat_xj = m_j a_xj                              predicted neighbours of x in block j
+n*_xj    = |N(x) \ {partner} ^ C_j|              measured on the coarsened legal training graph
+L_attach = mean over the row's 2K entries of smooth_l1(log1p n_hat, log1p n*)
+```
+
+`a_xj = sigmoid(s_xj)` is unchanged, so the counting layer keeps its bounds and its tests
+(`a <= 1` is what makes clustering `<= 1`). In count space the sigmoid is not the bottleneck:
+`d log1p(m sigma(s)) / ds = n (1 - a) / (1 + n)`, which is 0.5 at `n = 1`. `n = exp(s)` was considered and
+rejected: an unbounded `a` breaks the clustering bound.
+
+The target table is measured once, on every rank, from the broadcast assignments: `(R, 2, K)` `int16` on the CPU
+(about 57 MB at `R` = 221k, `K` = 64), sliced per batch by `_row_id` exactly as the coordinate targets are, and
+attached only to training batches. The queried partner is removed from each endpoint's counts, as it is for the
+coordinate targets. Self rows are masked with the same nonself rule as the coordinate loss; rows touching a node
+the pack has no features for -- which therefore has no cluster -- carry a zero mask. V_val attachment targets are
+not built: the term is training-only supervision, and V_val truth stays out of it.
+
+The struct stream's inner forward and the throughput probe call the model without `attach_targets`, and the term
+simply does not fire there.
 
 ## 6. Coordinate loss correction
 
@@ -247,7 +307,14 @@ is identical whether the protein is encoded alone or inside a pair batch; swap s
 every surrogate finite and bounded for random attachments and for `A = 0`; `deg`, `tri`, `clustering`, `common`, `jaccard`, `L3`, `l3_density` equal exact counts on
 a lifted binary graph built from an integer `m` and `B in {0, 1}`; gates at 1 reproduce the static graph;
 `slot_gates_open` fails closed on an MLP checkpoint; the self-pair mask and nonself scale change the loss only where
-intended; three-token prefixes have six rows per layer and the `v1` four-token path is unchanged.
+intended; three-token prefixes have six rows per layer and the `v1` four-token path is unchanged. **v0.6**: the
+attachment logits carry one bias and one query direction per coarse node (zeroing `P` leaves exactly the biases);
+seeding plus tied q/k makes each coarse node's logit respond to its own residue community and not to the others;
+`initialise` reproduces each block's mean training attachment and freezes `B` and `m`; `attachment_loss_rows` is
+zero at the targets and puts a nonzero gradient on every coarse node's readout; the target table removes the
+queried partner from exactly one block, swaps with the endpoints and masks featureless rows; the attachment term
+fires only when `attach_targets` rides along; the weighted `loss_term_*` scalars sum to `loss`; the optimizer
+groups and `trainable_parameters` agree once `B` and `m` are frozen.
 
 Integration: initialisation is identical on every rank after broadcast; checkpoint round-trip restores `P, B, m` and
 the scale buffer; two-rank DDP agreement of the structural-stream terms (follow `tests/test_struct_stream.py`);
@@ -257,12 +324,19 @@ checkpoint.
 ## 9. Launch
 
 Local first: implementation, tests, ruff, mypy, one Codex review, commit, push. Then on an idle H20 container, as
-one chain (`bash src/experiments/virtual_prompt_chain.sh`):
+one chain (`bash src/experiments/virtual_prompt_chain.sh [student config]`, defaulting to the v0.6 config and
+skipping the reader when `topo_prompt_full_v3/diagnostic_complete.json` already exists):
 
 ```bash
 hpc/run.sh train configs/split_seed42/topo_prompt_full_v3.yaml --worker-module src.train_b0 --run-kind diagnostic
-hpc/run.sh train configs/split_seed42/virtual_prompt_d.yaml
+hpc/run.sh train configs/split_seed42/virtual_prompt_d_rev1.yaml
 ```
+
+**v0.6 epoch-1 pass marks** (`metrics.jsonl`, all telemetry, none blocking): `val_virtual_attachment_selectivity`
+> 0.2; `train_attach_r2` > 0.3; implied mean degree (`val_virtual_attachment_mean x sum(m)`) within 20 % of 8.8;
+`grad_norm_attach_attention_path` within 10x of `grad_norm_coord_cal`; `val_coord_r2_relation` no longer negative
+on training-like rows. Selectivity still below 0.1 with the supervision in place would say the residue attention
+is the wrong reader for community membership, and the next revision targets the head, not the route.
 
 followed by the intervention chain used for `coord_gen_full` with `slot_gates_open` added. Expected cost: Stage I
 8–13 h with the v2 sensitivity rows (3.5 h without them), then the profiled v2 D epoch (about 50 min) times 15 with
@@ -296,6 +370,7 @@ density shift (§2) is unaddressed. Single-seed results are observations.
 
 | Version | Date | Changes |
 |---|---|---|
+| **v0.6** | **2026-09-16** | Point-1 fix from the epoch-8 diagnosis, five changes and nothing else (gate, `K = 64`, k-means, reader, objective weights and schedule all stand). **A** attachment supervision in count space; **B** per-coarse-node readout `s_uj = b_j + <P_j, o_uj> / sqrt(d_z)`, the shared `attachment` linear deleted; **C** `P` seeded on each cluster's mean residue state through the key map, attention queries tied to keys at init; **D** a direct Huber attachment loss on `log1p n_hat` against `log1p n*` with `w_attach = 1`, its target table measured once per rank and sliced by `_row_id`; **E** `B` and `m` frozen at their training-graph values. Telemetry adds selectivity, attachment R² and the per-term per-group gradient probe. New config `virtual_prompt_d_rev1.yaml`; no compatibility with v0.5 checkpoints. |
 | v0.1 | 2026-09-15 | Shared virtual nodes, fixed four-node blocks, endpoint attachments, query gates, standalone graph-response branch, frozen-baseline residual, separate prompt warmup. |
 | v0.2 | 2026-09-15 | Graph tokenizer feeding topology tokens into the reader; new Stage I on observed templates; trainable student encoder; nine-value template signature replacing the coordinate loss. |
 | v0.3 | 2026-09-15 | One design. Stage I and the coordinate interface kept; the generator alone replaced by a coarsened-graph prompt (`P, m, B` initialised from k-means over frozen pooled states and the training graph's block densities, per-node attachment, per-node query gates) whose 34 coordinates are closed-form expected counts. Template signature, graph tokenizer, observed-template Stage I, and encoder training dropped. Coordinate loss corrected (self-pairs masked, nonself scale) after the walk-kernel inversion was traced to the self-pair stratum. One launch (`virtual_prompt_d`) on the v2 D recipe; topology read first. |

@@ -418,6 +418,16 @@ residue-attention attachments and symmetric pair gates, initialized from the leg
 graph. `slot_gates_open` disables only its coarse-node gates; `mean_context` is unavailable
 on the compact spec. Neither coordinate semantics nor generator type is a search dimension.
 
+Spec v0.6 (`virtual_prompt_d_rev1`) keeps every one of those choices and fixes the
+gradient starvation the v0.5 run was diagnosed with: one readout bias and query direction
+per coarse node, queries seeded on each cluster's mean residue state with the attention's
+queries tied to its keys, the coarse graph's `m` and `B` frozen at their training-graph
+values, and a direct attachment loss — Huber on `log1p` predicted against true per-block
+neighbour counts, the queried partner removed, weight fixed at 1. The attachment weight is
+fixed like every other coordinate choice, never searched; its targets are training-only, so
+no V_val or test structure enters the student. Attachment selectivity, attachment R² and a
+per-term per-group gradient probe are logged as telemetry and block nothing.
+
 ### 6.2 The hyperparameters
 
 Boxes are log-uniform unless marked as a set or linear. Defaults are the first run and first

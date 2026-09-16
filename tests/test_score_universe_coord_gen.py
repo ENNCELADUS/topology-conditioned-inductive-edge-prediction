@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from src.data.packed_features import PackedFeatureTable
 from src.data.struct_coords import get_coord_spec
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
+from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
 
 from tests.test_prefix_model import _tiny_base_config
 from tests.test_score_universe import _build_prefix_packed_fixture
@@ -50,6 +52,14 @@ def _tiny_coord_gen(generator: str = "mlp") -> V3_1CoordGen:
     model.reader.generator.set_coord_stats(torch.zeros(dim), torch.ones(dim), 5)
     with torch.no_grad():
         model.reader.generator.gates.fill_(0.4)
+        if generator == "virtual_graph":
+            # A trained coarse graph has per-block attachment levels; at random
+            # init every coarse node sits at the same near-half attachment and
+            # the coordinates barely separate the rows.
+            virtual = cast(VirtualGraphGenerator, model.generator)
+            virtual.readout_bias.copy_(torch.tensor([-2.0, -0.5, 0.5, 2.0]))
+            virtual.P.mul_(8.0)
+            virtual.m_raw.copy_(torch.tensor([3.0, 5.0, 8.0, 2.0]).expm1().log())
     model.initialize_teacher()
     model.eval()
     return model
@@ -63,6 +73,9 @@ def test_model_builder_round_trips_the_checkpoint_config_and_statistics(generato
     )
     rebuilt.load_state_dict(model.state_dict())
     assert isinstance(rebuilt, V3_1CoordGen)
+    # The attachment weight travels in the checkpoint's config, like every
+    # other generator choice, so scoring rebuilds the same student.
+    assert rebuilt.cfg.virtual_graph.w_attach == model.cfg.virtual_graph.w_attach == 1.0
     assert float(rebuilt.reader.generator.coord_count) == 5.0
     assert all(not param.requires_grad for param in rebuilt.teacher.parameters())
     assert any(param.requires_grad for param in rebuilt.reader.parameters())

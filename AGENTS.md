@@ -73,6 +73,14 @@ selected method. Every piece of writing must explain how its context helps decid
   closed-form counts. It scores from endpoints alone; `slot_gates_open` sets coarse-node
   gates to one. `mean_context` is invalid on v2. Coordinate loss excludes self rows and scales
   continuous residuals by nonself training standard deviations; task/KD retain self rows.
+  `virtual_prompt_d_rev1` is spec v0.6, the point-1 fix from the epoch-8 diagnosis
+  (`docs/tmp/2026-09-16-virtual-prompt-diagnosis-and-revision.md`): one readout bias and query
+  direction per coarse node, queries seeded on each cluster's mean residue state with the
+  attention's queries tied to its keys, `m` and `B` frozen at their training-graph values, and
+  a direct per-block attachment loss (Huber on `log1p` counts, queried partner removed,
+  `virtual_graph.w_attach: 1.0`, training rows only) beside the coordinate loss. Its targets
+  ride on the training batch as `attach_targets`, so forwards without them (struct stream,
+  throughput probe, scoring) are unchanged. v0.5 checkpoints do not load into it.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

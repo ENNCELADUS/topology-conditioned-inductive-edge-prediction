@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import cast
 
 import torch
@@ -32,7 +33,7 @@ class VirtualGraphGenerator(nn.Module):
         self.P = nn.Parameter(torch.randn(k, d_z) / d_z**0.5)
         self.residue_projection = nn.Linear(d_model, d_z)
         self.attention = nn.MultiheadAttention(d_z, heads, batch_first=True)
-        self.attachment = nn.Linear(d_z, 1)
+        self.readout_bias = nn.Parameter(torch.zeros(k))
         self.m_raw = nn.Parameter(torch.ones(k))
         self.B_logits = nn.Parameter(torch.zeros(k, k))
         self.W = nn.Linear(2 * d_model, d_z)
@@ -65,54 +66,84 @@ class VirtualGraphGenerator(nn.Module):
     def telemetry(self, *, reset: bool = False) -> dict[str, torch.Tensor]:
         """Return additive eval sums (reduce across ranks before taking means).
 
-        Attachment sums and entropy sums have one entry per coarse node, with
-        ``attachment_count`` endpoint observations. Gate sums use ``gate_count``
-        pairs. ``adjacency_entropy`` is a parameter statistic, identical across
-        ranks, and must not be summed across ranks.
+        Attachment sums, entropy sums and logit moments have one entry per
+        coarse node, with ``attachment_count`` endpoint observations;
+        ``attachment_within_var_sum`` is one scalar over those observations.
+        Gate sums use ``gate_count`` pairs. ``adjacency_entropy`` is a parameter
+        statistic, identical across ranks, and must not be summed across ranks.
         """
         result = {name: value.clone() for name, value in self._telemetry.items()}
         for prefix in ("attachment", "gate"):
             for suffix in ("sum", "entropy_sum"):
                 result.setdefault(f"{prefix}_{suffix}", self.P.new_zeros(self.k))
             result.setdefault(f"{prefix}_count", self.P.new_zeros(()))
+        for suffix in ("logit_sum", "logit_sq_sum"):
+            result.setdefault(f"attachment_{suffix}", self.P.new_zeros(self.k))
+        result.setdefault("attachment_within_var_sum", self.P.new_zeros(()))
         result["adjacency_entropy"] = self._entropy(self.adjacency).mean()
         if reset:
             self.reset_telemetry()
         return result
 
     @torch.no_grad()
-    def _record(self, a: torch.Tensor, b: torch.Tensor, gates: torch.Tensor) -> None:
+    def _record(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        gates: torch.Tensor,
+        logits_a: torch.Tensor,
+        logits_b: torch.Tensor,
+    ) -> None:
+        additions: dict[str, torch.Tensor] = {}
         for prefix, values in (("attachment", torch.cat((a, b))), ("gate", gates)):
-            additions = {
-                f"{prefix}_sum": values.sum(0),
-                f"{prefix}_entropy_sum": self._entropy(values).sum(0),
-                f"{prefix}_count": values.new_tensor(values.size(0)),
-            }
-            for key, value in additions.items():
-                self._telemetry[key] = self._telemetry.get(key, torch.zeros_like(value)) + value
+            additions[f"{prefix}_sum"] = values.sum(0)
+            additions[f"{prefix}_entropy_sum"] = self._entropy(values).sum(0)
+            additions[f"{prefix}_count"] = values.new_tensor(values.size(0))
+        # Selectivity: how much of the logit variance is within a protein,
+        # across coarse nodes, rather than a per-protein scalar.
+        logits = torch.cat((logits_a, logits_b))
+        additions["attachment_logit_sum"] = logits.sum(0)
+        additions["attachment_logit_sq_sum"] = logits.square().sum(0)
+        additions["attachment_within_var_sum"] = logits.var(dim=1, correction=0).sum()
+        for key, value in additions.items():
+            self._telemetry[key] = self._telemetry.get(key, torch.zeros_like(value)) + value
 
     @torch.no_grad()
     def initialise(
         self,
-        pooled_states: torch.Tensor,
         assignments: torch.Tensor,
         adjacency: torch.Tensor | csr_matrix,
-        mean_degree: float,
+        cluster_mean_states: torch.Tensor,
     ) -> None:
-        """Install seeded clusters and legal loopless training block densities.
+        """Install the coarsening, seed the attention, and freeze the coarse graph.
 
-        ``adjacency`` accepts a dense tensor or scipy sparse matrix; its row
-        order must match pooled states and assignments. Cluster every node.
+        ``m`` and ``B`` are measured on the training graph and then frozen: they
+        are data, not parameters. The queries ``P`` are seeded in the key map's
+        own space and the attention's query projection is tied to its key
+        projection, so a score is a similarity in one random projection rather
+        than a dot product of two unrelated random maps. Each block's readout
+        bias reproduces that block's mean training attachment, which puts every
+        predicted count at the right order of magnitude at step zero.
+
+        Args:
+            assignments: Cluster label per training node ``(N,)``.
+            adjacency: The loopless training adjacency over those nodes, dense
+                or scipy sparse, in the same row order.
+            cluster_mean_states: Per-cluster mean residue state ``(K, d_model)``.
+
+        Raises:
+            ValueError: If any cluster is empty.
         """
         device = self.P.device
-        pools = pooled_states.to(device=device, dtype=torch.float32)
         labels = assignments.to(device=device, dtype=torch.long)
         sizes = torch.bincount(labels, minlength=self.k).float()
         if sizes.numel() != self.k or (sizes == 0).any():
             raise ValueError("virtual graph initialisation requires every cluster to be nonempty")
-        centroids = torch.zeros(self.k, pools.size(1), device=device)
-        centroids.index_add_(0, labels, pools)
-        self.P.copy_(self.W(centroids / sizes[:, None]))
+        self.P.copy_(self.residue_projection(cluster_mean_states.to(device, torch.float32)))
+        d_z = self.P.size(-1)
+        self.attention.in_proj_weight[:d_z].copy_(self.attention.in_proj_weight[d_z : 2 * d_z])
+        if self.attention.in_proj_bias is not None:
+            self.attention.in_proj_bias[: 2 * d_z].zero_()
         self.m_raw.copy_(sizes + torch.log(-torch.expm1(-sizes)))
         if isinstance(adjacency, torch.Tensor):
             row, col = adjacency.nonzero(as_tuple=True)
@@ -126,8 +157,22 @@ class VirtualGraphGenerator(nn.Module):
         pair_counts = sizes[:, None] * sizes[None, :] - torch.diag(sizes)
         density = (edge_counts / pair_counts.clamp_min(1)).clamp(1e-4, 1 - 1e-4)
         self.B_logits.copy_(torch.logit(density))
-        probability = torch.tensor(mean_degree, device=device) / sizes.sum()
-        self.attachment.bias.copy_(torch.logit(probability.clamp(1e-6, 1 - 1e-6)).reshape(1))
+        # Column mean of the node-to-block neighbour counts, per block size.
+        block_counts = torch.zeros(self.k, device=device)
+        block_counts.index_add_(0, labels[col[keep]], torch.ones(int(keep.sum()), device=device))
+        mean_attachment = block_counts / labels.numel() / sizes
+        self.readout_bias.copy_(torch.logit(mean_attachment.clamp(1e-6, 1 - 1e-6)))
+        self.freeze_coarse_graph()
+
+    def freeze_coarse_graph(self) -> None:
+        """Stop training ``B`` and ``m``; idempotent, and called on every rank.
+
+        Only the main process runs `initialise`; the other ranks receive the
+        coarse graph by broadcast and must freeze it themselves, or DDP and the
+        optimizer groups disagree across ranks.
+        """
+        self.B_logits.requires_grad_(False)
+        self.m_raw.requires_grad_(False)
 
     @staticmethod
     def pool(encoded: torch.Tensor, lengths: torch.Tensor | None) -> torch.Tensor:
@@ -149,7 +194,9 @@ class VirtualGraphGenerator(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Emit standardised compact fields and four distance-class logits."""
         with torch.autocast(device_type=encoded_a.device.type, enabled=False):
-            a, b = self.attach(encoded_a, lengths_a), self.attach(encoded_b, lengths_b)
+            logits_a = self.attachment_logits(encoded_a, lengths_a)
+            logits_b = self.attachment_logits(encoded_b, lengths_b)
+            a, b = logits_a.sigmoid(), logits_b.sigmoid()
             u, v = self.W(self.pool(encoded_a, lengths_a)), self.W(self.pool(encoded_b, lengths_b))
             pair = torch.cat((u + v, (u - v).abs(), u * v), -1)
             gates = (
@@ -170,7 +217,7 @@ class VirtualGraphGenerator(nn.Module):
             elif self.intervention != "none":
                 raise ValueError(f"unsupported virtual graph intervention {self.intervention!r}")
             if not self.training:
-                self._record(a, b, gates)
+                self._record(a, b, gates, logits_a, logits_b)
             c = self.count(a * gates, b * gates)
             raw = torch.stack(
                 (
@@ -203,7 +250,31 @@ class VirtualGraphGenerator(nn.Module):
                 "endpoint_v": z[:, 2:4],
                 "relation": z[:, 4:8],
                 "distance_logits": distance,
+                "attach_a": a,
+                "attach_b": b,
             }
+
+    def attachment_loss_rows(
+        self, parts: Mapping[str, torch.Tensor], targets: torch.Tensor
+    ) -> torch.Tensor:
+        r"""Per-row Huber on predicted against true per-block neighbour counts.
+
+        Supervision is in count space, where ``d log1p(m sigma(s)) / ds`` is
+        order one at ``n ~ 1``; the eight aggregate coordinates alone leave the
+        attachment logits with 1e-5 gradients. The caller masks self rows and
+        rows touching featureless nodes.
+
+        Args:
+            parts: A `forward` output, read for ``attach_a`` and ``attach_b``.
+            targets: ``(B, 2, K)`` counts ``|N(x) \ {partner} ^ C_j|``.
+
+        Returns:
+            The ``(B,)`` mean loss over the two endpoints' ``K`` blocks.
+        """
+        attachments = torch.stack((parts["attach_a"], parts["attach_b"]), dim=1).float()
+        predicted = (attachments * self.multiplicity.float()).log1p()
+        loss = F.smooth_l1_loss(predicted, targets.to(predicted).log1p(), reduction="none")
+        return loss.flatten(1).mean(dim=1)
 
     @property
     def multiplicity(self) -> torch.Tensor:
@@ -255,7 +326,14 @@ class VirtualGraphGenerator(nn.Module):
     def attachment_logits(
         self, encoded: torch.Tensor, lengths: torch.Tensor | None
     ) -> torch.Tensor:
-        """Return raw logits for exact startup calibration of the scalar bias."""
+        """Return ``(B, K)`` attachment logits, one readout per coarse node.
+
+        Coarse node ``j`` reads its own attended state with its own query
+        direction, ``s_uj = readout_bias[j] + <P_j, o_uj> / sqrt(d_z)``. A
+        readout shared across coarse nodes makes ``a_uj`` a per-protein scalar
+        whatever the attention does, which is what starved the graph
+        parameters of gradient in v0.5.
+        """
         with torch.autocast(device_type=encoded.device.type, enabled=False):
             pad = (
                 None
@@ -272,4 +350,5 @@ class VirtualGraphGenerator(nn.Module):
                 key_padding_mask=pad,
                 need_weights=False,
             )
-            return cast(torch.Tensor, self.attachment(output).squeeze(-1))
+            scores = (output * self.P[None]).sum(-1) / self.P.size(-1) ** 0.5
+            return cast(torch.Tensor, self.readout_bias[None] + scores)

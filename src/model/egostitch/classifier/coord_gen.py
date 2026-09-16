@@ -29,6 +29,13 @@ from src.model.egostitch.classifier.layers import _build_padding_mask, masked_ma
 from src.model.egostitch.classifier.topo_prompt import COORDS_KEY, V3_1TopoPrompt
 from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
 
+#: Batch key carrying ``(B, 2, K)`` per-block neighbour counts for the virtual
+#: attachment supervision, and the row mask that goes with it.
+ATTACH_KEY: str = "attach_targets"
+ATTACH_MASK_KEY: str = "attach_mask"
+#: Weighted loss terms the composite objective decomposes into, in the order the
+#: per-epoch gradient probe reports them. They sum to ``loss``.
+LOSS_TERM_NAMES: tuple[str, ...] = ("task", "kd", "coord", "attach", "rep")
 DISTANCE_NAMES: tuple[str, ...] = ("dist_2", "dist_3", "dist_4plus", "dist_inf")
 DISTANCE_INDEX: tuple[int, ...] = tuple(COORD_NAMES.index(name) for name in DISTANCE_NAMES)
 #: Distance classes the generator predicts: the four one-hot categories plus the
@@ -69,16 +76,33 @@ def distance_class_targets(coords: torch.Tensor, spec: str = COORD_SPEC) -> torc
 
 @dataclass(frozen=True)
 class VirtualGraphConfig:
-    """Fixed size and attention choices of the coarse graph."""
+    """Fixed size, attention and attachment-supervision choices of the coarse graph.
+
+    Attributes:
+        k: Number of coarse nodes.
+        d_z: Coarse-node and attention width.
+        heads: Attachment-attention heads.
+        gate_bias: Output bias of the query gate (gates start open).
+        w_attach: Weight of the per-block attachment count supervision.
+    """
 
     k: int = 64
     d_z: int = 128
     heads: int = 4
     gate_bias: float = 3.0
+    w_attach: float = 1.0
 
     def __post_init__(self) -> None:
+        """Validate sizes and the attachment weight.
+
+        Raises:
+            ValueError: On a non-positive size, a width not divisible by the
+                head count, or a negative ``w_attach``.
+        """
         if self.k <= 0 or self.d_z <= 0 or self.heads <= 0 or self.d_z % self.heads:
             raise ValueError("virtual_graph sizes must be positive and d_z divisible by heads")
+        if self.w_attach < 0.0:
+            raise ValueError("virtual_graph.w_attach must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -183,6 +207,7 @@ class CoordGenConfig:
             d_z=int(graph.get("d_z", 128)),
             heads=int(graph.get("heads", 4)),
             gate_bias=float(graph.get("gate_bias", 3.0)),
+            w_attach=float(graph.get("w_attach", 1.0)),
         )
         sha = raw.get("reader_checkpoint_sha256")
         return cls(
@@ -393,9 +418,14 @@ class V3_1CoordGen(nn.Module):
         interface_lr: float,
         weight_decay: float,
     ) -> list[dict[str, object]]:
-        """Separate endpoint regularisation while sharing the generator schedule."""
+        """Separate endpoint regularisation while sharing the generator schedule.
+
+        Frozen parameters -- the coarse graph's ``B`` and ``m`` once the training
+        graph is installed -- are excluded, so the groups and
+        `trainable_parameters` always name the same set.
+        """
         endpoint = (
-            list(self.generator.endpoint_head.parameters())
+            [p for p in self.generator.endpoint_head.parameters() if p.requires_grad]
             if isinstance(self.generator, CoordinateGenerator)
             else []
         )
@@ -410,7 +440,11 @@ class V3_1CoordGen(nn.Module):
             },
             {
                 "name": "generator",
-                "params": [p for p in self.generator.parameters() if id(p) not in endpoint_ids],
+                "params": [
+                    p
+                    for p in self.generator.parameters()
+                    if p.requires_grad and id(p) not in endpoint_ids
+                ],
                 "lr": generator_lr,
                 "max_lr": generator_lr,
                 "weight_decay": weight_decay,
@@ -551,6 +585,47 @@ class V3_1CoordGen(nn.Module):
             encoded_a, encoded_b, lengths_a, lengths_b, z_hat
         )
 
+    def nonself_mask(self, coords: torch.Tensor) -> torch.Tensor:
+        """``(B,)`` float mask of rows that have a shortest-path class.
+
+        Self-pairs carry no pair structure, so both the coordinate loss and the
+        attachment loss drop them; they keep task and KD supervision.
+        """
+        target = distance_class_targets(coords, self.cfg.coord_spec)
+        return (target != self.spec.self_distance_class).to(coords.dtype)
+
+    def _attachment_fit_sums(
+        self,
+        parts: Mapping[str, torch.Tensor],
+        targets: torch.Tensor,
+        row_mask: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        """Detached row means for the trainer's online attachment R^2.
+
+        The three means are taken over every row with a target table (self rows
+        included, since a self-pair's endpoint counts are well defined); only
+        rows touching a featureless node, which have no coarse-graph counts at
+        all, are dropped by ``row_mask``.
+        """
+        generator = cast(VirtualGraphGenerator, self.generator)
+        with torch.no_grad():
+            attachments = torch.stack((parts["attach_a"], parts["attach_b"]), dim=1).float()
+            predicted = (attachments * generator.multiplicity.float()).log1p()
+            truth = targets.to(predicted).log1p()
+            keep = (
+                torch.ones_like(predicted[:, 0, 0])
+                if row_mask is None
+                else row_mask.reshape(-1).to(predicted)
+            )
+            values = {
+                "attach_sse": (predicted - truth).square(),
+                "attach_target_sum": truth,
+                "attach_target_sq": truth.square(),
+            }
+            return {
+                key: (value.flatten(1).mean(dim=1) * keep).mean() for key, value in values.items()
+            }
+
     def coordinate_loss_rows(
         self, parts: Mapping[str, torch.Tensor], z_hat: torch.Tensor, coords: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -575,7 +650,7 @@ class V3_1CoordGen(nn.Module):
         )
         target = distance_class_targets(coords.to(z_hat.device), self.cfg.coord_spec)
         distance = F.cross_entropy(parts["distance_logits"].float(), target, reduction="none")
-        nonself = target != self.spec.self_distance_class
+        nonself = self.nonself_mask(coords.to(z_hat.device)).to(continuous)
         continuous = continuous * nonself
         distance = distance * nonself
         return continuous + distance, continuous, distance
@@ -595,11 +670,17 @@ class V3_1CoordGen(nn.Module):
             ``logits``, ``predicted_coords`` (standardised) and ``distance_logits``;
             with ``struct_coords`` also ``teacher_logits`` (unless ``kd_alpha == 0``),
             ``coord_loss``, ``coord_continuous_loss``, ``coord_distance_loss`` and
-            ``kd_loss`` (detached means); with ``label`` too, the composite
-            row-weighted ``loss``, its ``loss_weight_sum`` and the detached
-            ``task_loss``. Without ``struct_coords`` no loss is returned even if a
-            label is present, so a training step without attached targets fails
-            closed on the missing key.
+            ``kd_loss`` (detached means); with `ATTACH_KEY` on a virtual generator
+            also ``attach_loss`` and the detached ``attach_sse`` /
+            ``attach_target_sum`` / ``attach_target_sq`` row means the trainer
+            turns into an R²; with ``label`` too, the composite row-weighted
+            ``loss``, its ``loss_weight_sum``, the detached ``task_loss`` and the
+            undetached ``loss_term_*`` summands of `LOSS_TERM_NAMES`. Without
+            ``struct_coords`` no loss is returned even if a label is present, so a
+            training step without attached targets fails closed on the missing
+            key; without `ATTACH_KEY` -- the structural stream's inner forward,
+            the throughput probe, scoring -- the attachment term simply does not
+            fire.
         """
         merged: dict[str, torch.Tensor] = {}
         if batch is not None:
@@ -628,6 +709,16 @@ class V3_1CoordGen(nn.Module):
         output["coord_loss"] = coord_row.detach().mean()
         output["coord_continuous_loss"] = continuous_row.detach().mean()
         output["coord_distance_loss"] = distance_row.detach().mean()
+        attach_row: torch.Tensor | None = None
+        if isinstance(self.generator, VirtualGraphGenerator) and ATTACH_KEY in merged:
+            targets = merged[ATTACH_KEY]
+            row_mask = merged.get(ATTACH_MASK_KEY)
+            weight = self.nonself_mask(coords.to(z_hat.device)).to(z_hat)
+            if row_mask is not None:
+                weight = weight * row_mask.reshape(-1).to(z_hat)
+            attach_row = self.generator.attachment_loss_rows(parts, targets) * weight
+            output["attach_loss"] = attach_row.detach().mean()
+            output.update(self._attachment_fit_sums(parts, targets, row_mask))
         flat = logits.reshape(-1).float()
         kd_row: torch.Tensor | None = None
         if self.cfg.kd_alpha > 0.0 or self.cfg.w_kd_rep > 0.0:
@@ -651,6 +742,8 @@ class V3_1CoordGen(nn.Module):
         weights = 1.0 + (float(base.positive_weight) - 1.0) * labels
         weight_sum = weights.sum().detach()
         total_row = (1 - self.cfg.kd_alpha) * bce_row + self.cfg.w_coord * coord_row
+        if attach_row is not None:
+            total_row = total_row + self.cfg.virtual_graph.w_attach * attach_row
         if kd_row is not None:
             total_row = total_row + self.cfg.kd_alpha * kd_row
             q = torch.sigmoid(output["teacher_logits"].reshape(-1).float())
@@ -661,6 +754,7 @@ class V3_1CoordGen(nn.Module):
             # can aggregate them by row count into batching-invariant dataset means.
             output["teacher_entropy"] = entropy.detach().mean()
             output["kd_kl"] = (kd_row - entropy).detach().mean()
+        rep_row: torch.Tensor | None = None
         if self.cfg.w_kd_rep > 0:
             student_repr = self.reader.logits_from_standardized(
                 encoded_a, encoded_b, lengths_a, lengths_b, z_hat, return_pair_repr=True
@@ -680,6 +774,24 @@ class V3_1CoordGen(nn.Module):
         output["loss"] = (weights * total_row).sum() / weight_sum
         output["loss_weight_sum"] = weight_sum
         output["task_loss"] = ((weights * bce_row).sum() / weight_sum).detach()
+
+        def weighted(row: torch.Tensor | None, scale: float) -> torch.Tensor:
+            """The composite objective's share of one term, undetached."""
+            if row is None or scale == 0.0:
+                return torch.zeros((), dtype=logits.dtype, device=logits.device)
+            return scale * (weights * row).sum() / weight_sum
+
+        # The per-epoch gradient probe attributes each term to a parameter
+        # group; these are the exact summands of `loss`, so they must not be
+        # detached and must be emitted on every rank.
+        for name, row, scale in (
+            ("task", bce_row, 1 - self.cfg.kd_alpha),
+            ("kd", kd_row, self.cfg.kd_alpha),
+            ("coord", coord_row, self.cfg.w_coord),
+            ("attach", attach_row, self.cfg.virtual_graph.w_attach),
+            ("rep", rep_row, self.cfg.w_kd_rep),
+        ):
+            output[f"loss_term_{name}"] = weighted(row, float(scale))
         return output
 
 
@@ -692,7 +804,11 @@ __all__ = [
     "distance_class_targets",
     "FIELD_CONTINUOUS_INDEX",
     "RELATION_CONTINUOUS_INDEX",
+    "ATTACH_KEY",
+    "ATTACH_MASK_KEY",
+    "LOSS_TERM_NAMES",
     "CoordGenConfig",
     "CoordinateGenerator",
     "V3_1CoordGen",
+    "VirtualGraphConfig",
 ]
