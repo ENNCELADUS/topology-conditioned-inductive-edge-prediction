@@ -668,15 +668,22 @@ def _validate_staged_artifacts(
     model_family: str,
     require_val_region_validation_events: bool = False,
     expected_run_kind: str | None = None,
+    stop_after_epoch: int | None = None,
 ) -> None:
-    """Load and validate every formal worker artifact before hashing it."""
+    """Load and validate every formal worker artifact before hashing it.
+
+    ``stop_after_epoch`` is `train_b0`'s prefix halt: the schedule is still sized
+    by ``optim.epochs``, so a run that halted early publishes a ``last.pt`` (and
+    a ``metrics.jsonl``) covering ``stop_after_epoch`` epochs, not ``epochs``.
+    """
     import torch
 
+    expected_epochs = epochs if stop_after_epoch is None else stop_after_epoch
     for filename in ("best.pt", "last.pt", "metrics.jsonl", "run_metadata.json"):
         path = staging_dir / filename
         if not path.is_file() or path.stat().st_size <= 0:
             raise ValueError(f"{filename} is missing or empty")
-    for filename, exact_epoch in (("best.pt", None), ("last.pt", epochs)):
+    for filename, exact_epoch in (("best.pt", None), ("last.pt", expected_epochs)):
         payload = torch.load(staging_dir / filename, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict):
             raise ValueError(f"{filename} checkpoint payload must be a dict")
@@ -698,8 +705,8 @@ def _validate_staged_artifacts(
             if not line.strip():
                 raise ValueError("metrics.jsonl contains a blank row")
             metric_rows.append(json.loads(line))
-    if len(metric_rows) != epochs:
-        raise ValueError(f"metrics.jsonl must contain {epochs} evaluations")
+    if len(metric_rows) != expected_epochs:
+        raise ValueError(f"metrics.jsonl must contain {expected_epochs} evaluations")
     for expected_epoch, row in enumerate(metric_rows, start=1):
         if not isinstance(row, dict) or row.get("epoch") != expected_epoch:
             raise ValueError("metrics.jsonl epoch sequence is invalid")
@@ -1293,6 +1300,7 @@ def _run_pipeline_unlocked(
                 if args.worker_module == "src.train_egostitch"
                 else None
             ),
+            stop_after_epoch=cfg.optim.stop_after_epoch,
         )
     except Exception as error:
         rejected_profile = {**evidence_profile}

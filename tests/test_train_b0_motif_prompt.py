@@ -19,7 +19,7 @@ from src.train_b0 import Config, ModelConfig, StructStream, TrainResult
 
 from tests.model.test_motif_prompt_model import _model, _open_gates, _weights
 from tests.test_prefix_model import _pair_batch, _tiny_base_config
-from tests.test_train_b0 import _constant_metrics, _tiny_config
+from tests.test_train_b0 import _constant_metrics, _tiny_config, _write_yaml_config
 from tests.test_train_b0_struct import (
     _stream,
     _struct_fixture,
@@ -577,3 +577,63 @@ def test_the_stage_hook_ignores_every_other_family() -> None:
     optimizer.param_groups[0]["lr"] = 5e-4
     _set_motif_prompt_training_stage(model, optimizer, epoch=1)
     assert optimizer.param_groups[0]["lr"] == 5e-4
+
+
+# ------------------------------------------- optim.stop_after_epoch (task 19)
+
+
+def test_stop_after_epoch_parses_validates_and_leaves_the_config_hash_unchanged(
+    tmp_path: Path,
+) -> None:
+    from src.train_b0 import config_to_dict, load_config
+
+    plain_path = tmp_path / "plain.json"
+    _write_yaml_config(plain_path)
+    plain = load_config(plain_path)
+
+    stopped_path = tmp_path / "stopped.json"
+    _write_yaml_config(stopped_path, {"optim.stop_after_epoch": 2})
+    stopped = load_config(stopped_path)
+    assert stopped.optim.stop_after_epoch == 2
+    assert plain.optim.stop_after_epoch is None
+    assert config_to_dict(stopped) == config_to_dict(plain)
+
+    for illegal in (0, plain.optim.epochs + 1):
+        bad_path = tmp_path / f"bad-{illegal}.json"
+        _write_yaml_config(bad_path, {"optim.stop_after_epoch": illegal})
+        with pytest.raises(ValueError, match="optim.stop_after_epoch"):
+            load_config(bad_path)
+
+
+def test_a_resume_config_comparison_ignores_stop_after_epoch_only() -> None:
+    from src.train_b0 import _resume_comparable_config
+
+    saved = {
+        "output_dir": "a",
+        "seed": 0,
+        "optim": {"epochs": 15, "stop_after_epoch": 2, "lr": 1e-4},
+    }
+    current = {"output_dir": "b", "seed": 0, "optim": {"epochs": 15, "lr": 1e-4}}
+    assert _resume_comparable_config(saved) == _resume_comparable_config(current)
+    # The saved mapping is not mutated.
+    assert saved["optim"] == {"epochs": 15, "stop_after_epoch": 2, "lr": 1e-4}
+    diverged = {"output_dir": "b", "seed": 1, "optim": {"epochs": 15, "lr": 1e-4}}
+    assert _resume_comparable_config(saved) != _resume_comparable_config(diverged)
+    epochs_changed = {"output_dir": "b", "seed": 0, "optim": {"epochs": 2, "lr": 1e-4}}
+    assert _resume_comparable_config(saved) != _resume_comparable_config(epochs_changed)
+
+
+def test_schedule_total_steps_ignores_stop_after_epoch() -> None:
+    # The pilot keeps optim.epochs at 15 so the first two epochs are a true
+    # prefix of the full one-cycle: same trainability mask, same LRs, same order.
+    from src.train_b0 import _count_single_process_steps
+
+    cfg = _tiny_config(epochs=4)
+    stopped = replace(cfg, optim=replace(cfg.optim, stop_after_epoch=2))
+
+    def factory(epoch: int) -> list[dict[str, torch.Tensor]]:
+        return [{"label": torch.zeros(2)}] * (epoch + 1)
+
+    assert _count_single_process_steps(factory, stopped) == _count_single_process_steps(
+        factory, cfg
+    )

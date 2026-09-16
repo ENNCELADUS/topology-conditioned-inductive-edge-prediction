@@ -252,6 +252,19 @@ def test_staged_checkpoint_allows_selection_metadata(tmp_path: Path) -> None:
     _validate_staged_artifacts(tmp_path, epochs=2, model_family="v3_1")
 
 
+def test_staged_artifact_validation_accepts_a_short_last_pt_under_stop_after_epoch(
+    tmp_path: Path,
+) -> None:
+    # The teachability pilot keeps `optim.epochs: 15` so OneCycle stays sized by
+    # `schedule_total_steps` and halts after epoch 2, so `last.pt` is a prefix.
+    _write_train_outputs(tmp_path)
+    _validate_staged_artifacts(tmp_path, epochs=15, model_family="v3_1", stop_after_epoch=2)
+    with pytest.raises(ValueError, match="epoch must equal 15"):
+        _validate_staged_artifacts(tmp_path, epochs=15, model_family="v3_1")
+    with pytest.raises(ValueError, match="epoch must equal 3"):
+        _validate_staged_artifacts(tmp_path, epochs=15, model_family="v3_1", stop_after_epoch=3)
+
+
 def test_staged_checkpoint_rejects_missing_model_state(tmp_path: Path) -> None:
     _write_train_outputs(tmp_path)
     path = tmp_path / "best.pt"

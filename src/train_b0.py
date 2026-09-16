@@ -37,6 +37,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
 from contextlib import AbstractContextManager
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import cycle, islice
@@ -292,6 +293,15 @@ class OptimConfig:
             via ``scheduler.pct_start``.
         grad_clip: Gradient-norm clip value; 0 disables clipping.
         scheduler: Optional LR-schedule override; `None` keeps warmup+constant.
+        groups: Optional per-group peak learning rates.
+        stop_after_epoch: Halt the DDP training loop after this epoch without
+            resizing the schedule. ``optim.epochs`` still sizes the one-cycle, so
+            the run is an exact prefix of the full one -- what the spec section
+            7.4 teachability pilot needs and what ``--max-steps`` cannot do,
+            because the v3_1 DDP loop ignores that flag. It is a halt point, not
+            scientific config: `config_to_dict` drops it, so a two-epoch pilot
+            and the full run share one canonical config and one config hash, and
+            the winner can be continued through the guarded resume path.
     """
 
     lr: float
@@ -301,6 +311,7 @@ class OptimConfig:
     grad_clip: float
     scheduler: SchedulerConfig | None = None
     groups: dict[str, float] | None = None
+    stop_after_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -620,6 +631,27 @@ def _build_scheduler(
     )
 
 
+def _resume_comparable_config(config: Mapping[str, object]) -> dict[str, object]:
+    """Return the config a resume compares, with the excluded keys dropped.
+
+    ``output_dir`` is an attempt path and ``optim.stop_after_epoch`` is a halt
+    point; neither changes the training function, so neither may block a resume
+    (spec section 7.4). The argument is never mutated.
+
+    Args:
+        config: A serialized training config.
+
+    Returns:
+        A deep copy without the excluded keys.
+    """
+    comparable = deepcopy(dict(config))
+    comparable.pop("output_dir", None)
+    optim_block = comparable.get("optim")
+    if isinstance(optim_block, dict):
+        optim_block.pop("stop_after_epoch", None)
+    return comparable
+
+
 def _unwrapped_model(model: nn.Module) -> nn.Module:
     """Return the underlying model when Accelerate/DDP wrapped it."""
     current = model
@@ -866,7 +898,16 @@ def load_config(path: Path) -> Config:
     optim_raw = _as_mapping(_require(raw, "optim", ""), "optim")
     _check_no_unknown_keys(
         optim_raw,
-        ("lr", "weight_decay", "epochs", "warmup_steps", "grad_clip", "scheduler", "groups"),
+        (
+            "lr",
+            "weight_decay",
+            "epochs",
+            "warmup_steps",
+            "grad_clip",
+            "scheduler",
+            "groups",
+            "stop_after_epoch",
+        ),
         "optim",
     )
     groups = None
@@ -890,9 +931,19 @@ def load_config(path: Path) -> Config:
         grad_clip=_as_float(_require(optim_raw, "grad_clip", "optim."), "optim.grad_clip"),
         scheduler=_parse_scheduler(optim_raw.get("scheduler")),
         groups=groups,
+        stop_after_epoch=(
+            None
+            if optim_raw.get("stop_after_epoch") is None
+            else _as_int(optim_raw["stop_after_epoch"], "optim.stop_after_epoch")
+        ),
     )
     if optim.epochs < 1:
         raise ValueError(f"optim.epochs must be >= 1, got {optim.epochs}")
+    if optim.stop_after_epoch is not None and not 1 <= optim.stop_after_epoch <= optim.epochs:
+        raise ValueError(
+            "optim.stop_after_epoch must lie in [1, optim.epochs], got "
+            f"{optim.stop_after_epoch} with epochs={optim.epochs}"
+        )
 
     eval_raw = _as_mapping(_require(raw, "eval", ""), "eval")
     _check_no_unknown_keys(
@@ -1157,6 +1208,9 @@ def config_to_dict(cfg: Config) -> dict[str, Any]:
         result["eval"].pop("early_stop_metric")
     # Execution context, not scientific config: it never enters the config hash.
     result.pop("run_kind", None)
+    # A halt point, not scientific config: it never enters the config hash, so a
+    # two-epoch teachability pilot and the full run share one canonical config.
+    result["optim"].pop("stop_after_epoch", None)
     return result
 
 
@@ -5644,10 +5698,8 @@ def train_ddp_loop(
             saved_config = snapshot.get("config")
             if not isinstance(saved_config, dict):
                 raise RuntimeError("resume snapshot is missing its training configuration")
-            saved_resume_config = dict(saved_config)
-            current_resume_config = config_to_dict(cfg)
-            saved_resume_config.pop("output_dir", None)
-            current_resume_config.pop("output_dir", None)
+            saved_resume_config = _resume_comparable_config(saved_config)
+            current_resume_config = _resume_comparable_config(config_to_dict(cfg))
             if saved_resume_config != current_resume_config:
                 raise ValueError("resume configuration does not match the current training run")
             if snapshot.get("world_size") != world_size:
@@ -6421,6 +6473,16 @@ def train_ddp_loop(
                     "early stopping at epoch %d (%d evals without val-task-loss improvement)",
                     epoch,
                     cfg.eval.patience,
+                )
+            break
+        # After the epoch's `training_state.pt` commit, so the prefix stays
+        # resumable and the winner can be continued rather than restarted.
+        if cfg.optim.stop_after_epoch is not None and epoch >= cfg.optim.stop_after_epoch:
+            if accelerator.is_main_process:
+                logger.info(
+                    "halting after epoch %d of %d (optim.stop_after_epoch)",
+                    epoch,
+                    cfg.optim.epochs,
                 )
             break
     if not metrics_by_epoch or last_metrics is None:
