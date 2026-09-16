@@ -20,12 +20,18 @@ from src.data.motif_template import (
     EDGE_ENDPOINTS,
     EDGE_TYPES,
     N_EDGE_TYPES,
+    N_EDGES,
     N_ROLES,
     N_SLOTS,
     SLOT_ROLES,
     SLOT_U,
     SLOT_V,
     count_statistics,
+)
+from src.model.egostitch.classifier.layers import (
+    _build_padding_mask,
+    inner_token_mask,
+    masked_mean,
 )
 from src.model.egostitch.encoder.grit_gmt import _grit_layer_cfg, _GritBatch, dense_rrwp
 from src.vendor.grit_official import GritTransformerLayer
@@ -413,3 +419,217 @@ class MotifGritReader(nn.Module):
             "topo_v": self.token_norm(self.node_proj(nodes[:, SLOT_V])),
             "topo_rel": self.token_norm(self.pair_proj(relation)),
         }
+
+
+_GATE_DIM = 96
+_BIAS_CLIP = (0.01, 0.99)
+_TYPE_MASKS = tuple(
+    torch.as_tensor([kind == edge_type for kind in EDGE_TYPES]) for edge_type in range(N_EDGE_TYPES)
+)
+
+
+def _candidate_incidence() -> torch.Tensor:
+    """Return the row-normalised ``(3, 26, 26)`` incidence of the fixed candidate template."""
+    incidence = torch.zeros(N_EDGE_TYPES, N_SLOTS, N_SLOTS)
+    for edge, (i, j) in enumerate(EDGE_ENDPOINTS):
+        incidence[EDGE_TYPES[edge], i, j] = 1.0
+        incidence[EDGE_TYPES[edge], j, i] = 1.0
+    return incidence / incidence.sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+
+class _MessageLayer(nn.Module):
+    """One shared residual message-passing layer over the fixed candidate template.
+
+    Three relation transforms, one per *edge type* -- closure, attachment and
+    interior. Both sides of a family share a transform, which is what makes the
+    whole generator equivariant under ``u<->v, L<->R`` (spec section 4).
+    """
+
+    def __init__(self, dim: int) -> None:
+        """Build the relation transforms and the update MLP.
+
+        Args:
+            dim: Slot-state width.
+        """
+        super().__init__()
+        self.relations = nn.ModuleList(nn.Linear(dim, dim) for _ in range(N_EDGE_TYPES))
+        self.update = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim)
+        )
+
+    def forward(self, h: torch.Tensor, incidence: torch.Tensor) -> torch.Tensor:
+        """Aggregate typed mean messages and apply the residual update.
+
+        Args:
+            h: ``(B, 26, dim)`` slot states.
+            incidence: ``(3, 26, 26)`` row-normalised candidate incidence per type.
+
+        Returns:
+            Updated ``(B, 26, dim)`` states.
+        """
+        messages = torch.zeros_like(h)
+        for index, relation in enumerate(self.relations):
+            messages = messages + incidence[index].to(h.dtype) @ relation(h)
+        update: torch.Tensor = self.update(messages)
+        return h + update
+
+
+class MotifGenerator(nn.Module):
+    """Residue-conditioned edge gates over the fixed template (spec section 4).
+
+    Shared slot queries read ``H_u`` and ``H_v`` separately under residue-length
+    masks: eight bridge queries used on both sides and eight witness queries read
+    on both proteins, combined through the symmetric pair ``[a_u+a_v, |a_u-a_v|]``.
+    Gate-head inputs are LayerNormed and the heads are MLPs rather than free edge
+    logits, because the predecessor arm's gate died when its input norm grew.
+
+    Slot states are assembled in the canonical slot order ``[u, v, C, L, R]``, so
+    swapping the endpoints exchanges the left and right reads with the identity
+    index map and leaves the closure states fixed. Together with the three shared
+    typed heads that is exactly the `SWAP_PERM` equivariance of spec section 4.
+
+    ``gate_mode`` carries two of the section 8 controls: ``per_type`` emits one
+    common weight per pair and edge type, and ``mean_graph`` ignores the
+    endpoints entirely and returns the installed training-mean adjacency -- in
+    that mode no generator parameter is on the autograd path, which a trainer
+    must account for before wrapping the model in DDP.
+    """
+
+    incidence: torch.Tensor
+    fixed_logits: torch.Tensor
+
+    def __init__(self, d_model: int, cfg: MotifPromptConfig) -> None:
+        """Build the attention, the gate MPNN and the three typed heads.
+
+        Args:
+            d_model: Frozen trunk width the residue states arrive in.
+            cfg: The motif-prompt block.
+        """
+        super().__init__()
+        self.cfg = cfg
+        self.residue_proj = nn.Linear(d_model, _GATE_DIM)
+        self.attention = nn.MultiheadAttention(_GATE_DIM, 4, batch_first=True)
+        self.bridge_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * 0.02)
+        self.witness_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * 0.02)
+        self.endpoint_proj = nn.Linear(_GATE_DIM, _GATE_DIM)
+        self.witness_mix = nn.Sequential(
+            nn.Linear(2 * _GATE_DIM, _GATE_DIM), nn.GELU(), nn.Linear(_GATE_DIM, _GATE_DIM)
+        )
+        self.message_layers = nn.ModuleList(_MessageLayer(_GATE_DIM) for _ in range(2))
+        self.heads = nn.ModuleList(
+            nn.Sequential(
+                nn.LayerNorm(2 * _GATE_DIM),
+                nn.Linear(2 * _GATE_DIM, _GATE_DIM),
+                nn.GELU(),
+                nn.Linear(_GATE_DIM, 1),
+            )
+            for _ in range(N_EDGE_TYPES)
+        )
+        for head in self.heads:
+            output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
+            nn.init.normal_(output.weight, std=1e-3)
+            nn.init.zeros_(output.bias)
+        self.register_buffer("fixed_logits", torch.zeros(N_EDGES))
+        self.register_buffer("incidence", _candidate_incidence())
+
+    @torch.no_grad()
+    def init_biases(self, mean_weights: torch.Tensor) -> None:
+        """Set each head's output bias from the training mean weight of its type.
+
+        The mean is clipped to ``[0.01, 0.99]`` before the logit so no head
+        starts in a saturated region of the sigmoid (spec section 4).
+
+        Args:
+            mean_weights: ``(96,)`` training-corpus mean edge weights.
+
+        Raises:
+            ValueError: On a shape mismatch.
+        """
+        if tuple(mean_weights.shape) != (N_EDGES,):
+            raise ValueError(f"mean weights must be a ({N_EDGES},) vector")
+        low, high = _BIAS_CLIP
+        clipped = mean_weights.float().clamp(low, high)
+        self.fixed_logits.copy_(torch.logit(clipped))
+        for edge_type, head in enumerate(self.heads):
+            mask = _TYPE_MASKS[edge_type]
+            output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
+            output.bias.fill_(float(torch.logit(clipped[mask].mean())))
+
+    def _read(
+        self, queries: torch.Tensor, states: torch.Tensor, pad: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Let one shared query block attend over one endpoint's residue states."""
+        expanded = queries.unsqueeze(0).expand(states.size(0), -1, -1)
+        out, _ = self.attention(expanded, states, states, key_padding_mask=pad, need_weights=False)
+        return cast(torch.Tensor, out)
+
+    def _slot_states(
+        self,
+        encoded_u: torch.Tensor,
+        encoded_v: torch.Tensor,
+        lengths_u: torch.Tensor,
+        lengths_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the ``(B, 26, 96)`` slot states in canonical slot order."""
+        pad_u = _build_padding_mask(lengths_u, encoded_u.size(1))
+        pad_v = _build_padding_mask(lengths_v, encoded_v.size(1))
+        state_u = self.residue_proj(encoded_u)
+        state_v = self.residue_proj(encoded_v)
+        left = self._read(self.bridge_queries, state_u, pad_u)
+        right = self._read(self.bridge_queries, state_v, pad_v)
+        witness_u = self._read(self.witness_queries, state_u, pad_u)
+        witness_v = self._read(self.witness_queries, state_v, pad_v)
+        closure = self.witness_mix(
+            torch.cat([witness_u + witness_v, (witness_u - witness_v).abs()], dim=-1)
+        )
+        pooled_u = self.endpoint_proj(
+            masked_mean(state_u, inner_token_mask(x=state_u, padding_mask=pad_u))
+        )
+        pooled_v = self.endpoint_proj(
+            masked_mean(state_v, inner_token_mask(x=state_v, padding_mask=pad_v))
+        )
+        # `SLOT_U`, `SLOT_V`, `C_SLOTS`, `L_SLOTS` and `R_SLOTS` are contiguous
+        # and in this order (`src.data.motif_template`), so the assembly is one
+        # concatenation and no in-place scatter into a zero tensor is needed.
+        return torch.cat(
+            [pooled_u.unsqueeze(1), pooled_v.unsqueeze(1), closure, left, right], dim=1
+        )
+
+    def forward(
+        self,
+        encoded_u: torch.Tensor,
+        encoded_v: torch.Tensor,
+        lengths_u: torch.Tensor,
+        lengths_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict the 96 edge weights of one batch of pairs.
+
+        Args:
+            encoded_u: Frozen residue states of ``u`` ``(B, L_u, d_model)``.
+            encoded_v: Frozen residue states of ``v`` ``(B, L_v, d_model)``.
+            lengths_u: True residue lengths of ``u``.
+            lengths_v: True residue lengths of ``v``.
+
+        Returns:
+            ``(B, 96)`` weights in ``[0, 1]``.
+        """
+        batch = encoded_u.size(0)
+        if self.cfg.gate_mode == "mean_graph":
+            return torch.sigmoid(self.fixed_logits).unsqueeze(0).expand(batch, -1)
+        h = self._slot_states(encoded_u, encoded_v, lengths_u, lengths_v)
+        for layer in self.message_layers:
+            h = layer(h, self.incidence)
+
+        rows = _EDGE_ROWS.to(h.device).reshape(-1)
+        cols = _EDGE_COLS.to(h.device).reshape(-1)
+        h_i, h_j = h[:, rows], h[:, cols]
+        features = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1)
+        logits = features.new_zeros(batch, N_EDGES)
+        for edge_type, head in enumerate(self.heads):
+            mask = _TYPE_MASKS[edge_type].to(h.device)
+            block = features[:, mask]
+            if self.cfg.gate_mode == "per_type":
+                logits[:, mask] = head(block.mean(dim=1)).expand(-1, int(block.size(1)))
+            else:
+                logits[:, mask] = head(block).squeeze(-1)
+        return torch.sigmoid(logits)

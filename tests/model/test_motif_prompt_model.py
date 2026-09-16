@@ -9,6 +9,7 @@ from src.model.egostitch.classifier.motif_prompt import (
     FIELD_ORDER,
     GATE_MODES,
     MotifCountHead,
+    MotifGenerator,
     MotifGritReader,
     MotifPromptConfig,
     ReaderConfig,
@@ -184,3 +185,77 @@ def test_final_layer_edge_parameters_receive_gradient() -> None:
     o_e = params[f"layers.{len(reader.layers) - 1}.O_e.weight"]
     assert o_e.grad is not None and float(o_e.grad.abs().sum()) > 0.0
     assert reader.pair_proj.weight.grad is not None
+
+
+def _generator(seed: int = 0, **extra: object) -> MotifGenerator:
+    torch.manual_seed(seed)
+    cfg = MotifPromptConfig.from_mapping(
+        {"stage": "two", "base_checkpoint": "b.pt", "bundle_checkpoint": "s.pt", **extra}
+    )
+    return MotifGenerator(d_model=32, cfg=cfg).eval()
+
+
+def _states(n: int = 4, length: int = 7, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(n, length, 32, generator=gen), torch.full((n,), length, dtype=torch.long)
+
+
+def test_generator_emits_96_weights_in_the_unit_interval() -> None:
+    generator = _generator()
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    weights = generator(h_u, h_v, len_u, len_v).detach()
+    assert weights.shape == (4, 96)
+    assert float(weights.min()) >= 0.0 and float(weights.max()) <= 1.0
+
+
+def test_generator_is_equivariant_under_swapping_the_endpoints() -> None:
+    generator = _generator()
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    forward = generator(h_u, h_v, len_u, len_v)
+    reverse = generator(h_v, h_u, len_v, len_u)
+    torch.testing.assert_close(reverse, forward[:, list(SWAP_PERM)], rtol=1e-5, atol=1e-5)
+
+
+def test_output_biases_start_at_the_clipped_training_mean_in_logit_space() -> None:
+    generator = _generator()
+    mean = torch.full((96,), 0.001)
+    mean[16:32] = 0.4
+    generator.init_biases(mean)
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    weights = generator(h_u, h_v, len_u, len_v)
+    # Clipped to [0.01, 0.99] before the logit, so nothing saturates.
+    assert float(weights[:, :16].mean()) < 0.2
+    assert 0.2 < float(weights[:, 16:32].mean()) < 0.8
+
+
+def test_per_type_and_mean_graph_gate_modes_realise_their_controls() -> None:
+    per_type = _generator(gate_mode="per_type")
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    weights = per_type(h_u, h_v, len_u, len_v)
+    for block in (slice(0, 16), slice(16, 32), slice(32, 96)):
+        assert float(weights[:, block].std(dim=1).abs().max()) == pytest.approx(0.0, abs=1e-6)
+    mean_graph = _generator(gate_mode="mean_graph")
+    mean_graph.init_biases(torch.full((96,), 0.3))
+    fixed = mean_graph(h_u, h_v, len_u, len_v)
+    assert float(fixed.std(dim=0).abs().max()) == pytest.approx(0.0, abs=1e-6)
+    assert float(fixed.mean()) == pytest.approx(0.3, abs=1e-6)
+
+
+def test_gradients_reach_every_generator_parameter_on_a_non_degenerate_batch() -> None:
+    torch.manual_seed(2)
+    cfg = MotifPromptConfig.from_mapping(
+        {"stage": "two", "base_checkpoint": "b.pt", "bundle_checkpoint": "s.pt"}
+    )
+    generator = MotifGenerator(d_model=32, cfg=cfg)
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    generator(h_u, h_v, len_u, len_v).sum().backward()
+    missing = [name for name, p in generator.named_parameters() if p.grad is None]
+    assert missing == []
+    assert all(
+        p.grad is not None and torch.isfinite(p.grad).all() for _, p in generator.named_parameters()
+    )
