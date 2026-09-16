@@ -16,7 +16,14 @@ from typing import cast
 import torch
 from torch import nn
 
-from src.data.motif_template import count_statistics
+from src.data.motif_template import (
+    EDGE_ENDPOINTS,
+    EDGE_TYPES,
+    N_EDGE_TYPES,
+    N_SLOTS,
+    count_statistics,
+)
+from src.model.egostitch.encoder.grit_gmt import dense_rrwp
 
 FIELD_ORDER = ("topo_self", "topo_partner", "topo_rel", "topo_cnt")
 TEMPLATE_KEY = "motif_weights"
@@ -226,3 +233,70 @@ class MotifCountHead(nn.Module):
             )
             token: torch.Tensor = self.proj(features.float())
             return token.float()
+
+
+_EDGE_ROWS = torch.as_tensor([i for i, _ in EDGE_ENDPOINTS], dtype=torch.long).view(1, -1)
+_EDGE_COLS = torch.as_tensor([j for _, j in EDGE_ENDPOINTS], dtype=torch.long).view(1, -1)
+_EDGE_TYPE_IDS = torch.as_tensor(EDGE_TYPES, dtype=torch.long).view(1, -1)
+
+
+def dense_adjacency(weights: torch.Tensor) -> torch.Tensor:
+    """Scatter the 96 weights into a symmetric ``(B, 26, 26)`` adjacency.
+
+    Every unlisted entry, the diagonal and the queried ``u-v`` entry stay exactly
+    zero (spec section 2).
+
+    Args:
+        weights: ``(B, 96)`` edge weights.
+
+    Returns:
+        ``(B, 26, 26)`` symmetric adjacency in ``weights``' dtype.
+    """
+    batch = weights.size(0)
+    index = torch.arange(batch, device=weights.device).view(-1, 1)
+    rows = _EDGE_ROWS.to(weights.device)
+    cols = _EDGE_COLS.to(weights.device)
+    adj = weights.new_zeros(batch, N_SLOTS, N_SLOTS).index_put((index, rows, cols), weights)
+    return adj + adj.transpose(1, 2)
+
+
+def typed_adjacency(weights: torch.Tensor) -> torch.Tensor:
+    """Scatter the weights into a symmetric ``(B, 26, 26, 3)`` typed adjacency.
+
+    Args:
+        weights: ``(B, 96)`` edge weights.
+
+    Returns:
+        ``(B, 26, 26, 3)`` typed adjacency summing to `dense_adjacency`.
+    """
+    batch = weights.size(0)
+    index = torch.arange(batch, device=weights.device).view(-1, 1)
+    rows = _EDGE_ROWS.to(weights.device)
+    cols = _EDGE_COLS.to(weights.device)
+    types = _EDGE_TYPE_IDS.to(weights.device)
+    typed = weights.new_zeros(batch, N_SLOTS, N_SLOTS, N_EDGE_TYPES).index_put(
+        (index, rows, cols, types), weights
+    )
+    return typed + typed.transpose(1, 2)
+
+
+def motif_rrwp(adj: torch.Tensor, k: int) -> torch.Tensor:
+    """Compute the RRWP stack in fp32 with autocast explicitly disabled.
+
+    Verified on torch 2.10: ``torch.bmm`` and ``@`` return bf16 from *fp32*
+    inputs inside an active autocast context, so feeding `dense_rrwp` an fp32
+    tensor is not sufficient -- the whole call must run with autocast disabled
+    (spec section 5.2). `dense_rrwp` clamps the degree at ``1e-6`` and keeps the
+    autograd chain alive for a learned generator's exactly-zero adjacency; the
+    ``mask`` argument is deliberately not passed, because all 26 slots exist in
+    both stages (spec section 2).
+
+    Args:
+        adj: ``(B, 26, 26)`` untyped adjacency in any dtype.
+        k: Number of stacked walk orders, including the identity term.
+
+    Returns:
+        ``(B, 26, 26, k)`` float32 RRWP stack.
+    """
+    with torch.autocast(device_type=adj.device.type, enabled=False):
+        return dense_rrwp(adj.float(), k).float()
