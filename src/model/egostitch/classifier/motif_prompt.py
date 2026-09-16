@@ -13,6 +13,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import cast
 
+import torch
+from torch import nn
+
+from src.data.motif_template import count_statistics
+
 FIELD_ORDER = ("topo_self", "topo_partner", "topo_rel", "topo_cnt")
 TEMPLATE_KEY = "motif_weights"
 TEMPLATE_MASK_KEY = "motif_mask"
@@ -172,3 +177,52 @@ class MotifPromptConfig:
     def to_dict(self) -> dict[str, object]:
         """Return the block as a plain mapping (checkpoint-embeddable)."""
         return cast(dict[str, object], asdict(self))
+
+
+class MotifCountHead(nn.Module):
+    """The retained closed-form count pathway (spec section 5.1).
+
+    Reads the same predicted adjacency as the reader and emits one token from
+    four swap-invariant statistics: ``log1p`` wedge mass, ``log1p`` bridge mass,
+    the sum and the absolute difference of the two ``log1p`` degrees. The degree
+    pair never enters as ``[deg_u, deg_v]``, which would not be invariant under
+    ``u<->v``.
+    """
+
+    def __init__(self, width: int) -> None:
+        """Build the single linear map.
+
+        Args:
+            width: Token width.
+        """
+        super().__init__()
+        self.proj = nn.Linear(4, width)
+
+    def forward(self, weights: torch.Tensor) -> torch.Tensor:
+        """Return the ``(B, width)`` count token, always in float32.
+
+        The arithmetic runs with autocast disabled rather than merely on fp32
+        inputs: inside an active autocast context the matmul of the projection
+        would return bf16 from fp32 operands (spec section 5.1).
+
+        Args:
+            weights: ``(B, 96)`` predicted edge weights.
+
+        Returns:
+            The ``(B, width)`` count token in float32.
+        """
+        with torch.autocast(device_type=weights.device.type, enabled=False):
+            stats = count_statistics(weights.float())
+            log_u = torch.log1p(stats["deg_u"])
+            log_v = torch.log1p(stats["deg_v"])
+            features = torch.stack(
+                [
+                    torch.log1p(stats["wedge_mass"]),
+                    torch.log1p(stats["bridge_mass"]),
+                    log_u + log_v,
+                    (log_u - log_v).abs(),
+                ],
+                dim=-1,
+            )
+            token: torch.Tensor = self.proj(features.float())
+            return token.float()

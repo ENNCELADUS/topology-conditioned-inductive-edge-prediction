@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import pytest
+import torch
+from src.data.motif_template import SWAP_PERM
 from src.model.egostitch.classifier.motif_prompt import (
     FIELD_ORDER,
     GATE_MODES,
+    MotifCountHead,
     MotifPromptConfig,
     ReaderConfig,
 )
@@ -53,3 +56,27 @@ def test_config_validation_rejects_illegal_blocks() -> None:
 
 def test_gate_modes_are_the_three_spec_controls() -> None:
     assert GATE_MODES == ("learned", "per_type", "mean_graph")
+
+
+def _weights(n: int = 4, seed: int = 0) -> torch.Tensor:
+    gen = torch.Generator().manual_seed(seed)
+    return torch.rand(n, 96, generator=gen)
+
+
+def test_count_head_is_exactly_swap_invariant() -> None:
+    torch.manual_seed(0)
+    head = MotifCountHead(width=16)
+    weights = _weights()
+    swapped = weights[:, list(SWAP_PERM)]
+    torch.testing.assert_close(head(weights), head(swapped), rtol=0, atol=1e-6)
+
+
+def test_count_head_runs_in_fp32_under_autocast_and_stays_finite_at_zero() -> None:
+    head = MotifCountHead(width=16)
+    zero = torch.zeros(3, 96, requires_grad=True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        out = head(zero)
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert zero.grad is not None and torch.isfinite(zero.grad).all()
