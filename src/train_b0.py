@@ -713,6 +713,35 @@ def _set_topo_gen_training_stage(
     generator_group["lr"] = base_lr * (distill.gen_lr_scale if topo_gen.joint_stage else 1.0)
 
 
+def _set_motif_prompt_training_stage(
+    model: nn.Module, optimizer: torch.optim.Optimizer, *, epoch: int
+) -> None:
+    """Open the motif-prompt interface group after its warm-up epochs (spec section 7.5).
+
+    Every parameter that is ever trainable keeps ``requires_grad`` from
+    construction, so DDP registers and all-reduces it on every rank; the warm-up
+    freeze is the ``interface`` group's learning rate, which AdamW's decoupled
+    weight decay also multiplies, making ``lr = 0`` an exact freeze. The gate is
+    applied after every scheduler step, because OneCycleLR rewrites
+    ``group["lr"]`` on each step. Every other family is left untouched.
+
+    Args:
+        model: The (possibly DDP-wrapped) model.
+        optimizer: The prepared optimizer.
+        epoch: The 1-based epoch about to run.
+    """
+    raw_model = _unwrapped_model(model)
+    if not isinstance(raw_model, V3_1MotifPrompt):
+        return
+    warmup = raw_model.cfg.interface_warmup_epochs
+    raw_model.interface_open = (
+        True if raw_model.cfg.stage == "one" else warmup is not None and epoch > warmup
+    )
+    for group in optimizer.param_groups:
+        if group.get("name") == "interface" and not raw_model.interface_open:
+            group["lr"] = 0.0
+
+
 def _count_single_process_steps(factory: LoaderFactory, cfg: Config) -> int:
     """Count exact optimizer steps across all epochs for the single-process loop.
 
@@ -1898,6 +1927,7 @@ def train_loop(
             epoch=epoch,
             total_epochs=cfg.optim.epochs,
         )
+        _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
         last_epoch = epoch
         model.train()
         losses: list[float] = []
@@ -1918,6 +1948,7 @@ def train_loop(
                 epoch=epoch,
                 total_epochs=cfg.optim.epochs,
             )
+            _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
             global_step += 1
             losses.append(float(loss.detach().float().item()))
             if global_step % 50 == 0:
@@ -5769,6 +5800,7 @@ def train_ddp_loop(
             epoch=epoch,
             total_epochs=cfg.optim.epochs,
         )
+        _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
         model.train()
         local_loss_sum = 0.0
         local_loss_weight = 0.0
@@ -5935,6 +5967,8 @@ def train_ddp_loop(
                 epoch=epoch,
                 total_epochs=cfg.optim.epochs,
             )
+            # After the scheduler, which has just rewritten every group's LR.
+            _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
             if start_event is not None and end_event is not None:
                 end_event.record()  # type: ignore[no-untyped-call]
                 cuda_event_pairs.append((start_event, end_event))

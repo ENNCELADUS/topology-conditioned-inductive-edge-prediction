@@ -13,11 +13,12 @@ import torch
 from src.data.motif_template import MotifTemplateTable
 from src.data.struct_sampler import StructSubgraph
 from src.model.egostitch.classifier.b0_v31 import V3_1
-from src.model.egostitch.classifier.motif_prompt import V3_1MotifPrompt
+from src.model.egostitch.classifier.motif_prompt import TEMPLATE_KEY, V3_1MotifPrompt
 from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 from src.train_b0 import Config, ModelConfig, StructStream, TrainResult
 
-from tests.test_prefix_model import _tiny_base_config
+from tests.model.test_motif_prompt_model import _model, _open_gates, _weights
+from tests.test_prefix_model import _pair_batch, _tiny_base_config
 from tests.test_train_b0 import _constant_metrics, _tiny_config
 from tests.test_train_b0_struct import (
     _stream,
@@ -496,3 +497,83 @@ def test_stage_one_refuses_a_formal_run_and_stage_two_refuses_a_diagnostic_one()
     _assert_motif_run_kind(stage="two", run_kind="formal")
     with pytest.raises(RuntimeError, match="deployable"):
         _assert_motif_run_kind(stage="two", run_kind="diagnostic")
+
+
+# ------------------------------------------------- stage trainability (task 18)
+
+
+def test_the_interface_group_is_frozen_for_the_warmup_epochs_and_opens_after() -> None:
+    from src.train_b0 import _set_motif_prompt_training_stage
+
+    model = _model("two", interface_warmup_epochs=2)
+    optimizer = torch.optim.AdamW(model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2))
+    names = [group["name"] for group in optimizer.param_groups]
+    assert names == ["generator", "interface"]
+    for epoch in (1, 2):
+        for group in optimizer.param_groups:
+            group["lr"] = 3e-4  # what OneCycleLR would have just written
+        _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
+        assert optimizer.param_groups[0]["lr"] == 3e-4
+        assert optimizer.param_groups[1]["lr"] == 0.0
+        assert model.interface_open is False
+    for group in optimizer.param_groups:
+        group["lr"] = 3e-4
+    _set_motif_prompt_training_stage(model, optimizer, epoch=3)
+    assert optimizer.param_groups[1]["lr"] == 3e-4
+    assert model.interface_open is True
+
+
+def test_a_null_warmup_freezes_the_interface_for_every_epoch() -> None:
+    from src.train_b0 import _set_motif_prompt_training_stage
+
+    model = _model("two", interface_warmup_epochs=None)
+    optimizer = torch.optim.AdamW(model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2))
+    for epoch in (1, 3, 15):
+        optimizer.param_groups[1]["lr"] = 3e-4
+        _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
+        assert optimizer.param_groups[1]["lr"] == 0.0
+        assert model.interface_open is False
+
+
+def test_the_interface_weights_do_not_move_during_the_warmup_epochs() -> None:
+    from src.train_b0 import _set_motif_prompt_training_stage
+
+    model = _model("two", interface_warmup_epochs=2)
+    model.initialize_teacher()
+    _open_gates(model)
+    optimizer = torch.optim.AdamW(model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2))
+    before = model.reader.node_proj.weight.detach().clone()
+    generator_before = next(model.generator.parameters()).detach().clone()  # type: ignore[union-attr]
+    for group in optimizer.param_groups:
+        group["lr"] = 1e-3
+    _set_motif_prompt_training_stage(model, optimizer, epoch=1)
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    output = model(batch)
+    total = output["loss"] + output["slot_loss_rows"].mean() + output["topo_loss_rows"].mean()
+    total.backward()
+    optimizer.step()
+    torch.testing.assert_close(model.reader.node_proj.weight, before, rtol=0, atol=0)
+    assert model.generator is not None
+    assert not torch.equal(next(model.generator.parameters()), generator_before)
+
+
+def test_stage_one_leaves_the_reader_open_from_epoch_one() -> None:
+    from src.train_b0 import _set_motif_prompt_training_stage
+
+    model = _model("one")
+    optimizer = torch.optim.AdamW(model.optimizer_parameter_groups(1e-4, 1e-4, 1e-2))
+    optimizer.param_groups[0]["lr"] = 2e-4
+    _set_motif_prompt_training_stage(model, optimizer, epoch=1)
+    assert model.interface_open is True
+    assert optimizer.param_groups[0]["lr"] == 2e-4
+
+
+def test_the_stage_hook_ignores_every_other_family() -> None:
+    from src.train_b0 import _set_motif_prompt_training_stage
+
+    model = V3_1(**_tiny_base_config())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer.param_groups[0]["lr"] = 5e-4
+    _set_motif_prompt_training_stage(model, optimizer, epoch=1)
+    assert optimizer.param_groups[0]["lr"] == 5e-4
