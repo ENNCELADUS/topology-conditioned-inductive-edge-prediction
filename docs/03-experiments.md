@@ -397,7 +397,7 @@ study; they do not change the shared checkpoint selector or add runtime failure 
 | Fixed | Value | Reason |
 |---|---|---|
 | split, negative stream, positive weight | split seed 42, dynamic 1:5, weight 5 | evaluation/training protocol; run seeds are separate |
-| coordinate spec / generator | v1 (34 columns), MLP for the v2 factorial; v2 (8 continuous + 3 distance indicators), virtual graph for `virtual_prompt_d`; training-statistics standardisation | fixed per arm, never searched; structural pairs use the full training table |
+| coordinate spec / generator | v1 (34 columns), MLP for the v2 factorial; v3 (6 continuous + 3 distance indicators), repaired virtual graph for `virtual_prompt_v2_d`; training-statistics standardisation | fixed per arm, never searched; structural pairs use the full training table |
 | coordinate reduction | Huber in nonself training-standard-deviation units, averaged over continuous coordinates, plus distance cross-entropy; self rows excluded | reader units unchanged; self rows retain task/KD supervision |
 | prompt geometry | width 128, two slots per field, nine sites, zero-init gates | same established interface |
 | structural sampler | default 32 local + 8 background nodes; bfs/motif/bridge 0.5/0.25/0.25; one subgraph per step; subgraph BCE 1.0 | only total nodes, frequency and added-term scales vary below |
@@ -410,13 +410,23 @@ study; they do not change the shared checkpoint selector or add runtime failure 
 | KD form | pointwise soft-target BCE; anchor masked-softmax KL; immutable Stage I teacher on true coordinates | anchor temperature alone controls distribution shape |
 | representation KD and teacher-soft degree matching | zero in first wave | deferred matched ablations |
 
-The [virtual topology design](superpowers/specs/2026-09-15-virtual-topology-prompt-design.md)
-adds the fixed two-run chain `topo_prompt_full_v3` (compact true-coordinate ceiling) →
-`virtual_prompt_d` (endpoint-only student, D objective). The compact reader uses three
-fields and six prefix rows at each of nine sites. The student learns 64 coarse nodes,
-residue-attention attachments and symmetric pair gates, initialized from the legal training
-graph. `slot_gates_open` disables only its coarse-node gates; `mean_context` is unavailable
-on the compact spec. Neither coordinate semantics nor generator type is a search dimension.
+The [virtual topology repair](superpowers/specs/2026-09-16-virtual-topology-prompt-repair-design.md)
+uses the fixed two-run chain `topo_prompt_full_v4` (true-coordinate ceiling) →
+`virtual_prompt_v2_d` (endpoint-only student, D objective plus weight-1 attachment loss).
+The new v3 spec removes endpoint clustering: six continuous quantities and three distance
+indicators use three fields and six prefix rows at each of nine sites. Clustering MMD remains
+an evaluation metric. A fresh reader and fresh training statistics are required.
+
+The student uses 256 spectral blocks of the feature-present legal training graph, fixed block
+sizes/densities and fixed encoder-mean prototypes. Shared-projection residue attention and
+explicit slot matching predict neighbour counts, continuously supervised only on the ordinary
+edge stream. This auxiliary target is the full legal training-neighbour count; coordinate
+supervision remains queried-edge-removed. Pair gates and coordinate affine calibration are
+removed. `gates_off` still disables reader prompt gates; `mean`, `mean_relation` and `shuffle`
+remain prediction interventions. `mean_context` is unavailable on v2/v3. Neither coordinate
+semantics nor generator type is a search dimension. The older v2 virtual design is historical;
+its generator checkpoints are read on their original branch. No training has been launched
+for the repair, and a production-size memory/throughput check precedes any future launch.
 
 ### 6.2 The hyperparameters
 

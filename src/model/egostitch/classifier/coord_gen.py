@@ -26,7 +26,7 @@ from src.data.struct_coords import (
 )
 from src.model.egostitch.classifier.b0_v31 import unpack_pair_batch
 from src.model.egostitch.classifier.layers import _build_padding_mask, masked_max, masked_mean
-from src.model.egostitch.classifier.topo_prompt import COORDS_KEY, V3_1TopoPrompt
+from src.model.egostitch.classifier.topo_prompt import COORDS_KEY, INTERVENTIONS, V3_1TopoPrompt
 from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
 
 DISTANCE_NAMES: tuple[str, ...] = ("dist_2", "dist_3", "dist_4plus", "dist_inf")
@@ -71,10 +71,9 @@ def distance_class_targets(coords: torch.Tensor, spec: str = COORD_SPEC) -> torc
 class VirtualGraphConfig:
     """Fixed size and attention choices of the coarse graph."""
 
-    k: int = 64
+    k: int = 256
     d_z: int = 128
     heads: int = 4
-    gate_bias: float = 3.0
 
     def __post_init__(self) -> None:
         if self.k <= 0 or self.d_z <= 0 or self.heads <= 0 or self.d_z % self.heads:
@@ -152,8 +151,8 @@ class CoordGenConfig:
         get_coord_spec(self.coord_spec)
         if self.generator not in ("mlp", "virtual_graph"):
             raise ValueError("coord_gen.generator must be mlp or virtual_graph")
-        if self.generator == "virtual_graph" and self.coord_spec != "v2":
-            raise ValueError("virtual_graph requires coord_spec v2")
+        if self.generator == "virtual_graph" and self.coord_spec != "v3":
+            raise ValueError("virtual_graph requires coord_spec v3")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> CoordGenConfig:
@@ -179,10 +178,9 @@ class CoordGenConfig:
         if unknown_graph:
             raise ValueError(f"unknown virtual_graph keys: {sorted(unknown_graph)}")
         graph_cfg = VirtualGraphConfig(
-            k=int(graph.get("k", 64)),
+            k=int(graph.get("k", 256)),
             d_z=int(graph.get("d_z", 128)),
             heads=int(graph.get("heads", 4)),
-            gate_bias=float(graph.get("gate_bias", 3.0)),
         )
         sha = raw.get("reader_checkpoint_sha256")
         return cls(
@@ -338,7 +336,6 @@ class V3_1CoordGen(nn.Module):
                 k=graph_cfg.k,
                 d_z=graph_cfg.d_z,
                 heads=graph_cfg.heads,
-                gate_bias=graph_cfg.gate_bias,
             )
         else:
             self.generator = CoordinateGenerator(self.d_model, self.cfg)
@@ -438,26 +435,15 @@ class V3_1CoordGen(nn.Module):
     @property
     def intervention(self) -> str:
         """The reader's scoring-time intervention (applied to the predicted coordinates)."""
-        if (
-            isinstance(self.generator, VirtualGraphGenerator)
-            and self.generator.intervention != "none"
-        ):
-            return self.generator.intervention
         return self.reader.intervention
 
     @intervention.setter
     def intervention(self, value: str) -> None:
-        if value == "slot_gates_open":
-            if not isinstance(self.generator, VirtualGraphGenerator):
-                raise ValueError("slot_gates_open requires a virtual_graph checkpoint")
-            self.generator.intervention = value
-            self.reader.intervention = "none"
-        else:
-            if value == "mean_context" and not self.spec.context_dim:
-                raise ValueError("mean_context is unavailable for coord_spec v2")
-            if isinstance(self.generator, VirtualGraphGenerator):
-                self.generator.intervention = "none"
-            self.reader.intervention = value
+        if value not in INTERVENTIONS:
+            raise ValueError(f"unsupported coordinate intervention {value!r}")
+        if value == "mean_context" and not self.spec.context_dim:
+            raise ValueError("mean_context is unavailable without a context field")
+        self.reader.intervention = value
 
     def train(self, mode: bool = True) -> V3_1CoordGen:
         """Train the generator and interface while the frozen trunk and teacher stay in eval.
@@ -677,7 +663,31 @@ class V3_1CoordGen(nn.Module):
             rep_row = 1 - F.cosine_similarity(student_repr.float(), teacher_repr.float(), dim=-1)
             total_row = total_row + self.cfg.w_kd_rep * rep_row
             output["kd_rep_loss"] = rep_row.detach().mean()
+        if isinstance(self.generator, VirtualGraphGenerator) and "attachment_target_u" in merged:
+            attachment_rows = []
+            for side in ("u", "v"):
+                prediction = parts[f"attachment_counts_{side}"]
+                target = merged[f"attachment_target_{side}"].to(prediction.device)
+                if (target < 0).any():
+                    raise ValueError(
+                        "attachment supervision requires feature-present training nodes"
+                    )
+                attachment_rows.append(self.generator.attachment_loss_rows(prediction, target))
+            attachment_row = (attachment_rows[0] + attachment_rows[1]) * 0.5
+            # Node-prior supervision has equal endpoint/row weight, independent of label weights.
+            output["attachment_loss"] = attachment_row.mean()
+            for name, positive in (("nonzero", True), ("zero", False)):
+                errors = []
+                for side in ("u", "v"):
+                    prediction = parts[f"attachment_counts_{side}"]
+                    target = merged[f"attachment_target_{side}"].to(prediction.device)
+                    mask = target > 0 if positive else target == 0
+                    error = (prediction.log1p() - target.log1p()).abs()
+                    errors.append((error * mask).sum(1) / mask.sum(1).clamp_min(1))
+                output[f"attachment_{name}_error"] = ((errors[0] + errors[1]) * 0.5).detach().mean()
         output["loss"] = (weights * total_row).sum() / weight_sum
+        if "attachment_loss" in output:
+            output["loss"] = output["loss"] + output["attachment_loss"]
         output["loss_weight_sum"] = weight_sum
         output["task_loss"] = ((weights * bce_row).sum() / weight_sum).detach()
         return output

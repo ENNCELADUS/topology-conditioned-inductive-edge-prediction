@@ -29,6 +29,8 @@ Spec ``v2`` keeps degree and clustering per endpoint, common neighbours,
 Jaccard, L3 and L3 density, and merges the distant/disconnected indicator.
 Its three fields occupy eleven columns (eight continuous, three indicators);
 it does not compute the dropped walk and shell products.
+Spec ``v3`` also drops endpoint clustering, leaving nine columns (six
+continuous, three indicators) in the same three fields.
 
 Non-edges are read from dense all-pairs products; edges are recomputed exactly
 on the edge-deleted graph (`StructCoordinateTable._exact_pair`), which is also
@@ -179,10 +181,10 @@ def get_coord_spec(name: str = COORD_SPEC) -> CoordinateSpec:
     """Resolve a supported coordinate layout, preserving v1 defaults."""
     if name == "v1":
         return CoordinateSpec(name, ENDPOINT_NAMES, RELATION_NAMES, CONTEXT_NAMES)
-    if name == "v2":
+    if name in {"v2", "v3"}:
         return CoordinateSpec(
             name,
-            ENDPOINT_NAMES[:2],
+            ENDPOINT_NAMES[:2] if name == "v2" else ENDPOINT_NAMES[:1],
             ("log1p_common", "jaccard", "log1p_l3", "l3_density", "dist_2", "dist_3", "dist_4plus"),
             (),
         )
@@ -239,7 +241,7 @@ class StructCoordinateTable:
 
         Args:
             graph: A simple, loopless `networkx.Graph`; isolated nodes are kept.
-            spec: Checkpoint coordinate layout (v1 or compact v2).
+            spec: Checkpoint coordinate layout (v1, compact v2 or v3).
 
         Raises:
             ValueError: If the graph has a self-loop or no nodes.
@@ -267,7 +269,7 @@ class StructCoordinateTable:
         self.degree: NDArray[np.float64] = (
             np.asarray(adjacency.sum(axis=1)).reshape(-1).astype(np.float64)
         )
-        if self.spec.name == "v2":
+        if self.spec.name in {"v2", "v3"}:
             self._common = (adjacency @ adjacency).toarray().astype(np.float32)
             self._l3 = np.asarray(self._common @ adjacency, dtype=np.float32)
             self._triangles = np.diagonal(self._l3).astype(np.float64) / 2.0
@@ -356,12 +358,15 @@ class StructCoordinateTable:
         distance: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Assemble compact counts with the same numerical conventions as v1."""
+        endpoint_u = [_log1p(degree_u)]
+        endpoint_v = [_log1p(degree_v)]
+        if self.spec.name == "v2":
+            endpoint_u.append(_safe_divide(2 * triangles_u, degree_u * (degree_u - 1)))
+            endpoint_v.append(_safe_divide(2 * triangles_v, degree_v * (degree_v - 1)))
         return np.stack(
             [
-                _log1p(degree_u),
-                _safe_divide(2 * triangles_u, degree_u * (degree_u - 1)),
-                _log1p(degree_v),
-                _safe_divide(2 * triangles_v, degree_v * (degree_v - 1)),
+                *endpoint_u,
+                *endpoint_v,
                 _log1p(common),
                 _safe_divide(common, degree_u + degree_v - common),
                 _log1p(l3),
@@ -408,7 +413,7 @@ class StructCoordinateTable:
         union = degree_u + degree_v - common
         l3 = self._l3[u, v].astype(np.float64)
         distance = self._distance[u, v].astype(np.float64)
-        if self.spec.name == "v2":
+        if self.spec.name in {"v2", "v3"}:
             return self._compact(
                 degree_u, degree_v, self._triangles[u], self._triangles[v], common, l3, distance
             )
@@ -474,7 +479,7 @@ class StructCoordinateTable:
         Also correct for non-edges (nothing is removed), which is how the tests
         pin the dense path to this reference.
         """
-        if self.spec.name == "v2":
+        if self.spec.name in {"v2", "v3"}:
             return self._compact_exact_pair(u, v)
         n = self.size
         adjacency = self.adjacency

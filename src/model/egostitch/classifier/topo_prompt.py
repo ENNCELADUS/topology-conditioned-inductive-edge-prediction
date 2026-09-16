@@ -531,7 +531,7 @@ class V3_1TopoPrompt(nn.Module):
         if self.intervention == "gates_off":
             return z, 0.0
         if self.intervention == "mean_context" and not self.generator.spec.context_dim:
-            raise ValueError("mean_context is unavailable: coord_spec v2 has no context field")
+            raise ValueError("mean_context is unavailable without a context field")
         fields = {
             "mean": self.generator.spec.fields,
             "mean_endpoint": ("endpoint_u", "endpoint_v"),

@@ -65,14 +65,18 @@ selected method. Every piece of writing must explain how its context helps decid
   C/D add rank/degree/motif. `struct.scale` scales only those added terms, never subgraph BCE.
   Study defaults and search order are `docs/03-experiments.md` §6; no v2 study has been launched.
   The earlier Stage I/II configs remain v1 comparisons; Stages III/IV are retired.
-- Virtual topology prompt (`coord_spec: v2`, design
-  `docs/superpowers/specs/2026-09-15-virtual-topology-prompt-design.md`): `topo_prompt_full_v3`
-  retrains the corruption-trained Stage I ceiling on 8 continuous coordinates and 3 distance
-  indicators, three fields/six prefix rows. `virtual_prompt_d` uses the v2 D objective with
-  a 64-node training-graph coarsening, residue-attention attachments, symmetric pair gates and
-  closed-form counts. It scores from endpoints alone; `slot_gates_open` sets coarse-node
-  gates to one. `mean_context` is invalid on v2. Coordinate loss excludes self rows and scales
-  continuous residuals by nonself training standard deviations; task/KD retain self rows.
+- Virtual topology prompt repair (`coord_spec: v3`, design
+  `docs/superpowers/specs/2026-09-16-virtual-topology-prompt-repair-design.md`): `topo_prompt_full_v4`
+  retrains the corruption-trained Stage I ceiling on 6 continuous coordinates and 3 distance
+  indicators (no clustering), three fields/six prefix rows. `virtual_prompt_v2_d` uses the D
+  objective plus fixed-weight 1 attachment supervision on the ordinary edge stream only.
+  Its 256-block spectral coarsening has fixed sizes, densities and encoder-mean prototypes;
+  shared-projection residue attention and explicit slot matching predict neighbour counts.
+  There is no pair gate or coordinate affine calibration. Scoring remains endpoint-only;
+  `mean_context` is invalid on v2/v3. Coordinate loss excludes self rows and scales continuous
+  residuals by nonself training standard deviations; task/KD retain self rows. Clustering
+  MMD remains an evaluation metric. The older virtual design and checkpoints are historical
+  and remain readable on their original branch; no old-generator compatibility path exists.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

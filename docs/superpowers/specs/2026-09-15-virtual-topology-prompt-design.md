@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-15
 **Version:** v0.5 (supersedes v0.4 of the same day; change log in §12)
-**Status:** implemented and reviewed on 2026-09-15; approved two-run launch chain. No scientific results yet.
+**Status:** historical implementation record, superseded by the [2026-09-16 repair](2026-09-16-virtual-topology-prompt-repair-design.md). Commands, model fields and conclusions below describe the old branch and are not the active contract.
 **Reads on:** `docs/superpowers/specs/2026-09-13-topology-prompt-two-stage-v2-design.md` (the v2 recipe this design plugs into),
 `docs/results/topo_prompt_stage2_verdict/README.md` (the Stage II verdict), `docs/results/topo_prompt_stage2_curves/` (the probe dump).
 
@@ -236,8 +236,8 @@ Outcomes:
   removes part of it: the coarse graph carries pair-relevant structure. Replicate seeds 1–2, then test.
 - Topology improves but every intervention row is within noise of the main row: the gain is density calibration
   from per-node attachment; write it as that.
-- No V_val topology change: the training-graph coarsening does not make pair structure more predictable from
-  attributes. The generator route is closed on this evidence and the reader side becomes the next object.
+- No V_val topology change: this historical implementation did not improve the measured topology. This
+  observation does not establish that endpoint structure is unpredictable or close the generator route.
 
 ## 8. Implementation checks
 

@@ -34,7 +34,7 @@ def _reader_config(spec: str = "v1") -> dict[str, object]:
 
 def _tiny_coord_gen(generator: str = "mlp") -> V3_1CoordGen:
     torch.manual_seed(0)
-    spec = "v2" if generator == "virtual_graph" else "v1"
+    spec = "v3" if generator == "virtual_graph" else "v1"
     model = V3_1CoordGen(
         reader=_reader_config(spec),
         coord_gen={
@@ -46,6 +46,20 @@ def _tiny_coord_gen(generator: str = "mlp") -> V3_1CoordGen:
             "virtual_graph": {"k": 4, "d_z": 8, "heads": 2},
         },
     )
+    if generator == "virtual_graph":
+        # Simulate a learned nonconstant matcher; zero-init count heads intentionally
+        # predict each slot's prior before any training.
+        from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
+
+        assert isinstance(model.generator, VirtualGraphGenerator)
+        with torch.no_grad():
+            model.generator.prototypes.normal_()
+            model.generator.slot_bias.fill_(0.0)
+            model.generator.multiplicity.fill_(10.0)
+            model.generator.adjacency.fill_(0.2)
+            head = model.generator.attachment[-1]
+            assert isinstance(head, torch.nn.Linear)
+            head.weight.normal_(std=2.0)
     dim = get_coord_spec(spec).coord_dim
     model.reader.generator.set_coord_stats(torch.zeros(dim), torch.ones(dim), 5)
     with torch.no_grad():
@@ -186,32 +200,32 @@ def test_coordinate_transplant_substitutes_the_source_pair_prediction(
     np.testing.assert_allclose(packed, reference.numpy().reshape(-1), rtol=0.0, atol=1e-5)
 
 
-def test_cli_accepts_virtual_graph_slot_gate_intervention() -> None:
-    args = score_universe.build_parser().parse_args(
-        [
-            "score",
-            "--checkpoint",
-            "virtual.pt",
-            "--pairs",
-            "val_cls",
-            "--output",
-            "scores.npz",
-            "--prefix-intervention",
-            "slot_gates_open",
-        ]
-    )
-    assert args.prefix_intervention == "slot_gates_open"
+def test_cli_rejects_virtual_graph_slot_gate_intervention() -> None:
+    with pytest.raises(SystemExit):
+        score_universe.build_parser().parse_args(
+            [
+                "score",
+                "--checkpoint",
+                "virtual.pt",
+                "--pairs",
+                "val_cls",
+                "--output",
+                "scores.npz",
+                "--prefix-intervention",
+                "slot_gates_open",
+            ]
+        )
 
 
 def test_shuffle_bank_preserves_compact_coordinates_and_row_order() -> None:
-    predictions = torch.arange(44, dtype=torch.float32).reshape(4, 11)
+    predictions = torch.arange(36, dtype=torch.float32).reshape(4, 9)
     bank = score_universe._coord_gen_source_coords(
-        [[2, 0], [3, 1]], lambda rows: predictions[rows], num_rows=4, coord_dim=11
+        [[2, 0], [3, 1]], lambda rows: predictions[rows], num_rows=4, coord_dim=9
     )
     torch.testing.assert_close(bank, predictions)
 
 
 def test_slot_gate_intervention_refuses_mlp_checkpoint() -> None:
     model = _tiny_coord_gen()
-    with pytest.raises(ValueError, match="virtual_graph"):
+    with pytest.raises(ValueError):
         model.intervention = "slot_gates_open"

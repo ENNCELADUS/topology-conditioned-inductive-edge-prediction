@@ -1,4 +1,4 @@
-"""A learned training-graph coarsening behind the compact coordinate interface."""
+"""Fixed training-graph coarsening with supervised, endpoint-only attachments."""
 
 from __future__ import annotations
 
@@ -11,45 +11,50 @@ from torch.nn import functional as F
 
 
 class VirtualGraphGenerator(nn.Module):
-    """Attend from shared coarse nodes to residues and count pair topology."""
+    """Match protein residues to fixed block prototypes and count pair topology."""
 
     coord_mean: torch.Tensor
     coord_std: torch.Tensor
+    prototypes: torch.Tensor
+    multiplicity: torch.Tensor
+    adjacency: torch.Tensor
 
     def __init__(
         self,
         d_model: int,
         *,
-        k: int = 64,
+        k: int = 256,
         d_z: int = 128,
         heads: int = 4,
-        gate_bias: float = 3.0,
         coord_mean: torch.Tensor | None = None,
         coord_std: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
-        self.k = k
-        self.P = nn.Parameter(torch.randn(k, d_z) / d_z**0.5)
+        if k < 1 or d_z < 1 or heads < 1 or d_z % heads:
+            raise ValueError("positive dimensions and d_z divisible by heads are required")
+        self.k, self.heads = k, heads
+        self.register_buffer("prototypes", torch.zeros(k, d_model))
+        self.register_buffer("multiplicity", torch.ones(k))
+        self.register_buffer("adjacency", torch.zeros(k, k))
         self.residue_projection = nn.Linear(d_model, d_z)
-        self.attention = nn.MultiheadAttention(d_z, heads, batch_first=True)
-        self.attachment = nn.Linear(d_z, 1)
-        self.m_raw = nn.Parameter(torch.ones(k))
-        self.B_logits = nn.Parameter(torch.zeros(k, k))
-        self.W = nn.Linear(2 * d_model, d_z)
-        self.phi = nn.Sequential(nn.Linear(4 * d_z, d_z), nn.GELU(), nn.Linear(d_z, 1))
-        nn.init.constant_(cast(nn.Linear, self.phi[-1]).bias, gate_bias)
-        # Degree/clustering share their calibration across endpoint roles.
-        self.cal_scale = nn.Parameter(torch.ones(6))
-        self.cal_shift = nn.Parameter(torch.zeros(6))
+        self.attachment = nn.Sequential(nn.Linear(4 * d_z, d_z), nn.GELU(), nn.Linear(d_z, 1))
+        nn.init.zeros_(cast(nn.Linear, self.attachment[-1]).weight)
+        nn.init.zeros_(cast(nn.Linear, self.attachment[-1]).bias)
+        self.slot_bias = nn.Parameter(torch.full((k,), float(torch.tensor(0.01).expm1().log())))
         self.distance_head = nn.Linear(3, 4)
         self.register_buffer(
             "coord_mean",
-            torch.zeros(11) if coord_mean is None else coord_mean.detach().float().clone(),
+            torch.zeros(9) if coord_mean is None else coord_mean.detach().float().clone(),
         )
         self.register_buffer(
-            "coord_std", torch.ones(11) if coord_std is None else coord_std.detach().float().clone()
+            "coord_std", torch.ones(9) if coord_std is None else coord_std.detach().float().clone()
         )
-        self.intervention = "none"
+        if self.coord_mean.shape != (9,) or self.coord_std.shape != (9,):
+            raise ValueError("virtual graph requires nine v3 coordinate statistics")
+        if not torch.isfinite(self.coord_mean).all() or not torch.isfinite(self.coord_std).all():
+            raise ValueError("coordinate statistics must be finite")
+        if (self.coord_std <= 0).any():
+            raise ValueError("coordinate standard deviations must be positive")
         self._telemetry: dict[str, torch.Tensor] = {}
 
     def reset_telemetry(self) -> None:
@@ -63,33 +68,25 @@ class VirtualGraphGenerator(nn.Module):
 
     @torch.no_grad()
     def telemetry(self, *, reset: bool = False) -> dict[str, torch.Tensor]:
-        """Return additive eval sums (reduce across ranks before taking means).
-
-        Attachment sums and entropy sums have one entry per coarse node, with
-        ``attachment_count`` endpoint observations. Gate sums use ``gate_count``
-        pairs. ``adjacency_entropy`` is a parameter statistic, identical across
-        ranks, and must not be summed across ranks.
-        """
+        """Additive attachment statistics; reduce ranks before taking means."""
         result = {name: value.clone() for name, value in self._telemetry.items()}
-        for prefix in ("attachment", "gate"):
-            for suffix in ("sum", "entropy_sum"):
-                result.setdefault(f"{prefix}_{suffix}", self.P.new_zeros(self.k))
-            result.setdefault(f"{prefix}_count", self.P.new_zeros(()))
-        result["adjacency_entropy"] = self._entropy(self.adjacency).mean()
+        for suffix in ("sum", "entropy_sum"):
+            result.setdefault(f"attachment_{suffix}", self.prototypes.new_zeros(self.k))
+        result.setdefault("attachment_count", self.prototypes.new_zeros(()))
         if reset:
             self.reset_telemetry()
         return result
 
     @torch.no_grad()
-    def _record(self, a: torch.Tensor, b: torch.Tensor, gates: torch.Tensor) -> None:
-        for prefix, values in (("attachment", torch.cat((a, b))), ("gate", gates)):
-            additions = {
-                f"{prefix}_sum": values.sum(0),
-                f"{prefix}_entropy_sum": self._entropy(values).sum(0),
-                f"{prefix}_count": values.new_tensor(values.size(0)),
-            }
-            for key, value in additions.items():
-                self._telemetry[key] = self._telemetry.get(key, torch.zeros_like(value)) + value
+    def _record(self, a: torch.Tensor, b: torch.Tensor) -> None:
+        values = torch.cat((a, b))
+        additions = {
+            "attachment_sum": values.sum(0),
+            "attachment_entropy_sum": self._entropy(values).sum(0),
+            "attachment_count": values.new_tensor(values.size(0)),
+        }
+        for key, value in additions.items():
+            self._telemetry[key] = self._telemetry.get(key, torch.zeros_like(value)) + value
 
     @torch.no_grad()
     def initialise(
@@ -97,23 +94,28 @@ class VirtualGraphGenerator(nn.Module):
         pooled_states: torch.Tensor,
         assignments: torch.Tensor,
         adjacency: torch.Tensor | csr_matrix,
-        mean_degree: float,
     ) -> None:
-        """Install seeded clusters and legal loopless training block densities.
+        """Install masked-mean prototypes, loopless densities and count biases.
 
-        ``adjacency`` accepts a dense tensor or scipy sparse matrix; its row
-        order must match pooled states and assignments. Cluster every node.
+        Input rows cover precisely the feature-present legal training graph.
+        Per-block mean neighbor counts determine the initial count bias.
         """
-        device = self.P.device
+        device = self.prototypes.device
         pools = pooled_states.to(device=device, dtype=torch.float32)
         labels = assignments.to(device=device, dtype=torch.long)
+        if pools.shape != (labels.numel(), self.prototypes.size(1)) or labels.ndim != 1:
+            raise ValueError("prototype states and assignments must have matching rows")
+        if labels.numel() == 0 or (labels < 0).any() or (labels >= self.k).any():
+            raise ValueError("assignments must index the configured blocks")
         sizes = torch.bincount(labels, minlength=self.k).float()
-        if sizes.numel() != self.k or (sizes == 0).any():
+        if (sizes == 0).any():
             raise ValueError("virtual graph initialisation requires every cluster to be nonempty")
-        centroids = torch.zeros(self.k, pools.size(1), device=device)
+        if adjacency.shape != (labels.numel(), labels.numel()):
+            raise ValueError("training adjacency must match prototype rows")
+        centroids = torch.zeros_like(self.prototypes)
         centroids.index_add_(0, labels, pools)
-        self.P.copy_(self.W(centroids / sizes[:, None]))
-        self.m_raw.copy_(sizes + torch.log(-torch.expm1(-sizes)))
+        self.prototypes.copy_(centroids / sizes[:, None])
+        self.multiplicity.copy_(sizes)
         if isinstance(adjacency, torch.Tensor):
             row, col = adjacency.nonzero(as_tuple=True)
         else:
@@ -123,22 +125,23 @@ class VirtualGraphGenerator(nn.Module):
         keep = row != col
         ids = labels[row[keep]] * self.k + labels[col[keep]]
         edge_counts = torch.bincount(ids, minlength=self.k**2).reshape(self.k, self.k).float()
+        if not torch.equal(edge_counts, edge_counts.T):
+            raise ValueError("training adjacency must be undirected")
         pair_counts = sizes[:, None] * sizes[None, :] - torch.diag(sizes)
-        density = (edge_counts / pair_counts.clamp_min(1)).clamp(1e-4, 1 - 1e-4)
-        self.B_logits.copy_(torch.logit(density))
-        probability = torch.tensor(mean_degree, device=device) / sizes.sum()
-        self.attachment.bias.copy_(torch.logit(probability.clamp(1e-6, 1 - 1e-6)).reshape(1))
+        self.adjacency.copy_(edge_counts / pair_counts.clamp_min(1))
+        mean_counts = (edge_counts.sum(0) / labels.numel()).clamp_min(0.01)
+        self.slot_bias.copy_(mean_counts + torch.log(-torch.expm1(-mean_counts)))
 
     @staticmethod
     def pool(encoded: torch.Tensor, lengths: torch.Tensor | None) -> torch.Tensor:
-        """Masked mean/max summaries used only by the query gate."""
+        """Masked-mean encoder states for fixed semantic prototype construction."""
         keep = torch.ones(encoded.shape[:2], dtype=torch.bool, device=encoded.device)
         if lengths is not None:
             keep = torch.arange(encoded.size(1), device=encoded.device)[None] < lengths[:, None]
-        states = encoded.float()
-        mean = states.masked_fill(~keep[..., None], 0).sum(1) / keep.sum(1).clamp_min(1)[:, None]
-        maximum = states.masked_fill(~keep[..., None], -torch.inf).amax(1)
-        return torch.cat((mean, maximum), -1)
+        return (
+            encoded.float().masked_fill(~keep[..., None], 0).sum(1)
+            / keep.sum(1).clamp_min(1)[:, None]
+        )
 
     def forward(
         self,
@@ -147,37 +150,18 @@ class VirtualGraphGenerator(nn.Module):
         lengths_a: torch.Tensor | None,
         lengths_b: torch.Tensor | None,
     ) -> dict[str, torch.Tensor]:
-        """Emit standardised compact fields and four distance-class logits."""
+        """Emit six standardized continuous coordinates and distance logits."""
         with torch.autocast(device_type=encoded_a.device.type, enabled=False):
-            a, b = self.attach(encoded_a, lengths_a), self.attach(encoded_b, lengths_b)
-            u, v = self.W(self.pool(encoded_a, lengths_a)), self.W(self.pool(encoded_b, lengths_b))
-            pair = torch.cat((u + v, (u - v).abs(), u * v), -1)
-            gates = (
-                self.phi(
-                    torch.cat(
-                        (
-                            pair[:, None].expand(-1, self.k, -1),
-                            self.P[None].expand(pair.size(0), -1, -1),
-                        ),
-                        -1,
-                    )
-                )
-                .squeeze(-1)
-                .sigmoid()
-            )
-            if self.intervention == "slot_gates_open":
-                gates = torch.ones_like(gates)
-            elif self.intervention != "none":
-                raise ValueError(f"unsupported virtual graph intervention {self.intervention!r}")
+            nu = self.attachment_counts(encoded_a, lengths_a)
+            nv = self.attachment_counts(encoded_b, lengths_b)
+            a, b = nu / self.multiplicity, nv / self.multiplicity
             if not self.training:
-                self._record(a, b, gates)
-            c = self.count(a * gates, b * gates)
+                self._record(a, b)
+            c = self.count(a, b)
             raw = torch.stack(
                 (
                     c["degree_u"].log1p(),
-                    c["clustering_u"],
                     c["degree_v"].log1p(),
-                    c["clustering_v"],
                     c["common"].log1p(),
                     c["jaccard"],
                     c["l3"].log1p(),
@@ -185,9 +169,7 @@ class VirtualGraphGenerator(nn.Module):
                 ),
                 -1,
             )
-            scale = torch.cat((self.cal_scale[:2], self.cal_scale[:2], self.cal_scale[2:]))
-            shift = torch.cat((self.cal_shift[:2], self.cal_shift[:2], self.cal_shift[2:]))
-            z = (raw * scale + shift - self.coord_mean[:8]) / self.coord_std[:8]
+            z = (raw - self.coord_mean[:6]) / self.coord_std[:6]
             distance = self.distance_head(
                 torch.stack(
                     (
@@ -199,49 +181,27 @@ class VirtualGraphGenerator(nn.Module):
                 )
             )
             return {
-                "endpoint_u": z[:, :2],
-                "endpoint_v": z[:, 2:4],
-                "relation": z[:, 4:8],
+                "endpoint_u": z[:, :1],
+                "endpoint_v": z[:, 1:2],
+                "relation": z[:, 2:6],
                 "distance_logits": distance,
+                "attachment_counts_u": nu,
+                "attachment_counts_v": nv,
             }
 
-    @property
-    def multiplicity(self) -> torch.Tensor:
-        """Positive effective block sizes."""
-        return F.softplus(self.m_raw)
-
-    @property
-    def adjacency(self) -> torch.Tensor:
-        """Symmetric block probabilities, including within-block density."""
-        return ((self.B_logits + self.B_logits.T) * 0.5).sigmoid()
-
     def count(self, a: torch.Tensor, b: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Count loopless lifted-graph motifs from effective attachments.
-
-        Fractional degrees need a bounded clustering extension: zero below
-        degree two's singular boundary, and at most one above it. Fractional
-        blocks below one likewise contain zero distinct within-block pairs.
-        Both agree with ordinary graph counts for integer binary lifts.
-        """
+        """Loopless lifted-graph counts with distinct within-block node pairs."""
         with torch.autocast(device_type=a.device.type, enabled=False):
             a, b = a.float(), b.float()
             m = self.multiplicity.float()
-            pairs = m[:, None] * m[None, :]
-            pairs = pairs - torch.diag(m.square()) + torch.diag((m * (m - 1)).clamp_min(0))
+            pairs = m[:, None] * m[None, :] - torch.diag(m)
             edges = pairs * self.adjacency.float()
             du, dv = a @ m, b @ m
-            tu, tv = (a @ edges * a).sum(-1) * 0.5, (b @ edges * b).sum(-1) * 0.5
-            cu = torch.where(du > 1, 2 * tu / (du * (du - 1)).clamp_min(1e-8), 0.0).clamp(0, 1)
-            cv = torch.where(dv > 1, 2 * tv / (dv * (dv - 1)).clamp_min(1e-8), 0.0).clamp(0, 1)
             common = (a * b * m).sum(-1)
             l3 = (a @ edges * b).sum(-1)
             return {
                 "degree_u": du,
                 "degree_v": dv,
-                "triangles_u": tu,
-                "triangles_v": tv,
-                "clustering_u": cu,
-                "clustering_v": cv,
                 "common": common,
                 "jaccard": common / (du + dv - common).clamp_min(1e-8),
                 "l3": l3,
@@ -249,27 +209,40 @@ class VirtualGraphGenerator(nn.Module):
             }
 
     def attach(self, encoded: torch.Tensor, lengths: torch.Tensor | None) -> torch.Tensor:
-        """Return per-protein attachments, ignoring padded residues."""
-        return self.attachment_logits(encoded, lengths).sigmoid()
+        """Per-protein block probabilities, independent of the queried partner."""
+        return self.attachment_counts(encoded, lengths) / self.multiplicity
 
-    def attachment_logits(
+    def attachment_counts(
         self, encoded: torch.Tensor, lengths: torch.Tensor | None
     ) -> torch.Tensor:
-        """Return raw logits for exact startup calibration of the scalar bias."""
+        """Shared normalized Q/K matching, with no independent Q/K projections."""
         with torch.autocast(device_type=encoded.device.type, enabled=False):
-            pad = (
-                None
-                if lengths is None
-                else (
-                    torch.arange(encoded.size(1), device=encoded.device)[None] >= lengths[:, None]
-                )
-            )
             states = self.residue_projection(encoded.float())
-            output, _ = self.attention(
-                self.P[None].expand(encoded.size(0), -1, -1),
-                states,
-                states,
-                key_padding_mask=pad,
-                need_weights=False,
+            prototypes = self.residue_projection(self.prototypes.float())
+            batch, residues, width = states.shape
+            q = F.normalize(prototypes.reshape(self.k, self.heads, -1), dim=-1)
+            kv = F.normalize(states.reshape(batch, residues, self.heads, -1), dim=-1)
+            scores = 4.0 * torch.einsum("khd,blhd->bhkl", q, kv)
+            if lengths is not None:
+                if (lengths <= 0).any() or (lengths > residues).any():
+                    raise ValueError("attachment requires nonempty valid residue lengths")
+                pad = torch.arange(residues, device=encoded.device)[None] >= lengths[:, None]
+                scores = scores.masked_fill(pad[:, None, None, :], -torch.inf)
+            output = torch.einsum("bhkl,blhd->bkhd", scores.softmax(-1), kv).reshape(
+                batch, self.k, width
             )
-            return cast(torch.Tensor, self.attachment(output).squeeze(-1))
+            p = q.reshape(self.k, width)[None].expand(batch, -1, -1)
+            features = torch.cat((output, p, output * p, (output - p).abs()), -1)
+            raw = cast(torch.Tensor, self.attachment(features)).squeeze(-1) + self.slot_bias
+            return torch.minimum(F.softplus(raw), self.multiplicity)
+
+    @staticmethod
+    def attachment_loss_rows(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Equal-weight nonzero/zero block Huber means for each endpoint row."""
+        errors = F.huber_loss(predicted.float().log1p(), target.float().log1p(), reduction="none")
+        positive = target > 0
+        positive_n, zero_n = positive.sum(-1), (~positive).sum(-1)
+        positive_mean = (errors * positive).sum(-1) / positive_n.clamp_min(1)
+        zero_mean = (errors * ~positive).sum(-1) / zero_n.clamp_min(1)
+        groups = (positive_n > 0).float() + (zero_n > 0).float()
+        return (positive_mean + zero_mean) / groups.clamp_min(1)

@@ -11,6 +11,7 @@ from src.data.struct_coords import (
     FIELD_SLICES,
     StructCoordinateTable,
     coordinate_statistics,
+    get_coord_spec,
     reference_pair_coords,
 )
 
@@ -196,3 +197,49 @@ def test_compact_statistics_pool_endpoint_roles() -> None:
     np.testing.assert_array_equal(std[:2], std[2:4])
     assert mean[0] == 1.0
     assert std[0] == pytest.approx(np.sqrt(2.0))
+
+
+@pytest.mark.parametrize("seed", [0, 21])
+def test_v3_projects_v2_for_edges_non_edges_self_and_disconnected_pairs(seed: int) -> None:
+    graph = _random_graph(seed, n=12, p=0.3)
+    pairs = [(u, v) for u in graph for v in graph]
+    old_spec = get_coord_spec("v2")
+    spec = get_coord_spec("v3")
+    table = StructCoordinateTable(graph, spec="v3")
+    expected = StructCoordinateTable(graph, spec="v2").coords(pairs)
+    columns = [old_spec.coord_names.index(name) for name in spec.coord_names]
+    actual = table.coords(pairs)
+    np.testing.assert_array_equal(actual, expected[:, columns])
+    assert actual.shape == (len(pairs), 9)
+    assert spec.fields == ("endpoint_u", "endpoint_v", "relation")
+    assert spec.continuous_indices == tuple(range(6))
+    assert spec.distance_indices == (6, 7, 8)
+    assert spec.self_distance_class == 3
+    assert table.coords([]).shape == (0, 9)
+    swapped = table.coords([(v, u) for u, v in pairs])
+    np.testing.assert_array_equal(actual[:, 0], swapped[:, 1])
+    np.testing.assert_array_equal(actual[:, 1], swapped[:, 0])
+    np.testing.assert_array_equal(actual[:, 2:], swapped[:, 2:])
+    for row, (u, v) in enumerate(pairs):
+        np.testing.assert_allclose(
+            actual[row], table._exact_pair(table.index[u], table.index[v]), atol=1e-6
+        )
+        if u == v:
+            assert actual[row, 6:].sum() == 0
+
+
+def test_v3_removes_queried_edge_before_measuring_and_pools_endpoint_statistics() -> None:
+    graph = nx.Graph([("a", "b"), ("b", "c"), ("c", "a"), ("a", "d")])
+    actual = StructCoordinateTable(graph, spec="v3").coords([("a", "b")])
+    graph.remove_edge("a", "b")
+    expected = StructCoordinateTable(graph, spec="v3").coords([("a", "b")])
+    np.testing.assert_array_equal(actual, expected)
+    assert actual[0, 0] == pytest.approx(np.log1p(2))
+    assert actual[0, 1] == pytest.approx(np.log1p(1))
+    assert actual[0, 6] == 1  # The removed edge leaves a common neighbour.
+    coords = np.zeros((5, 9), dtype=np.float32)
+    coords[:, 0] = np.arange(5)
+    mean, std = coordinate_statistics(coords, spec="v3")
+    assert mean[0] == mean[1] == 1
+    assert std[0] == std[1] == pytest.approx(np.sqrt(2.0))
+    np.testing.assert_array_equal(std[2:], np.ones(7))

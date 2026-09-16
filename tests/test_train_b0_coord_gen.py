@@ -271,7 +271,7 @@ def test_compact_coordinate_fit_reports_only_present_fields(generator: str) -> N
         val_cls_pairs=[("v0", "v1"), ("v0", "v3")],
         universe_pairs=[],
         device=torch.device("cpu"),
-        spec="v2",
+        spec="v3",
     )
     reader_config = {
         "base": _tiny_base_config(),
@@ -280,20 +280,20 @@ def test_compact_coordinate_fit_reports_only_present_fields(generator: str) -> N
             "width": 8,
             "slots_per_field": 1,
             "field_mask_prob": 0.0,
-            "coord_spec": "v2",
+            "coord_spec": "v3",
         },
     }
     model = V3_1CoordGen(
         reader=reader_config,
         coord_gen={
-            "coord_spec": "v2",
+            "coord_spec": "v3",
             "hidden": 16,
             "generator": generator,
             "virtual_graph": {"k": 2, "d_z": 8, "heads": 2},
         },
     )
     model.reader.generator.set_coord_stats(
-        torch.zeros(get_coord_spec("v2").coord_dim), torch.ones(get_coord_spec("v2").coord_dim), 2
+        torch.zeros(get_coord_spec("v3").coord_dim), torch.ones(get_coord_spec("v3").coord_dim), 2
     )
     model.initialize_teacher()
     metrics = _coordinate_fit_metrics(
@@ -302,7 +302,7 @@ def test_compact_coordinate_fit_reports_only_present_fields(generator: str) -> N
     if generator == "virtual_graph":
         assert 0 <= metrics["val_virtual_attachment_mean"] <= 1
         assert metrics["val_virtual_usage_0"] >= 0
-        assert 0 <= metrics["val_virtual_gate_mean"] <= 1
+        assert "val_virtual_gate_mean" not in metrics
     assert "val_coord_r2_context" not in metrics
     assert "val_coord_r2_endpoint" in metrics and "val_coord_r2_relation" in metrics
     assert all(np.isfinite(value) for value in metrics.values())
@@ -320,7 +320,7 @@ def _virtual_initialisation_fixture() -> tuple[TopoPromptRows, object, V3_1Coord
         val_cls_pairs=[],
         universe_pairs=[],
         device=torch.device("cpu"),
-        spec="v2",
+        spec="v3",
     )
     node_ids = [*rows.train_table.nodes, "held_out"]
     manifest = PackedFeatureManifest(
@@ -343,10 +343,10 @@ def _virtual_initialisation_fixture() -> tuple[TopoPromptRows, object, V3_1Coord
     model = V3_1CoordGen(
         reader={
             "base": _tiny_base_config(),
-            "topo_prompt": {"trainable": "all", "coord_spec": "v2"},
+            "topo_prompt": {"trainable": "all", "coord_spec": "v3"},
         },
         coord_gen={
-            "coord_spec": "v2",
+            "coord_spec": "v3",
             "generator": "virtual_graph",
             "virtual_graph": {"k": 2, "d_z": 8, "heads": 2},
         },
@@ -406,7 +406,12 @@ def _virtual_initialisation_worker(rank: int, root: str) -> None:
             model, rows, cast(PackedFeatureTable, table), accelerator, seed=13
         )
         torch.save(
-            {"state": model.state_dict(), "metadata": metadata}, Path(root) / f"rank-{rank}.pt"
+            {
+                "state": model.state_dict(),
+                "metadata": metadata,
+                "attachment_targets": rows.attachment_targets,
+            },
+            Path(root) / f"rank-{rank}.pt",
         )
     finally:
         dist.destroy_process_group()
@@ -419,6 +424,9 @@ def test_virtual_initialisation_broadcast_and_checkpoint_round_trip(tmp_path: Pa
     left = torch.load(tmp_path / "rank-0.pt", weights_only=True)
     right = torch.load(tmp_path / "rank-1.pt", weights_only=True)
     assert left["metadata"] == right["metadata"]
+    torch.testing.assert_close(
+        left["attachment_targets"], right["attachment_targets"], rtol=0, atol=0
+    )
     for key, value in left["state"].items():
         if key.startswith("generator.") or key == "coordinate_scale":
             torch.testing.assert_close(value, right["state"][key], rtol=0, atol=0)
@@ -457,29 +465,134 @@ def test_virtual_initialisation_omits_featureless_nodes_without_changing_targets
     assert torch.equal(rows.train, original_targets)
 
 
-def test_virtual_initial_attachment_mean_matches_training_density() -> None:
+def test_virtual_initialisation_installs_fixed_graph_and_node_prior_targets() -> None:
+    from sklearn.cluster import SpectralClustering
     from src.data.packed_features import PackedFeatureTable
     from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
     from src.train_b0 import initialise_virtual_graph
 
-    torch.manual_seed(91)
     rows, packed, model = _virtual_initialisation_fixture()
     table = cast(PackedFeatureTable, packed)
     generator = cast(VirtualGraphGenerator, model.generator)
-    weight_before = generator.attachment.weight.detach().clone()
-    metadata = initialise_virtual_graph(model, rows, table, Accelerator(cpu=True), seed=13)
-    model.eval()
-    attachments = []
-    with torch.no_grad():
-        for node in rows.train_table.nodes:
-            index = table.manifest.node_index()[node]
-            tokens, lengths = table.gather_nodes(
-                torch.tensor([index]), table.manifest.nodes[index].length
+    initialise_virtual_graph(model, rows, table, Accelerator(cpu=True), seed=13)
+    adjacency = rows.train_table.adjacency.astype(np.float64)
+    labels = SpectralClustering(
+        n_clusters=2,
+        n_components=2,
+        affinity="precomputed",
+        assign_labels="cluster_qr",
+        eigen_solver="arpack",
+        random_state=13,
+    ).fit_predict(adjacency)
+    membership = np.eye(2)[labels]
+    sizes = membership.sum(0)
+    expected = torch.tensor(adjacency @ membership, dtype=torch.float32)
+    assert rows.attachment_targets is not None
+    torch.testing.assert_close(rows.attachment_targets, expected)
+    torch.testing.assert_close(generator.multiplicity, torch.tensor(sizes, dtype=torch.float32))
+    denominator = sizes[:, None] * sizes[None, :] - np.diag(sizes)
+    density = np.divide(
+        membership.T @ adjacency @ membership,
+        denominator,
+        out=np.zeros((2, 2)),
+        where=denominator > 0,
+    )
+    torch.testing.assert_close(generator.adjacency, torch.tensor(density, dtype=torch.float32))
+    assert "multiplicity" in dict(generator.named_buffers())
+    assert "adjacency" in dict(generator.named_buffers())
+    assert rows.attachment_targets.shape[0] == len(rows.train_table.nodes)
+    assert "held_out" not in rows.train_table.nodes
+
+    batch = {"_row_id": torch.tensor([1, 0])}
+    rows.attach_train(batch)
+    for column, side in enumerate(("u", "v")):
+        torch.testing.assert_close(
+            batch[f"attachment_target_{side}"],
+            expected[rows.train_endpoint_indices[[1, 0], column]],
+        )
+    validation = {"_row_id": torch.empty(0, dtype=torch.long)}
+    rows.attach_val(validation)
+    assert not any(key.startswith("attachment_target") for key in validation)
+
+
+@pytest.mark.parametrize("cut", [1, 2, 4])
+def test_composite_ddp_loss_matches_global_gradient_with_unequal_partitions(cut: int) -> None:
+    from src.train_b0 import _scale_training_loss
+    from torch.nn import functional as F
+
+    torch.manual_seed(73)
+    model = torch.nn.Linear(3, 2)
+    features = torch.randn(5, 3)
+    labels = torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0])
+    counts = torch.tensor([0.0, 2.0, 1.0, 0.0, 3.0])
+    weights = 1 + 4 * labels
+
+    def output(start: int, stop: int) -> dict[str, torch.Tensor]:
+        logits = model(features[start:stop])
+        w = weights[start:stop]
+        task = (
+            F.binary_cross_entropy_with_logits(logits[:, 0], labels[start:stop], reduction="none")
+            * w
+        ).sum() / w.sum()
+        attachment = F.huber_loss(F.softplus(logits[:, 1]).log1p(), counts[start:stop].log1p())
+        return {
+            "loss": task + attachment,
+            "attachment_loss": attachment,
+            "loss_weight_sum": w.sum(),
+        }
+
+    global_objective = output(0, 5)["loss"]
+    expected = torch.autograd.grad(global_objective, tuple(model.parameters()))
+    partitioned = torch.stack(
+        [
+            _scale_training_loss(
+                output(start, stop),
+                local_count=stop - start,
+                global_count=5,
+                world_size=2,
+                global_weight=weights.sum(),
             )
-            attachments.append(generator.attach(model.encoder(tokens, lengths), lengths))
-    observed = float(torch.cat(attachments).mean())
-    target = float(rows.train_table.degree.mean()) / len(rows.train_table.nodes)
-    assert observed == pytest.approx(target, abs=1e-7)
-    assert metadata["initial_attachment_mean"] == pytest.approx(target, abs=1e-7)
-    assert metadata["initial_attachment_target"] == pytest.approx(target)
-    assert torch.equal(generator.attachment.weight, weight_before)
+            / 2
+            for start, stop in ((0, cut), (cut, 5))
+        ]
+    ).sum()
+    actual = torch.autograd.grad(partitioned, tuple(model.parameters()))
+    torch.testing.assert_close(partitioned, global_objective)
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right)
+
+
+def test_virtual_resume_reuses_saved_partition_without_reclustering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.data.packed_features import PackedFeatureTable
+    from src.train_b0 import initialise_virtual_graph
+
+    rows, table, model = _virtual_initialisation_fixture()
+    metadata = initialise_virtual_graph(
+        model, rows, cast(PackedFeatureTable, table), Accelerator(cpu=True), seed=13
+    )
+    torch.save(
+        {"model_state": model.state_dict(), "virtual_graph": metadata},
+        tmp_path / "training_state.pt",
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("resume must not refit spectral clusters")
+
+    monkeypatch.setattr("sklearn.cluster.SpectralClustering.fit_predict", forbidden)
+    restored_rows, restored_table, restored = _virtual_initialisation_fixture()
+    restored_metadata = initialise_virtual_graph(
+        restored,
+        restored_rows,
+        cast(PackedFeatureTable, restored_table),
+        Accelerator(cpu=True),
+        seed=99,
+        resume_attempt=tmp_path,
+    )
+    assert restored_metadata == metadata
+    assert rows.attachment_targets is not None
+    assert restored_rows.attachment_targets is not None
+    torch.testing.assert_close(rows.attachment_targets, restored_rows.attachment_targets)
+    for key, value in model.generator.state_dict().items():
+        torch.testing.assert_close(value, restored.generator.state_dict()[key])

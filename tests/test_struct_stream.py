@@ -30,7 +30,7 @@ def _virtual_steps(rank: int, world: int) -> dict[str, torch.Tensor]:
         val_cls_pairs=[],
         universe_pairs=[],
         device=torch.device("cpu"),
-        spec="v2",
+        spec="v3",
     )
     base = _tiny_base_config()
     base["regularization"] = dict.fromkeys(cast(dict[str, object], base["regularization"]), 0.0)
@@ -40,7 +40,7 @@ def _virtual_steps(rank: int, world: int) -> dict[str, torch.Tensor]:
         reader={
             "base": base,
             "topo_prompt": {
-                "coord_spec": "v2",
+                "coord_spec": "v3",
                 "trainable": "all",
                 "width": 8,
                 "slots_per_field": 1,
@@ -48,7 +48,7 @@ def _virtual_steps(rank: int, world: int) -> dict[str, torch.Tensor]:
             },
         },
         coord_gen={
-            "coord_spec": "v2",
+            "coord_spec": "v3",
             "generator": "virtual_graph",
             "w_anchor": 1.0,
             "virtual_graph": {"k": 4, "d_z": 8, "heads": 2},

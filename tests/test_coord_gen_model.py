@@ -253,21 +253,21 @@ def test_compact_student_scores_with_three_fields_and_four_distance_classes() ->
 
 def test_virtual_student_round_trip_and_training_keep_teacher_frozen() -> None:
     reader = _reader_config()
-    reader["topo_prompt"] = {**cast(dict[str, object], reader["topo_prompt"]), "coord_spec": "v2"}
+    reader["topo_prompt"] = {**cast(dict[str, object], reader["topo_prompt"]), "coord_spec": "v3"}
     config = {
-        "coord_spec": "v2",
+        "coord_spec": "v3",
         "generator": "virtual_graph",
         "virtual_graph": {"k": 3, "d_z": 8, "heads": 2},
     }
     model = V3_1CoordGen(reader=reader, coord_gen=config)
-    model.reader.generator.set_coord_stats(torch.zeros(11), torch.ones(11), 10)
+    model.reader.generator.set_coord_stats(torch.zeros(9), torch.ones(9), 10)
     model.initialize_teacher()
     with torch.no_grad():
         model.reader.generator.gates.fill_(0.2)
     batch = _pair_batch()
-    coords = torch.rand(len(batch["label"]), 11)
-    coords[:, 8:] = 0
-    coords[:, 8] = 1
+    coords = torch.rand(len(batch["label"]), 9)
+    coords[:, 6:] = 0
+    coords[:, 6] = 1
     model.install_coordinate_scale(coords)
     model.train()
     with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -285,11 +285,27 @@ def test_virtual_student_round_trip_and_training_keep_teacher_frozen() -> None:
     model.eval()
     rebuilt.eval()
     torch.testing.assert_close(model(batch)["logits"], rebuilt(batch)["logits"])
-    model.intervention = "slot_gates_open"
-    assert model.intervention == "slot_gates_open"
-    assert torch.isfinite(model(batch)["logits"]).all()
-    with pytest.raises(ValueError, match="virtual"):
-        _model().intervention = "slot_gates_open"
+    with pytest.raises(ValueError):
+        model.intervention = "slot_gates_open"
+
+    # Supervision changes the objective, never the prediction path, and contributes once.
+    model.train()
+    base_batch = batch | {"struct_coords": coords}
+    torch.manual_seed(19)  # Hold reader dropout fixed across target interventions.
+    plain = model(base_batch)
+    targets = {
+        "attachment_target_u": torch.zeros(len(coords), 3),
+        "attachment_target_v": torch.ones(len(coords), 3),
+    }
+    torch.manual_seed(19)
+    supervised = model(base_batch | targets)
+    torch.manual_seed(19)
+    changed = model(base_batch | {key: value + 2 for key, value in targets.items()})
+    torch.testing.assert_close(supervised["logits"], plain["logits"])
+    torch.testing.assert_close(changed["logits"], plain["logits"])
+    torch.testing.assert_close(supervised["loss"], plain["loss"] + supervised["attachment_loss"])
+    assert "attachment_loss" not in plain
+    assert supervised["attachment_loss"] != changed["attachment_loss"]
 
 
 def test_logits_from_encoded_matches_forward_and_gates_off_is_the_reader_base() -> None:

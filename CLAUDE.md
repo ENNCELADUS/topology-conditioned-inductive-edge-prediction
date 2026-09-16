@@ -58,7 +58,14 @@ selected method. Every piece of writing must explain how its context helps decid
   scored without any truth graph; read against `prefix_base` and against the row's own reader
   (its ceiling); interventions `gates_off`, `mean*` and `shuffle` -- the last transplants the
   *predicted* coordinates of another row of the universe onto this row's endpoints, the
-  marginal-preserving null `mean` is not.
+  marginal-preserving null `mean` is not. The virtual-graph student (`coord_gen.generator:
+  virtual_graph`, repair spec `docs/superpowers/specs/2026-09-16-virtual-topology-prompt-repair-design.md`)
+  is `configs/split_seed42/virtual_prompt_v2_d.yaml` on `coord_spec: v3` (six continuous
+  coordinates + three distance indicators, no clustering) with the fresh reader `topo_prompt_full_v4`:
+  256 fixed spectral blocks of the legal training graph (sizes, densities, encoder-mean prototypes
+  as buffers), shared-projection residue matching that predicts per-block neighbour counts, a weight-1
+  attachment loss on the ordinary edge stream only, no pair gates and no coordinate affine. The v2
+  64-block design is historical; no old-generator compatibility path exists.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

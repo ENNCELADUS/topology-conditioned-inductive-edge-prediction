@@ -1,19 +1,19 @@
-# Virtual graph student, fixed v2 D objective. Subgraph BCE stays 1.0.
+# Repaired virtual graph student: fixed D objective plus attachment loss (weight 1).
+# Attachment supervision is edge-stream only; subgraph BCE stays 1.0.
 # Supply the explicitly selected immutable reader checkpoint before downstream use.
 # Study trials use --skip-test; full 15-epoch schedule, no early stopping.
-# Spec: docs/superpowers/specs/2026-09-15-virtual-topology-prompt-design.md
+# Spec: docs/superpowers/specs/2026-09-16-virtual-topology-prompt-repair-design.md
 model:
   family: v3_1_coord_gen
   config:
     coord_gen:
       generator: virtual_graph
-      coord_spec: v2
+      coord_spec: v3
       virtual_graph:
-        k: 64
+        k: 256
         d_z: 128
         heads: 4
-        gate_bias: 3.0
-      reader_checkpoint: outputs/split_seed42/topo_prompt_full_v3/best.pt
+      reader_checkpoint: outputs/split_seed42/topo_prompt_full_v4/best.pt
       trainable: interface_head
       hidden: 512
       layers: 2
@@ -70,7 +70,7 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/split_seed42/virtual_prompt_d
+output_dir: outputs/split_seed42/virtual_prompt_v2_d
 mixed_precision: bf16
 struct:
   nodes: 40

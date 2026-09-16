@@ -137,7 +137,6 @@ PREFIX_INTERVENTIONS: tuple[str, ...] = (
     "mean_endpoint",
     "mean_relation",
     "mean_context",
-    "slot_gates_open",
 )
 #: `derive_val_region_split`'s parameters for `_load_val_region_split`'s
 #: production re-derivation; the test seam a small monkeypatched value lets

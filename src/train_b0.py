@@ -126,7 +126,6 @@ from src.eval.val_topology import (
 from src.model.egostitch.classifier.b0_v31 import BEST_V3_1_CONFIG, V3_1
 from src.model.egostitch.classifier.coord_gen import (
     CoordGenConfig,
-    CoordinateGenerator,
     V3_1CoordGen,
     distance_class_targets,
 )
@@ -3834,6 +3833,11 @@ class TopoPromptRows:
         train_table = StructCoordinateTable(train_graph, spec=spec)
         self.train = torch.from_numpy(train_table.coords(train_pairs))
         self.train_table = train_table
+        node_index = {node: i for i, node in enumerate(train_table.nodes)}
+        self.train_endpoint_indices = torch.tensor(
+            [[node_index[a], node_index[b]] for a, b in train_pairs], dtype=torch.long
+        ).reshape(-1, 2)
+        self.attachment_targets: torch.Tensor | None = None
         mean, std = coordinate_statistics(self.train.numpy()[np.asarray(stats_rows)], spec=spec)
         self.coord_mean = torch.from_numpy(mean)
         self.coord_std = torch.from_numpy(std)
@@ -3860,6 +3864,13 @@ class TopoPromptRows:
     def attach_train(self, batch: Batch) -> None:
         """Inject this training batch's coordinates by ``_row_id``."""
         self._attach(batch, self.train)
+        if self.attachment_targets is not None:
+            row_ids = batch["_row_id"].detach().to("cpu", torch.int64)
+            endpoints = self.train_endpoint_indices[row_ids]
+            for column, side in enumerate(("u", "v")):
+                batch[f"attachment_target_{side}"] = self.attachment_targets[
+                    endpoints[:, column]
+                ].to(self._device, non_blocking=True)
 
     def attach_val(self, batch: Batch) -> None:
         """Inject this V_val classification batch's coordinates by ``_row_id``."""
@@ -3885,9 +3896,10 @@ def initialise_virtual_graph(
     accelerator: Accelerator,
     *,
     seed: int,
+    resume_attempt: Path | None = None,
 ) -> dict[str, object]:
     """Coarsen only the legal training graph once, then synchronise every rank."""
-    from sklearn.cluster import KMeans
+    from sklearn.cluster import SpectralClustering
 
     from src.model.egostitch.classifier.virtual_graph import VirtualGraphGenerator
 
@@ -3903,70 +3915,73 @@ def initialise_virtual_graph(
             legal_nodes = rows.train_table.nodes
             included = [i for i, node in enumerate(legal_nodes) if node in node_index]
             omitted = [node for node in legal_nodes if node not in node_index]
-            adjacency = rows.train_table.adjacency[included, :][:, included]
-            pooled = []
-            for node in (legal_nodes[i] for i in included):
-                index = node_index[node]
-                indices = torch.tensor([index], device=accelerator.device)
-                tokens, lengths = table.gather_nodes(indices, table.manifest.nodes[index].length)
-                with accelerator.autocast():
-                    encoded = model.encoder(tokens, lengths)
-                pooled.append(CoordinateGenerator.pool(encoded, lengths).float().cpu()[0])
-            states = torch.stack(pooled)
-            array = states.numpy()
-            standardised = (array - array.mean(axis=0)) / np.maximum(array.std(axis=0), 1e-6)
-            assignments = KMeans(n_clusters=generator.k, random_state=seed, n_init=10).fit_predict(
-                standardised
-            )
-            mean_degree = float(adjacency.sum() / len(included))
-            generator.initialise(
-                states.to(accelerator.device),
-                torch.from_numpy(assignments).to(accelerator.device),
-                adjacency,
-                mean_degree,
-            )
-            # Fit only the scalar attachment bias; retain no residue-state corpus.
-            attachment_logits = []
-            for node in (legal_nodes[i] for i in included):
-                index = node_index[node]
-                indices = torch.tensor([index], device=accelerator.device)
-                tokens, lengths = table.gather_nodes(indices, table.manifest.nodes[index].length)
-                with accelerator.autocast():
-                    encoded = model.encoder(tokens, lengths)
-                attachment_logits.append(
-                    (generator.attachment_logits(encoded, lengths) - generator.attachment.bias)
-                    .float()
-                    .cpu()
-                    .flatten()
+            if resume_attempt is not None:
+                snapshot = torch.load(
+                    resume_attempt / "training_state.pt", map_location="cpu", weights_only=False
                 )
-            logits = torch.cat(attachment_logits)
-            target = mean_degree / len(included)
-            lower, upper = -100.0 - float(logits.max()), 100.0 - float(logits.min())
-            for _ in range(64):
-                middle = (lower + upper) / 2.0
-                if float((logits + middle).sigmoid().mean()) < target:
-                    lower = middle
-                else:
-                    upper = middle
-            generator.attachment.bias.fill_((lower + upper) / 2.0)
-            initial_mean = float(
-                (logits + float(generator.attachment.bias.item())).sigmoid().mean()
-            )
-            payload[0] = {
-                "metadata": {
-                    "seed": seed,
-                    "train_nodes": len(included),
-                    "train_edges": int(adjacency.nnz // 2),
-                    "omitted_featureless_nodes": omitted,
-                    "omitted_featureless_count": len(omitted),
-                    "k": generator.k,
-                    "mean_degree": mean_degree,
-                    "initial_attachment_target": target,
-                    "initial_attachment_mean": initial_mean,
-                    "cluster_sizes": np.bincount(assignments, minlength=generator.k).tolist(),
-                    "initialisation": "standardised_encoder_pool_kmeans",
+                metadata = snapshot["virtual_graph"]
+                if set(metadata["node_ids"]) != {legal_nodes[i] for i in included}:
+                    raise ValueError(
+                        "resume virtual graph training nodes differ from current inputs"
+                    )
+                legal_index = {node: i for i, node in enumerate(legal_nodes)}
+                included = [legal_index[node] for node in metadata["node_ids"]]
+                generator.load_state_dict(
+                    {
+                        key.removeprefix("generator."): value
+                        for key, value in snapshot["model_state"].items()
+                        if key.startswith("generator.")
+                    }
+                )
+                payload[0] = {
+                    "included": included,
+                    "assignments": metadata["assignments"],
+                    "metadata": metadata,
                 }
-            }
+            else:
+                adjacency = rows.train_table.adjacency[included, :][:, included]
+                pooled = []
+                for node in (legal_nodes[i] for i in included):
+                    index = node_index[node]
+                    indices = torch.tensor([index], device=accelerator.device)
+                    tokens, lengths = table.gather_nodes(
+                        indices, table.manifest.nodes[index].length
+                    )
+                    with accelerator.autocast():
+                        encoded = model.encoder(tokens, lengths)
+                    pooled.append(generator.pool(encoded, lengths).float().cpu()[0])
+                states = torch.stack(pooled)
+                assignments = SpectralClustering(
+                    n_clusters=generator.k,
+                    n_components=generator.k,
+                    affinity="precomputed",
+                    assign_labels="cluster_qr",
+                    eigen_solver="arpack",
+                    random_state=seed,
+                ).fit_predict(adjacency.astype(np.float64))
+                mean_degree = float(adjacency.sum() / len(included))
+                generator.initialise(
+                    states.to(accelerator.device),
+                    torch.from_numpy(assignments).to(accelerator.device),
+                    adjacency,
+                )
+                payload[0] = {
+                    "assignments": assignments.tolist(),
+                    "included": included,
+                    "metadata": {
+                        "node_ids": [legal_nodes[i] for i in included],
+                        "assignments": assignments.tolist(),
+                        "seed": seed,
+                        "train_nodes": len(included),
+                        "train_edges": int(adjacency.nnz // 2),
+                        "omitted_featureless_nodes": omitted,
+                        "omitted_featureless_count": len(omitted),
+                        "k": generator.k,
+                        "mean_degree": mean_degree,
+                        "cluster_sizes": np.bincount(assignments, minlength=generator.k).tolist(),
+                        "initialisation": "training_graph_spectral_cluster_qr",
+                    },
+                }
         except Exception as error:
             payload[0] = {"error": f"{type(error).__name__}: {error}"}
         finally:
@@ -3979,6 +3994,14 @@ def initialise_virtual_graph(
     if accelerator.num_processes > 1:
         for value in generator.state_dict().values():
             torch.distributed.broadcast(value, src=0)
+    # Reconstruct node-prior targets on every rank; never broadcast or store row-by-slot corpora.
+    included = outcome["included"]
+    assignments = np.asarray(outcome["assignments"], dtype=np.int64)
+    membership = np.eye(generator.k, dtype=np.float32)[assignments]
+    adjacency = rows.train_table.adjacency[included, :][:, included]
+    targets = torch.full((len(rows.train_table.nodes), generator.k), -1.0)
+    targets[included] = torch.from_numpy(np.asarray(adjacency @ membership, dtype=np.float32))
+    rows.attachment_targets = targets
     rows.virtual_metadata = cast(dict[str, object], outcome["metadata"])
     return rows.virtual_metadata
 
@@ -4079,11 +4102,10 @@ def _coordinate_fit_metrics(
     result["val_kd_loss"] = float(scalars[3].item()) / rows_total
     if virtual is not None:
         telemetry = virtual.telemetry(reset=True)
-        result["val_virtual_adjacency_entropy"] = float(telemetry.pop("adjacency_entropy"))
         reduced = {
             key: accelerator.reduce(value, reduction="sum") for key, value in telemetry.items()
         }
-        for prefix in ("attachment", "gate"):
+        for prefix in ("attachment",):
             count = max(float(reduced[f"{prefix}_count"]), 1.0)
             result[f"val_virtual_{prefix}_mean"] = float(reduced[f"{prefix}_sum"].mean()) / count
             entropy = reduced[f"{prefix}_entropy_sum"] / count
@@ -4907,6 +4929,30 @@ def _struct_grad_norm(term: torch.Tensor, model: nn.Module, world_size: int) -> 
     return float(torch.linalg.vector_norm(flat).item())
 
 
+def _scale_training_loss(
+    output: Mapping[str, torch.Tensor],
+    *,
+    local_count: int,
+    global_count: int,
+    world_size: int,
+    global_weight: torch.Tensor | None,
+) -> torch.Tensor:
+    """Scale task-weighted and attachment row-mean terms independently for DDP."""
+    attachment = output.get("attachment_loss")
+    main = output["loss"] if attachment is None else output["loss"] - attachment
+    if global_weight is None:
+        loss = scale_ddp_mean_loss(
+            main, local_count=local_count, global_count=global_count, world_size=world_size
+        )
+    else:
+        loss = main * (world_size * output["loss_weight_sum"] / global_weight)
+    if attachment is not None:
+        loss = loss + scale_ddp_mean_loss(
+            attachment, local_count=local_count, global_count=global_count, world_size=world_size
+        )
+    return loss
+
+
 def _topology_due(
     epoch: int, *, epochs: int, topology_every: int, classification_only: bool
 ) -> bool:
@@ -5230,6 +5276,7 @@ def train_ddp_loop(
         grad_norm_struct: dict[str, float] = {}
         grad_norm_task = 0.0
         grad_norm_kd = 0.0
+        grad_norm_attachment = 0.0
         epoch_steps = 0
         epoch_local_pairs = 0
         epoch_global_pairs = 0
@@ -5272,29 +5319,59 @@ def train_ddp_loop(
             start_event, end_event = _maybe_cuda_events(use_cuda)
             output = model(batch)
             local_mean_loss = output["loss"]
+            # Attachment uses row means, while task/coordinate losses use label weights.
+            attachment_loss = output.get("attachment_loss")
+            weighted_mean_loss = (
+                local_mean_loss if attachment_loss is None else local_mean_loss - attachment_loss
+            )
             effective_weight = output.get("loss_weight_sum")
-            if effective_weight is None:
-                batch_loss_weight = float(local_count)
-                loss = scale_ddp_mean_loss(
-                    local_mean_loss,
-                    local_count=local_count,
-                    global_count=global_count,
-                    world_size=world_size,
-                )
-            else:
-                global_weight = accelerator.reduce(effective_weight.detach(), reduction="sum")
-                batch_loss_weight = float(effective_weight.item())
-                loss = local_mean_loss * (world_size * effective_weight / global_weight)
+            global_weight = (
+                None
+                if effective_weight is None
+                else accelerator.reduce(effective_weight.detach(), reduction="sum")
+            )
+            batch_loss_weight = (
+                float(local_count) if effective_weight is None else float(effective_weight.item())
+            )
+            loss = _scale_training_loss(
+                output,
+                local_count=local_count,
+                global_count=global_count,
+                world_size=world_size,
+                global_weight=global_weight,
+            )
             if isinstance(_unwrapped_model(model), V3_1CoordGen):
                 # These diagnostics are unweighted row means (see V3_1CoordGen.forward),
                 # so they aggregate by row count; `task_loss` alone is weight-normalised.
                 batch_rows = float(output["logits"].numel())
                 epoch_online_weight += batch_rows
-                for key in ("coord_loss", "task_loss", "kd_loss", "teacher_entropy", "kd_kl"):
+                for key in (
+                    "coord_loss",
+                    "task_loss",
+                    "kd_loss",
+                    "teacher_entropy",
+                    "kd_kl",
+                    "attachment_loss",
+                    "attachment_nonzero_error",
+                    "attachment_zero_error",
+                ):
                     if key in output:
                         epoch_online_sums[key] = epoch_online_sums.get(key, 0.0) + (
                             float(output[key].detach().item()) * batch_rows
                         )
+            if epoch_steps == 0 and "attachment_loss" in output:
+                scaled_attachment = scale_ddp_mean_loss(
+                    output["attachment_loss"],
+                    local_count=local_count,
+                    global_count=global_count,
+                    world_size=world_size,
+                )
+                # This helper averages pre-scaled gradients across ranks before taking the norm.
+                grad_norm_attachment = _struct_grad_norm(
+                    scaled_attachment,
+                    cast(V3_1CoordGen, _unwrapped_model(model)).generator,
+                    world_size,
+                )
             kd_loss: torch.Tensor | None = None
             if kd_bank is not None:
                 kd_local, kd_stats = kd_bank.loss(
@@ -5374,7 +5451,7 @@ def train_ddp_loop(
             epoch_steps += 1
             epoch_local_pairs += local_count
             epoch_global_pairs += global_count
-            local_loss_sum += float(local_mean_loss.detach().float().item()) * batch_loss_weight
+            local_loss_sum += float(weighted_mean_loss.detach().float().item()) * batch_loss_weight
             local_loss_weight += batch_loss_weight
             if "_row_id" not in batch:
                 raise ValueError("training batch is missing required _row_id coverage metadata")
@@ -5573,6 +5650,9 @@ def train_ddp_loop(
             )
             for index, key in enumerate(online_keys, start=1):
                 entry[f"train_{key}"] = float(online_values[index] / online_values[0].clamp_min(1))
+            if "attachment_loss" in online_keys:
+                train_loss += cast(float, entry["train_attachment_loss"])
+                entry["train_loss"] = train_loss
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
@@ -5615,6 +5695,12 @@ def train_ddp_loop(
             )
             entry["grad_norm_task"] = float(grad_norm_tensor[0].item())
             entry["grad_norm_kd"] = float(grad_norm_tensor[1].item())
+        if isinstance(_unwrapped_model(model), V3_1CoordGen):
+            entry["grad_norm_attachment"] = float(
+                accelerator.reduce(
+                    torch.tensor(grad_norm_attachment, device=accelerator.device), reduction="mean"
+                )
+            )
         if outcome.topology is not None:
             entry.update(
                 {
@@ -5767,6 +5853,9 @@ def train_ddp_loop(
                         "warmup_steps": warmup_steps,
                         "schedule_total_steps": schedule_total_steps,
                         "model_state": model_state,
+                        "virtual_graph": topo_rows.virtual_metadata
+                        if topo_rows is not None
+                        else None,
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
                         "scaler": (
@@ -6180,14 +6269,12 @@ def _run_probe_mode(
         if topo_rows is not None:
             topo_rows.attach_train(batch)
         loss: torch.Tensor | None = None
+        probe_output: dict[str, torch.Tensor] | None = None
         local_failure: tuple[str, str] | None = None
         try:
-            loss = scale_ddp_mean_loss(
-                model(batch)["loss"],
-                local_count=local_count,
-                global_count=global_count,
-                world_size=world_size,
-            )
+            probe_output = model(batch)
+            assert probe_output is not None
+            loss = probe_output["loss"]
             if not bool(torch.isfinite(loss).all()):
                 local_failure = ("nonfinite", "non-finite probe loss")
         except RuntimeError as error:
@@ -6212,8 +6299,24 @@ def _run_probe_mode(
             )
             _emit_probe_candidate_failure(kind, message)
             raise RuntimeError(message)
-        if loss is None:  # pragma: no cover - collective failure breaks above
+        if (
+            loss is None or probe_output is None
+        ):  # pragma: no cover - collective failure breaks above
             raise RuntimeError("probe forward produced no loss")
+        # Enter the weight collective only after every rank survived its forward.
+        effective_weight = probe_output.get("loss_weight_sum")
+        global_weight = (
+            None
+            if effective_weight is None
+            else accelerator.reduce(effective_weight.detach(), reduction="sum")
+        )
+        loss = _scale_training_loss(
+            probe_output,
+            local_count=local_count,
+            global_count=global_count,
+            world_size=world_size,
+            global_weight=global_weight,
+        )
         optimizer.zero_grad()
         # From this point onward DDP collectives may already be in flight. Any
         # exception must escape the worker immediately; serializing it and entering
@@ -6379,7 +6482,12 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         model.install_coordinate_scale(topo_rows.train)
         if model.cfg.generator == "virtual_graph":
             virtual_metadata = initialise_virtual_graph(
-                model, topo_rows, table, accelerator, seed=cfg.seed
+                model,
+                topo_rows,
+                table,
+                accelerator,
+                seed=cfg.seed,
+                resume_attempt=args.resume_attempt,
             )
             metadata_error: list[str | None] = [None]
             if accelerator.is_main_process:
