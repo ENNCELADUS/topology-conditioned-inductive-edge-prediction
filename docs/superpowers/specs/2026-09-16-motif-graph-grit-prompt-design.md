@@ -1,0 +1,753 @@
+# Motif graph prompts read by GRIT
+
+**Date:** 2026-09-16. **Version:** v9 (supersedes v8 of the same day; change log in §11).
+**Status:** architecture selected; intended as the paper's deployable topology arm. A bounded pilot
+(§0.2) precedes the wave as a resource-allocation decision, not as a proof of impossibility.
+Not implemented, trained or scored.
+It supersedes the coordinate/coarse-block interface **for this proposed arm only**. Existing
+`virtual_prompt_d*` checkpoints, run records and the historical September 15 specification remain valid
+descriptions of their own implementations.
+
+Evidence: [synthesis](../../../literature/research_reports/2026-09-16-virtual-topology-prompt-litreview/phase4_synthesis.md),
+[verification/corrections](../../../literature/research_reports/2026-09-16-virtual-topology-prompt-litreview/phase3_verification.md),
+[adversarial review](../../../literature/research_reports/2026-09-16-virtual-topology-prompt-litreview/phase5_adversarial_review.md),
+[feasibility audit](../../../literature/research_reports/2026-09-16-virtual-topology-prompt-litreview/phase5_feasibility_audit.md),
+the A–E reports, and the dataset probes in `docs/tmp/template_discriminativeness/`.
+Numerical settings are design defaults, not literature-derived optima.
+
+## 0. Decision, pilot and what changed
+
+### 0.1 The decision
+
+Both requested revisions are adopted, each with one reversal.
+
+- **Revision 1, a graph reader instead of predicted statistics: adopted as an addition, not a
+  replacement.** GRIT reads the predicted motif graph and emits endpoint and relation tokens; the
+  closed-form counts stay, computed from the *same* predicted adjacency and carried as a fourth prompt
+  token. The supporting evidence, stated at its real strength: LPFormer is itself a learned
+  pair-conditioned attention encoder and still concatenates raw counts into its score, and on ogbl-ppa
+  ablating those counts moves Hits@100 63.32 → 44.37 while ablating the learned attention moves it
+  63.32 → 62.77. That is one dataset, one architecture, and *observed-graph* counts; it does not
+  establish a general ratio across architectures, and it does not show that our truncated, predicted,
+  weighted motif masses behave like LPFormer's count features. It is a strong reason to keep a count
+  pathway and no reason to delete the reader. Our own probes point the same way without bounding
+  anything: ranking every nonself pair of a universe by hub-penalised closure mass alone reaches
+  precision@|E| 0.63 on V_val and 0.57 on test (a whole-universe oracle diagnostic with its own row set
+  and self-loop convention, **not** comparable to a reported BFS-macro GS), while richer readouts of
+  attribute-derived block structure gained about 0.04 AUROC over counts in the specific readouts we
+  measured — a measurement of those readouts, not a ceiling on a graph reader.
+- **Revision 2, prior-knowledge templates instead of a free coarsening: adopted, with our data choosing
+  the templates.** A fixed, pair-labelled, 26-slot motif graph replaces the K-block coarsening. Two
+  families: shared-neighbour wedges and length-three bridges. Weights carry hub penalties (`1/sqrt(d)`
+  per incident edge, so a wedge contributes `1/d(w)` and a bridge `1/sqrt(d_i d_j)`), the forms that rank
+  pairs best on our graphs. L3 enters degree-normalised, never as raw path counts. The L3 principle is
+  motivation only: on this benchmark positives are overwhelmingly closed, and "bridge without closure"
+  is more typical of negatives than positives.
+
+Why this shape: the pair is inside the computation rather than appearing only in the output, the input
+tensor is fixed-size, and every richer component degrades to a count-only model that is itself a strong
+ranker. Pair labelling is a sound design reason; it is not a retrospective proof that the previous
+endpoint-conditioned interface violated an applicable impossibility theorem.
+
+### 0.2 Bounded pilot before the wave, and the stop rule it does and does not license
+
+Three designs have finished at the trunk's level, and the measured common factor is weak
+attribute-to-structure transfer for unseen proteins. Before committing the wave, buy information cheaply.
+
+**Pilot A, about one GPU-hour, no model change.** Score the published `topo_prompt_frozen` checkpoint
+through the existing `row_coords` path with `--allow-oracle-diagnostic` on **V_val**, under four
+coordinate sources: true coordinates; coordinates composed from kNN-50 attribute-transferred
+neighbourhoods; the training mean; and kNN-50 after the coordinate calibration defined below. That
+checkpoint is the right instrument because `gates_off` reproduces `prefix_base` exactly and it holds the
+best shape ratios of any row (V_val AUPRC 0.940 / GS 0.648 on truth).
+
+*Coordinate calibration, defined — and it is not density matching.* Rescale each **continuous** coordinate
+by a single affine map fitted on **training** rows so that its mean and standard deviation match the
+training-row statistics of the corresponding true coordinate. Eligible coordinates are the continuous
+entries of the reader's spec only. The categorical distance indicators (`dist_2`, `dist_3`, `dist_4plus`,
+`dist_inf` in spec `v1`) are **excluded**: an independent affine map per indicator destroys their
+simplex semantics. Where a predicted coordinate has zero variance on training rows, apply the shift alone
+and record the coordinate as degenerate. This changes inputs, not the threshold, which is selected
+afterwards by the usual rule.
+
+This is coordinate moment calibration. It does **not** match the assembled-graph density that the
+nonlinear reader and its threshold produce; those are different quantities and the pilot must not conflate
+them. The **output-density control** is a separate object, defined in §8 as an independently trained
+baseline evaluated at a common assembled density, and it is not part of pilot A.
+
+**Pilot B, CPU plus one state-caching pass.** Fit a head from frozen **residue** states to the **96 edge
+weights** of §2 — the generator's own bounded output space, under G's `u<->v, L<->R` equivariance — and derive
+the §7.3 profiles from those weights. Evaluate on held-out training nodes and on V_val. Pooled-feature kNN
+discards exactly what residue attention can read, so pilot A alone would understate the design's input.
+
+*Predict edges, not profiles, and read against a feasible baseline.* A head that emits sorted profiles
+directly can beat every realisable generator by predicting a profile no graph attains, which would make the
+pilot unreadable. Concretely: mix empty templates with templates holding one bridge at attachments `1/sqrt(2)`
+and interior weight 1. The mean sorted profile carries two attachments at `0.3536` and a top path product at
+`0.25`, while any graph with those attachments and interior weights in `[0,1]` has a largest path product of
+`0.3536^2 = 0.125`. The mean profile is infeasible, and a predictor that reaches it is not a generator. Pilot
+B therefore predicts edge weights and reports four quantities:
+
+- the **conditional head**, the object of interest;
+- the **symmetric constant graph**: one row-independent 96-weight vector optimised on training rows against
+  the same §7.3 loss, tied across sides and symmetric on the interior block — the plain "predict the average"
+  competitor;
+- the **asymmetric fixed template**, the baseline the reported margin is read against: one row-independent
+  96-weight vector carrying **no symmetry constraint**, optimised on training rows against the same §7.3 loss
+  and evaluated directly on its invariant profiles. v6 reached this object by the wrong route and saddled it
+  with a superfluous oracle orientation. `L_slot` is **exactly invariant** to `u<->v, L<->R`: the swap leaves
+  every wedge product fixed, transposes the bridge-product and interior matrices and exchanges the two
+  attachment vectors, so all four sorted profiles are unchanged. Verified over 100 random fixtures at a maximum
+  loss difference of `6.9e-18` in float64 (`1.9e-9` in fp32) — rounding. Target-informed orientation therefore
+  buys exactly nothing here, and no upper bound follows from it. What the symmetric constant graph genuinely
+  lacks is the ability to hold two distinct attachment values: tying the sides duplicates every entry of its
+  attachment profile, so a head emitting one fixed *asymmetric* template — say attachments `1/sqrt(2)` and
+  `1/sqrt(3)` — beats it on every row while predicting nothing row-dependent. Dropping the symmetry constraint,
+  not adding an orientation, is the fix. This template need not be a legal equivariant generator; `L_slot`
+  cannot tell the difference, which is precisely why it is the right comparator for this loss;
+- the **unconstrained mean-profile predictor**, a reference only. It may sit below both. Part of any such gap is
+  infeasibility, since the mean profile need not be realisable, but optimisation failure and the head's function
+  class land in the same gap, and the counterexample above does not attribute a particular gap to infeasibility.
+
+*What pilot B can and cannot establish.* It measures **weight-profile and family-mass predictability**,
+because that is all §7.3 supervises. It does **not** measure whether motif connectivity transfers: the
+sorted-product target is invariant to which witness carries which mass, and sorting the binary interior
+targets reduces them to the number of interior edges. Report the margin over the asymmetric fixed template, not
+the raw fit. Profile accuracy and downstream utility are reported as separate quantities and neither is
+allowed to stand in for the other.
+
+Beating **one fitted** template is empirical evidence on held-out rows, not a bound over all fixed templates:
+the head may simply have found a better constant along a different optimisation path. Report two further
+quantities beside the margin. First, the dispersion of the head's predicted sorted profiles across rows, per
+coordinate, in units of `s_family`. Second, a **row-transplant control** that reuses §8's seeded whole-graph
+transplant: keep every predicted graph intact and re-pair the held-out predictions with targets under one
+seeded permutation, then report the rise in `L_slot`. A head whose loss does not rise under transplant is not
+using row information, whatever its margin over the fitted template.
+
+v7's collapse control — averaging the predicted 96-weight vectors and scoring that one constant — is
+**withdrawn**. Edge-space averaging is not invariant to the anonymous-slot permutation §3 randomises, so it can
+destroy a motif that both rows predicted perfectly. Two rows carrying the same wedge at weight `0.5` through
+different closure slots each score zero loss, with identical sorted profiles and wedge mass `0.25`, yet their
+edgewise mean holds two half-strength wedges: mass `0.125` and loss `0.00244140625`, reproduced. That gap is
+slot misalignment, not row-dependent prediction. The transplant leaves the same fixture at exactly zero, which
+is the correct reading. If orientation is wanted for the downstream classification instead, that is a separate
+target-informed diagnostic and is labelled as one.
+
+*Conditioning measurement, pre-registered (§7.3).* Fit the head twice, at `beta_i = 0` and `beta_i = 1`, on
+held-out training rows. **Do not divide by a near-zero target.** v5's per-row relative error with a `1e-6` floor
+is dominated by rows whose true mass is zero, and empty motifs are legitimate targets here: against truth
+`[0, 0.1]` the near-correct prediction `[1e-4, 0.1]` scores a mean relative error of 50.0 while the collapsed
+`[0, 0]` scores 0.5, so that selector prefers total collapse — the gate saturation §4 exists to avoid. Report
+two separate quantities per family instead, both as means over rows:
+
+- **false mass on zero-target rows:** `mean(mass_hat)` over rows with `mass* = 0`, in mass units;
+- **reconstruction on positive-target rows:** `mean|mass_hat - mass*|` over rows with `mass* > 0`, divided by
+  the fixed scalar `s_family = mean(mass*)` over all training rows with `mass* > 0`. That scale is computed
+  once, recorded in the report, and reused unchanged across both fits and every later comparison.
+
+Adopt `beta_i = 1` if it lowers the **bridge** family's normalised positive-target reconstruction and its
+zero-target false mass satisfies `F_1 - F_0 <= max(0.1 * F_0, delta * s_bridge)` with `delta = 0.01`, fixed here
+and not revisited once the pilot has run; otherwise keep `beta_i = 0`. The absolute allowance exists because a
+bare 10% guard collapses to zero tolerance at `F_0 = 0`, where it would reject a reconstruction improving from
+1.0 to 0.1 against a false mass moving from 0 to `1e-9`. A difference below 5% of the `beta_i = 0` value —
+comparing the means defined above, never medians — is a tie and keeps `beta_i = 0` as the simpler objective.
+Report both strata's row counts. If the zero-target stratum is empty the guard is vacuous and is recorded as
+such; if the positive-target stratum is empty the decision is undefined, `beta_i = 0` stands, and the reason is
+recorded. An empty stratum never yields a silent mean. Per-group gradient norms (closure, attachment, interior
+heads) at initialisation and at the end are reported as telemetry beside the decision, not as part of it.
+
+**What the pilots license.** A negative on both is a *resource-allocation* decision: we stop investing in
+endpoint-only structure generation on this evidence, and we write that negative. It is **not** a proof
+that no endpoint-only generator can succeed. kNN-50's inputs are not strictly richer than the generator's
+(it reads training adjacency; the generator reads residue states, which kNN-50 does not), and feeding its
+coordinates into a frozen reader confounds generator quality, coordinate calibration and reader
+distribution shift. `phase3_verification.md` already recorded that kNN-50 is not an information ceiling
+even among functions of its own features; this specification does not reinstate that claim.
+
+**Reading.** The decision is made on **V_val and held-out training rows only**. Test rows are not scored
+for this decision: choosing an architecture on test evidence is the exact failure this project demoted a
+whole split for. Any test-side version of either pilot is run after the architecture is fixed, reported
+as a labelled diagnostic, and disclosed. The margins used to read the pilots (±0.01 GS, ±0.5 MMD ratio)
+are the project's practical reporting thresholds, not statistical uncertainty bounds.
+
+### 0.3 Amendments carried since the first decision
+
+Ten amendments separate this arm from the v1 text. Five further owner reviews corrected the supervision and
+the instruments that judge it — the path-product loss and its raw interior term, pilot B's feasible and
+orientation-aware baselines, its selector, the structural-frequency and batching reclassifications, the
+calibration / output-density split with its algorithm and self-loop convention, and the caching, autocast,
+warm-up-schedule and gradient-check fixes. All are listed in §11 and already applied in the sections below.
+
+| # | Change | Reason |
+|---|---|---|
+| A | Counts retained as a fourth prompt token (§5.1); literature strength stated at its real scope (§0.1) | LPFormer's ablation supports keeping counts; it does not establish a cross-architecture ratio |
+| B | `L_slot` replaced by a fully specified, permutation-invariant per-family **order-statistics** loss covering **all 96 edges**, in the same bounded space as the prediction (§7.3) | The v2 community-occupancy target left the 64 interior bridge edges with zero derivative, mismatched Stage I's witness semantics, and left slot correspondence, smoothing and the count→weight conversion undefined |
+| C | **Reversed: the sampled-subgraph stream and its structural objectives are kept in both stages** (§7.1, §7.2), with the cost stated and a compute lever named | Owner decision: this arm is the paper's deployable topology row, and the structural objectives are what produced the project's best topology to date |
+| D | Caching of compiled graphs decided from measured compilation time, not by rule (§3) | Both the audit's "15× worse" and v2's "never cache" were wrong; measured, recomputation is 1.34× (§3) |
+| E | Teacher selected by **downstream utility under predicted inputs**, with the Stage I checkpoint rule reconciled explicitly (§7.4) | Minimising token reconstruction error is optimised by constant or low-variance tokens |
+| F | Corruption widened to `lambda ~ U(0,1)` (§3) | Realised generator quality maps to roughly the upper half of the old range |
+| G | Density-matched and degree-matched controls; count-only, GRIT-only and combined are **separately trained arms**, and the prefix adapter gains per-field row masking (§6, §8) | Verified: `prefix_branch` softmaxes over all prefix rows jointly and gates are per head, not per field, so zeroing a field's tokens is not an exact submodel |
+| H | Modules under `classifier/`; fp32 promotion in the RRWP path; precision validation extended to this family (§9) | Audit findings confirmed against current source |
+| I | `topo_cnt` given an explicitly symmetric degree representation (§5.1) | `[deg_u, deg_v]` is not swap-invariant, yet §6 leaves the token unchanged under AB/BA |
+| J | Cost figures labelled derived vs measured (§9) | The audit states plainly that no new row is grounded in a profile |
+
+## 1. Task contract
+
+```mermaid
+flowchart TD
+    X[Endpoint features x_u, x_v] --> E[Frozen residue encoder]
+    E --> H[H_u, H_v]
+    H --> G[Residue attention and small gate MPNN]
+    G --> A[Weighted wedge and bridge motif graph]
+    A --> R[GRIT graph reader R]
+    A --> N[Closed-form count head]
+    R --> T[topo_u, topo_v, topo_rel]
+    N --> C[topo_cnt]
+    T --> P[Gated KV prefix adapter]
+    C --> P
+    H --> F[Existing bidirectional pair reader F]
+    P --> F
+    F --> M[Existing MLP head]
+    M --> Y[Probability of the queried edge]
+```
+
+Inference is exactly `(x_u,x_v) -> p_uv = p_vu`. No node IDs, neighbour lookup, training-node bank,
+observed query graph, label or universe statistic enters this forward. Learned slot vectors are ordinary
+parameters, initialised randomly, not a retrieval database. The motif graph is an intermediate
+computation for this edge decision, not a generated interactome.
+
+## 2. The graph: two templates, shared witnesses
+
+Fixed slot sets `V^P = {u,v} union C union L union R`, with `|C|=|L|=|R|=8` (26 nodes).
+
+| Family | Allowed edges | Number | Role |
+|---|---|---:|---|
+| `closure` | `u-c`, `c-v` for c in C | 16 | A shared witness; with the queried edge removed the motif is a wedge, never a triangle containing the answer |
+| `attach` | `u-l` for l in L; `r-v` for r in R | 16 | Endpoint attachments, shared parameters across sides |
+| `interior` | `l-r` for l in L, r in R | 64 | The bridge crossing |
+
+These 96 undirected edges have weights in `[0,1]`. Every other adjacency entry, the diagonal and the
+queried `u-v` entry is exactly zero. GRIT's attention grid may include `(u,v)` and diagonal pair states;
+those are attention entries, not graph edges.
+
+Each physical edge receives one predicted weight used in both orientations; no two path gates compete for
+a shared edge. Multiple bridges share witnesses. C and L/R are **role copies**: an observed protein may
+occur in both families, but this is not an induced-subgraph claim. For a bridge the two real intermediates
+are distinct.
+
+The endpoints share an endpoint-role embedding, C slots a closure-role embedding, L/R slots a bridge-role
+embedding. R receives role embeddings, weighted adjacency and derived walk/degree encodings only —
+neither raw residue states nor generator hidden states nor slot-index embeddings — so an unrestricted
+pair-feature vector cannot enter disguised as node features. Permutations within C, or within each side of
+the bridge, do not alter its prediction. Generator slot seeds are private to G.
+
+All 26 slots exist in both stages (`mask=1`); unused slots carry zero incident edges. An empty template is
+valid. The reader's input size is constant, which removes literal off-size extrapolation; it does not
+remove shifts in effective connectivity or density, which §8's controls and §3's corruption address.
+
+## 3. Constructing the Stage I training graph
+
+For each nonself training pair, start from the legal, loopless training graph and remove the `{u,v}` edge
+**before** constructing neighbourhoods, candidates, weights or truncation scores. All V_val nodes and every
+pair touching them remain excluded.
+
+1. **Closure:** take `N(u) intersect N(v)` minus the endpoints. Select at most eight witnesses by
+   descending `1/d(w)` in the edge-removed graph. Set both incident weights to `1/sqrt(d(w))`, so the
+   product is the resource-allocation contribution `1/d(w)`.
+2. **Bridge:** take the bipartite candidate graph between `N(u)\{v}` and `N(v)\{u}` with distinct
+   intermediates. Score each left candidate by the sum of `1/sqrt(d(i) d(j))` over its candidate bridges,
+   right candidates analogously; keep the top eight per side and their mutual original edges. Set `u-i` to
+   `1/sqrt(d(i))`, `j-v` to `1/sqrt(d(j))`, and a present interior bridge to 1. An isolated selected
+   intermediate keeps its endpoint attachment and is not counted as a path.
+3. Fill remaining slots with role-only isolated nodes. Use stable seeded tie-breaking independent of
+   labels. Swapping endpoints must exchange L and R and preserve C, including tie-breaking. Randomise slot
+   order within roles during training; no training identity is an input feature. The §7.3 loss is
+   permutation-invariant, so this randomisation and the loss are consistent by construction.
+
+The product along each retained bridge is its degree-normalised L3 contribution. The families keep these
+priors **in the edge weights**; §5.1 also exposes their sums. The compiler discards unselected witnesses
+and cross-family identity, so its ceiling is below a full-ego oracle.
+
+**Caching is a measured choice, not a rule.** Measured on the real seed-42 split: the corpus holds
+**2,483,246 unique rows** against **221,142** presented per epoch. The sampler aliases `epoch_rows[0]` to
+`epoch_rows[1]` for probe planning while the training loop runs epochs 1–15, so the training total is
+`15 × 221,142 = 3,317,130` presentations and recomputing per epoch costs **1.34×** the compilations of
+caching once. (An earlier revision of this file said 1.43× by summing the aliased epoch 0; the audit's
+"15× worse" was wrong in the other direction.) A cached table is 96 fp32 weights per row against the fixed
+global edge list, **0.95 GB** (0.48 GB fp16); per-row indices do not exist because the template is fixed.
+Decide from a measured compile time on 10k rows: cache if compilation is slow enough that 1.34× matters
+against 0.95 GB of host memory, otherwise recompile per epoch. Count probe-planning compilations
+separately. Record the choice and the measured rate in `profile.json`.
+
+The structural stream's subgraph pairs (§7.1) are resampled every step, so their *hit rate* is low, but
+their targets are functions of the queried pair and the fixed training graph and are therefore perfectly
+cacheable; whether a cache pays is empirical, not prohibited. Cache the shared CSR adjacency and degree
+unconditionally.
+
+**Self rows** use an explicit empty template in Stage I — an override, not a consequence, since
+`N(u) intersect N(u) = N(u)` would otherwise fill the closure family. They retain task BCE and are
+excluded from §7.3 and §7.5. Stage II applies the same feature-only generator to every row including
+identical-feature pairs; no self flag exists at inference. Report self and nonself strata separately.
+
+**Stationary corruption:** on nonself Stage I rows use the clean adjacency half the time, otherwise
+`(1-lambda) A* + lambda Abar` with `lambda ~ Uniform(0,1)`. `Abar` is the mean training adjacency after
+random within-role permutations, computed from the training corpus only. The range is widened from v1
+because previous generators' realised quality corresponds to the upper part of it.
+
+## 4. Generator G: residue-conditioned edge gates
+
+Reuse frozen `prefix_base` residue states. One four-head attention layer lets learned 96-dimensional slot
+queries read `H_u` and `H_v` separately with residue-length masks: eight shared bridge queries per side and
+eight shared witness queries over both proteins. Initialise queries independently; never from named
+training proteins or a retrieval bank.
+
+- Endpoint gate states are projections of each endpoint's masked pooled residue state.
+- Left and right states come from the same bridge-query module attending to `H_u` and `H_v`.
+- Each C state combines its two attention outputs through `[a_u+a_v, |a_u-a_v|]` and a shared MLP.
+
+Run two shared residual message-passing layers of width 96 over the fixed candidate template, with
+relation-specific message transforms and mean aggregation. Internal features reach the gate heads only.
+
+For each allowed undirected edge predict `w_ij = sigmoid(MLP_type([h_i+h_j, |h_i-h_j|]))`, one value used
+in both orientations, attachment heads shared across sides. **LayerNorm the gate-head inputs** and
+reparameterise the heads through an MLP rather than optimising edge logits directly: the predecessor's gate
+died when its input norm grew (`||u*v||` 23 to 162, pushing the pre-activation to 13 where the sigmoid
+derivative is about 2e-6). Initialise output biases from the training mean weight per edge type, clipped to
+`[0.01,0.99]` in logit space, with small nonzero head weights so gradients reach the generator. No global
+pair-density gate, free adjacency, hard top-k, Gumbel sampler or evaluation-time binarisation. Soft edges
+are a deterministic computational graph, not independent Bernoulli probabilities nor a claim to recover
+named neighbours.
+
+G is equivariant to `u<->v, L<->R`. Its private seeds can distinguish attachments while the reader stays
+order-invariant; this permits more than one activity value but does not guarantee the model uses it.
+
+## 5. Reading the graph: counts and GRIT
+
+### 5.1 The count head (retained)
+
+From the same predicted adjacency `Ahat`, compute differentiably, in fp32:
+
+```
+wedge_mass    = sum_{c in C} w(u,c) w(c,v)                      hub-penalised closure mass
+bridge_mass   = sum_{l,r} w(u,l) w(l,r) w(r,v)                  degree-normalised L3 mass
+deg_u         = sum_j w(u,j),   deg_v = sum_j w(v,j)
+```
+
+```
+topo_cnt = W_cnt [ log1p(wedge_mass), log1p(bridge_mass),
+                   log1p(deg_u) + log1p(deg_v), |log1p(deg_u) - log1p(deg_v)| ]
+```
+
+The degree pair enters through a sum and an absolute difference, so `topo_cnt` is **invariant** under
+`u<->v` by construction and §6 correctly leaves it unchanged across AB/BA. These are the two statistics our
+all-pairs probe ranks highest and the two the compiler's weights carry.
+
+### 5.2 GRIT R and the three topology tokens
+
+Vendored GRIT layers through a small adapter: three layers, width 96, four heads, RRWP `[I,P,P^2,P^3]`,
+covering both motif lengths. **Disable autocast around the RRWP arithmetic and then promote to fp32**,
+before forming adjacency sums, degree normalisation and walk products. Casting the adjacency alone is not
+enough: verified locally on torch 2.10, `torch.bmm` and `@` return bf16 from **fp32 inputs** inside an
+active autocast context, and return fp32 only with autocast disabled. `dense_rrwp` today computes in
+`adj.dtype`, so it must be wrapped in `torch.autocast(..., enabled=False)`, not merely fed fp32 tensors.
+Confirm on GPU as well as CPU. Use the existing `1e-6` degree floor; isolated rows have zero transition
+entries. Keep typed raw weights in the edge embedding and weighted degree in the degree input, since walk
+normalisation alone discards edge scale. Retain the per-token LayerNorm adapter to avoid batch-dependent
+predictions. All 26 nodes take part in full attention. GRIT's published expressiveness results quantify
+over binary adjacencies; no equivalent claim is made here for fractional weights, and no located work
+measures RRWP accuracy against edge-weight noise, so §3's corruption sweep is our only evidence.
+
+After the final layer, with node states `h_u,h_v` and directed pair states `e_uv,e_vu`:
+
+```
+topo_u   = W_node h_u        topo_v = W_node h_v        topo_rel = W_pair (e_uv + e_vu)/2
+```
+
+The endpoint map is shared; the relation token is swap-invariant. It exists although the queried adjacency
+entry is zero, because attention and RRWP update the pair representation without inserting the answer.
+Anonymous pooling seeds are query-independent and would not yield two endpoint-specific tokens; a mean over
+nodes would obscure the queried relation.
+
+**Adapter note.** The vendored layer already computes the final edge state and writes it to
+`batch.edge_attr` whenever `update_e` is set; only the `O_e`/`norm_e` constructor flags are disabled on the
+last layer of the existing encoder. The new adapter passes them true and gathers row `(u,v)` by a
+precomputed index buffer. No vendor edit, no PMA readout; the existing oracle encoder and its checkpoints
+are untouched.
+
+## 6. Interface with F: preserve the content residual
+
+Start from the published `prefix_base`, including its residue encoder, bidirectional cross-attention,
+`abba_max` aggregation and MLP head. Freeze all of it in both stages.
+
+At each of the nine cross-attention sites a small adapter maps the ordered fields
+`[topo_self, topo_partner, topo_rel, topo_cnt]` to two prefix rows per field, eight rows total, through the
+existing role-aware swap rules and the separately normalised prefix branch. The update stays
+`content_update + tanh(alpha_site,head) * topology_prefix_update`, with `alpha = 0` at Stage I
+initialisation. Keep the trained Stage I gates when Stage II starts. With gates off, frozen `F` and the
+head reproduce the published base bit for bit. Retain the AB/BA symmetrisation, swapping the two endpoint
+tokens and leaving `topo_rel` and `topo_cnt` unchanged, which is correct because both are swap-invariant
+(§5.1, §5.2).
+
+**Field masking, and why an inference ablation is not a submodel.** Verified in the current implementation:
+`prefix_branch` applies a single `softmax` over *all* prefix rows jointly, and the gates are shaped
+`(n_layers, SITES, n_heads)` — per head, never per field. Zeroing a field's token values therefore leaves
+its keys in the softmax denominator, and deleting its rows changes the normalisation of the others.
+Neither operation reproduces a model trained without that field. The adapter therefore supports explicit
+**per-field row masking** (the field's rows are removed from the prefix entirely, and the branch
+renormalises over the remainder), and the count-only, GRIT-only and combined variants of §8 are
+**separately trained arms**. Masking at inference is reported only as an intervention, never as an
+attribution of training-time gain.
+
+Freezing `F` is supported by this project's own measurement: the frozen-trunk Stage I lane reached V_val
+AUPRC 0.940 / GS 0.648 against the fully trained lane's 0.961 / 0.691, with better test topology.
+
+## 7. Training schedule and losses
+
+### 7.1 Streams present in both stages
+
+Two streams, as in the established two-stage recipe:
+
+- **Task stream:** legal training pairs with the dynamic 1:5 negative stream, weighted BCE, positive
+  weight 5.
+- **Structural stream (retained, owner decision):** one sampled 40-node training subgraph per step
+  (32 local + 8 background; bfs/motif/bridge 0.5/0.25/0.25), scored over its legal pairs, with
+  `{subgraph BCE 1.0, rank 1.0, degree 0.1, motif 0.1}` — the seed-42 structural winner. Every pair inside
+  the sampled subgraph needs its own compiled motif graph, so this stream, not the reader, dominates cost
+  (§9). This stream is why the arm can be read as a topology method at all, and it is the reason the
+  project's best topology row to date exists.
+
+  **Neither `struct.subgraphs_per_epoch` nor `max_pairs_per_rank` is a compute lever.** A step without a
+  subgraph contributes an exact zero structural loss and active steps receive no inverse-frequency
+  compensation, so halving `subgraphs_per_epoch` roughly halves structural supervision relative to task BCE:
+  the recipe is no longer `{1, 1, 0.1, 0.1}`. `max_pairs_per_rank` is no safer, and v4's description of it as
+  chunking was wrong. In `build_distributed_epoch_plan` it sets
+  `local_cap = min(max_pairs_per_rank, token_budget_per_rank // (2*boundary))`, then
+  `global_cap = local_cap * world_size` and `step_count = ceil(rows / global_cap)`, and the planned batch
+  dataset's length *is* the rank's optimizer-step count. Lowering the cap where it binds shrinks the global
+  batch and multiplies optimizer steps; because `subgraphs_per_epoch: null` means `count = steps`, it
+  multiplies the structural subgraphs per epoch by the same factor. Where it does not bind, it saves nothing.
+
+  The one true chunking lever is **`struct.token_budget`**: it sets `per_chunk` within a subgraph's pair
+  scoring only, so every legal pair of the sampled subgraph is still scored exactly once into the same
+  assembled logit matrix and the objective is unchanged. Take memory there first. If `max_pairs_per_rank` must
+  still move, treat it as a batching-protocol change: either hold the logical batch and the per-step structural
+  draw fixed with gradient accumulation, or apply the identical cap to **every** control in §8 and say so in the
+  result note. The same rule governs a frequency change, which may additionally be compensated by scaling the
+  structural weight by the inverse frequency, accepting the higher gradient variance that introduces. Never
+  silently trade any of the three for wall time.
+
+### 7.2 Stage I: teach R and the interface on a bounded true graph
+
+Train R, its token projections, the count head, role embeddings and the prefix adapter/gates; freeze F and
+its head. Each graph target is compiled from the full legal training graph minus the queried edge. Both
+streams of §7.1 are active. Run a full 15-epoch one-cycle, no early stopping. AdamW, LR `1e-4`, weight
+decay `1e-2`, clip 1.
+
+V_val true-template scoring is a labelled oracle diagnostic, never a training target. Stage I success
+proves only that a bounded true graph is usable through this interface; it is not evidence of
+endpoint-only transfer.
+
+### 7.3 `L_slot`: the per-family order-statistics loss (all 96 edges)
+
+The v2 target is replaced, and so is v3's first attempt at it. Supervise sorted **path products**, not
+sorted edge weights. Sorting the 16 closure edge weights as one multiset is invariant to moving weight
+between the two sides of a wedge: truth `w(u,c1)=w(c1,v)=0.5` and prediction `w(u,c1)=w(u,c2)=0.5` have
+identical edge multisets and therefore zero loss, while their wedge masses are 0.25 and 0. Products remove
+that failure, because the quantity supervised is the one the count head reads.
+
+Per row, define
+
+```
+p_c   = w(u,c) * w(c,v)                     c in C          8 wedge products
+q_lr  = w(u,l) * w(l,r) * w(r,v)            l in L, r in R  64 path products
+a_k   = the 16 raw attachment weights       u-l and r-v
+b_lr  = the 64 raw interior weights         l-r
+```
+
+and the identical quantities `p*, q*, a*, b*` on the compiled graph. Then
+
+```
+L_slot = beta_p * mean_i Huber( sort_desc(p)_i , sort_desc(p*)_i )
+       + beta_q * mean_i Huber( sort_desc(q)_i , sort_desc(q*)_i )
+       + beta_a * mean_i Huber( sort_desc(a)_i , sort_desc(a*)_i )
+       + beta_i * mean_i Huber( sort_desc(b)_i , sort_desc(b*)_i )
+```
+
+with `beta_p = beta_q = beta_a = beta_i = 1` and `delta = 1`. Sorting is a permutation, so gradient reaches
+the predicted weight occupying each rank; the product terms route it to both (or all three) edges of each
+motif, and the raw terms keep gradient flowing to an edge whose path product vanishes because a *different*
+edge of that path is zero. All 96 edges are reached on non-degenerate inputs.
+
+**The raw interior term exists because the products alone are badly conditioned.** For a bridge `q = a b c`,
+`dq/db = a c`, so the interior gradient is attenuated quadratically by small attachments, and the attachment
+term contributes nothing to it, since `dL_a/db = 0`. This bites on fully non-degenerate inputs, not only at
+zero. With every attachment at `0.1`, every predicted interior at `0.1` and every true interior at 1, the
+predicted and true bridge masses are 0.064 and 0.64 — a 90% mass deficit — yet the mean product term is
+`4.05e-5` and the gradient into an interior logit is `1.27e-7`, against `1.27e-3` under direct interior
+supervision: four orders of magnitude on this fixture, before batch averaging. Connected gradients are
+therefore not the same thing as an effective teaching signal, and §9's check does not test for one. The
+interior term is exactly symmetric with the attachment term already present and restores an `O(1)` signal;
+because the interior targets are binary, its sorted form supervises how many interior edges exist, which is
+all a permutation-invariant loss can say about them. `beta_i` is decided by the pre-registered pilot-B
+measurement of §0.2 and may be set to zero there. Rescaling `beta_q` instead is rejected: it would move the
+wedge-to-bridge mass balance as well as the conditioning.
+
+Because `wedge_mass = sum_c p_c` and `bridge_mass = sum_{l,r} q_lr` are sums over the supervised
+multisets, and a sum is permutation-invariant, matching the sorted products **pins both count-head
+quantities exactly**. The loss is permutation-invariant within each role family, consistent with the slot
+randomisation of §3, and needs no correspondence between anonymous slots and named witnesses. It lives in
+the bounded `[0,1]` space of the prediction, so no conversion from unbounded occupancy counts and no
+smoothing operator has to be defined.
+
+What it still does not do: it pins family masses and strength profiles, **not connectivity**. Two graphs
+with the same product multisets but different witness assignments are indistinguishable to it, which is
+deliberate, since witness identity is the quantity the probes say does not transfer. A successful profile
+fit is therefore **not** evidence that motif connectivity transfers, and §0.2 and §8 must not read it that
+way. If pilot B shows the interior family is unpredictable while the closure family is, set `beta_q`
+and `beta_i` to zero and report the arm as closure-supervised rather than implying more.
+
+### 7.4 Teacher selection
+
+Two distinct selections, stated separately because v2 conflated them:
+
+- The **published Stage I reader** is the checkpoint chosen by the existing five-metric V_val rank. This is
+  the row reported as the Stage I diagnostic.
+- The **immutable teacher `R_T`** is chosen by **downstream utility under predicted inputs**, never by how
+  reproducible its tokens are. Minimising token reconstruction error is optimised by constant or
+  low-variance tokens, and errors in differently scaled representation spaces are not comparable. The
+  procedure: take at most three Stage I candidates (the five-metric winner and its neighbours), run the
+  **first two epochs of the §7.5 schedule** against each, and rank the candidates by the existing
+  `geometric_rd_five_rank_v1` rule on their V_val panel under *predicted* inputs, with fixed probe, data
+  order and seed. Cost is three two-epoch pilots, not three full runs. If time forbids even that, the
+  default is the five-metric winner, reported as "not selected for teachability".
+
+**"The first two epochs" is literal, and v4's account of it contradicted itself.** OneCycle is sized by
+`schedule_total_steps`, the exact optimizer-step count over `1..optim.epochs`, so a config with `epochs: 2`
+yields a *compressed* two-epoch cycle that ramps and anneals inside the warm-up — a different probe, ranking
+teachers under an LR trajectory the real run never sees. The pilot instead keeps `optim.epochs: 15` and halts
+after epoch 2 through a new `optim.stop_after_epoch` key; `--max-steps` cannot do this, because the v3_1 loop
+ignores it. Under that configuration the two epochs *are* a valid prefix of the 15-epoch run: same trainability
+mask, same LRs, same data order.
+
+**Checkpoint bundle and handoff.** A Stage I candidate is a **bundle**: GRIT `R`, the count head, the
+token projections `W_node`/`W_pair`/`W_cnt`, the role embeddings, and the prefix adapter with its gates.
+Each teachability pilot loads one candidate's complete bundle for both roles — `R_T` is an immutable
+eval-mode copy of that bundle, and `R_S` plus the adapter are initialised from the *same* bundle, so the
+student never starts from a different Stage I checkpoint than its teacher. The winning bundle is the one
+that initialises the final student. Because the pilot is a true prefix, the winner is **continued**, not
+restarted — a reversal of v4, which asserted the opposite from a wrong premise. The resume path restores
+model, optimiser, scheduler and per-rank RNG state and refuses to resume unless the saved resume config,
+world size, warmup steps and `schedule_total_steps` all match, so an accepted continuation is a continuation
+of the same run; exclude `optim.stop_after_epoch` from that config comparison exactly as `output_dir` is
+already excluded. If the pilot config differs from the final Stage II config in any other key, or the world
+size or data order changes, restart from the Stage I bundle instead: the prefix property is what licenses
+continuing, and it is conditional. Selection reads V_val only, the universe the protocol already uses for
+checkpoint and threshold selection, so continuing adds no new exposure. Either way, two epochs are a budgeted
+proxy for early transfer only; they do not establish which teacher wins after the epoch-3 unfreezing, and the
+result note says so.
+
+### 7.5 Stage II: generate the graph from the endpoints
+
+Initialise `R_S`, the count head, the token projections, the role embeddings and the prefix adapter from
+the **single selected Stage I bundle of §7.4**, the same bundle `R_T` copies; freeze F and the head
+throughout.
+
+| Epochs | Trainable | Frozen |
+|---|---|---|
+| 1–2 | G (attention, private seeds, gate MPNN, heads) | `R_S`, count head, prefix adapter, F/head, `R_T` |
+| 3–15 | G; final block and output projections of `R_S`; count head; prefix adapter/gates | Earlier `R_S` blocks and role/input embeddings; F/head; all `R_T` |
+
+15-epoch one-cycle, no early stopping, five-metric selection. New generator at AdamW LR `1e-4`, weight
+decay `1e-2`, clip 1; reader and prefix parameters use 0.1 times the instantaneous generator LR once
+opened. The freeze-forever arm uses the same initialisation, batches and schedule.
+
+```
+L_II = L_task_BCE + L_struct + w_slot * L_slot + 0.1 * L_topo        (w_slot = 1)
+```
+
+`L_struct` is §7.1's structural stream. `L_topo` is the light representation term: with fixed non-affine
+LayerNorm `N`, `mean over fields and dimensions of (N(R_T(Ahat)) - stopgrad(N(R_T(A*))))^2`, over all four
+token fields, averaged over valid nonself rows per stream and then across streams; an empty stream
+contributes a differentiable zero. `R_T(Ahat)` runs with autograd so the loss reaches G; only `R_T(A*)` is
+detached. F never receives the teacher's true-graph tokens in the student scoring path.
+
+Do **not** add a class-conditional path-count hinge, coordinate regression, affine calibration, logit KD or
+anchor KD by default. Task loss plus a representation constraint does not identify the graph; the intended
+claim is that a constrained learned structural computation helps the queried edge, never that the witnesses
+recover true neighbours.
+
+## 8. Boundaries, comparisons and reading
+
+Validation selects models and thresholds and supplies no generator-training graph, prompt target,
+corruption mean or bank. Stage II formal scoring loads only the saved model and endpoint features. True
+V_val/test template compilation belongs exclusively to labelled Stage I and oracle diagnostics.
+
+Use `geometric_rd_five_rank_v1` / `test_protocol_v8` from `docs/03-experiments.md`: closest-geometric-RD
+threshold on the V_val sampled union, five-rank selection on AUPRC, GS and the three MMD ratios, RD
+reporting-only; an independent max-F1 classification threshold on `val_cls`. Replay both thresholds
+unchanged. Report AUROC/AUPRC, Accuracy/F1/MCC, ECE/Brier and all five topology metrics, self and nonself
+strata separately, and per-C-class strata where the benchmark's pair classes are available.
+
+**Seeds and pre-registration.** The main arm and the density control run **three seeds**; pay for them by
+dropping the endpoint-only and relation-only readout rows and one motif-family ablation. Pre-register the
+reading — row, metric, margin — before scoring. Single-seed differences inside ±0.01 GS and ±0.5 MMD ratio
+are not read; one previous arm's V_val MMD swung 5.8–14.4 across epochs of a single run. These margins are
+reporting thresholds, not confidence intervals.
+
+| Comparison | Trained? | Question answered |
+|---|---|---|
+| Published `prefix_base`, and exact gates-off | reuse | Is the topology intervention useful at all? |
+| **Output-density-matched `prefix_base` and B0** | trained | Is any topology gain shape, or only threshold placement? The standing evidence gap; mandatory. Defined below. |
+| **Degree-only control** | trained | Is the gain a degree artefact? This benchmark's negatives are degree-biased and sequence models are known to ride on degree. Defined below. |
+| **Count-only** (fields masked at the adapter, trained from scratch) | trained | Does the reader earn its complexity over the counts? |
+| **GRIT-only** (count field masked, trained from scratch) | trained | Do the counts earn their place next to the reader? |
+| Direct residue-conditioned prefix, matched trainable budget and same `L_topo` | trained | Does a graph bottleneck help beyond a conditional adapter? |
+| One common edge weight per pair and edge type | trained | Is the gain a per-type density signal? |
+| Fixed training-mean graph, trained R/adapter, same schedule | trained | Does query-conditioned connectivity matter? |
+| Freeze R/adapter for all 15 epochs vs the warm-up | trained | Does adaptation repair the teacher-student input shift? |
+| Closure-only and bridge-only, inactive family zeroed in both stages | trained | Does each family earn its place? |
+| `w_slot = 0`, and `L_topo = 0`, all else matched | trained | Which supervision contributes? |
+
+**The degree-only control, defined.** v8 named this row "degree-matched" and left its algorithm unstated,
+which admits two incompatible readings. It is the **trained** reading, matching its neighbours in the table: an
+arm identical to this one in every other respect, trained from scratch on the same schedule, whose prompt
+carries only the symmetric degree pair `[log1p(deg_u) + log1p(deg_v), |log1p(deg_u) - log1p(deg_v)|]` computed
+from the *predicted* adjacency. `wedge_mass` and `bridge_mass` are zeroed in `topo_cnt` and the three GRIT
+fields are removed by the per-field row masking of §6. It is **not** a degree-marginal re-thresholding: degree
+marginals appear in this specification only as a *reported* quantity under the scoring interventions below,
+never as a matching target. If this control matches the full arm, the topology gain is degree and the motif
+graph has earned nothing.
+
+**The output-density control, defined.** This is a property of the assembled graph, not of the coordinate
+inputs, and it is a different object from the coordinate calibration of §0.2. It asks: at equal density, is
+the arm's assembled edge set a better *shape*, or was the apparent gain threshold placement? A previous arm's
+entire topology headline was traced to a per-universe logit shift, which is what this control exposes. The
+algorithm, stated on the objects `test_protocol_v8` already uses:
+
+1. **Universe and self-loops.** The protocol's sampled BFS subgraphs for the split, pooled into one union of
+   scored pairs. Rows are the pairs the protocol scores, self-pairs included; a self-pair over the threshold
+   assembles as a self-loop (`assemble_graph`) and **official GS and RD retain it**.
+   `compute_graph_similarity` takes Dice over edge *sets* in which a self-loop is an ordinary element, so an
+   extra self-loop against a one-edge reference gives GS `2/3` — reproduced. v5 asserted the opposite and was
+   wrong: the only place self-loops are stripped is the threshold sweep's `recall` diagnostic, never GS, and
+   the docstring records that self-loops are first-class labelled queries retained by official GS/RD. This
+   control keeps the official convention for every row; a loopless variant is permitted only as a separate,
+   labelled diagnostic. The legacy G1 failure — a non-self threshold population against a self-loop-stripped
+   reference count — is this same mistake, already made once.
+2. **Target.** `target_edges` is the number of union pairs **this arm** realises at its protocol
+   V_val-selected threshold on the evaluation union: its own assembled edge count, taken directly, with no rate
+   transferred between universes. Record it beside `N_union`, the number of scored pairs in the union. A rate
+   may be used instead only if it is the selected-pair fraction `selected_pairs / N_union`; it is **not**
+   `nx.density`, whose denominator counts node pairs over the whole node set while a sampled union holds only
+   some of those pairs. Because every row scores the same union over the same nodes, an equal selected count is
+   an equal assembled edge count and therefore an equal assembled density.
+3. **Threshold.** For each row — this arm, `prefix_base`, B0 — call the existing
+   `density_matched_threshold(probs, target_edges)`. It admits tie groups **atomically**, returning the
+   smallest observed value whose cumulative top-down count is still `<= target_edges`, so the realised count is
+   `<= target_edges` and exact equality is not guaranteed. Report each row's realised edge count beside the
+   target; where a row lands more than 1% below it, mark that row's shape comparison approximate rather than
+   adjusting the target.
+4. **Scope.** One threshold per row, applied unchanged to every subgraph, as `evaluate_fixed_threshold` does.
+   Matching the *union* density does **not** equalise density inside each BFS subgraph, so per-subgraph RD
+   still varies and a density-matched row's macro RD is not 1. Read GS and the three MMD ratios at the matched
+   density, and treat RD there as a diagnostic of that residual spread, not as a matched quantity.
+
+Report it **alongside**, never instead of, the protocol's V_val-selected threshold, since re-selecting a
+threshold per row is outside `test_protocol_v8`.
+
+Scoring interventions on the selected checkpoint: whole-universe seeded graph transplant between rows,
+independent permutation of C attachment correspondence for one endpoint, and independent bridge rewiring
+relative to the endpoint attachments. These preserve weight multisets and family totals but **not** every
+node's weighted degree; report the changed degree marginals. Permute globally before shard division, never
+within label-pure shards. No threshold reselection on test interventions.
+
+A better edge metric alone does not establish improved topology. If a density-only or direct-prefix control
+matches the arm, connectivity has not earned its mechanism. If Stage I gains and Stage II does not, the
+remaining problem is transfer, not a need for a stronger oracle.
+
+## 9. Implementation path, cost and verification
+
+New family `v3_1_motif_prompt`. **All new modules live under `src/model/egostitch/classifier/`**: the
+EgoStitch generator and encoder registry slots exchange `ImaginedGraph` and `GraphEmbedding`, which carry
+no pair channel and take no residue input, so the motif reader and generator cannot occupy them, and
+`registry.py`/`composite.py` are not touchpoints.
+
+- `src/data/`: deterministic template compiler with queried-edge removal, and the §7.3 target tensor.
+- `src/model/egostitch/classifier/motif_prompt.py`: generator, count head, GRIT adapter exposing node and
+  symmetric pair states, four-token prefix interface with per-field masking, frozen base composition.
+- Training, scoring and evaluation entry points: family registration, stage trainability, structural-stream
+  support, teacher targets, diagnostics and truth-free score loading, plus the `optim.stop_after_epoch` key
+  of §7.4 and its exclusion from the resume-config comparison. No parallel pipeline.
+
+**Cost, with every figure labelled.** *Measured in this repo:* `b0_v31` 102 s/epoch train at 59.7 GiB/rank;
+`prefix_base` 316.6 s; struct arms 245–270 s at **81.7 GiB/rank** against the 85 GiB cap; the GRIT teacher
+722 s at 72.5 GiB. *Derived, not measured* (the audit states plainly that no new row is grounded in a
+profile): task stream about 410 s/epoch, structural stream about 600 s/epoch, GRIT-26 +100–400 s in Stage I
+and +300–900 s in Stage II, motif compilation for the structural stream +40–400 s, giving roughly
+1,150–1,800 s/epoch for Stage I and 1,350–2,300 s/epoch for Stage II, about 6.5–11 h per 15-epoch lane.
+These totals **include** the structural stream retained in §7.1. No 26-node GRIT profile exists anywhere in
+the repo, and the 61.8 GiB figure quoted for a previous Stage II arm has no profile behind it in this
+checkout and must not be used as a ceiling.
+
+The binding constraint is memory, not arithmetic: the reader is about 0.08 GFLOP/row against the trunk's
+~27, but struct arms already sit about 3 GiB under the cap. Mitigations, in order: set a
+`struct.token_budget` override as previous struct runs required, since it alone leaves the objective intact;
+then, only as a declared protocol change under §7.1's rules, reduce `max_pairs_per_rank` toward 1536 — with
+gradient accumulation, or applied identically to every control — and halve `struct.subgraphs_per_epoch`.
+**Profile one epoch before allocating the wave.**
+
+Required checks: queried-edge deletion before weighting and truncation; no V_val or boundary targets;
+compiler and generator swap equivariance; within-role permutation invariance of both the reader and
+`L_slot`; finite outputs and gradients at zero and tiny weights; **connected, finite gradients reaching all
+96 edges on deliberately non-degenerate fixtures**, interior family included, from `L_slot` and from the
+task path — not universal nonzero gradients, since a correctly matched sorted profile has zero gradient by
+construction, including in the wedge counterexample of §7.3; a fixture asserting that `L_slot` is nonzero
+when the predicted and compiled wedge masses differ while their edge multisets agree; a fixture holding small
+attachments and wrong interior weights, asserting the **analytic derivative of `L_slot` with respect to an
+interior weight** — `(1/64) * err_q * a * c` from the product term against `(1/64) * err_b` from the interior
+term, so that enabling `beta_i` raises `|dL/d(interior logit)|` from `1.266e-7` to `1.266e-3` on §7.3's fixture,
+the factor of `1e4` the closed form predicts. Head-gradient *norm* ratios are telemetry only and never a pass
+condition: they scale with head parameterisation, parameter count and residual size, so a correctly fitted
+attachment head can carry almost no gradient while a badly fitted interior head correctly carries a large one; active final GRIT edge
+parameters; exact gates-off base identity; per-field masking renormalises correctly; identical clean and
+predicted graph layouts; self-row masking confined to `L_slot` and `L_topo`; checkpoint round-trip; scoring
+with no graph or target files; batch- and shard-independent outputs; DDP initialisation and gradient
+agreement. Telemetry — gate saturation, effective rank, family usage, per-term per-group gradient norms
+from epoch 1 — is reported and acted on, never a run eligibility gate.
+
+**Precision landmine.** `validate_score_precision` returns early for any family that is not
+`egostitch_e2e`, so this arm gets no protection from `validate_artifact_precision` against a
+bf16-contaminated artifact. Extend the validator to this family before the first formal score.
+
+## 10. Evidence limits
+
+The dataset probes behind this design already inspected test labels and topology, including a test-fitted
+logistic readout; that complement is excluded from the case for deployment and the exposure is part of this
+design's provenance. The §0.2 pilots deliberately keep the investment decision on V_val and held-out
+training rows. A result on the same test set must disclose this history.
+
+The graph, its compiler, the warm-up and the losses are our design, not a combination proved optimal by the
+cited work. The nearest published mechanism — a fixed virtual template with query-conditioned learned gates
+read by a graph network from endpoint features — was reproduced on this benchmark and **lost** to B0
+(V_val AUPRC 0.730 / GS 0.250 against 0.814 / 0.401), with its gates nearly constant across epochs. The
+published base rate for learned-structure gains on link prediction is small and inconsistent. Expect a
+modest result at best, and treat the structural stream, not the reader, as the component most likely to
+move the topology panel. Weighted motif truncation, imperfect generation, reader drift, density shortcuts
+and runtime cost remain unresolved risks. Stage I must be trained anew; coordinate-reader checkpoints
+cannot instantiate this interface.
+
+## 11. Change log
+
+| Version | Date | Changes |
+|---|---|---|
+| v9 | 2026-09-16 | Implementation-planning clarifications, no design change. §8's "degree-matched control" is renamed the **degree-only control** and given an algorithm: a trained arm whose prompt carries only the symmetric degree pair from the predicted adjacency, with the mass entries zeroed and the GRIT fields row-masked — not a degree-marginal re-thresholding, which this specification never uses as a matching target. Recorded because the plan could not write that control's config from the v8 text. Separately, §11 was lost from the file between the v8 edit and the planning pass and has been reconstructed from the edit scripts; the cause was not determined and the file is untracked, so no git history existed to recover from. |
+| v8 | 2026-09-16 | Sixth owner review; no architectural blocker found. Pilot B's **collapse control is withdrawn**: averaging predicted edge weights is not invariant to the anonymous-slot permutation §3 randomises, so two rows predicting the same wedge through different closure slots — each at zero loss, identical sorted profiles, wedge mass `0.25` — average to two half-strength wedges at mass `0.125` and loss `0.00244140625` (reproduced), which would have been misread as row-dependent prediction. Row-dependence is now tested by a **row-transplant control** reusing §8's seeded whole-graph transplant, which keeps each predicted graph intact and scores exactly zero on that fixture, alongside the retained asymmetric fixed-template baseline and profile dispersion (§0.2). |
+| v7 | 2026-09-16 | Fifth owner review. The oracle orientation of v6 is removed as vacuous: `L_slot` is **exactly invariant** under `u<->v, L<->R` — wedge products fixed, bridge-product and interior matrices transposed, attachment vectors exchanged, so every sorted profile is unchanged (verified, max `6.9e-18` in float64 over 100 fixtures). The comparator is simply an **asymmetric** fixed template; removing the symmetry constraint, not adding an orientation, is what the v6 counterexample called for. Beating one fitted template is downgraded from a bound to held-out empirical evidence, with a profile-dispersion statistic and a **collapse control** (evaluate the head's own row-mean 96-weight vector) added to test row-dependence directly (§0.2). *The collapse control was withdrawn in v8; the dispersion statistic stands.* The false-mass guard gains a pre-declared absolute allowance `F_1 - F_0 <= max(0.1*F_0, 0.01*s_bridge)`, since the bare 10% form is zero-tolerance at `F_0 = 0` and would reject a 1.0 → 0.1 reconstruction gain against a `1e-9` false mass; empty-stratum behaviour is defined so no undefined mean can select a setting (§0.2). |
+| v6 | 2026-09-16 | Fourth owner review, on the instruments rather than the model. The `beta_i` selector no longer divides by a near-zero target: against truth `[0, 0.1]` a per-row relative error with a `1e-6` floor scores the near-correct `[1e-4, 0.1]` at 50.0 and the collapsed `[0, 0]` at 0.5, so it would have selected collapse; zero-target false mass and fixed-scale positive-target reconstruction are now reported and decided separately, with the tie aggregate named (§0.2). **The v5 self-loop claim was wrong**: `compute_graph_similarity` is Dice over edge sets that retain self-loops (an extra loop against a one-edge reference gives GS `2/3`, reproduced), and only the sweep's `recall` diagnostic strips them, so the density control keeps the official convention; `target_edges` is the arm's own realised union edge count, and any rate is the selected-pair fraction, never `nx.density` (§8). Pilot B gains a fixed-template comparator, since a conditional head can beat a symmetric constant graph at identical sorted profiles on every row, and the mean-profile gap is no longer called a measurement of infeasibility (§0.2). *The orientation half of that amendment was wrong and v7 removes it.* The interior-gradient check tests the analytic interior-weight derivative (`1.266e-7` to `1.266e-3`, the predicted `1e4`) instead of a head-gradient-norm ratio, which is now telemetry (§9). |
+| v5 | 2026-09-16 | Third owner review. Pilot B predicts the 96 **edge weights** and derives the profiles, read against an optimised **constant-graph** baseline, because a mean sorted profile need not be realisable by any graph (worked counterexample in §0.2). `L_slot` gains a raw **interior** term `beta_i`: for `q = a b c` the interior gradient is attenuated by `a c`, measured at `1.27e-7` against `1.27e-3` on a non-degenerate fixture carrying a 90% bridge-mass deficit, and the attachment term does not reach interior weights at all (§7.3); `beta_i` is settled by a pre-registered pilot-B measurement. `max_pairs_per_rank` corrected: it sets the global batch and the optimizer-step count, and through `count = steps` the structural-subgraph count, so it is a protocol change and not chunking; `struct.token_budget` is the only true chunking lever (§7.1, §9). The output-density control gains an exact algorithm — union, self-loop convention, `target_edges`, atomic tie handling through `density_matched_threshold`, and the statement that union matching leaves per-subgraph RD unmatched (§8). The warm-up contradiction is resolved: the pilot keeps the 15-epoch OneCycle sizing and stops at epoch 2 via `optim.stop_after_epoch`, which makes it a true prefix, so the winner is **continued** under the guarded resume path rather than restarted (§7.4). |
+| v4 | 2026-09-16 | Second owner review. `L_slot` supervises sorted **path products**, not sorted edge weights, so it pins `wedge_mass` and `bridge_mass` exactly and the wedge counterexample is no longer a zero-loss state (§7.3); pilot B's success criterion restricted to profile/mass predictability against a training-mean baseline, with connectivity explicitly excluded (§0.2). `subgraphs_per_epoch` reclassified from compute lever to objective change, with memory levers named instead (§7.1). "Density matching" split into coordinate calibration (§0.2, continuous coordinates only, distance indicators excluded, degenerate case defined) and a separately defined output-density control (§8). Caching ratio corrected to **1.34×** after the `epoch_rows[0]` alias was found; struct-pair targets noted as cacheable. Teacher handoff specified as a complete bundle with restart-not-continue and the five-metric rule (§7.4, §7.5). Gradient verification weakened to connected finite gradients on non-degenerate fixtures; RRWP requires autocast **disabled**, not merely fp32 inputs (§5.2, §9). |
+| v3 | 2026-09-16 | First owner review. Structural stream restored to both stages (C). `L_slot` redefined as a per-family order-statistics loss covering all 96 edges (B). Teacher selected by downstream utility (E). Ceiling test downgraded to a V_val-only pilot and a resource-allocation stop rule (§0.2). Count-only/GRIT-only become trained arms with per-field masking (G). `topo_cnt` made explicitly swap-invariant (I). Caching decided from measurement (D). Cost figures labelled derived vs measured (J). Literature strength stated at its real scope (A). |
+| v2 | 2026-09-16 | Nine amendments after an adversarial review returned "do not proceed as specified" and a feasibility audit returned "buildable with named changes". |
+| v1 | 2026-09-16 | First decision: motif template graph read by GRIT, three tokens, counts removed, corpus-wide compilation implied, teacher by true-template rank. |
+
+No implementation, training, scoring, HPO or monitoring was performed by this design task.

@@ -1,5 +1,9 @@
 # Virtual topology prompt: a coarsened-graph generator behind the v1 coordinate interface
 
+**Next architecture decision (2026-09-16):** [motif graph prompts read by GRIT](2026-09-16-motif-graph-grit-prompt-design.md).
+That separate candidate replaces coordinates with graph-derived tokens. It is not implemented;
+this document continues to describe the existing coarsened-graph arms and checkpoints.
+
 **Date:** 2026-09-15
 **Version:** v0.6 (supersedes v0.5 of 2026-09-15; change log in §12)
 **Status:** v0.5 ran and was diagnosed at epoch 8 (`docs/tmp/2026-09-16-virtual-prompt-diagnosis-and-revision.md`);

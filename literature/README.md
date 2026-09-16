@@ -4,9 +4,13 @@ The active PDF library lives under `literature/models/`. Filenames use
 `year_venue_arxiv_<id>_title.pdf` when an arXiv ID is known and
 `year_venue_title.pdf` otherwise.
 
-- Active PDFs: 116
-- PDFs with arXiv IDs in filenames: 112
-- PDFs without confirmed arXiv IDs: 4
+- Local PDF snapshot (2026-09-16): 175
+- PDFs with arXiv IDs in filenames: 165
+- PDFs without arXiv IDs in filenames: 10
+
+The latest [virtual topology prompt review and architecture decision](research_reports/2026-09-16-virtual-topology-prompt-litreview/README.md)
+includes the recovered five-thread bibliography, verification corrections and a selected GRIT/template
+graph candidate. It is a design record, not an implemented or evaluated method.
 
 ## Folder map
 
@@ -20,6 +24,9 @@ The active PDF library lives under `literature/models/`. Filenames use
 | `graph_generation/` | Generative graph models |
 | `graph_generation_realism/` | Graph-generation realism and evaluation |
 | `graph_structure_learning/` | Latent structure, refinement, pooling, masking, and GSL benchmarks |
+| `graph_prompting/` | Graph prompt structure, conditional prompts and prompt benchmarks |
+| `graph_transformers/` | Graph readers, virtual nodes and structural encodings |
+| `prompt_and_prefix_tuning/` | Prefix interfaces, frozen-backbone adaptation and unfreezing schedules |
 | `kg_inductive_lineage/` | Inductive knowledge-graph reasoning lineage |
 | `cv_generative_mechanisms/` | Generative mechanisms imported from computer vision |
 
