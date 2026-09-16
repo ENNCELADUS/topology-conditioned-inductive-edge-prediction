@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import networkx as nx
 import numpy as np
 import pytest
@@ -264,3 +266,41 @@ def test_profiles_and_counts_are_invariant_under_a_within_role_permutation() -> 
         )
     for key, value in count_statistics(shuffled).items():
         torch.testing.assert_close(value, count_statistics(weights)[key])
+
+
+@pytest.mark.slow
+def test_no_compiled_target_ever_names_a_v_val_or_boundary_node(benchmark_root: Path) -> None:
+    from src.data.artifacts import load_benchmark
+    from src.data.partition import build_g_struct
+    from src.data.val_region import derive_val_region_split
+
+    bench = load_benchmark(benchmark_root, "breadth_first", verify=False)
+    raw_negatives = [
+        pair
+        for labeled in (bench.split.train_pairs, bench.split.val_pairs)
+        for pair, label in zip(labeled.pairs, labeled.labels.tolist(), strict=True)
+        if label == 0
+    ]
+    split = derive_val_region_split(
+        bench.split.train_nodes,
+        bench.split.train_graph.edges(),
+        raw_negatives,
+        bench.positive_edges,
+    )
+    table = MotifTemplateTable(build_g_struct(split.train_nodes, split.training_positives))
+    assert not (set(table.nodes) & set(split.v_val))
+    pairs = sorted(split.training_positives)[:64]
+    for u, v in pairs:
+        assert u not in split.v_val and v not in split.v_val
+        row = table.compile_row(u, v)
+        for node in row.closure + row.left + row.right:
+            assert node not in split.v_val
+
+
+def test_summary_records_the_measured_compile_rate() -> None:
+    table = MotifTemplateTable(_wedge_graph())
+    summary = table.summary()
+    assert summary["nodes"] == len(table.nodes)
+    assert summary["edges"] == 96
+    assert isinstance(summary["compile_seconds_per_10k"], float)
+    assert summary["compile_seconds_per_10k"] >= 0.0
