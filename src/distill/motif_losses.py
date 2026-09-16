@@ -1,13 +1,17 @@
-"""``L_slot``, the motif-prompt per-family order-statistics loss.
+"""``L_slot`` and ``L_topo``, the motif-prompt graph-supervision losses.
 
 Design: ``docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md``
-section 7.3. Four multisets are supervised per row -- the 8 wedge products, the
-64 bridge path products, the 16 raw attachment weights and the 64 raw interior
-weights -- each through a descending sort and a Huber term. Sibling of
+sections 7.3 and 7.5. ``L_slot`` supervises four multisets per row -- the 8 wedge
+products, the 64 bridge path products, the 16 raw attachment weights and the 64
+raw interior weights -- each through a descending sort and a Huber term.
+``L_topo`` is the light representation term comparing the four token fields the
+immutable teacher reads from the predicted and the true graph. Sibling of
 `src.distill.struct_losses`, where the other training losses live.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
 
 import torch
 from torch.nn import functional as F
@@ -117,3 +121,78 @@ def slot_loss(
         beta_i=beta_i,
         huber_delta=huber_delta,
     ).mean()
+
+
+TOPO_FIELDS: tuple[str, ...] = ("topo_u", "topo_v", "topo_rel", "topo_cnt")
+
+
+def topo_loss_rows(
+    student: Mapping[str, torch.Tensor], teacher: Mapping[str, torch.Tensor]
+) -> torch.Tensor:
+    """Per-row ``L_topo``: squared error of fixed non-affine LayerNorms (spec section 7.5).
+
+    ``N`` is `torch.nn.functional.layer_norm` with no learnable affine, applied to
+    each of the four token fields, so the term compares directions rather than
+    scales and a global shift or positive rescaling of a field costs nothing. The
+    teacher side is detached here; the caller runs ``R_T(Ahat)`` with autograd so
+    the loss reaches the generator, and only ``R_T(A*)`` under `torch.no_grad`.
+
+    Rows are independent, so a caller masks self rows out (spec section 3).
+
+    Args:
+        student: The four fields the teacher read from the predicted graph.
+        teacher: The four fields the immutable teacher read from the true graph.
+
+    Returns:
+        ``(B,)`` per-row mean squared error over fields and dimensions, in float32.
+
+    Raises:
+        KeyError: If either mapping is missing one of `TOPO_FIELDS`.
+    """
+    terms: list[torch.Tensor] = []
+    for name in TOPO_FIELDS:
+        ours = student[name].float()
+        theirs = teacher[name].float().detach()
+        width = ours.size(-1)
+        normalised = F.layer_norm(ours, (width,))
+        reference = F.layer_norm(theirs, (width,))
+        terms.append((normalised - reference).square().mean(dim=-1))
+    return torch.stack(terms, dim=-1).mean(dim=-1)
+
+
+def stream_mean(
+    rows: Sequence[torch.Tensor], masks: Sequence[torch.Tensor], *, like: torch.Tensor
+) -> torch.Tensor:
+    """Average per-stream row means, then average across the non-empty streams.
+
+    The task stream and the structural stream carry very different row counts, so
+    the spec averages inside a stream first and weights the streams equally. An
+    empty stream -- no rows at all, or no valid nonself rows -- contributes a
+    differentiable zero rather than dropping out of the graph, so DDP sees the
+    same parameters on every rank (spec section 7.5).
+
+    Args:
+        rows: One ``(n_s,)`` per-row tensor per stream.
+        masks: One ``(n_s,)`` valid-row mask per stream, aligned with ``rows``.
+        like: A tensor supplying dtype, device and the autograd connection.
+
+    Returns:
+        The scalar mean.
+
+    Raises:
+        ValueError: If ``rows`` and ``masks`` differ in length.
+    """
+    if len(rows) != len(masks):
+        raise ValueError(f"rows ({len(rows)}) and masks ({len(masks)}) must be aligned")
+    zero = like.sum() * 0.0
+    means: list[torch.Tensor] = []
+    for row, mask in zip(rows, masks, strict=True):
+        if row.numel() == 0:
+            continue
+        weight = mask.to(row).sum()
+        if float(weight) == 0.0:
+            continue
+        means.append((row * mask.to(row)).sum() / weight)
+    if not means:
+        return zero
+    return zero + torch.stack(means).mean()

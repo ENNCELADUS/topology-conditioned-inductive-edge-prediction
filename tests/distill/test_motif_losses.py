@@ -1,4 +1,4 @@
-"""L_slot: order statistics, mass pinning, invariances and the interior derivative."""
+"""L_slot order statistics and mass pinning; L_topo directions and stream averaging."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from src.data.motif_template import (
     count_statistics,
     role_permutation,
 )
-from src.distill.motif_losses import slot_loss, slot_loss_rows
+from src.distill.motif_losses import slot_loss, slot_loss_rows, stream_mean, topo_loss_rows
 
 _BETAS = {"beta_p": 1.0, "beta_q": 1.0, "beta_a": 1.0, "beta_i": 1.0, "huber_delta": 1.0}
 _FAMILIES = ("beta_p", "beta_q", "beta_a", "beta_i")
@@ -277,3 +277,76 @@ def test_the_product_term_alone_reproduces_the_documented_mean_of_4_05e_minus_5(
     target[0, 32:] = 1.0
     loss = slot_loss(predicted, target, **_only("beta_q"))
     assert float(loss) == pytest.approx(4.05e-5, rel=1e-3)
+
+
+_FIELDS = ("topo_u", "topo_v", "topo_rel", "topo_cnt")
+
+
+def _tokens(n: int = 3, width: int = 8, seed: int = 0) -> dict[str, torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    return {name: torch.randn(n, width, generator=gen) for name in _FIELDS}
+
+
+def test_topo_loss_is_zero_on_identical_tokens_and_ignores_a_global_shift_and_scale() -> None:
+    tokens = _tokens()
+    rows = topo_loss_rows(tokens, tokens)
+    assert rows.shape == (3,)
+    assert float(rows.abs().max()) == pytest.approx(0.0, abs=1e-6)
+    scaled = {name: 3.0 * value + 5.0 for name, value in tokens.items()}
+    assert float(topo_loss_rows(scaled, tokens).abs().max()) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_topo_loss_detaches_the_teacher_but_not_the_student() -> None:
+    student = {name: value.clone().requires_grad_(True) for name, value in _tokens(seed=1).items()}
+    teacher = {name: value.clone().requires_grad_(True) for name, value in _tokens(seed=2).items()}
+    topo_loss_rows(student, teacher).sum().backward()  # type: ignore[no-untyped-call]
+    assert all(value.grad is not None for value in student.values())
+    assert all(value.grad is None for value in teacher.values())
+
+
+def test_topo_loss_covers_all_four_fields() -> None:
+    student = _tokens(seed=1)
+    teacher = _tokens(seed=1)
+    for name in _FIELDS:
+        perturbed = dict(student)
+        perturbed[name] = student[name] + 1.5
+        assert float(topo_loss_rows(perturbed, teacher).sum()) > 0.0
+
+
+def test_topo_loss_raises_when_a_field_is_missing() -> None:
+    tokens = _tokens()
+    partial = {name: value for name, value in tokens.items() if name != "topo_cnt"}
+    with pytest.raises(KeyError, match="topo_cnt"):
+        topo_loss_rows(partial, tokens)
+
+
+def test_an_empty_stream_contributes_a_differentiable_zero() -> None:
+    anchor = torch.zeros((), requires_grad=True)
+    rows = torch.stack([torch.tensor(0.5), torch.tensor(1.5)]) + anchor
+    mask = torch.tensor([1.0, 0.0])
+    torch.testing.assert_close(stream_mean([rows], [mask], like=anchor), torch.tensor(0.5))
+    empty = stream_mean([], [], like=anchor)
+    assert float(empty) == 0.0
+    assert empty.requires_grad
+    torch.testing.assert_close(
+        stream_mean([rows, rows.new_zeros(0)], [mask, mask.new_zeros(0)], like=anchor),
+        torch.tensor(0.5),
+    )
+
+
+def test_stream_mean_weights_streams_equally_regardless_of_their_row_counts() -> None:
+    anchor = torch.zeros((), requires_grad=True)
+    big = torch.full((10,), 2.0) + anchor
+    small = torch.full((1,), 0.0) + anchor
+    combined = stream_mean([big, small], [torch.ones(10), torch.ones(1)], like=anchor)
+    torch.testing.assert_close(combined, torch.tensor(1.0))
+    combined.backward()  # type: ignore[no-untyped-call]
+    assert anchor.grad is not None
+
+
+def test_a_fully_masked_stream_drops_out_rather_than_dividing_by_zero() -> None:
+    anchor = torch.zeros((), requires_grad=True)
+    rows = torch.tensor([1.0, 3.0]) + anchor
+    masked = stream_mean([rows, rows], [torch.ones(2), torch.zeros(2)], like=anchor)
+    torch.testing.assert_close(masked, torch.tensor(2.0))
+    assert float(stream_mean([rows], [torch.zeros(2)], like=anchor)) == 0.0
