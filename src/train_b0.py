@@ -135,7 +135,12 @@ from src.model.egostitch.classifier.coord_gen import (
     V3_1CoordGen,
     distance_class_targets,
 )
-from src.model.egostitch.classifier.motif_prompt import TEMPLATE_KEY, V3_1MotifPrompt
+from src.model.egostitch.classifier.motif_prompt import FAMILIES as MOTIF_FAMILIES
+from src.model.egostitch.classifier.motif_prompt import (
+    FIELD_ORDER,
+    TEMPLATE_KEY,
+    V3_1MotifPrompt,
+)
 from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
 from src.model.egostitch.classifier.topo_prompt import (
@@ -151,10 +156,20 @@ _REP_COS_ARMS = frozenset({"kd_rep", "kd_rank_rep", "kd_logit_rep"})
 
 logger = logging.getLogger(__name__)
 
-MODEL_FAMILIES = ("v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen", "f0_mlp")
-V3_1_FAMILIES = frozenset({"v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen"})
+MODEL_FAMILIES = (
+    "v3_1",
+    "v3_1_prefix",
+    "v3_1_topo_prompt",
+    "v3_1_coord_gen",
+    "v3_1_motif_prompt",
+    "f0_mlp",
+)
+V3_1_FAMILIES = frozenset(
+    {"v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen", "v3_1_motif_prompt"}
+)
 TOPO_PROMPT_FAMILY = "v3_1_topo_prompt"
 COORD_GEN_FAMILY = "v3_1_coord_gen"
+MOTIF_PROMPT_FAMILY = "v3_1_motif_prompt"
 RUN_KINDS = ("formal", "diagnostic")
 
 
@@ -1138,13 +1153,16 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
         return _resolve_topo_prompt_kwargs(model_cfg)
     if model_cfg.family == COORD_GEN_FAMILY:
         return _resolve_coord_gen_kwargs(model_cfg)
+    if model_cfg.family == MOTIF_PROMPT_FAMILY:
+        return _resolve_motif_prompt_kwargs(model_cfg)
     if model_cfg.family == "v3_1":
         return dict(model_cfg.config) if model_cfg.config else dict(BEST_V3_1_CONFIG)
     if model_cfg.family == "f0_mlp":
         return dict(model_cfg.config)
     raise ValueError(
         f"unknown model family '{model_cfg.family}' "
-        "(expected v3_1, v3_1_prefix, v3_1_topo_prompt, v3_1_coord_gen, or f0_mlp)"
+        "(expected v3_1, v3_1_prefix, v3_1_topo_prompt, v3_1_coord_gen, "
+        "v3_1_motif_prompt, or f0_mlp)"
     )
 
 
@@ -1164,7 +1182,7 @@ def _base_loss_kwargs(model_cfg: ModelConfig) -> Mapping[str, object]:
         The flat kwargs mapping to read ``positive_weight`` / ``label_smoothing`` from.
     """
     kwargs = resolve_model_kwargs(model_cfg)
-    if model_cfg.family in ("v3_1_prefix", TOPO_PROMPT_FAMILY):
+    if model_cfg.family in ("v3_1_prefix", TOPO_PROMPT_FAMILY, MOTIF_PROMPT_FAMILY):
         return cast(Mapping[str, object], kwargs["base"])
     if model_cfg.family == COORD_GEN_FAMILY:
         reader = cast(Mapping[str, object], kwargs["reader"])
@@ -1299,6 +1317,76 @@ def _resolve_coord_gen_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     return {"reader": reader_config, "coord_gen": block.to_dict()}
 
 
+def _load_motif_bundle(path: Path) -> tuple[Mapping[str, object], str]:
+    """Load a published ``v3_1_motif_prompt`` Stage I bundle and digest the file.
+
+    The bundle is the reader, the count head, the token projections, the role
+    embeddings and the prefix adapter with its gates (spec section 7.4). The
+    digest is provenance only, never verified (project rule: no digest pinning).
+
+    Args:
+        path: The Stage I bundle checkpoint path.
+
+    Returns:
+        ``(payload, sha256)``.
+
+    Raises:
+        ValueError: If the payload is not a ``v3_1_motif_prompt`` checkpoint mapping.
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping) or payload.get("model_family") != MOTIF_PROMPT_FAMILY:
+        raise ValueError(
+            f"{path}: motif_prompt.bundle_checkpoint must be a published "
+            "v3_1_motif_prompt checkpoint"
+        )
+    return payload, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resolve_motif_prompt_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
+    """Resolve the ``v3_1_motif_prompt`` constructor kwargs.
+
+    The frozen trunk's config comes from exactly one place: ``model.config.base``
+    (explicit `V3_1` kwargs) or the embedded config of
+    ``model.config.motif_prompt.base_checkpoint``. Checkpoint paths and digests
+    are recorded as provenance and never verified.
+
+    Args:
+        model_cfg: The ``model:`` config section.
+
+    Returns:
+        ``{"motif_prompt": ..., "base": ...}``.
+
+    Raises:
+        ValueError: If the block is missing, an unexpected sibling key is present,
+            or neither an inline ``base`` nor a ``base_checkpoint`` names the trunk.
+    """
+    raw = dict(model_cfg.config)
+    block = raw.pop("motif_prompt", None)
+    if not isinstance(block, Mapping):
+        raise ValueError("model.config.motif_prompt is required for v3_1_motif_prompt")
+    base = raw.pop("base", None)
+    extra = sorted(raw)
+    if extra:
+        raise ValueError(
+            f"v3_1_motif_prompt accepts only model.config.{{motif_prompt,base}}, got {extra}"
+        )
+    resolved = dict(cast(Mapping[str, object], block))
+    checkpoint = str(resolved.get("base_checkpoint", "") or "")
+    if base is None:
+        if not checkpoint:
+            raise ValueError(
+                "v3_1_motif_prompt needs model.config.base or motif_prompt.base_checkpoint"
+            )
+        payload, digest = _load_base_checkpoint(Path(checkpoint))
+        base = cast(Mapping[str, object], payload["model_config"])
+        resolved["base_checkpoint_sha256"] = digest
+    bundle = str(resolved.get("bundle_checkpoint", "") or "")
+    if bundle:
+        _, bundle_digest = _load_motif_bundle(Path(bundle))
+        resolved["bundle_checkpoint_sha256"] = bundle_digest
+    return {"motif_prompt": resolved, "base": dict(cast(Mapping[str, object], base))}
+
+
 def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     """Embed the frozen base's ``model_config`` and record the base file's SHA-256.
 
@@ -1387,6 +1475,24 @@ def build_model(cfg: Config) -> nn.Module:
             raise ValueError(f"{reader_path}: reader checkpoint carries no coordinate statistics")
         _validate_topo_gen_distill_contract(gen_model, cfg.distill)
         return gen_model
+    if cfg.model.family == MOTIF_PROMPT_FAMILY:
+        motif_model = V3_1MotifPrompt(**kwargs)  # type: ignore[arg-type]
+        block = cast(Mapping[str, object], kwargs["motif_prompt"])
+        base_checkpoint = str(block.get("base_checkpoint", "") or "")
+        if base_checkpoint:
+            payload, _ = _load_base_checkpoint(Path(base_checkpoint))
+            motif_model.base.load_state_dict(cast(Mapping[str, Any], payload["model_state"]))
+        bundle = str(block.get("bundle_checkpoint", "") or "")
+        if bundle:
+            # The whole Stage I bundle initialises both roles: `R_S` and the
+            # adapter train on, `R_T` is the immutable eval-mode copy (spec 7.4).
+            stage_one, _ = _load_motif_bundle(Path(bundle))
+            motif_model.load_state_dict(
+                cast(Mapping[str, Any], stage_one["model_state"]), strict=False
+            )
+            motif_model.initialize_teacher()
+        _validate_topo_gen_distill_contract(motif_model, cfg.distill)
+        return motif_model
     if cfg.model.family == "v3_1":
         v3_1_model = V3_1(**kwargs)
         _validate_topo_gen_distill_contract(v3_1_model, cfg.distill)
@@ -1986,6 +2092,19 @@ def _run_metadata(
                 "kd_alpha": gen_kwargs.get("kd_alpha"),
                 "anchor": gen_kwargs.get("w_anchor"),
             },
+        }
+    if cfg.model.family == MOTIF_PROMPT_FAMILY:
+        motif_kwargs = cast(Mapping[str, object], model_kwargs["motif_prompt"])
+        run_metadata["motif_prompt"] = {
+            "stage": motif_kwargs.get("stage"),
+            "fields": list(cast(Sequence[str], motif_kwargs.get("fields", FIELD_ORDER))),
+            "families": list(cast(Sequence[str], motif_kwargs.get("families", MOTIF_FAMILIES))),
+            "token_source": motif_kwargs.get("token_source"),
+            "gate_mode": motif_kwargs.get("gate_mode"),
+            "base_checkpoint": motif_kwargs.get("base_checkpoint") or None,
+            "base_checkpoint_sha256": motif_kwargs.get("base_checkpoint_sha256"),
+            "bundle_checkpoint": motif_kwargs.get("bundle_checkpoint") or None,
+            "bundle_checkpoint_sha256": motif_kwargs.get("bundle_checkpoint_sha256"),
         }
     if "virtual_graph" in result.runtime_profile:
         run_metadata["virtual_graph"] = result.runtime_profile["virtual_graph"]
