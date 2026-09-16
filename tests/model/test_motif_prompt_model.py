@@ -94,6 +94,21 @@ def test_count_head_runs_in_fp32_under_autocast_and_stays_finite_at_zero() -> No
     assert zero.grad is not None and torch.isfinite(zero.grad).all()
 
 
+def test_count_head_under_autocast_is_bit_identical_to_the_autocast_free_token() -> None:
+    # The trailing `.float()` would make an unguarded token fp32 too, so the
+    # dtype alone proves nothing: the projection has to run with autocast
+    # disabled or the token carries bf16 precision (spec section 5.1).
+    torch.manual_seed(0)
+    head = MotifCountHead(width=16)
+    weights = _weights(seed=4)
+    reference = head(weights)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        guarded = head(weights)
+        naive = head.proj(torch.zeros(weights.size(0), 4))
+    assert torch.equal(guarded, reference)
+    assert naive.dtype == torch.bfloat16
+
+
 def test_dense_adjacency_is_symmetric_with_a_zero_diagonal_and_no_uv_entry() -> None:
     adj = dense_adjacency(_weights())
     assert adj.shape == (4, 26, 26)
