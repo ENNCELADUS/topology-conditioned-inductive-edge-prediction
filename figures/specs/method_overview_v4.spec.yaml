@@ -1,0 +1,656 @@
+# Method overview figure v4 for the ICLR 2027 paper (canonical source for
+# figures/method_overview_v4.{drawio,svg,png,pdf}).
+#
+# Architecture drawn: docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md (v9)
+#   S1 task contract, S2 the 26-slot / 96-edge motif graph, S4 generator G,
+#   S5 count head + GRIT reader R, S6 the gated KV prefix interface with frozen F,
+#   S7 the two stages, the trainability table and where the losses attach.
+#
+# Naming: G is the GENERATOR throughout, as in the specification. The observed graph is
+# called "the legal training graph"; its compiled 26-slot template is A*.
+#
+# Style follows figures/specs/method_overview.spec.yaml and figures/tmp/method_overview_v3.spec.yaml:
+#   rectangles = layers, stadiums = tensors, circles = motif slots,
+#   fill = who trains it / who may see it, orange dashed = supervision.
+# The three edge families carry two channels (hue and stroke weight), so colour is
+# never the only carrier of meaning.
+#
+# Re-render (draw.io skill CLI; no draw.io Desktop on this Mac, so PNG/PDF come from headless Chrome):
+#   node ~/.claude/skills/drawio/scripts/cli.js figures/specs/method_overview_v4.spec.yaml \\
+#        figures/method_overview_v4.drawio --validate
+#   node ~/.claude/skills/drawio/scripts/cli.js figures/specs/method_overview_v4.spec.yaml \\
+#        figures/method_overview_v4.svg --validate
+#   PNG: headless Chrome --screenshot on the SVG
+#   PDF: headless Chrome --print-to-pdf on an HTML wrapper with @page{size:<W>px <H>px;margin:0}
+meta:
+  profile: academic-paper
+  figureType: architecture
+  theme: academic-color
+  palette: okabe-ito
+  source: generated
+  layout: vertical
+  routing: orthogonal
+  print: { widthPt: 396, minPt: 7 }
+  font:
+    primary: "Helvetica, Arial, sans-serif"
+    cjk: "Helvetica, Arial, sans-serif"
+    formula: "Times New Roman, Times, serif"
+  title: "Motif graph prompts read by GRIT: the deployable topology arm"
+  description: "The strict input is the endpoint pair (x_u, x_v). A frozen residue encoder from the published prefix_base gives H_u and H_v; the generator G turns them into one sigmoid weight per allowed edge of a fixed 26-slot motif graph. Two readers see that same predicted adjacency: a closed-form count head emits topo_cnt, and a three-layer GRIT reader emits topo_u, topo_v and topo_rel. The four ordered fields enter a gated KV prefix adapter at all nine cross-attention sites of the frozen pair reader F, whose frozen MLP head returns p_uv = p_vu. Stage I feeds A*, compiled from the legal training graph with the queried edge removed, and trains the reader side only; Stage II feeds the generated graph and trains G, opening part of R after a two-epoch warm-up."
+  legend: "Rectangles are layers, stadiums are tensors, circles are motif slots. G denotes the generator throughout; the observed graph is called the legal training graph. Blue: frozen in both stages, the published prefix_base. Yellow: trained in Stage I and partly reopened in Stage II. Green: trained in Stage II only, the generator G. Pink: true structure, Stage I and teacher only, never available at inference. Blue lines are the 16 closure edges, green lines the 16 attach edges, and the shaded block the 64 interior edges. Orange dashed arrows are training losses."
+
+nodes:
+  - id: banner
+    type: text
+    label: "Strict inference contract: no node IDs, no neighbour lookup, no\ntraining-node bank, no observed query graph, no universe statistic."
+    bounds: { x: 40, y: 30, width: 1320, height: 84 }
+    style: { align: "center", fontSize: 26, fontColor: "#333333" }
+  - id: xin
+    type: terminal
+    label: "( xᵤ , xᵥ ) — the test-time input"
+    bounds: { x: 40, y: 142, width: 644, height: 72 }
+    style: { fillColor: "#F2F2F2", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 30, fontColor: "#111111" }
+  - id: enc
+    type: matrix
+    label: "Frozen residue encoder (prefix_base)"
+    bounds: { x: 40, y: 246, width: 644, height: 76 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111", bold: true, fontSize: 28, fontColor: "#111111" }
+  - id: hstates
+    type: terminal
+    label: "Hᵤ , Hᵥ  residue states"
+    bounds: { x: 40, y: 354, width: 644, height: 76 }
+    style: { fillColor: "#F2F2F2", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 28, fontColor: "#111111" }
+  - id: gtrain
+    type: terminal
+    label: "Legal training graph (Stage I only)"
+    bounds: { x: 712, y: 142, width: 648, height: 72 }
+    style: { fillColor: "#F9D9D9", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 28, fontColor: "#111111" }
+  - id: compile
+    type: matrix
+    label: "Template compiler — no parameters\nremove the queried {u,v} edge, then keep\n≤ 8 closure and ≤ 8 bridge slots per side"
+    bounds: { x: 712, y: 246, width: 648, height: 126 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: astar
+    type: terminal
+    label: "A* — the compiled\nmotif graph\nL_slot target"
+    bounds: { x: 712, y: 404, width: 308, height: 126 }
+    style: { fillColor: "#F9D9D9", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 26, fontColor: "#111111" }
+  - id: rt
+    type: matrix
+    label: "Rᵀ — frozen copy\nof Stage I (eval)\nL_topo target"
+    bounds: { x: 1050, y: 404, width: 310, height: 126 }
+    style: { fillColor: "#F9D9D9", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: genpanel
+    type: matrix
+    label: " "
+    bounds: { x: 40, y: 562, width: 642, height: 700 }
+    style: { fillColor: "#F4FAF6", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: gen_title
+    type: text
+    label: "Generator G — Stage II only"
+    bounds: { x: 56, y: 576, width: 612, height: 46 }
+    style: { align: "center", bold: true, fontSize: 28 }
+  - id: g_attn
+    type: matrix
+    label: "One 4-head residue attention layer\n26 learned slot queries read Hᵤ , Hᵥ:\n8 witness queries over both, 8 bridge\nqueries per side, 2 endpoint queries\nC state = MLP on [aᵤ+aᵥ, |aᵤ−aᵥ|]"
+    bounds: { x: 60, y: 636, width: 604, height: 190 }
+    style: { fillColor: "#CFE8D5", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: g_mp
+    type: matrix
+    label: "Two shared residual message-passing\nlayers, width 96, relation-specific\nmessages, over the fixed template"
+    bounds: { x: 60, y: 846, width: 604, height: 122 }
+    style: { fillColor: "#CFE8D5", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: g_head
+    type: matrix
+    label: "Typed sigmoid gate heads: one weight\nper allowed edge, used in both\norientations, heads shared per type"
+    bounds: { x: 60, y: 988, width: 604, height: 122 }
+    style: { fillColor: "#CFE8D5", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: g_note
+    type: text
+    label: "Equivariant to u↔v with L↔R; no free\nadjacency, top-k or sampler."
+    bounds: { x: 60, y: 1130, width: 604, height: 86 }
+    style: { align: "left", fontSize: 26, fontColor: "#333333" }
+  - id: motifpanel
+    type: matrix
+    label: " "
+    bounds: { x: 712, y: 562, width: 648, height: 700 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: motif_title
+    type: text
+    label: "The motif graph: 26 slots, 96 edges"
+    bounds: { x: 727, y: 576, width: 618, height: 46 }
+    style: { align: "center", bold: true, fontSize: 28 }
+  - id: u
+    type: matrix
+    label: "u"
+    bounds: { x: 770, y: 676, width: 38, height: 430 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 30, verticalAlign: "top", fontColor: "#111111" }
+  - id: v
+    type: matrix
+    label: "v"
+    bounds: { x: 1264, y: 676, width: 38, height: 430 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 30, verticalAlign: "top", fontColor: "#111111" }
+  - id: c0
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 681, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: c1
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 703, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: c2
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 725, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: c3
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 747, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: c4
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 769, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: c5
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 791, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: c6
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 813, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: c7
+    type: operator
+    label: " "
+    bounds: { x: 1006, y: 835, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#0072B2", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l0
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 915, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r0
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 915, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l1
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 937, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r1
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 937, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l2
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 959, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r2
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 959, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l3
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 981, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r3
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 981, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l4
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 1003, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r4
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 1003, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l5
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 1025, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r5
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 1025, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l6
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 1047, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r6
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 1047, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: l7
+    type: operator
+    label: " "
+    bounds: { x: 852, y: 1069, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: r7
+    type: operator
+    label: " "
+    bounds: { x: 1180, y: 1069, width: 18, height: 18 }
+    style: { fillColor: "#FFFFFF", strokeColor: "#009E73", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: interior
+    type: matrix
+    label: "interior family\nevery l – r pair\n8 × 8 = 64 edges"
+    bounds: { x: 884, y: 911, width: 284, height: 180 }
+    style: { fillColor: "#EAD4E4", strokeColor: "#B07AA1", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: lbl_C
+    type: text
+    label: "C : 8 closure slots"
+    bounds: { x: 856, y: 630, width: 320, height: 46 }
+    style: { align: "center", fontSize: 26, fontColor: "#0072B2" }
+  - id: lbl_L
+    type: text
+    label: "L : 8 slots"
+    bounds: { x: 762, y: 862, width: 200, height: 46 }
+    style: { align: "center", fontSize: 26, fontColor: "#009E73" }
+  - id: lbl_R
+    type: text
+    label: "R : 8 slots"
+    bounds: { x: 1090, y: 862, width: 200, height: 46 }
+    style: { align: "center", fontSize: 26, fontColor: "#009E73" }
+  - id: lbl_zero
+    type: text
+    label: "w(u,v) ≡ 0"
+    bounds: { x: 886, y: 1100, width: 300, height: 46 }
+    style: { align: "center", fontSize: 26, fontColor: "#666666" }
+  - id: motif_note
+    type: text
+    label: "Weights in [0,1];  w(u,v) and the whole\ndiagonal are 0;  both readers see it."
+    bounds: { x: 727, y: 1154, width: 618, height: 84 }
+    style: { align: "center", fontSize: 26, fontColor: "#333333" }
+  - id: grit
+    type: matrix
+    label: "GRIT reader R\n3 layers, 96 wide\n4 heads, in fp32\nRRWP [I,P,P²,P³]\nroles + weights only\ntopo_u = W_node hᵤ\ntopo_v = W_node hᵥ\ntopo_rel = W_pair ē"
+    bounds: { x: 712, y: 1294, width: 320, height: 300 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: cnt
+    type: matrix
+    label: "Count head, closed\nform, in fp32\nwedge mass\nΣ_c w(u,c) w(c,v)\nbridge mass\nΣ w(u,l)w(l,r)w(r,v)\ndegrees: sum, |diff|\ntopo_cnt = W log1p"
+    bounds: { x: 1040, y: 1294, width: 320, height: 300 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: t1
+    type: matrix
+    label: "topo_self"
+    bounds: { x: 712, y: 1646, width: 150, height: 78 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", bold: true, fontSize: 26, fontColor: "#111111" }
+  - id: t2
+    type: matrix
+    label: "topo_partner"
+    bounds: { x: 872, y: 1646, width: 196, height: 78 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", bold: true, fontSize: 26, fontColor: "#111111" }
+  - id: t3
+    type: matrix
+    label: "topo_rel"
+    bounds: { x: 1078, y: 1646, width: 136, height: 78 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", bold: true, fontSize: 26, fontColor: "#111111" }
+  - id: t4
+    type: matrix
+    label: "topo_cnt"
+    bounds: { x: 1224, y: 1646, width: 136, height: 78 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", bold: true, fontSize: 26, fontColor: "#111111" }
+  - id: adapter
+    type: matrix
+    label: " "
+    bounds: { x: 712, y: 1756, width: 648, height: 190 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: adapterA
+    type: text
+    label: "Gated KV prefix adapter: 2 prefix rows\nper field, 8 rows, at F's nine cross-\nattention sites.  update = content +\ntanh(α)·prefix; α = 0 ⇒ base exactly"
+    bounds: { x: 732, y: 1772, width: 608, height: 158 }
+    style: { align: "center", fontSize: 26 }
+  - id: fbox
+    type: matrix
+    label: "Pair reader F (prefix_base), frozen"
+    bounds: { x: 712, y: 1978, width: 648, height: 60 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111", bold: true, fontSize: 26, fontColor: "#111111" }
+  - id: head
+    type: matrix
+    label: "MLP output head — frozen"
+    bounds: { x: 712, y: 2070, width: 648, height: 60 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111", bold: true, fontSize: 26, fontColor: "#111111" }
+  - id: pout
+    type: terminal
+    label: "p̂ᵤᵥ = p̂ᵥᵤ = P( edge(u,v) | xᵤ , xᵥ )"
+    bounds: { x: 712, y: 2162, width: 648, height: 76 }
+    style: { fillColor: "#F2F2F2", strokeColor: "#111111", fontFamily: "Times New Roman, Times, serif", italic: true, fontSize: 28, fontColor: "#111111" }
+  - id: stageI
+    type: matrix
+    label: " "
+    bounds: { x: 40, y: 1294, width: 644, height: 190 }
+    style: { fillColor: "#FAFAFA", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: stageIA
+    type: text
+    label: "Stage I — the reader on a true graph\ninput  A*, the compiled true graph\ntrain  R, count head, projections,\n       role embeds, prefix adapter"
+    bounds: { x: 60, y: 1310, width: 604, height: 158 }
+    style: { align: "left", fontSize: 26 }
+  - id: stageII
+    type: matrix
+    label: " "
+    bounds: { x: 40, y: 1512, width: 644, height: 222 }
+    style: { fillColor: "#FAFAFA", strokeColor: "#111111", fontSize: 26, fontColor: "#111111" }
+  - id: stageIIA
+    type: text
+    label: "Stage II — the generator builds Â\ninput  Â, generated from Hᵤ , Hᵥ\nep 1-2 train G only (warm-up)\nep 3-15 also the final R block and the\n       prefix adapter and count head"
+    bounds: { x: 60, y: 1528, width: 604, height: 190 }
+    style: { align: "left", fontSize: 26 }
+  - id: lossesA
+    type: text
+    label: "Stage I   L = L_task (BCE) + L_struct\nStage II  + L_slot + 0.1·L_topo\nL_struct: one sampled 40-node training"
+    bounds: { x: 40, y: 1762, width: 644, height: 122 }
+    style: { align: "left", fontSize: 26, fontColor: "#B45309" }
+  - id: lossesB
+    type: text
+    label: "subgraph per step over its legal pairs\nL_slot: per-family sorted order stats\nL_topo: vs the frozen teacher Rᵀ"
+    bounds: { x: 40, y: 1884, width: 644, height: 122 }
+    style: { align: "left", fontSize: 26, fontColor: "#B45309" }
+  - id: lg1
+    type: matrix
+    label: "frozen: prefix_base"
+    bounds: { x: 40, y: 2038, width: 316, height: 46 }
+    style: { fillColor: "#C9DAF8", strokeColor: "#111111", align: "left", spacingLeft: 8, fontSize: 26, fontColor: "#111111" }
+  - id: lg2
+    type: matrix
+    label: "Stage I / teacher"
+    bounds: { x: 368, y: 2038, width: 316, height: 46 }
+    style: { fillColor: "#F9D9D9", strokeColor: "#111111", align: "left", spacingLeft: 8, fontSize: 26, fontColor: "#111111" }
+  - id: lg3
+    type: matrix
+    label: "Stage I, open in II"
+    bounds: { x: 40, y: 2090, width: 316, height: 46 }
+    style: { fillColor: "#FCEFB0", strokeColor: "#111111", align: "left", spacingLeft: 8, fontSize: 26, fontColor: "#111111" }
+  - id: lg4
+    type: matrix
+    label: "Stage II only: G"
+    bounds: { x: 368, y: 2090, width: 316, height: 46 }
+    style: { fillColor: "#CFE8D5", strokeColor: "#111111", align: "left", spacingLeft: 8, fontSize: 26, fontColor: "#111111" }
+  - id: sw_clo
+    type: formula
+    label: " "
+    bounds: { x: 40, y: 2160, width: 48, height: 9 }
+    style: { fillColor: "#0072B2", strokeColor: "#0072B2", fontSize: 26, fontColor: "#111111" }
+  - id: tx_clo
+    type: text
+    label: "closure  ×16"
+    bounds: { x: 96, y: 2142, width: 260, height: 46 }
+    style: { align: "left", fontSize: 26 }
+  - id: sw_att
+    type: formula
+    label: " "
+    bounds: { x: 368, y: 2161, width: 48, height: 7 }
+    style: { fillColor: "#009E73", strokeColor: "#009E73", fontSize: 26, fontColor: "#111111" }
+  - id: tx_att
+    type: text
+    label: "attach  ×16"
+    bounds: { x: 424, y: 2142, width: 260, height: 46 }
+    style: { align: "left", fontSize: 26 }
+  - id: sw_int
+    type: formula
+    label: " "
+    bounds: { x: 40, y: 2198, width: 48, height: 38 }
+    style: { fillColor: "#EAD4E4", strokeColor: "#B07AA1", strokeWidth: 2.5, fontSize: 26, fontColor: "#111111" }
+  - id: tx_int
+    type: text
+    label: "interior  ×64"
+    bounds: { x: 96, y: 2194, width: 260, height: 46 }
+    style: { align: "left", fontSize: 26 }
+  - id: tx_loss
+    type: text
+    label: "dashed = a loss"
+    bounds: { x: 424, y: 2194, width: 260, height: 46 }
+    style: { align: "left", fontSize: 26, fontColor: "#B45309" }
+
+edges:
+  - from: xin
+    to: enc
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: enc
+    to: hstates
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: hstates
+    to: genpanel
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.5016, entryY: 0 }
+  - from: hstates
+    to: fbox
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5 }
+    waypoints: [ { x: 706, y: 392 }, { x: 706, y: 2008 } ]
+  - from: genpanel
+    to: motifpanel
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 1, exitY: 0.3, entryX: 0, entryY: 0.3 }
+  - from: gtrain
+    to: compile
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: compile
+    to: astar
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.2377, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: astar
+    to: rt
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.5 }
+  - from: astar
+    to: motifpanel
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.2377, entryY: 0 }
+  - from: motifpanel
+    to: grit
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.2469, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: motifpanel
+    to: cnt
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.7531, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: grit
+    to: t1
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.2344, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: grit
+    to: t2
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.8063, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: grit
+    to: t3
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.97, exitY: 1, entryX: 0.5, entryY: 0 }
+    waypoints: [ { x: 1022, y: 1616 }, { x: 1146, y: 1616 } ]
+  - from: cnt
+    to: t4
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.7875, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: t1
+    to: adapter
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.1157, entryY: 0 }
+  - from: t2
+    to: adapter
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.3981, entryY: 0 }
+  - from: t3
+    to: adapter
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.6698, entryY: 0 }
+  - from: t4
+    to: adapter
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.8951, entryY: 0 }
+  - from: adapter
+    to: fbox
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: fbox
+    to: head
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: head
+    to: pout
+    type: primary
+    style: { strokeColor: "#111111", strokeWidth: 2.5, exitX: 0.5, exitY: 1, entryX: 0.5, entryY: 0 }
+  - from: u
+    to: c0
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.0326, entryX: 0, entryY: 0.5 }
+  - from: c0
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.0326 }
+  - from: u
+    to: c1
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.0837, entryX: 0, entryY: 0.5 }
+  - from: c1
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.0837 }
+  - from: u
+    to: c2
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.1349, entryX: 0, entryY: 0.5 }
+  - from: c2
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.1349 }
+  - from: u
+    to: c3
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.186, entryX: 0, entryY: 0.5 }
+  - from: c3
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.186 }
+  - from: u
+    to: c4
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.2372, entryX: 0, entryY: 0.5 }
+  - from: c4
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.2372 }
+  - from: u
+    to: c5
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.2884, entryX: 0, entryY: 0.5 }
+  - from: c5
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.2884 }
+  - from: u
+    to: c6
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.3395, entryX: 0, entryY: 0.5 }
+  - from: c6
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.3395 }
+  - from: u
+    to: c7
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.3907, entryX: 0, entryY: 0.5 }
+  - from: c7
+    to: v
+    type: primary
+    style: { strokeColor: "#0072B2", strokeWidth: 2.8, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.3907 }
+  - from: u
+    to: l0
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5767, entryX: 0, entryY: 0.5 }
+  - from: r0
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.5767 }
+  - from: u
+    to: l1
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.6279, entryX: 0, entryY: 0.5 }
+  - from: r1
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.6279 }
+  - from: u
+    to: l2
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.6791, entryX: 0, entryY: 0.5 }
+  - from: r2
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.6791 }
+  - from: u
+    to: l3
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.7302, entryX: 0, entryY: 0.5 }
+  - from: r3
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.7302 }
+  - from: u
+    to: l4
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.7814, entryX: 0, entryY: 0.5 }
+  - from: r4
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.7814 }
+  - from: u
+    to: l5
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.8326, entryX: 0, entryY: 0.5 }
+  - from: r5
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.8326 }
+  - from: u
+    to: l6
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.8837, entryX: 0, entryY: 0.5 }
+  - from: r6
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.8837 }
+  - from: u
+    to: l7
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.9349, entryX: 0, entryY: 0.5 }
+  - from: r7
+    to: v
+    type: primary
+    style: { strokeColor: "#009E73", strokeWidth: 2.0, endArrow: "none", exitX: 1, exitY: 0.5, entryX: 0, entryY: 0.9349 }
+  - from: u
+    to: v
+    type: primary
+    style: { strokeColor: "#888888", strokeWidth: 2, endArrow: "none", dashed: true, exitX: 1, exitY: 0.9721, entryX: 0, entryY: 0.9721 }
+  - from: astar
+    to: genpanel
+    type: data
+    style: { strokeColor: "#B45309", strokeWidth: 2.5 }
+    waypoints: [ { x: 690, y: 467 }, { x: 690, y: 1040 } ]
+  - from: rt
+    to: t4
+    type: data
+    style: { strokeColor: "#B45309", strokeWidth: 2.5 }
+    waypoints: [ { x: 1380, y: 467 }, { x: 1380, y: 1685 } ]
