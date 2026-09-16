@@ -12,6 +12,7 @@ queried ``u-v`` entry are exactly zero.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import networkx as nx
@@ -338,3 +339,101 @@ class MotifTemplateTable:
                 weights, closure, left, right, key=key, seed=seed, epoch=epoch
             )
         return CompiledTemplate(weights=weights, closure=closure, left=left, right=right)
+
+    def weights_by_index(
+        self,
+        u_idx: NDArray[np.int64],
+        v_idx: NDArray[np.int64],
+        *,
+        seed: int = 0,
+        epoch: int = 0,
+        randomise: bool = False,
+    ) -> NDArray[np.float32]:
+        """Compile every index pair into an ``(n, 96)`` weight table, in row order.
+
+        Args:
+            u_idx: ``(n,)`` indices into `nodes`.
+            v_idx: ``(n,)`` indices aligned with ``u_idx``.
+            seed: Slot-randomisation seed lane.
+            epoch: Slot-randomisation epoch lane.
+            randomise: Randomise slot order within each role.
+
+        Returns:
+            ``(n, 96)`` float32 weights.
+
+        Raises:
+            ValueError: On mismatched or out-of-range index arrays.
+        """
+        left_idx = np.asarray(u_idx, dtype=np.int64)
+        right_idx = np.asarray(v_idx, dtype=np.int64)
+        if left_idx.shape != right_idx.shape or left_idx.ndim != 1:
+            raise ValueError("u_idx and v_idx must be aligned 1-D index arrays")
+        size = len(self.nodes)
+        if left_idx.size and (
+            left_idx.min() < 0
+            or right_idx.min() < 0
+            or left_idx.max() >= size
+            or right_idx.max() >= size
+        ):
+            raise ValueError("pair index outside the motif template table")
+        out = np.zeros((left_idx.size, N_EDGES), dtype=np.float32)
+        rows = zip(left_idx.tolist(), right_idx.tolist(), strict=True)
+        for row, (a, b) in enumerate(rows):
+            out[row] = self.compile_row(
+                self.nodes[a], self.nodes[b], seed=seed, epoch=epoch, randomise=randomise
+            ).weights
+        return out
+
+    def weights(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        seed: int = 0,
+        epoch: int = 0,
+        randomise: bool = False,
+    ) -> NDArray[np.float32]:
+        """Compile node-id pairs into an ``(n, 96)`` weight table, in row order.
+
+        Args:
+            pairs: ``(u, v)`` node-id pairs.
+            seed: Slot-randomisation seed lane.
+            epoch: Slot-randomisation epoch lane.
+            randomise: Randomise slot order within each role.
+
+        Returns:
+            ``(n, 96)`` float32 weights, aligned with ``pairs``.
+        """
+        u_idx = np.fromiter((self.index[u] for u, _ in pairs), dtype=np.int64, count=len(pairs))
+        v_idx = np.fromiter((self.index[v] for _, v in pairs), dtype=np.int64, count=len(pairs))
+        return self.weights_by_index(u_idx, v_idx, seed=seed, epoch=epoch, randomise=randomise)
+
+
+def apply_families(weights: NDArray[np.float32], families: Sequence[str]) -> NDArray[np.float32]:
+    """Zero every edge of a family that is not active (spec section 8 family ablations).
+
+    Args:
+        weights: ``(..., 96)`` weights.
+        families: Active families, drawn from ``("closure", "bridge")``.
+
+    Returns:
+        A copy with the inactive families' edges set to zero.
+    """
+    out = np.array(weights, dtype=np.float32, copy=True)
+    if "closure" not in families:
+        out[..., :16] = 0.0
+    if "bridge" not in families:
+        out[..., 16:] = 0.0
+    return out
+
+
+def mean_template(weights: NDArray[np.float32]) -> NDArray[np.float32]:
+    """Return the training-corpus mean adjacency ``Abar`` (spec section 3).
+
+    Args:
+        weights: ``(n, 96)`` compiled weights over the training corpus.
+
+    Returns:
+        The ``(96,)`` float32 mean weight vector.
+    """
+    mean = np.asarray(weights, dtype=np.float32).mean(axis=0)
+    return np.asarray(mean, dtype=np.float32)

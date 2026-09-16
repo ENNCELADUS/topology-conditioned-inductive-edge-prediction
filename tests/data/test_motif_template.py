@@ -160,3 +160,54 @@ def test_self_rows_get_an_explicit_empty_template() -> None:
     row = table.compile_row("u", "u")
     assert not row.weights.any()
     assert (row.closure, row.left, row.right) == ((), (), ())
+
+
+def test_bridge_truncation_ranks_by_hub_penalised_bridge_mass() -> None:
+    graph = nx.Graph()
+    graph.add_edge("u", "v")
+    # Ten left candidates; l0 bridges to a low-degree right node, l9 to a hub.
+    for i in range(10):
+        graph.add_edge("u", f"l{i}")
+        graph.add_edge(f"l{i}", f"r{i}")
+        graph.add_edge(f"r{i}", "v")
+        for j in range(i):
+            graph.add_edge(f"r{i}", f"hub{i}_{j}")
+    table = MotifTemplateTable(graph)
+    row = table.compile_row("u", "v")
+    assert len(row.left) == 8 and len(row.right) == 8
+    assert "l0" in row.left and "r0" in row.right
+    assert "r9" not in row.right
+
+
+def test_an_isolated_selected_intermediate_keeps_its_attachment_and_no_path() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from([("u", "v"), ("u", "a"), ("v", "b")])
+    table = MotifTemplateTable(graph)
+    row = table.compile_row("u", "v")
+    assert row.left == ("a",) and row.right == ("b",)
+    assert row.weights[16] > 0.0 and row.weights[24] > 0.0
+    assert float(row.weights[32:96].sum()) == 0.0
+
+
+def test_within_role_randomisation_permutes_slots_but_preserves_the_multisets() -> None:
+    table = MotifTemplateTable(_wedge_graph())
+    plain = table.compile_row("u", "v")
+    shuffled = table.compile_row("u", "v", seed=7, epoch=3, randomise=True)
+    for block in (CLOSURE_U, CLOSURE_V, ATTACH_L, ATTACH_R, INTERIOR):
+        np.testing.assert_allclose(
+            np.sort(shuffled.weights[block]), np.sort(plain.weights[block]), atol=0
+        )
+    assert set(shuffled.closure) == set(plain.closure)
+
+
+def test_weights_batches_rows_in_order_and_family_gating_zeroes_a_family() -> None:
+    from src.data.motif_template import apply_families
+
+    table = MotifTemplateTable(_wedge_graph())
+    rows = table.weights([("u", "v"), ("v", "u"), ("u", "u")])
+    assert rows.shape == (3, 96) and rows.dtype == np.float32
+    np.testing.assert_allclose(rows[1], rows[0][list(SWAP_PERM)], atol=0)
+    assert not rows[2].any()
+    closure_only = apply_families(rows, ("closure",))
+    assert float(closure_only[:, 16:].sum()) == 0.0
+    assert float(closure_only[:, :16].sum()) == float(rows[:, :16].sum())
