@@ -1,0 +1,174 @@
+"""Motif-graph prompts read by GRIT on a frozen V3.1 trunk.
+
+Design: ``docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md``.
+Stage I trains the reader, the count head, the token projections, the role
+embeddings and the prefix adapter on compiled true training templates; Stage II
+trains a residue-conditioned generator that predicts the same 96 edge weights
+from ``(x_u, x_v)`` alone, read through the identical interface.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from typing import cast
+
+FIELD_ORDER = ("topo_self", "topo_partner", "topo_rel", "topo_cnt")
+TEMPLATE_KEY = "motif_weights"
+TEMPLATE_MASK_KEY = "motif_mask"
+INTERVENTIONS = (
+    "none",
+    "gates_off",
+    "mean",
+    "shuffle_graph",
+    "permute_closure",
+    "rewire_bridge",
+)
+STAGES = ("one", "two")
+TOKEN_SOURCES = ("graph", "direct")
+GATE_MODES = ("learned", "per_type", "mean_graph")
+FAMILIES = ("closure", "bridge")
+
+
+@dataclass(frozen=True)
+class ReaderConfig:
+    """The GRIT reader block (spec section 5.2)."""
+
+    layers: int = 3
+    dim: int = 96
+    heads: int = 4
+    rrwp_k: int = 4
+
+    def __post_init__(self) -> None:
+        """Validate the reader shape.
+
+        Raises:
+            ValueError: On a non-positive size or an indivisible width.
+        """
+        if self.layers <= 0 or self.dim <= 0 or self.heads <= 0:
+            raise ValueError("reader.layers, reader.dim and reader.heads must be positive")
+        if self.rrwp_k < 1:
+            raise ValueError("reader.rrwp_k must be at least 1")
+        if self.dim % self.heads:
+            raise ValueError(f"reader.dim ({self.dim}) must be divisible by reader.heads")
+
+
+@dataclass(frozen=True)
+class CorruptionConfig:
+    """Stationary Stage I adjacency corruption (spec section 3)."""
+
+    prob: float = 0.5
+    lambda_min: float = 0.0
+    lambda_max: float = 1.0
+
+    def __post_init__(self) -> None:
+        """Validate the distribution.
+
+        Raises:
+            ValueError: On an out-of-range probability or an empty lambda range.
+        """
+        if not 0.0 <= self.prob <= 1.0:
+            raise ValueError("motif_prompt.corruption.prob must lie in [0, 1]")
+        if not 0.0 <= self.lambda_min <= self.lambda_max <= 1.0:
+            raise ValueError("motif_prompt.corruption lambda range must lie in [0, 1]")
+
+
+@dataclass(frozen=True)
+class MotifPromptConfig:
+    """The ``model.config.motif_prompt`` block."""
+
+    stage: str = "one"
+    base_checkpoint: str = ""
+    base_checkpoint_sha256: str | None = None
+    bundle_checkpoint: str = ""
+    bundle_checkpoint_sha256: str | None = None
+    width: int = 128
+    slots_per_field: int = 2
+    reader: ReaderConfig = field(default_factory=ReaderConfig)
+    corruption: CorruptionConfig = field(default_factory=CorruptionConfig)
+    fields: tuple[str, ...] = FIELD_ORDER
+    families: tuple[str, ...] = FAMILIES
+    token_source: str = "graph"
+    gate_mode: str = "learned"
+    interface_warmup_epochs: int | None = 2
+    w_slot: float = 1.0
+    w_topo: float = 0.1
+    beta_p: float = 1.0
+    beta_q: float = 1.0
+    beta_a: float = 1.0
+    beta_i: float = 1.0
+    huber_delta: float = 1.0
+    cache_templates: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate the block.
+
+        Raises:
+            ValueError: On an unknown enum value, a missing required checkpoint,
+                a duplicated or empty field/family list, or a negative weight.
+        """
+        if self.stage not in STAGES:
+            raise ValueError(f"motif_prompt.stage must be one of {list(STAGES)}")
+        if not self.base_checkpoint:
+            raise ValueError("motif_prompt requires motif_prompt.base_checkpoint")
+        if self.stage == "two" and not self.bundle_checkpoint:
+            raise ValueError("stage 'two' requires motif_prompt.bundle_checkpoint")
+        if self.width <= 0 or self.slots_per_field <= 0:
+            raise ValueError("motif_prompt.width and slots_per_field must be positive")
+        if not self.fields or len(set(self.fields)) != len(self.fields):
+            raise ValueError("motif_prompt.fields must be a non-empty set of field names")
+        if any(name not in FIELD_ORDER for name in self.fields):
+            raise ValueError(f"motif_prompt.fields must be drawn from {list(FIELD_ORDER)}")
+        if not self.families or any(name not in FAMILIES for name in self.families):
+            raise ValueError(
+                f"motif_prompt.families must be a non-empty subset of {list(FAMILIES)}"
+            )
+        if self.token_source not in TOKEN_SOURCES:
+            raise ValueError(f"motif_prompt.token_source must be one of {list(TOKEN_SOURCES)}")
+        if self.gate_mode not in GATE_MODES:
+            raise ValueError(f"motif_prompt.gate_mode must be one of {list(GATE_MODES)}")
+        if self.interface_warmup_epochs is not None and self.interface_warmup_epochs < 0:
+            raise ValueError("motif_prompt.interface_warmup_epochs must be non-negative or null")
+        for name in ("w_slot", "w_topo", "beta_p", "beta_q", "beta_a", "beta_i"):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"motif_prompt.{name} must be non-negative")
+        if self.huber_delta <= 0.0:
+            raise ValueError("motif_prompt.huber_delta must be positive")
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> MotifPromptConfig:
+        """Parse the block, rejecting unknown keys.
+
+        Args:
+            raw: The mapping under ``model.config.motif_prompt``.
+
+        Returns:
+            The parsed config.
+
+        Raises:
+            ValueError: On unknown keys.
+        """
+        allowed = set(cls.__dataclass_fields__)
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise ValueError(f"unknown motif_prompt keys: {unknown}")
+        values = dict(raw)
+        reader = ReaderConfig(**cast(Mapping[str, int], values.pop("reader", {})))
+        corruption = CorruptionConfig(**cast(Mapping[str, float], values.pop("corruption", {})))
+        fields_raw = values.pop("fields", FIELD_ORDER)
+        families_raw = values.pop("families", FAMILIES)
+        warmup = values.pop("interface_warmup_epochs", 2)
+        return cls(
+            reader=reader,
+            corruption=corruption,
+            fields=tuple(str(name) for name in cast(Sequence[object], fields_raw)),
+            families=tuple(str(name) for name in cast(Sequence[object], families_raw)),
+            interface_warmup_epochs=None if warmup is None else int(cast(int, warmup)),
+            # The remaining keys are heterogeneous scalars validated at
+            # runtime by __post_init__; ** unpacking cannot be typed here.
+            **values,  # type: ignore[arg-type]
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the block as a plain mapping (checkpoint-embeddable)."""
+        return cast(dict[str, object], asdict(self))
