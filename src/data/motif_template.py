@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import networkx as nx
 import numpy as np
+import torch
 from numpy.typing import NDArray
 
 from src.data.artifacts import canonical_pair
@@ -437,3 +438,56 @@ def mean_template(weights: NDArray[np.float32]) -> NDArray[np.float32]:
     """
     mean = np.asarray(weights, dtype=np.float32).mean(axis=0)
     return np.asarray(mean, dtype=np.float32)
+
+
+def slot_profiles(weights: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return the four section 7.3 supervised multisets of a weight table.
+
+    Args:
+        weights: ``(B, 96)`` edge weights against `EDGE_ENDPOINTS`.
+
+    Returns:
+        ``p`` the 8 wedge products, ``q`` the 64 path products, ``a`` the 16 raw
+        attachment weights and ``b`` the 64 raw interior weights, in float32.
+
+    Raises:
+        ValueError: If ``weights`` is not ``(B, 96)``.
+    """
+    if weights.dim() != 2 or weights.size(-1) != N_EDGES:
+        raise ValueError(
+            f"motif weights must have shape (B, {N_EDGES}), got {tuple(weights.shape)}"
+        )
+    value = weights.float()
+    closure_u = value[:, CLOSURE_U]
+    closure_v = value[:, CLOSURE_V]
+    attach_l = value[:, ATTACH_L]
+    attach_r = value[:, ATTACH_R]
+    interior = value[:, INTERIOR].reshape(-1, 8, 8)
+    products = attach_l.unsqueeze(2) * interior * attach_r.unsqueeze(1)
+    return {
+        "p": closure_u * closure_v,
+        "q": products.reshape(-1, 64),
+        "a": torch.cat([attach_l, attach_r], dim=1),
+        "b": interior.reshape(-1, 64),
+    }
+
+
+def count_statistics(weights: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return the closed-form count-head statistics of a weight table (spec section 5.1).
+
+    Args:
+        weights: ``(B, 96)`` edge weights against `EDGE_ENDPOINTS`.
+
+    Returns:
+        ``wedge_mass`` and ``bridge_mass``, the sums of the supervised wedge and
+        path products, and the weighted endpoint degrees ``deg_u`` and ``deg_v``,
+        each ``(B,)`` in float32.
+    """
+    parts = slot_profiles(weights)
+    value = weights.float()
+    return {
+        "wedge_mass": parts["p"].sum(dim=1),
+        "bridge_mass": parts["q"].sum(dim=1),
+        "deg_u": value[:, CLOSURE_U].sum(dim=1) + value[:, ATTACH_L].sum(dim=1),
+        "deg_v": value[:, CLOSURE_V].sum(dim=1) + value[:, ATTACH_R].sum(dim=1),
+    }

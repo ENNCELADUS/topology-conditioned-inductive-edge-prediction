@@ -5,6 +5,7 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 import pytest
+import torch
 from src.data.motif_template import (
     ATTACH_L,
     ATTACH_R,
@@ -26,7 +27,9 @@ from src.data.motif_template import (
     TYPE_CLOSURE,
     TYPE_INTERIOR,
     MotifTemplateTable,
+    count_statistics,
     role_permutation,
+    slot_profiles,
 )
 
 
@@ -211,3 +214,53 @@ def test_weights_batches_rows_in_order_and_family_gating_zeroes_a_family() -> No
     closure_only = apply_families(rows, ("closure",))
     assert float(closure_only[:, 16:].sum()) == 0.0
     assert float(closure_only[:, :16].sum()) == float(rows[:, :16].sum())
+
+
+def test_slot_profiles_are_products_and_raw_weights() -> None:
+    weights = torch.zeros(2, 96)
+    weights[0, 0] = 0.5  # w(u, c0)
+    weights[0, 8] = 0.4  # w(c0, v)
+    weights[0, 16] = 0.2  # w(u, l0)
+    weights[0, 24] = 0.5  # w(r0, v)
+    weights[0, 32] = 0.7  # w(l0, r0)
+    parts = slot_profiles(weights)
+    assert parts["p"].shape == (2, 8)
+    assert parts["q"].shape == (2, 64)
+    assert parts["a"].shape == (2, 16)
+    assert parts["b"].shape == (2, 64)
+    assert parts["p"][0, 0].item() == pytest.approx(0.2)
+    assert parts["q"][0, 0].item() == pytest.approx(0.2 * 0.7 * 0.5)
+    assert parts["a"][0, 0].item() == pytest.approx(0.2)
+    assert parts["a"][0, 8].item() == pytest.approx(0.5)
+    assert parts["b"][0, 0].item() == pytest.approx(0.7)
+    assert not parts["p"][1].any()
+
+
+def test_count_statistics_are_the_sums_of_the_supervised_multisets() -> None:
+    weights = torch.rand(4, 96)
+    parts = slot_profiles(weights)
+    stats = count_statistics(weights)
+    torch.testing.assert_close(stats["wedge_mass"], parts["p"].sum(dim=1))
+    torch.testing.assert_close(stats["bridge_mass"], parts["q"].sum(dim=1))
+    torch.testing.assert_close(
+        stats["deg_u"], weights[:, 0:8].sum(dim=1) + weights[:, 16:24].sum(dim=1)
+    )
+    torch.testing.assert_close(
+        stats["deg_v"], weights[:, 8:16].sum(dim=1) + weights[:, 24:32].sum(dim=1)
+    )
+
+
+def test_profiles_and_counts_are_invariant_under_a_within_role_permutation() -> None:
+    weights = torch.rand(3, 96)
+    perm = torch.as_tensor(
+        role_permutation((1, 0, 2, 3, 4, 5, 6, 7), (2, 3, 4, 5, 6, 7, 0, 1), tuple(range(8)))
+    )
+    shuffled = torch.zeros_like(weights)
+    shuffled[:, perm] = weights
+    for key in ("p", "q", "a", "b"):
+        torch.testing.assert_close(
+            slot_profiles(shuffled)[key].sort(dim=1, descending=True).values,
+            slot_profiles(weights)[key].sort(dim=1, descending=True).values,
+        )
+    for key, value in count_statistics(shuffled).items():
+        torch.testing.assert_close(value, count_statistics(weights)[key])
