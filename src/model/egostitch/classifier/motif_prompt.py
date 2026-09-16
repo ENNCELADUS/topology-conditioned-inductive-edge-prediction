@@ -10,11 +10,13 @@ from ``(x_u, x_v)`` alone, read through the identical interface.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import cast
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from src.data.motif_template import (
     EDGE_ENDPOINTS,
@@ -28,6 +30,8 @@ from src.data.motif_template import (
     SLOT_V,
     count_statistics,
 )
+from src.distill.motif_losses import slot_loss_rows, topo_loss_rows
+from src.model.egostitch.classifier.b0_v31 import V3_1, unpack_pair_batch
 from src.model.egostitch.classifier.layers import (
     CrossAttentionLayer,
     _build_padding_mask,
@@ -53,6 +57,8 @@ STAGES = ("one", "two")
 TOKEN_SOURCES = ("graph", "direct")
 GATE_MODES = ("learned", "per_type", "mean_graph")
 FAMILIES = ("closure", "bridge")
+LOSS_TERM_NAMES = ("task", "slot", "topo")
+_GRAPH_INTERVENTIONS = ("shuffle_graph", "permute_closure", "rewire_bridge")
 
 
 @dataclass(frozen=True)
@@ -428,6 +434,16 @@ _BIAS_CLIP = (0.01, 0.99)
 _TYPE_MASKS = tuple(
     torch.as_tensor([kind == edge_type for kind in EDGE_TYPES]) for edge_type in range(N_EDGE_TYPES)
 )
+
+
+def _family_mask(families: Sequence[str]) -> torch.Tensor:
+    """Return the ``(96,)`` 0/1 mask keeping only the active motif families."""
+    mask = torch.ones(N_EDGES)
+    if "closure" not in families:
+        mask[:16] = 0.0
+    if "bridge" not in families:
+        mask[16:] = 0.0
+    return mask
 
 
 def _candidate_incidence() -> torch.Tensor:
@@ -841,3 +857,597 @@ class MotifPromptCrossAttentionLayer(nn.Module):
         cls_token = cls_token + layer.drop_cls_attn(attn_cls) + branch
         cls_token = cls_token + layer.drop_cls_ffn(layer.ff_cls(layer.norm_cls_ffn(cls_token)))
         return h_a, h_b, cls_token
+
+
+class V3_1MotifPrompt(nn.Module):
+    """A frozen bidirectional-cross `V3_1` reading a motif graph through gated prefixes.
+
+    ``reader`` and ``adapter`` are registered before ``base`` so
+    ``next(model.parameters())`` is trainable -- the structural stream builds its
+    zero-loss anchor from it. Stage I reads a compiled template from
+    ``batch['motif_weights']`` and fails closed without one; Stage II predicts the
+    template from the endpoints and never reads a truth graph at inference, where
+    ``batch['motif_weights']`` is a supervision *target* only.
+
+    With every gate at zero, and under ``intervention='gates_off'``, the frozen
+    trunk and head reproduce the published base bit for bit: `prefix_branch`
+    multiplies by ``tanh(0)`` before the output projection, so the added branch is
+    an exact zero tensor.
+    """
+
+    name: str = "v3_1_motif_prompt"
+    mean_template: torch.Tensor
+    family_mask: torch.Tensor
+
+    def __init__(self, *, base: Mapping[str, object], motif_prompt: Mapping[str, object]) -> None:
+        """Build the frozen base and the motif path on top.
+
+        Args:
+            base: The base `V3_1` constructor kwargs (a checkpoint's ``model_config``).
+            motif_prompt: The ``model.config.motif_prompt`` block.
+
+        Raises:
+            ValueError: If the base trunk has no bidirectional cross-attention layers.
+        """
+        super().__init__()
+        self.cfg = MotifPromptConfig.from_mapping(motif_prompt)
+        self.base_config: dict[str, object] = dict(base)
+        base_model = V3_1(**self.base_config)
+        trunk = base_model.cross_attention
+        if trunk.mixing_mode != "bidirectional_cross" or len(trunk.layers) == 0:
+            raise ValueError(
+                "v3_1_motif_prompt needs a base with model.config.mixing.mode == "
+                "'bidirectional_cross' and at least one cross-attention layer"
+            )
+        self.d_model = int(base_model.d_model)
+        self.input_dim = int(base_model.input_dim)
+        self.kd_rep_head = None
+        self.kd_struct_head = None
+        self.topo_gen = None
+        self.reader = MotifGritReader(self.cfg.reader, self.cfg.width)
+        self.count_head = MotifCountHead(self.cfg.width)
+        self.direct_head = (
+            nn.Sequential(
+                nn.LayerNorm(2 * self.d_model),
+                nn.Linear(2 * self.d_model, 4 * self.cfg.width),
+                nn.GELU(),
+                nn.Linear(4 * self.cfg.width, 3 * self.cfg.width),
+            )
+            if self.cfg.token_source == "direct"
+            else None
+        )
+        self.adapter = MotifPromptAdapter(
+            self.d_model, len(trunk.layers), int(base_model.n_heads), self.cfg
+        )
+        self.generator = MotifGenerator(self.d_model, self.cfg) if self.cfg.stage == "two" else None
+        self.base = base_model
+        for param in self.base.parameters():
+            param.requires_grad_(False)
+        self.base.eval()
+        self.prompt_layers = nn.ModuleList(
+            MotifPromptCrossAttentionLayer(cast(CrossAttentionLayer, layer), index, self.adapter)
+            for index, layer in enumerate(trunk.layers)
+        )
+        self.register_buffer("mean_template", torch.zeros(N_EDGES))
+        # Derived from `cfg.families` on every construction, so a checkpoint can
+        # never restore a stale family gate over a changed config.
+        self.register_buffer("family_mask", _family_mask(self.cfg.families), persistent=False)
+        self.teacher: nn.Module | None = None
+        self.intervention: str = "none"
+        self.corruption_seed = 42
+        self.interface_open = self.cfg.stage == "one" or self.cfg.interface_warmup_epochs == 0
+
+    @property
+    def encoder(self) -> nn.Module:
+        """The frozen base's per-node encoder (packed scoring caches its output)."""
+        return self.base.encoder
+
+    def train(self, mode: bool = True) -> V3_1MotifPrompt:
+        """Switch the wrapper's mode while the frozen base and teacher stay in eval.
+
+        Args:
+            mode: Training mode for the motif path.
+
+        Returns:
+            ``self``.
+        """
+        super().train(mode)
+        self.base.eval()
+        if self.teacher is not None:
+            self.teacher.eval()
+        return self
+
+    def trainable_parameters(self) -> list[nn.Parameter]:
+        """Parameters the optimiser updates."""
+        return [param for param in self.parameters() if param.requires_grad]
+
+    def _interface_modules(self) -> list[nn.Module]:
+        """The Stage I bundle: the reader, the count head and the prefix adapter."""
+        modules: list[nn.Module] = [self.reader, self.count_head, self.adapter]
+        if self.direct_head is not None:
+            modules.append(self.direct_head)
+        return modules
+
+    def optimizer_parameter_groups(
+        self, generator_lr: float, interface_lr: float, weight_decay: float
+    ) -> list[dict[str, object]]:
+        """Two named groups: ``generator`` and the 0.1x ``interface`` (spec section 7.5).
+
+        Every parameter that is ever trainable keeps ``requires_grad`` from
+        construction, so DDP registers and all-reduces it. The epochs 1-2 warm-up
+        is realised by zeroing the ``interface`` group's LR, which is an exact
+        freeze under AdamW's decoupled weight decay.
+
+        Args:
+            generator_lr: Peak LR of the generator group.
+            interface_lr: Peak LR of the reader/count-head/adapter group.
+            weight_decay: Decoupled weight decay for both groups.
+
+        Returns:
+            The non-empty groups, generator first.
+        """
+        interface = [
+            param
+            for module in self._interface_modules()
+            for param in module.parameters()
+            if param.requires_grad
+        ]
+        interface_ids = {id(param) for param in interface}
+        generator = [
+            param
+            for param in self.parameters()
+            if param.requires_grad and id(param) not in interface_ids
+        ]
+        groups: list[dict[str, object]] = []
+        for name, params, lr in (
+            ("generator", generator, generator_lr),
+            ("interface", interface, interface_lr),
+        ):
+            if params:
+                groups.append(
+                    {
+                        "name": name,
+                        "params": params,
+                        "lr": lr,
+                        "max_lr": lr,
+                        "weight_decay": weight_decay,
+                    }
+                )
+        return groups
+
+    @torch.no_grad()
+    def install_mean_template(self, mean: torch.Tensor) -> None:
+        """Publish the training-corpus mean adjacency ``Abar`` (spec section 3).
+
+        Args:
+            mean: ``(96,)`` mean of the randomised compiled training templates.
+
+        Raises:
+            ValueError: On a shape mismatch or a non-finite entry.
+        """
+        if tuple(mean.shape) != (N_EDGES,) or not torch.isfinite(mean).all():
+            raise ValueError(f"mean template must be a finite ({N_EDGES},) vector")
+        self.mean_template.copy_(mean.to(self.mean_template))
+        if self.generator is not None:
+            self.generator.init_biases(self.mean_template)
+
+    def initialize_teacher(self) -> None:
+        """Snapshot the loaded Stage I bundle as the immutable teacher ``R_T``.
+
+        The bundle is the reader, the count head, the token projections carried
+        inside them and the prefix adapter with its gates (spec section 7.4), so
+        the student never starts from a different Stage I checkpoint than its
+        teacher.
+        """
+        members: dict[str, nn.Module] = {
+            "reader": deepcopy(self.reader),
+            "count_head": deepcopy(self.count_head),
+            "adapter": deepcopy(self.adapter),
+        }
+        if self.direct_head is not None:
+            members["direct_head"] = deepcopy(self.direct_head)
+        self.teacher = nn.ModuleDict(members).requires_grad_(False).eval()
+
+    def set_corruption_step(self, step: int, seed: int = 42) -> None:
+        """Set reproducible Stage I corruption for this global training step.
+
+        Args:
+            step: Global optimiser step.
+            seed: Run seed.
+        """
+        self.corruption_seed = seed + step * 104729
+
+    def _corrupt(self, weights: torch.Tensor) -> torch.Tensor:
+        """Mix half the nonself Stage I rows towards ``Abar`` (spec section 3)."""
+        cfg = self.cfg.corruption
+        if not self.training or self.cfg.stage != "one" or cfg.prob == 0.0:
+            return weights
+        rng = torch.Generator(device=weights.device).manual_seed(self.corruption_seed)
+        selected = torch.rand((weights.size(0), 1), device=weights.device, generator=rng) < cfg.prob
+        span = cfg.lambda_max - cfg.lambda_min
+        lam = cfg.lambda_min + span * torch.rand(
+            (weights.size(0), 1), device=weights.device, generator=rng
+        )
+        mixed = (1.0 - lam) * weights + lam * self.mean_template.to(weights).unsqueeze(0)
+        return torch.where(selected, mixed, weights)
+
+    def _tokens(
+        self,
+        bundle: nn.ModuleDict | None,
+        weights: torch.Tensor,
+        encoded_u: torch.Tensor,
+        encoded_v: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Read one graph through the student path or through the immutable teacher."""
+        if bundle is None:
+            reader, count_head = self.reader, self.count_head
+            direct_head: nn.Module | None = self.direct_head
+        else:
+            reader = cast(MotifGritReader, bundle["reader"])
+            count_head = cast(MotifCountHead, bundle["count_head"])
+            # `nn.ModuleDict` is not a `Mapping`, so membership is the only read.
+            has_direct = "direct_head" in bundle
+            direct_head = bundle["direct_head"] if has_direct else None
+        if direct_head is None:
+            tokens: dict[str, torch.Tensor] = reader(weights)
+        else:
+            pooled = torch.cat([encoded_u.mean(dim=1), encoded_v.mean(dim=1)], dim=-1)
+            parts = cast(torch.Tensor, direct_head(pooled)).chunk(3, dim=-1)
+            tokens = {"topo_u": parts[0], "topo_v": parts[1], "topo_rel": parts[2]}
+        tokens["topo_cnt"] = count_head(weights)
+        return tokens
+
+    def tokens_from_weights(
+        self, weights: torch.Tensor, encoded_u: torch.Tensor, encoded_v: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Return the four token fields for one batch of motif graphs.
+
+        Args:
+            weights: ``(B, 96)`` edge weights.
+            encoded_u: Residue states of ``u`` (used only by ``token_source='direct'``).
+            encoded_v: Residue states of ``v``.
+
+        Returns:
+            ``topo_u``, ``topo_v``, ``topo_rel`` and ``topo_cnt``.
+        """
+        return self._tokens(None, weights, encoded_u, encoded_v)
+
+    def predict_weights(
+        self,
+        encoded_u: torch.Tensor,
+        encoded_v: torch.Tensor,
+        lengths_u: torch.Tensor,
+        lengths_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stage II: predict the 96 edge weights from the endpoints alone.
+
+        Args:
+            encoded_u: Frozen residue states of ``u``.
+            encoded_v: Frozen residue states of ``v``.
+            lengths_u: True residue lengths of ``u``.
+            lengths_v: True residue lengths of ``v``.
+
+        Returns:
+            ``(B, 96)`` predicted weights, family-gated.
+
+        Raises:
+            RuntimeError: If called on a Stage I model, which has no generator.
+        """
+        if self.generator is None:
+            raise RuntimeError("stage 'one' has no generator; supply batch['motif_weights']")
+        return self._gate_families(self.generator(encoded_u, encoded_v, lengths_u, lengths_v))
+
+    def _gate_families(self, weights: torch.Tensor) -> torch.Tensor:
+        """Zero every edge of an inactive family, in both stages (spec section 8)."""
+        if len(self.cfg.families) == len(FAMILIES):
+            return weights
+        return weights * self.family_mask.to(weights)
+
+    def _apply_intervention(self, weights: torch.Tensor) -> tuple[torch.Tensor, float]:
+        """Return the (possibly substituted) graph and the gate scale.
+
+        Fails closed rather than silently no-opping. The three whole-graph
+        substitutions of spec section 8 are scorer-level: they re-pair rows across
+        the *whole scored universe*, which only the scorer can see, and reach this
+        class as an explicit ``weights`` argument to `logits_from_encoded`, exactly
+        as `V3_1Prefix` handles ``shuffle``.
+
+        Raises:
+            ValueError: On an unknown intervention name or a scorer-level one.
+        """
+        if self.intervention not in INTERVENTIONS:
+            raise ValueError(f"unknown motif_prompt intervention {self.intervention!r}")
+        if self.intervention == "none":
+            return weights, 1.0
+        if self.intervention == "gates_off":
+            return weights, 0.0
+        if self.intervention == "mean":
+            mean = self._gate_families(self.mean_template.to(weights))
+            return mean.unsqueeze(0).expand_as(weights), 1.0
+        raise ValueError(
+            f"motif_prompt intervention {self.intervention!r} is a scoring-time substitution "
+            "over the whole universe; the scorer passes the substituted graph as an explicit "
+            "weights argument and leaves the model on 'none'"
+        )
+
+    def _trunk(
+        self,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+        prefixes_a: list[torch.Tensor],
+        prefixes_b: list[torch.Tensor],
+        gate_scale: float,
+    ) -> torch.Tensor:
+        """Drive the frozen trunk once, in the A-as-self orientation."""
+        trunk = self.base.cross_attention
+        mask_a = _build_padding_mask(lengths_a, h_a.size(1))
+        mask_b = _build_padding_mask(lengths_b, h_b.size(1))
+        cls_token = trunk.cls_token.repeat(h_a.size(0), 1, 1)
+        for index, layer in enumerate(self.prompt_layers):
+            h_a, h_b, cls_token = layer(
+                h_a,
+                h_b,
+                cls_token,
+                mask_a,
+                mask_b,
+                prefixes_a[index],
+                prefixes_b[index],
+                gate_scale,
+            )
+        cls_vec = cls_token.squeeze(1)
+        if trunk.pair_readout_mode == "pair_context_gated":
+            return cast(torch.Tensor, trunk.pair_context_readout(h_a, h_b, cls_vec, mask_a, mask_b))
+        base_repr = trunk._rich_pooling_readout(h_a, h_b, cls_vec, mask_a, mask_b)  # noqa: SLF001
+        if trunk.pair_readout_mode == "grid_sketch_fusion":
+            return cast(
+                torch.Tensor, trunk.grid_sketch_readout(base_repr, h_a, h_b, mask_a, mask_b)
+            )
+        return base_repr
+
+    def logits_from_encoded(
+        self,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+        *,
+        weights: torch.Tensor,
+        return_pair_repr: bool = False,
+    ) -> torch.Tensor:
+        """Compute logits from encoded token states and one batch of motif graphs.
+
+        Shared by `forward` and packed scoring, which caches the frozen encoder's
+        output across pairs, so the trunk drive exists once. A scorer's
+        whole-universe graph substitution arrives here as ``weights``.
+
+        Args:
+            encoded_a: Frozen encoder output for item A ``(B, L_a, d_model)``.
+            encoded_b: Frozen encoder output for item B ``(B, L_b, d_model)``.
+            lengths_a: True sequence lengths for A.
+            lengths_b: True sequence lengths for B.
+            weights: ``(B, 96)`` motif graph of each pair, with A as endpoint ``u``.
+            return_pair_repr: Return the representation before the output head.
+
+        Returns:
+            The pair logits, or the pair representation.
+
+        Raises:
+            ValueError: If an intervention is set while `self.training`
+                (interventions are scoring-time only), or via
+                `_apply_intervention` on an unknown or scorer-level name.
+        """
+        if self.intervention != "none" and self.training:
+            raise ValueError("motif_prompt interventions are scoring-time only; call eval() first")
+        weights, gate_scale = self._apply_intervention(weights)
+        tokens = self.tokens_from_weights(weights, encoded_a, encoded_b)
+        view_a, view_b = self.adapter.views(tokens)
+        prefixes_a = [self.adapter.prefix(i, view_a) for i in range(len(self.prompt_layers))]
+        prefixes_b = [self.adapter.prefix(i, view_b) for i in range(len(self.prompt_layers))]
+        feature_ab = self._trunk(
+            encoded_a, encoded_b, lengths_a, lengths_b, prefixes_a, prefixes_b, gate_scale
+        )
+        if self.base.order_aggregation == "single":
+            pair_repr = feature_ab
+        else:
+            feature_ba = self._trunk(
+                encoded_b, encoded_a, lengths_b, lengths_a, prefixes_b, prefixes_a, gate_scale
+            )
+            pair_repr = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
+        if return_pair_repr:
+            return pair_repr
+        return cast(torch.Tensor, self.base.output_head(pair_repr))
+
+    def resolve_weights(
+        self,
+        merged: Mapping[str, torch.Tensor],
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the graph the trunk reads for this batch.
+
+        Stage I reads the compiled template and corrupts it; Stage II predicts it
+        from the endpoints and treats any attached template as a target only.
+
+        Args:
+            merged: The merged batch.
+            encoded_a: Frozen encoder output for item A.
+            encoded_b: Frozen encoder output for item B.
+            lengths_a: True sequence lengths for A.
+            lengths_b: True sequence lengths for B.
+
+        Returns:
+            ``(B, 96)`` edge weights.
+
+        Raises:
+            ValueError: If Stage I is called without ``batch['motif_weights']``.
+        """
+        if self.cfg.stage == "two":
+            return self.predict_weights(encoded_a, encoded_b, lengths_a, lengths_b)
+        target = merged.get(TEMPLATE_KEY)
+        if target is None:
+            raise ValueError(
+                "v3_1_motif_prompt stage 'one' requires batch['motif_weights']; this stage "
+                "never scores a pair without its compiled template"
+            )
+        # The corruption mixes towards the ungated corpus mean, so the family
+        # gate is applied last and holds in both stages (spec section 8).
+        return self._gate_families(self._corrupt(target.to(encoded_a)))
+
+    def forward(
+        self, batch: dict[str, torch.Tensor] | None = None, **kwargs: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Score pairs and, when targets ride along, return the composite loss.
+
+        Args:
+            batch: Optional batch dictionary.
+            **kwargs: Additional batch tensors merged into ``batch``.
+
+        Returns:
+            ``logits`` always; ``predicted_weights`` in Stage II; in Stage II with
+            ``motif_weights`` also ``slot_loss_rows`` and, once a teacher is
+            snapshotted, ``topo_loss_rows``; with ``label`` the weighted composite
+            ``loss``, its ``loss_weight_sum``, the detached ``task_loss`` and the
+            undetached ``loss_term_*`` summands of `LOSS_TERM_NAMES`.
+
+        Raises:
+            ValueError: If Stage I is called without ``batch['motif_weights']``,
+                or an intervention is set while training.
+        """
+        merged: dict[str, torch.Tensor] = {}
+        if batch is not None:
+            merged.update(batch)
+        merged.update(kwargs)
+        emb_a, emb_b, lengths_a, lengths_b = unpack_pair_batch(merged, self.input_dim)
+        with torch.no_grad():
+            encoded_a = self.base.encoder(emb_a, lengths_a)
+            encoded_b = self.base.encoder(emb_b, lengths_b)
+        weights = self.resolve_weights(merged, encoded_a, encoded_b, lengths_a, lengths_b)
+        logits = self.logits_from_encoded(
+            encoded_a, encoded_b, lengths_a, lengths_b, weights=weights
+        )
+        output: dict[str, torch.Tensor] = {"logits": logits}
+        if self.cfg.stage == "two":
+            # `_apply_intervention` may have substituted the graph the trunk read;
+            # report what was actually read, not what the generator emitted.
+            output["predicted_weights"] = self._apply_intervention(weights)[0]
+        slot_row, topo_row = self._supervision_rows(merged, weights, encoded_a, encoded_b)
+        if slot_row is not None:
+            output["slot_loss_rows"] = slot_row
+        if topo_row is not None:
+            output["topo_loss_rows"] = topo_row
+        if "label" not in merged:
+            return output
+        self._add_composite_loss(output, logits, merged["label"], slot_row, topo_row)
+        return output
+
+    def _supervision_rows(
+        self,
+        merged: Mapping[str, torch.Tensor],
+        weights: torch.Tensor,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return the masked per-row ``L_slot`` and ``L_topo`` of this batch.
+
+        Only Stage II is supervised on the graph: in Stage I the compiled template
+        is the model's *input*, so comparing it against itself would add a constant
+        with no gradient path (spec sections 7.2 and 7.5). Self rows carry task BCE
+        but are excluded from both terms through ``batch['motif_mask']``.
+        """
+        target = merged.get(TEMPLATE_KEY)
+        if self.cfg.stage != "two" or target is None:
+            return None, None
+        target = target.to(weights)
+        mask = merged.get(TEMPLATE_MASK_KEY)
+        row_mask = torch.ones_like(weights[:, 0]) if mask is None else mask.reshape(-1).to(weights)
+        slot_row = (
+            slot_loss_rows(
+                weights,
+                target,
+                beta_p=self.cfg.beta_p,
+                beta_q=self.cfg.beta_q,
+                beta_a=self.cfg.beta_a,
+                beta_i=self.cfg.beta_i,
+                huber_delta=self.cfg.huber_delta,
+            )
+            * row_mask
+        )
+        if self.teacher is None or self.cfg.w_topo == 0.0:
+            return slot_row, None
+        bundle = cast(nn.ModuleDict, self.teacher)
+        # Both sides run through the immutable teacher: `R_T(Ahat)` keeps autograd
+        # so the term reaches the generator, `R_T(A*)` is detached (spec 7.5).
+        student_tokens = self._tokens(bundle, weights, encoded_a, encoded_b)
+        with torch.no_grad():
+            teacher_tokens = self._tokens(bundle, target, encoded_a, encoded_b)
+        return slot_row, topo_loss_rows(student_tokens, teacher_tokens) * row_mask
+
+    def _add_composite_loss(
+        self,
+        output: dict[str, torch.Tensor],
+        logits: torch.Tensor,
+        label: torch.Tensor,
+        slot_row: torch.Tensor | None,
+        topo_row: torch.Tensor | None,
+    ) -> None:
+        """Fold the task BCE, ``L_slot`` and ``L_topo`` into one weighted objective."""
+        flat = logits.reshape(-1).float()
+        labels = label.reshape(-1).float()
+        smoothing = float(self.base.label_smoothing)
+        targets = labels * (1.0 - smoothing) + 0.5 * smoothing if smoothing > 0.0 else labels
+        bce_row = F.binary_cross_entropy_with_logits(flat, targets, reduction="none")
+        row_weights = 1.0 + (float(self.base.positive_weight) - 1.0) * labels
+        weight_sum = row_weights.sum().detach()
+        total_row = bce_row
+        if slot_row is not None:
+            total_row = total_row + self.cfg.w_slot * slot_row
+        if topo_row is not None:
+            total_row = total_row + self.cfg.w_topo * topo_row
+        output["loss"] = (row_weights * total_row).sum() / weight_sum
+        output["loss_weight_sum"] = weight_sum
+        output["task_loss"] = ((row_weights * bce_row).sum() / weight_sum).detach()
+
+        def weighted(row: torch.Tensor | None, scale: float) -> torch.Tensor:
+            """The composite objective's share of one term, undetached."""
+            if row is None or scale == 0.0:
+                return torch.zeros((), dtype=logits.dtype, device=logits.device)
+            return scale * (row_weights * row).sum() / weight_sum
+
+        # The per-epoch gradient probe attributes each term to a parameter group;
+        # these are the exact summands of `loss`, so they must not be detached and
+        # must be emitted on every rank.
+        for name, row, scale in (
+            ("task", bce_row, 1.0),
+            ("slot", slot_row, self.cfg.w_slot),
+            ("topo", topo_row, self.cfg.w_topo),
+        ):
+            output[f"loss_term_{name}"] = weighted(row, float(scale))
+
+
+__all__ = [
+    "FAMILIES",
+    "FIELD_ORDER",
+    "GATE_MODES",
+    "INTERVENTIONS",
+    "LOSS_TERM_NAMES",
+    "STAGES",
+    "TEMPLATE_KEY",
+    "TEMPLATE_MASK_KEY",
+    "TOKEN_SOURCES",
+    "CorruptionConfig",
+    "MotifCountHead",
+    "MotifGenerator",
+    "MotifGritReader",
+    "MotifPromptAdapter",
+    "MotifPromptConfig",
+    "MotifPromptCrossAttentionLayer",
+    "ReaderConfig",
+    "V3_1MotifPrompt",
+    "dense_adjacency",
+    "motif_rrwp",
+    "typed_adjacency",
+]

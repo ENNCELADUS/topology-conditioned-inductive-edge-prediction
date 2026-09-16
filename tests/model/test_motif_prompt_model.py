@@ -8,18 +8,22 @@ from src.data.motif_template import SWAP_PERM, role_permutation
 from src.model.egostitch.classifier.motif_prompt import (
     FIELD_ORDER,
     GATE_MODES,
+    TEMPLATE_KEY,
     MotifCountHead,
     MotifGenerator,
     MotifGritReader,
     MotifPromptAdapter,
     MotifPromptConfig,
     ReaderConfig,
+    V3_1MotifPrompt,
     dense_adjacency,
     motif_rrwp,
     typed_adjacency,
 )
 from src.model.egostitch.classifier.prefix import prefix_branch
 from src.model.egostitch.encoder.grit_gmt import dense_rrwp
+
+from tests.test_prefix_model import _pair_batch, _tiny_base_config
 
 
 def test_config_round_trip_and_defaults() -> None:
@@ -282,7 +286,7 @@ def _tokens(n: int = 4, width: int = 16, seed: int = 5) -> dict[str, torch.Tenso
 def test_gates_start_at_zero_and_have_one_entry_per_layer_site_head() -> None:
     adapter = _adapter()
     assert adapter.gates.shape == (3, 3, 4)
-    assert float(adapter.gates.abs().sum()) == 0.0
+    assert float(adapter.gates.detach().abs().sum()) == 0.0
 
 
 def test_the_two_views_swap_only_the_endpoint_fields() -> None:
@@ -330,3 +334,133 @@ def test_masking_a_field_renormalises_the_branch_over_the_remaining_rows() -> No
     branch_removed = prefix_branch(mha, query, removed, gate, 1.0)
     # Zeroing the values leaves the keys in the denominator; removing the rows does not.
     assert not torch.allclose(branch_zeroed, branch_removed, rtol=1e-4, atol=1e-4)
+
+
+def _model(stage: str = "one", seed: int = 0, **extra: object) -> V3_1MotifPrompt:
+    torch.manual_seed(seed)
+    block: dict[str, object] = {
+        "stage": stage,
+        "base_checkpoint": "base.pt",
+        "width": 16,
+        "slots_per_field": 2,
+        "reader": {"layers": 2, "dim": 16, "heads": 4, "rrwp_k": 4},
+    }
+    if stage == "two":
+        block["bundle_checkpoint"] = "bundle.pt"
+    block.update(extra)
+    model = V3_1MotifPrompt(base=_tiny_base_config(), motif_prompt=block)
+    model.install_mean_template(torch.full((96,), 0.1))
+    return model
+
+
+def _open_gates(model: V3_1MotifPrompt, seed: int = 1) -> None:
+    gen = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        model.adapter.gates.copy_(torch.randn(model.adapter.gates.shape, generator=gen))
+
+
+@pytest.mark.parametrize("stage", ["one", "two"])
+def test_zero_gates_reproduce_the_frozen_base_bit_for_bit(stage: str) -> None:
+    model = _model(stage).eval().requires_grad_(False)
+    batch = _pair_batch()
+    batch[TEMPLATE_KEY] = _weights(n=batch["emb_a"].size(0))
+    ours = model(batch)["logits"]
+    theirs = model.base(_pair_batch())["logits"]
+    assert torch.equal(ours, theirs)
+
+
+def test_gates_off_intervention_reproduces_the_base_with_open_gates() -> None:
+    model = _model("one").eval().requires_grad_(False)
+    _open_gates(model)
+    batch = _pair_batch()
+    batch[TEMPLATE_KEY] = _weights(n=batch["emb_a"].size(0))
+    assert not torch.equal(model(batch)["logits"], model.base(_pair_batch())["logits"])
+    model.intervention = "gates_off"
+    assert torch.equal(model(batch)["logits"], model.base(_pair_batch())["logits"])
+
+
+def test_stage_one_requires_the_template_and_stage_two_never_reads_one() -> None:
+    stage_one = _model("one").eval()
+    with pytest.raises(ValueError, match="requires batch"):
+        stage_one(_pair_batch())
+    stage_two = _model("two").eval()
+    out = stage_two(_pair_batch())
+    assert "logits" in out and "predicted_weights" in out
+    assert out["predicted_weights"].shape[-1] == 96
+
+
+def test_scorer_level_interventions_fail_closed_at_the_model() -> None:
+    model = _model("two").eval()
+    model.intervention = "shuffle_graph"
+    with pytest.raises(ValueError, match="scoring-time substitution"):
+        model(_pair_batch())
+    model.intervention = "not_an_intervention"
+    with pytest.raises(ValueError, match="unknown motif_prompt intervention"):
+        model(_pair_batch())
+
+
+def test_mean_intervention_substitutes_the_published_training_mean_graph() -> None:
+    model = _model("two").eval().requires_grad_(False)
+    _open_gates(model)
+    model.intervention = "mean"
+    out = model(_pair_batch())
+    torch.testing.assert_close(
+        out["predicted_weights"],
+        model.mean_template.unsqueeze(0).expand(out["predicted_weights"].size(0), -1),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_self_row_masking_is_confined_to_the_slot_and_topo_terms() -> None:
+    model = _model("two")
+    model.initialize_teacher()
+    _open_gates(model)
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    batch["motif_mask"] = torch.tensor([1.0, 0.0, 1.0, 1.0])
+    out = {key: value.detach() for key, value in model(batch).items()}
+    assert float(out["slot_loss_rows"][1]) == 0.0
+    assert float(out["topo_loss_rows"][1]) == 0.0
+    assert float(out["slot_loss_rows"][0]) > 0.0
+    assert float(out["topo_loss_rows"][0]) > 0.0
+    # The masked row still carries task BCE.
+    assert float(out["task_loss"]) > 0.0
+
+
+def test_checkpoint_round_trip_preserves_logits_and_the_mean_template() -> None:
+    model = _model("two").eval().requires_grad_(False)
+    _open_gates(model)
+    batch = _pair_batch()
+    before = model(batch)["logits"]
+    state = {key: value.clone() for key, value in model.state_dict().items()}
+    restored = _model("two", seed=99).eval().requires_grad_(False)
+    restored.load_state_dict(state, strict=True)
+    torch.testing.assert_close(restored(batch)["logits"], before, rtol=0, atol=0)
+    torch.testing.assert_close(restored.mean_template, model.mean_template, rtol=0, atol=0)
+
+
+def test_interface_parameters_are_registered_trainable_but_gated_by_interface_open() -> None:
+    model = _model("two")
+    names = {name for name, p in model.named_parameters() if p.requires_grad}
+    assert any(name.startswith("generator.") for name in names)
+    assert any(name.startswith("reader.") for name in names)
+    assert not any(name.startswith("base.") for name in names)
+    assert not any(name.startswith("teacher") for name in names)
+    groups = model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2)
+    assert [group["name"] for group in groups] == ["generator", "interface"]
+    assert groups[1]["max_lr"] == 1e-5
+    assert model.interface_open is False
+    assert _model("one").interface_open is True
+
+
+@pytest.mark.parametrize("stage", ["one", "two"])
+def test_an_inactive_family_is_zeroed_in_both_stages(stage: str) -> None:
+    model = _model(stage, families=["closure"]).eval().requires_grad_(False)
+    batch = _pair_batch()
+    batch[TEMPLATE_KEY] = torch.ones(batch["emb_a"].size(0), 96)
+    encoded_a = model.base.encoder(batch["emb_a"], batch["len_a"])
+    encoded_b = model.base.encoder(batch["emb_b"], batch["len_b"])
+    read = model.resolve_weights(batch, encoded_a, encoded_b, batch["len_a"], batch["len_b"])
+    assert float(read[:, 16:].abs().sum()) == 0.0
+    assert float(read[:, :16].abs().sum()) > 0.0
