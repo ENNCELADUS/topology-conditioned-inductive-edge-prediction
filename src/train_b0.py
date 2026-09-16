@@ -66,6 +66,7 @@ from src.data.distributed_pairs import (
     identity_compact_batch,
 )
 from src.data.features import FeatureStore, build_f0_matrix
+from src.data.motif_template import MotifTemplateTable
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     BUCKET_BOUNDARIES,
@@ -134,6 +135,7 @@ from src.model.egostitch.classifier.coord_gen import (
     V3_1CoordGen,
     distance_class_targets,
 )
+from src.model.egostitch.classifier.motif_prompt import TEMPLATE_KEY, V3_1MotifPrompt
 from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
 from src.model.egostitch.classifier.topo_prompt import (
@@ -4195,6 +4197,7 @@ class StructStream:
         seed: int,
         val_sampler: StructSampler | None = None,
         coordinates: TopoPromptRows | None = None,
+        templates: MotifTemplateTable | None = None,
         autocast: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         if token_budget < 1:
@@ -4205,6 +4208,7 @@ class StructStream:
         self._sampler = sampler
         self._val_sampler = val_sampler
         self._coordinates = coordinates
+        self._motif_table = templates
         # The teacher is called as a child module, outside the autocast wrapper
         # Accelerate installs on the prepared model's forward; the caller passes
         # `accelerator.autocast` so the pass sees the run's mixed precision.
@@ -4223,6 +4227,9 @@ class StructStream:
         self._val_plan: StructEpochPlan | None = None
         self.last_terms: dict[str, torch.Tensor] = {}
         self.last_subgraph: StructSubgraph | None = None
+        # Per-row `L_slot`/`L_topo` of the last scored subgraph, for the trainer's
+        # per-stream average (spec section 7.5); empty for every other family.
+        self.last_motif_rows: dict[str, torch.Tensor] = {}
 
     # ------------------------------------------------------------ planning
 
@@ -4271,6 +4278,7 @@ class StructStream:
         """
         device = self._table.tokens.device
         self._teacher_logits = None
+        self.last_motif_rows = {}
         mask_np = sampler.legal_mask(subgraph)
         target = torch.from_numpy(sampler.adjacency(subgraph)).to(device)
         mask = torch.from_numpy(mask_np).to(device)
@@ -4292,6 +4300,8 @@ class StructStream:
             buckets[boundary].append(row)
         raw_model = _unwrapped_model(model)
         parts: list[torch.Tensor] = []
+        slot_parts: list[torch.Tensor] = []
+        topo_parts: list[torch.Tensor] = []
         teacher_parts: list[torch.Tensor] = []
         local_rows: list[int] = []
         pair_coords: torch.Tensor | None = None
@@ -4309,6 +4319,16 @@ class StructStream:
             pair_coords = torch.from_numpy(
                 coord_table.coords_for_pairs(np.asarray(a), np.asarray(b))
             ).to(device)
+        pair_templates: torch.Tensor | None = None
+        if isinstance(raw_model, V3_1MotifPrompt):
+            if self._motif_table is None:
+                raise RuntimeError("motif-prompt structural stream requires a template table")
+            motif_table = self._motif_table
+            left = [motif_table.index[subgraph.nodes[i]] for i, _ in pairs]
+            right = [motif_table.index[subgraph.nodes[j]] for _, j in pairs]
+            pair_templates = torch.from_numpy(
+                motif_table.weights_by_index(np.asarray(left), np.asarray(right))
+            ).to(device)
 
         rank_cost = [0] * self._world_size
         for boundary, rows in buckets.items():
@@ -4321,6 +4341,7 @@ class StructStream:
                     if owner != self._rank:
                         continue
                 coords = pair_coords[chunk] if pair_coords is not None else None
+                templates = pair_templates[chunk] if pair_templates is not None else None
                 anchor = torch.as_tensor(
                     [packed[pairs[r][0]] for r in chunk], dtype=torch.int64, device=device
                 )
@@ -4328,12 +4349,13 @@ class StructStream:
                     [packed[pairs[r][1]] for r in chunk], dtype=torch.int64, device=device
                 )
 
-                def forward(
+                def chunk_batch(
                     anchor: torch.Tensor,
                     partner: torch.Tensor,
                     boundary: int,
                     coords: torch.Tensor | None,
-                ) -> torch.Tensor:
+                    templates: torch.Tensor | None,
+                ) -> dict[str, torch.Tensor]:
                     # `boundary` is explicit: a closure over the loop variable
                     # would recompute every chunk at the last bucket.
                     emb_a, len_a = self._table.gather_nodes(anchor, boundary)
@@ -4342,13 +4364,73 @@ class StructStream:
                     if isinstance(raw_model, V3_1TopoPrompt):
                         assert coords is not None
                         batch[COORDS_KEY] = coords
+                    if templates is not None:
+                        batch[TEMPLATE_KEY] = templates
+                    return batch
+
+                def forward(
+                    anchor: torch.Tensor,
+                    partner: torch.Tensor,
+                    boundary: int,
+                    coords: torch.Tensor | None,
+                ) -> torch.Tensor:
+                    batch = chunk_batch(anchor, partner, boundary, coords, None)
                     output = cast(dict[str, torch.Tensor], raw_model(batch))
                     out = output["logits"]
                     if out.dim() > 1 and out.size(-1) == 1:
                         out = out.squeeze(-1)
                     return out.float()
 
-                if torch.is_grad_enabled():
+                def motif_forward(
+                    anchor: torch.Tensor,
+                    partner: torch.Tensor,
+                    boundary: int,
+                    templates: torch.Tensor,
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                    """Score one chunk; motif rows also carry their L_slot/L_topo terms.
+
+                    The rows are computed inside the checkpointed region, so they
+                    have to leave it as outputs: an intermediate stashed on the
+                    model would be freed and recomputed with no path back to G.
+                    Only this family takes this branch; every other arm keeps the
+                    single-tensor ``forward`` above unchanged.
+                    """
+                    batch = chunk_batch(anchor, partner, boundary, None, templates)
+                    output = cast(dict[str, torch.Tensor], raw_model(batch))
+                    out = output["logits"]
+                    if out.dim() > 1 and out.size(-1) == 1:
+                        out = out.squeeze(-1)
+                    out = out.float()
+                    # A row tensor is always returned, so an arm without a teacher
+                    # (or with ``w_topo == 0``) still contributes a differentiable
+                    # zero and every rank stacks the same shapes.
+                    zero = out.new_zeros(out.shape[0]) + out.sum() * 0.0
+                    return (
+                        out,
+                        output.get("slot_loss_rows", zero).float(),
+                        output.get("topo_loss_rows", zero).float(),
+                    )
+
+                if templates is not None:
+                    motif_out = (
+                        cast(
+                            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                            checkpoint(
+                                motif_forward,
+                                anchor,
+                                partner,
+                                boundary,
+                                templates,
+                                use_reentrant=False,
+                            ),
+                        )
+                        if torch.is_grad_enabled()
+                        else motif_forward(anchor, partner, boundary, templates)
+                    )
+                    chunk_logits = motif_out[0]
+                    slot_parts.append(motif_out[1])
+                    topo_parts.append(motif_out[2])
+                elif torch.is_grad_enabled():
                     chunk_logits = cast(
                         torch.Tensor,
                         checkpoint(forward, anchor, partner, boundary, coords, use_reentrant=False),
@@ -4381,6 +4463,14 @@ class StructStream:
         row_index = torch.as_tensor(local_rows, dtype=torch.int64, device=device)
         if parts:
             flat = flat.index_put((row_index,), torch.cat(parts))
+        if pair_templates is not None:
+            # Rank-local rows in chunk order: the trainer means them per stream,
+            # and DDP averages the resulting gradients across ranks (spec 7.5).
+            anchor_zero = dependency.float()
+            self.last_motif_rows = {
+                "slot": (torch.cat(slot_parts) if slot_parts else flat.new_zeros(0)) + anchor_zero,
+                "topo": (torch.cat(topo_parts) if topo_parts else flat.new_zeros(0)) + anchor_zero,
+            }
         if distributed:
             flat = differentiable_all_reduce(flat, op=dist.ReduceOp.SUM)  # type: ignore[no-untyped-call]
         index_a = torch.as_tensor([i for i, _ in pairs], dtype=torch.int64, device=device)

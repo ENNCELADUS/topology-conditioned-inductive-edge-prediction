@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import yaml
 from accelerate import Accelerator
+from src.data.motif_template import MotifTemplateTable
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable, PackedNodeRecord
 from src.data.struct_sampler import StructSampler
 from src.distill.struct_config import StructConfig
@@ -180,6 +181,7 @@ def _stream(
     token_budget: int = 1 << 20,
     val_sampler: StructSampler | None = None,
     coordinates: TopoPromptRows | None = None,
+    templates: MotifTemplateTable | None = None,
 ) -> StructStream:
     config = StructConfig.from_mapping(
         {
@@ -201,6 +203,7 @@ def _stream(
         seed=0,
         val_sampler=val_sampler,
         coordinates=coordinates,
+        templates=templates,
     )
 
 
