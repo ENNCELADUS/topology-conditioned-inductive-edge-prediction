@@ -66,7 +66,7 @@ from src.data.distributed_pairs import (
     identity_compact_batch,
 )
 from src.data.features import FeatureStore, build_f0_matrix
-from src.data.motif_template import MotifTemplateTable
+from src.data.motif_template import MotifTemplateTable, mean_template
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     BUCKET_BOUNDARIES,
@@ -139,6 +139,7 @@ from src.model.egostitch.classifier.motif_prompt import FAMILIES as MOTIF_FAMILI
 from src.model.egostitch.classifier.motif_prompt import (
     FIELD_ORDER,
     TEMPLATE_KEY,
+    TEMPLATE_MASK_KEY,
     V3_1MotifPrompt,
 )
 from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
@@ -3173,6 +3174,7 @@ def _evaluate_val_universe(
     v_idx: np.ndarray,
     reference: ValTopologyReference,
     row_coords: torch.Tensor | None = None,
+    row_templates: torch.Tensor | None = None,
     logits_sink: Callable[[np.ndarray], None] | None = None,
 ) -> ValTopologyResult:
     """Score the exact ball-union rows and select sampled-only topology threshold.
@@ -3200,6 +3202,9 @@ def _evaluate_val_universe(
         reference: The once-per-run `ValTopologyReference`.
         row_coords: Optional ``(n_rows, COORD_DIM)`` CPU structural coordinates
             of the universe rows (the topology-prompt arm), sliced per batch.
+        row_templates: Optional ``(n_rows, 96)`` CPU compiled motif templates of
+            the universe rows (motif-prompt Stage I, a labelled ceiling
+            diagnostic), sliced per batch.
         logits_sink: Optional recipient of gathered, ordered logits on every rank.
 
     Returns:
@@ -3217,6 +3222,11 @@ def _evaluate_val_universe(
             f"V_val universe coordinates cover {int(row_coords.shape[0])} rows, "
             f"universe has {n_rows}"
         )
+    if row_templates is not None and int(row_templates.shape[0]) != n_rows:
+        raise ValueError(
+            f"V_val universe templates cover {int(row_templates.shape[0])} rows, "
+            f"universe has {n_rows}"
+        )
 
     row_ids = torch.arange(rank, n_rows, world_size, dtype=torch.int64)
     model.eval()
@@ -3229,6 +3239,8 @@ def _evaluate_val_universe(
             batch: Batch = {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
             if row_coords is not None:
                 batch[COORDS_KEY] = row_coords.index_select(0, rows).to(device)
+            if row_templates is not None:
+                batch[TEMPLATE_KEY] = row_templates.index_select(0, rows).to(device)
             output = model(batch)
             logits = output["logits"]
             if logits.dim() > 1 and logits.size(-1) == 1:
@@ -4064,6 +4076,171 @@ class TopoPromptRows:
             "universe_rows": int(self.universe.shape[0]),
             "build_seconds": self.build_seconds,
         }
+
+
+class MotifTemplateRows:
+    """Compiled motif templates for every row a motif-prompt run scores.
+
+    Training rows are compiled on the V_val-masked training graph with the
+    queried edge removed. The V_val classification rows and the V_val topology
+    universe are compiled on the V_val gold graph, which is held-out truth, so
+    they exist for Stage I alone: spec section 8 gives true V_val template
+    compilation exclusively to labelled Stage I and oracle diagnostics, and
+    Stage II is deployable and scores from ``(x_u, x_v)`` only. Every rank
+    builds the same tensors (deterministic), keeps them on the CPU, and slices
+    per batch by ``_row_id`` -- the contract `TopoPromptRows` uses.
+    """
+
+    def __init__(
+        self,
+        *,
+        train_graph: nx.Graph,
+        train_pairs: Sequence[Pair],
+        stats_rows: np.ndarray,
+        device: torch.device,
+        seed: int,
+        val_graph: nx.Graph | None = None,
+        val_cls_pairs: Sequence[Pair] | None = None,
+        universe_pairs: Sequence[Pair] | None = None,
+    ) -> None:
+        """Compile every row once.
+
+        Args:
+            train_graph: Loopless training structural graph (V_val excluded).
+            train_pairs: The trainer's training rows in row-id order.
+            stats_rows: Row ids the mean template is taken over (epoch 1's rows).
+            device: Device batches live on.
+            seed: Slot-randomisation seed lane.
+            val_graph: Loopless V_val gold graph; Stage I only.
+            val_cls_pairs: The V_val classification rows in row-id order; Stage I only.
+            universe_pairs: The V_val topology ball-union rows in row-id order;
+                Stage I only.
+
+        Raises:
+            ValueError: If a V_val graph is given without its row lists, or a
+                row list without the graph.
+        """
+        if (val_graph is None) != (val_cls_pairs is None or universe_pairs is None):
+            raise ValueError(
+                "MotifTemplateRows needs a V_val graph together with its row lists, or neither"
+            )
+        started = time.monotonic()
+        self.train_table = MotifTemplateTable(train_graph)
+        self.train_pairs: list[Pair] = list(train_pairs)
+        self.train = torch.from_numpy(
+            self.train_table.weights(train_pairs, seed=seed, epoch=1, randomise=True)
+        )
+        self.train_mask = _motif_self_row_mask(train_pairs)
+        self.mean = torch.from_numpy(
+            mean_template(self.train.numpy()[np.asarray(stats_rows, dtype=np.int64)])
+        )
+        self.stats_rows = int(np.asarray(stats_rows).size)
+        self.val_table: MotifTemplateTable | None = None
+        self.val_cls: torch.Tensor | None = None
+        self.val_cls_mask: torch.Tensor | None = None
+        self.universe: torch.Tensor | None = None
+        if val_graph is not None:
+            assert val_cls_pairs is not None and universe_pairs is not None
+            self.val_table = MotifTemplateTable(val_graph)
+            self.val_cls = torch.from_numpy(self.val_table.weights(val_cls_pairs))
+            self.val_cls_mask = _motif_self_row_mask(val_cls_pairs)
+            self.universe = torch.from_numpy(self.val_table.weights(universe_pairs))
+        self._device = device
+        self.build_seconds = time.monotonic() - started
+        self.compile_rate = float(
+            cast(float, self.train_table.summary()["compile_seconds_per_10k"])
+        )
+
+    def install(self, model: nn.Module) -> None:
+        """Publish the training mean adjacency into the model's buffer.
+
+        Args:
+            model: The (possibly DDP-wrapped) motif-prompt model.
+
+        Raises:
+            TypeError: If the model is not a `V3_1MotifPrompt`.
+        """
+        raw_model = _unwrapped_model(model)
+        if not isinstance(raw_model, V3_1MotifPrompt):
+            raise TypeError("MotifTemplateRows.install needs a V3_1MotifPrompt")
+        raw_model.install_mean_template(self.mean)
+
+    def _attach(self, batch: Batch, table: torch.Tensor, mask: torch.Tensor) -> None:
+        rows = batch["_row_id"].detach().to("cpu", torch.int64)
+        batch[TEMPLATE_KEY] = table.index_select(0, rows).to(self._device, non_blocking=True)
+        batch[TEMPLATE_MASK_KEY] = mask.index_select(0, rows).to(
+            self._device, torch.float32, non_blocking=True
+        )
+
+    def attach_train(self, batch: Batch) -> None:
+        """Inject this training batch's compiled templates and self-row mask."""
+        self._attach(batch, self.train, self.train_mask)
+
+    def attach_val(self, batch: Batch) -> None:
+        """Inject this V_val classification batch's templates by ``_row_id``.
+
+        Raises:
+            RuntimeError: On a Stage II carrier, which compiles no V_val truth.
+        """
+        if self.val_cls is None or self.val_cls_mask is None:
+            raise RuntimeError(
+                "this MotifTemplateRows holds no compiled V_val templates; true V_val "
+                "template compilation is Stage I only (spec section 8)"
+            )
+        self._attach(batch, self.val_cls, self.val_cls_mask)
+
+    def summary(self) -> dict[str, object]:
+        """Provenance for logs and ``run_metadata.json``."""
+        return {
+            "train_rows": int(self.train.shape[0]),
+            "stats_rows": self.stats_rows,
+            "val_cls_rows": 0 if self.val_cls is None else int(self.val_cls.shape[0]),
+            "universe_rows": 0 if self.universe is None else int(self.universe.shape[0]),
+            "build_seconds": self.build_seconds,
+            "compile_seconds_per_10k": self.compile_rate,
+        }
+
+
+def _motif_self_row_mask(pairs: Sequence[Pair]) -> torch.Tensor:
+    """Return the nonself row mask of ``pairs``.
+
+    Self rows keep task BCE and are excluded from ``L_slot`` and ``L_topo``
+    alone (spec section 3).
+
+    Args:
+        pairs: Rows in row-id order.
+
+    Returns:
+        A ``(len(pairs),)`` float32 mask, 0 on a self row.
+    """
+    return torch.tensor([0.0 if u == v else 1.0 for u, v in pairs], dtype=torch.float32)
+
+
+def _assert_motif_run_kind(*, stage: str, run_kind: str | None) -> None:
+    """Fail closed on a motif-prompt stage / run-kind mismatch.
+
+    Stage I compiles true V_val templates for validation, so it is a ceiling
+    diagnostic; Stage II is deployable and must not be published as one
+    (spec section 8).
+
+    Args:
+        stage: ``motif_prompt.stage``.
+        run_kind: ``cfg.run_kind``.
+
+    Raises:
+        RuntimeError: On a Stage I formal run or a Stage II diagnostic run.
+    """
+    if stage == "one" and run_kind != "diagnostic":
+        raise RuntimeError(
+            "v3_1_motif_prompt stage 'one' compiles V_val truth templates during validation; "
+            "launch it with --run-kind diagnostic "
+            "(hpc/run.sh train <config> --run-kind diagnostic)"
+        )
+    if stage == "two" and run_kind == "diagnostic":
+        raise RuntimeError(
+            "v3_1_motif_prompt stage 'two' is deployable: it scores from (x_u, x_v) alone and "
+            "must be launched as a formal run"
+        )
 
 
 @torch.no_grad()
@@ -5303,6 +5480,7 @@ def train_ddp_loop(
     require_topology: bool = False,
     val_topology_reference: ValTopologyReference | None = None,
     topo_rows: TopoPromptRows | None = None,
+    motif_rows: MotifTemplateRows | None = None,
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
@@ -5350,6 +5528,9 @@ def train_ddp_loop(
         topo_rows: Optional structural coordinates of every training row
             (`TopoPromptRows`), attached to each batch before the forward for
             the ``v3_1_topo_prompt`` family.
+        motif_rows: Optional compiled motif templates of every training row
+            (`MotifTemplateRows`), attached to each batch before the forward for
+            the ``v3_1_motif_prompt`` family.
 
     Returns:
         The `TrainResult`, identical across ranks except for the main-rank-only
@@ -5637,9 +5818,11 @@ def train_ddp_loop(
                 kd_bank.attach(batch)
             if topo_rows is not None:
                 topo_rows.attach_train(batch)
+            if motif_rows is not None:
+                motif_rows.attach_train(batch)
 
             raw_training_model = _unwrapped_model(model)
-            if isinstance(raw_training_model, V3_1TopoPrompt):
+            if isinstance(raw_training_model, (V3_1TopoPrompt, V3_1MotifPrompt)):
                 raw_training_model.set_corruption_step(global_step, seed=cfg.seed)
             start_event, end_event = _maybe_cuda_events(use_cuda)
             output = model(batch)
@@ -6547,6 +6730,7 @@ def _run_probe_mode(
     token_budget_per_rank: int,
     profile_output: Path,
     topo_rows: TopoPromptRows | None = None,
+    motif_rows: MotifTemplateRows | None = None,
 ) -> None:
     """Run warm-up + timed steps and write one rank-zero ``ProbeResult`` JSON."""
     runtime = cfg.runtime
@@ -6587,6 +6771,8 @@ def _run_probe_mode(
         local_count, global_count = _batch_pair_counts(batch, world_size)
         if topo_rows is not None:
             topo_rows.attach_train(batch)
+        if motif_rows is not None:
+            motif_rows.attach_train(batch)
         loss: torch.Tensor | None = None
         local_failure: tuple[str, str] | None = None
         try:
@@ -6803,6 +6989,51 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 raise RuntimeError(f"virtual graph metadata write failed: {metadata_error[0]}")
         if accelerator.is_main_process:
             logger.info("coord_gen coordinate targets ready: %s", topo_rows.summary())
+    motif_rows: MotifTemplateRows | None = None
+    if isinstance(model, V3_1MotifPrompt):
+        # Stage I reads a compiled true template as its *input*, on the training
+        # graph (legal) and, for validation, on the V_val gold graph (held-out
+        # truth) -- a ceiling diagnostic. Stage II predicts the graph from the
+        # endpoints, so it compiles training targets only and never touches V_val
+        # truth: spec section 8 gives true V_val template compilation exclusively
+        # to labelled Stage I and oracle diagnostics.
+        stage = model.cfg.stage
+        _assert_motif_run_kind(stage=stage, run_kind=cfg.run_kind)
+        if cfg.distill is not None and cfg.distill.active:
+            raise RuntimeError(
+                "v3_1_motif_prompt external distill sections are not supported for this family"
+            )
+        if cfg.eval.classification_only:
+            raise RuntimeError("v3_1_motif_prompt requires the V_val topology pass")
+        corpus = _dynamic_training_corpus(cfg, assembled)
+        if stage == "one":
+            reference = build_val_topology_reference(val_split)
+            universe = val_ball_union_universe(val_split)
+            universe_pairs = [
+                (reference.nodes[int(a)], reference.nodes[int(b)])
+                for a, b in zip(universe.u_idx.tolist(), universe.v_idx.tolist(), strict=True)
+            ]
+            motif_rows = MotifTemplateRows(
+                train_graph=val_split.build_training_graph(),
+                train_pairs=corpus.pairs,
+                stats_rows=corpus.epoch_rows[1],
+                device=accelerator.device,
+                seed=cfg.seed,
+                val_graph=val_split.build_g_val_simple(),
+                val_cls_pairs=val_cls_pairs,
+                universe_pairs=universe_pairs,
+            )
+        else:
+            motif_rows = MotifTemplateRows(
+                train_graph=val_split.build_training_graph(),
+                train_pairs=corpus.pairs,
+                stats_rows=corpus.epoch_rows[1],
+                device=accelerator.device,
+                seed=cfg.seed,
+            )
+        motif_rows.install(model)
+        if accelerator.is_main_process:
+            logger.info("motif templates ready (stage %s): %s", stage, motif_rows.summary())
     # The prompt family reads true coordinates on the V_val universe; the
     # generator family predicts them there and only reports its fit on val_cls.
     universe_coords = (
@@ -6813,6 +7044,12 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         if topo_rows is not None and isinstance(model, V3_1CoordGen)
         else None
     )
+    # Stage I alone carries V_val templates; the Stage II carrier compiled none,
+    # so its validation batches and universe pass see no truth graph at all.
+    universe_templates = motif_rows.universe if motif_rows is not None else None
+    attach_val_fn: Callable[[Batch], None] | None = topo_rows.attach_val if topo_rows else None
+    if motif_rows is not None and motif_rows.val_cls is not None:
+        attach_val_fn = motif_rows.attach_val
 
     if args.ddp_mode == "probe":
         _run_probe_mode(
@@ -6823,6 +7060,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             token_budget_per_rank=args.token_budget_per_rank,
             profile_output=args.profile_output,
             topo_rows=topo_rows,
+            motif_rows=motif_rows,
         )
         return
 
@@ -6898,6 +7136,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             seed=cfg.seed,
             val_sampler=val_struct_sampler,
             coordinates=topo_rows,
+            templates=motif_rows.train_table if motif_rows is not None else None,
             autocast=accelerator.autocast,
         )
         if accelerator.is_main_process:
@@ -6936,7 +7175,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
             label_smoothing=val_label_smoothing,
             validation_bank=validation_bank,
-            attach=topo_rows.attach_val if topo_rows is not None else None,
+            attach=attach_val_fn,
             diagnostics_fn=coord_fit_fn,
         ),
     )
@@ -6966,6 +7205,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             v_idx=v_idx,
             reference=reference,
             row_coords=universe_coords,
+            row_templates=universe_templates,
         )
         if topo_rows is not None and cfg.model.family in {"v3_1_topo_prompt", "v3_1_coord_gen"}:
             if cfg.eval.eval_every != 1 or cfg.eval.topology_every != 1:
@@ -6989,7 +7229,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     topology_eval_fn=topology_evaluate_fn,
                     label_smoothing=val_label_smoothing,
                     validation_bank=validation_bank,
-                    attach=topo_rows.attach_val if topo_rows is not None else None,
+                    attach=attach_val_fn,
                     diagnostics_fn=coord_fit_fn,
                 ),
             )
@@ -7031,6 +7271,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     struct_stream=struct_stream,
                     require_topology=not cfg.eval.classification_only,
                     topo_rows=topo_rows,
+                    motif_rows=motif_rows,
                 ),
             )
         except BaseException:
@@ -7075,6 +7316,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         require_topology=not cfg.eval.classification_only,
         val_topology_reference=reference,
         topo_rows=topo_rows,
+        motif_rows=motif_rows,
     )
     if cfg.model.family == "v3_1_prefix":
         _finalize_prefix_mean(

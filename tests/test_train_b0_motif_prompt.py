@@ -6,6 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
+import networkx as nx
+import numpy as np
 import pytest
 import torch
 from src.data.motif_template import MotifTemplateTable
@@ -375,3 +377,122 @@ def test_run_metadata_records_the_motif_provenance(tmp_path: Path) -> None:
     assert isinstance(block["base_checkpoint_sha256"], str)
     assert block["bundle_checkpoint"] is None
     assert block["families"] == ["closure", "bridge"]
+
+
+# ------------------------------------------- per-row templates and stage guards (task 17)
+
+
+def _tiny_training_graph() -> nx.Graph:
+    """A small loopless graph carrying closures and bridges."""
+    graph = nx.Graph()
+    graph.add_edges_from([("a", "b"), ("b", "c"), ("c", "a"), ("c", "d"), ("b", "d")])
+    return graph
+
+
+def test_motif_rows_attach_the_template_and_mask_by_row_id() -> None:
+    from src.train_b0 import MotifTemplateRows
+
+    graph = _tiny_training_graph()
+    pairs = [("a", "b"), ("a", "c"), ("a", "a")]
+    rows = MotifTemplateRows(
+        train_graph=graph,
+        train_pairs=pairs,
+        stats_rows=np.asarray([0, 1, 2]),
+        device=torch.device("cpu"),
+        seed=0,
+    )
+    batch = {"_row_id": torch.tensor([2, 0])}
+    rows.attach_train(batch)
+    assert batch["motif_weights"].shape == (2, 96)
+    torch.testing.assert_close(batch["motif_weights"], rows.train[[2, 0]])
+    # The self row is excluded from L_slot and L_topo but keeps task BCE.
+    torch.testing.assert_close(batch["motif_mask"], torch.tensor([0.0, 1.0]))
+
+
+def test_the_mean_template_is_measured_over_the_epoch_one_rows_only() -> None:
+    from src.train_b0 import MotifTemplateRows
+
+    graph = _tiny_training_graph()
+    pairs = [("a", "b"), ("a", "c"), ("b", "c")]
+    rows = MotifTemplateRows(
+        train_graph=graph,
+        train_pairs=pairs,
+        stats_rows=np.asarray([0, 1]),
+        device=torch.device("cpu"),
+        seed=0,
+    )
+    torch.testing.assert_close(rows.mean, rows.train[[0, 1]].mean(dim=0))
+    assert rows.summary()["stats_rows"] == 2
+    assert rows.summary()["train_rows"] == 3
+    assert rows.summary()["val_cls_rows"] == 0
+
+
+def test_installing_the_mean_publishes_it_into_the_models_buffer() -> None:
+    from src.train_b0 import MotifTemplateRows
+
+    graph = _tiny_training_graph()
+    rows = MotifTemplateRows(
+        train_graph=graph,
+        train_pairs=[("a", "b"), ("a", "c")],
+        stats_rows=np.asarray([0, 1]),
+        device=torch.device("cpu"),
+        seed=0,
+    )
+    model = _motif_model()
+    rows.install(model)
+    torch.testing.assert_close(model.mean_template, rows.mean)
+    with pytest.raises(TypeError, match="V3_1MotifPrompt"):
+        rows.install(V3_1(**_tiny_base_config()))
+
+
+def test_stage_two_rows_compile_no_v_val_template_and_refuse_to_attach_one() -> None:
+    # Spec section 8: true V_val template compilation belongs exclusively to
+    # labelled Stage I and oracle diagnostics.
+    from src.train_b0 import MotifTemplateRows
+
+    rows = MotifTemplateRows(
+        train_graph=_tiny_training_graph(),
+        train_pairs=[("a", "b"), ("a", "c")],
+        stats_rows=np.asarray([0]),
+        device=torch.device("cpu"),
+        seed=0,
+    )
+    assert rows.val_cls is None
+    assert rows.universe is None
+    with pytest.raises(RuntimeError, match="no compiled V_val templates"):
+        rows.attach_val({"_row_id": torch.tensor([0])})
+
+
+def test_stage_one_rows_carry_the_v_val_tables_and_attach_them_by_row_id() -> None:
+    from src.train_b0 import MotifTemplateRows
+
+    graph = _tiny_training_graph()
+    val_pairs = [("a", "b"), ("b", "c"), ("b", "b")]
+    rows = MotifTemplateRows(
+        train_graph=graph,
+        train_pairs=[("a", "b"), ("a", "c")],
+        stats_rows=np.asarray([0]),
+        device=torch.device("cpu"),
+        seed=0,
+        val_graph=graph,
+        val_cls_pairs=val_pairs,
+        universe_pairs=val_pairs[:2],
+    )
+    assert rows.val_cls is not None and rows.universe is not None
+    assert rows.universe.shape == (2, 96)
+    batch = {"_row_id": torch.tensor([2, 1])}
+    rows.attach_val(batch)
+    torch.testing.assert_close(batch["motif_weights"], rows.val_cls[[2, 1]])
+    torch.testing.assert_close(batch["motif_mask"], torch.tensor([0.0, 1.0]))
+    assert rows.summary()["universe_rows"] == 2
+
+
+def test_stage_one_refuses_a_formal_run_and_stage_two_refuses_a_diagnostic_one() -> None:
+    from src.train_b0 import _assert_motif_run_kind
+
+    with pytest.raises(RuntimeError, match="--run-kind diagnostic"):
+        _assert_motif_run_kind(stage="one", run_kind="formal")
+    _assert_motif_run_kind(stage="one", run_kind="diagnostic")
+    _assert_motif_run_kind(stage="two", run_kind="formal")
+    with pytest.raises(RuntimeError, match="deployable"):
+        _assert_motif_run_kind(stage="two", run_kind="diagnostic")
