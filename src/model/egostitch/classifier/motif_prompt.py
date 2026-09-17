@@ -395,6 +395,22 @@ class MotifGritReader(nn.Module):
         self.pair_proj = nn.Linear(cfg.dim, width)
         self.token_norm = nn.LayerNorm(width)
 
+    def adaptable_modules(self) -> list[nn.Module]:
+        """The final block and the output projections: all Stage II may adapt.
+
+        Returns:
+            The modules spec section 7.5 opens after the warm-up.
+        """
+        return [self.layers[-1], self.node_proj, self.pair_proj, self.token_norm]
+
+    def frozen_stage_two_modules(self) -> list[nn.Module]:
+        """The role/input embeddings and every earlier block.
+
+        Returns:
+            The modules spec section 7.5 keeps frozen for all of Stage II.
+        """
+        return [self.role_embed, self.node_embed, self.edge_embed, *list(self.layers)[:-1]]
+
     def _flat_batch(self, weights: torch.Tensor, adj: torch.Tensor) -> _GritBatch:
         """Flatten one batch of motif graphs into the layout GRIT's layer reads."""
         batch = weights.size(0)
@@ -874,9 +890,9 @@ class MotifPromptCrossAttentionLayer(nn.Module):
 class V3_1MotifPrompt(nn.Module):
     """A frozen bidirectional-cross `V3_1` reading a motif graph through gated prefixes.
 
-    ``reader`` and ``adapter`` are registered before ``base`` so
-    ``next(model.parameters())`` is trainable -- the structural stream builds its
-    zero-loss anchor from it. Stage I reads a compiled template from
+    ``reader`` and ``adapter`` are registered before ``base``, so the structural
+    stream's first-trainable-parameter anchor lands on the motif path rather than
+    on the frozen trunk. Stage I reads a compiled template from
     ``batch['motif_weights']`` and fails closed without one; Stage II predicts the
     template from the endpoints and never reads a truth graph at inference, where
     ``batch['motif_weights']`` is a supervision *target* only.
@@ -942,6 +958,7 @@ class V3_1MotifPrompt(nn.Module):
             MotifPromptCrossAttentionLayer(cast(CrossAttentionLayer, layer), index, self.adapter)
             for index, layer in enumerate(trunk.layers)
         )
+        self._freeze_permanently_frozen()
         self.register_buffer("mean_template", torch.zeros(N_EDGES))
         # Derived from `cfg.families` on every construction, so a checkpoint can
         # never restore a stale family gate over a changed config.
@@ -975,9 +992,39 @@ class V3_1MotifPrompt(nn.Module):
         """Parameters the optimiser updates."""
         return [param for param in self.parameters() if param.requires_grad]
 
+    def _freeze_permanently_frozen(self) -> None:
+        """Drop every parameter this configuration can never train.
+
+        Two section 8 controls bypass a whole module: ``token_source='direct'``
+        never calls the reader, and ``gate_mode='mean_graph'`` returns the
+        installed mean adjacency without touching a generator parameter. Stage II
+        additionally freezes the reader's role/input embeddings and every block
+        but the last for the whole run (spec section 7.5). Production DDP wraps
+        this model with ``find_unused_parameters=False``, so a trainable parameter
+        that never receives a gradient aborts the second iteration: the freeze
+        happens here, at construction, before any wrapping.
+        """
+        if self.cfg.token_source == "direct":
+            self.reader.requires_grad_(False)
+        elif self.cfg.stage == "two":
+            for module in self.reader.frozen_stage_two_modules():
+                module.requires_grad_(False)
+        if self.cfg.gate_mode == "mean_graph" and self.generator is not None:
+            self.generator.requires_grad_(False)
+
     def _interface_modules(self) -> list[nn.Module]:
-        """The Stage I bundle: the reader, the count head and the prefix adapter."""
-        modules: list[nn.Module] = [self.reader, self.count_head, self.adapter]
+        """The warm-up-controlled bundle: reader interface, count head, prefix adapter.
+
+        Stage I trains the whole reader (spec section 7.2). Stage II may adapt
+        only its final block and the output projections once the warm-up opens
+        the group (spec section 7.5), so the earlier blocks and the role/input
+        embeddings -- frozen outright in `_freeze_permanently_frozen` -- are not
+        members of it and opening the group cannot reach them.
+        """
+        reader_modules: list[nn.Module] = (
+            [self.reader] if self.cfg.stage == "one" else self.reader.adaptable_modules()
+        )
+        modules: list[nn.Module] = [*reader_modules, self.count_head, self.adapter]
         if self.direct_head is not None:
             modules.append(self.direct_head)
         return modules

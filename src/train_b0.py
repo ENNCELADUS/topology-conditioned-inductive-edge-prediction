@@ -5015,7 +5015,11 @@ class StructStream:
         plan = self._epoch_plan(epoch, steps)
         positions = self._positions(len(plan.subgraphs), rank=self._rank, steps=steps, step=step)
         global_count = self._global_step_count(len(plan.subgraphs), steps=steps, step=step)
-        zero = next(model.parameters()).sum() * 0.0
+        # The first *trainable* parameter, as `_score` already anchors on: an arm
+        # may freeze whichever parameter happens to be registered first (the
+        # motif reader's role embeddings are frozen for all of Stage II), and an
+        # anchor without a grad_fn would make this zero loss unbackwardable.
+        zero = next(p for p in model.parameters() if p.requires_grad).sum() * 0.0
         self.last_terms = {}
         self.last_subgraph = None
         # Cleared here and not only in `_score`: a step this rank scores no

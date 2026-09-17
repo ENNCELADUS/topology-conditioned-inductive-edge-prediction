@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
 from src.data.motif_template import SWAP_PERM, count_statistics, role_permutation
@@ -490,6 +492,86 @@ def test_interface_parameters_are_registered_trainable_but_gated_by_interface_op
     assert groups[1]["max_lr"] == 1e-5
     assert model.interface_open is False
     assert _model("one").interface_open is True
+
+
+def _trainable_without_gradient(model: V3_1MotifPrompt, **batch_extra: torch.Tensor) -> list[str]:
+    """Names of trainable parameters one forward/backward never reaches.
+
+    Production DDP wraps this model with ``find_unused_parameters=False``, so any
+    such parameter aborts the second iteration.
+    """
+    _open_gates(model)
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    batch["label"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    batch.update(batch_extra)
+    output = model(batch)
+    (output["loss"] + output["loss_term_slot"] + output["loss_term_topo"]).backward()
+    return sorted(
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad and param.grad is None
+    )
+
+
+def test_every_trainable_parameter_is_reached_by_one_backward() -> None:
+    assert _trainable_without_gradient(_model("two")) == []
+
+
+def test_the_direct_token_control_freezes_the_bypassed_reader() -> None:
+    # `token_source='direct'` never calls the reader, so leaving it trainable
+    # kills the control on the second DDP iteration.
+    model = _model("two", token_source="direct")
+    assert all(not param.requires_grad for param in model.reader.parameters())
+    assert _trainable_without_gradient(model) == []
+
+
+def test_the_mean_graph_control_freezes_the_bypassed_generator() -> None:
+    # `gate_mode='mean_graph'` returns a buffer, so no generator parameter is on
+    # the autograd path at all.
+    model = _model("two", gate_mode="mean_graph")
+    assert model.generator is not None
+    assert all(not param.requires_grad for param in model.generator.parameters())
+    assert _trainable_without_gradient(model) == []
+    # With no trainable generator the optimiser holds the interface group alone.
+    groups = model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2)
+    assert [group["name"] for group in groups] == ["interface"]
+
+
+def test_stage_two_opens_only_the_final_reader_block_and_the_output_projections() -> None:
+    # Spec section 7.5: epochs 3-15 adapt the final block and output projections
+    # of `R_S`, the count head and the adapter; earlier blocks and the role/input
+    # embeddings stay frozen for the whole run.
+    model = _model("two")
+    frozen = {name for name, param in model.named_parameters() if not param.requires_grad}
+    assert {name for name in frozen if name.startswith("reader.")} == {
+        "reader.role_embed.weight",
+        "reader.node_embed.weight",
+        "reader.node_embed.bias",
+        "reader.edge_embed.weight",
+        "reader.edge_embed.bias",
+        *{name for name, _ in model.reader.layers[0].named_parameters(prefix="reader.layers.0")},
+    }
+    names_by_id = {id(param): name for name, param in model.named_parameters()}
+    groups = model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2)
+    interface = {names_by_id[id(param)] for param in cast(list[object], groups[1]["params"])}
+    reader_interface = {name for name in interface if name.startswith("reader.")}
+    adaptable = ("reader.layers.1.", "reader.node_proj", "reader.pair_proj", "reader.token_norm")
+    assert all(name.startswith(adaptable) for name in reader_interface)
+    assert "reader.node_proj.weight" in reader_interface
+    assert "reader.pair_proj.weight" in reader_interface
+    assert any(name.startswith("reader.layers.1.") for name in reader_interface)
+
+
+def test_stage_one_trains_the_whole_reader() -> None:
+    # Spec section 7.2 trains R, its token projections, the count head, the role
+    # embeddings and the adapter; only F and its head are frozen.
+    model = _model("one")
+    assert all(param.requires_grad for param in model.reader.parameters())
+    names_by_id = {id(param): name for name, param in model.named_parameters()}
+    groups = model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2)
+    interface = {names_by_id[id(param)] for param in cast(list[object], groups[0]["params"])}
+    assert {name for name, _ in model.reader.named_parameters(prefix="reader")} <= interface
 
 
 @pytest.mark.parametrize("stage", ["one", "two"])
