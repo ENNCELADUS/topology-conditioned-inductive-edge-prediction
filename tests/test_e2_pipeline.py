@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import cast
 
@@ -879,6 +879,56 @@ def test_orchestrator_launches_only_the_train_stage(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------- run_pipeline: success paths
+
+
+def test_a_worker_without_stop_after_epoch_still_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`optim.stop_after_epoch` is `train_b0`'s key; other workers have no such field.
+
+    `src.train_egostitch` builds an `EgoOptimConfig`, so reading the attribute
+    unconditionally raises `AttributeError` *after* training finished and rejects
+    a completed attempt instead of publishing it.
+    """
+    from src import train_b0
+    from src.train_egostitch import EgoOptimConfig
+
+    def fake_load_config(path: Path) -> train_b0.Config:
+        base = train_b0.load_config(path)
+        ego_optim = EgoOptimConfig(
+            lr=base.optim.lr,
+            weight_decay=base.optim.weight_decay,
+            epochs=base.optim.epochs,
+            warmup_steps=base.optim.warmup_steps,
+            grad_clip=base.optim.grad_clip,
+        )
+        assert not hasattr(ego_optim, "stop_after_epoch")
+        return replace(base, optim=cast(train_b0.OptimConfig, ego_optim))
+
+    class EgoLikeWorker:
+        pass
+
+    EgoLikeWorker.load_config = staticmethod(fake_load_config)  # type: ignore[attr-defined]
+    EgoLikeWorker.prepare_pack = staticmethod(train_b0.prepare_pack)  # type: ignore[attr-defined]
+
+    base_args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+    original_import = importlib.import_module
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda name: EgoLikeWorker if name == "fake.ego_like_worker" else original_import(name),
+    )
+    args = PipelineArgs(
+        config=base_args.config,
+        pack_dir=base_args.pack_dir,
+        output_dir=base_args.output_dir,
+        worker_module="fake.ego_like_worker",
+        skip_test=True,
+    )
+
+    assert run_pipeline(args, training_command_runner=_make_fake_runner()) == 0
+    assert (output_dir / "complete.json").is_file()
+    assert not (output_dir / "failure.json").exists()
 
 
 class TestRunPipelineSuccess:

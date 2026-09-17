@@ -1300,7 +1300,10 @@ def _run_pipeline_unlocked(
                 if args.worker_module == "src.train_egostitch"
                 else None
             ),
-            stop_after_epoch=cfg.optim.stop_after_epoch,
+            # `optim.stop_after_epoch` is `train_b0`'s prefix halt; `EgoOptimConfig`
+            # has no such field, and reading it unconditionally would reject a
+            # completed EgoStitch attempt after training rather than publish it.
+            stop_after_epoch=getattr(cfg.optim, "stop_after_epoch", None),
         )
     except Exception as error:
         rejected_profile = {**evidence_profile}
