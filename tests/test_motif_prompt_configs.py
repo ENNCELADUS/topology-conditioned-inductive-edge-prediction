@@ -71,7 +71,7 @@ def test_every_motif_config_shares_one_chunking_and_batching_protocol(name: str)
     # (spec section 7.1).
     cfg = load_config(CONFIG_DIR / name)
     assert cfg.struct is not None and cfg.struct.token_budget == 98304
-    assert cfg.struct.resident_tokens == 196608
+    assert cfg.struct.resident_tokens == 393216
     assert cfg.runtime is not None and cfg.runtime.max_pairs_per_rank == 1536
 
 

@@ -107,9 +107,11 @@ struct:
   # per chunk against 512-1024-token nodes (~25 trunk forwards per rank per
   # step) at 46 GiB/rank and ~19 steps/min; 98304 with the joint backward gave
   # ~3 chunks per rank at 65-71 GiB/rank and ~27 steps/min. The split pass with
-  # 196608 resident tokens targets ~80 GiB/rank under the 85 GiB limit.
+  # 196608 resident tokens measured 58 GiB/rank and ~33 steps/min (bridge_only,
+  # same container); 393216 resident tokens spends that headroom on fewer
+  # recomputes, targeting ~75 GiB/rank under the 85 GiB limit.
   # Neither subgraphs_per_epoch nor runtime.max_pairs_per_rank may be traded for
   # wall time: the first halves structural supervision, the second changes the
   # global batch, the optimizer-step count and hence the structural-subgraph count.
   token_budget: 98304
-  resident_tokens: 196608
+  resident_tokens: 393216
