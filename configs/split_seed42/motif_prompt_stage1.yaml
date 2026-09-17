@@ -57,7 +57,10 @@ optim:
     anneal_strategy: cos
   groups:
     generator: {max_lr: 1.0e-4}
-    interface: {max_lr: 1.0e-5} # 0.1x the generator peak (spec section 7.5)
+    # Stage I has no generator, so the interface is the only optimizer group and
+    # it trains the whole reader at spec section 7.2's 1e-4. The 0.1x interface
+    # rate is section 7.5's Stage II rule and does not apply here.
+    interface: {max_lr: 1.0e-4}
 eval:
   patience: null # full 15-epoch schedule, no early stopping (spec section 7.2)
   eval_every: 1

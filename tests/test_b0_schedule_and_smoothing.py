@@ -241,6 +241,67 @@ class TestBuildScheduler:
         # warmup_steps is ignored once OneCycle owns the schedule.
         assert observed[0] < observed[9]
 
+    def test_a_lone_named_group_keeps_its_own_peak(self, tmp_path: Path) -> None:
+        """A group's `max_lr` is honoured even when it is the only group.
+
+        A frozen generator or a Stage I arm leaves one named optimizer group, so
+        reading the per-group peak only above one group would silently substitute
+        the global peak and train that group at ten times its configured rate.
+        """
+        cfg = _config_with_scheduler(tmp_path, dict(ONECYCLE_BLOCK))
+        group: dict[str, object] = {
+            "name": "interface",
+            "params": [nn.Parameter(torch.zeros(1))],
+            "lr": 1.0e-5,
+            "max_lr": 1.0e-5,
+        }
+        optimizer = torch.optim.AdamW([group], lr=1.0e-4)
+        total_steps = 100
+        scheduler = _build_scheduler(optimizer, cfg, warmup_steps=0, total_steps=total_steps)
+
+        assert optimizer.param_groups[0]["max_lr"] == pytest.approx(1.0e-5)
+        observed = [scheduler.get_last_lr()[0]]
+        for _ in range(total_steps - 1):
+            optimizer.step()
+            _step_scheduler(scheduler)
+            observed.append(scheduler.get_last_lr()[0])
+        assert max(observed) == pytest.approx(1.0e-5, rel=1e-6)
+
+    @pytest.mark.parametrize(
+        ("config_name", "block", "expected_peak"),
+        [
+            ("motif_prompt_mean_graph.yaml", {"stage": "two", "gate_mode": "mean_graph"}, 1e-5),
+            ("motif_prompt_stage1.yaml", {"stage": "one"}, 1e-4),
+        ],
+    )
+    def test_a_single_group_arm_trains_at_its_configured_peak(
+        self, config_name: str, block: dict[str, object], expected_peak: float
+    ) -> None:
+        """The two shipped arms whose optimizer has one group keep that group's peak.
+
+        ``gate_mode: mean_graph`` freezes the generator and Stage I has none, so the
+        interface is their only group. The control exists to isolate query-conditioned
+        connectivity and only reads against the main arm at the same 0.1x interface
+        rate; Stage I trains the whole reader at its spec section 7.2 ``1e-4``, the
+        0.1x rate being section 7.5's Stage II rule.
+        """
+        from src.train_b0 import _build_optimizer
+
+        from tests.model.test_motif_prompt_model import _model
+
+        cfg = load_config(Path("configs/split_seed42") / config_name)
+        optimizer = _build_optimizer(_model(**block), cfg)  # type: ignore[arg-type]
+        assert [group["name"] for group in optimizer.param_groups] == ["interface"]
+        _build_scheduler(optimizer, cfg, warmup_steps=0, total_steps=100)
+        assert optimizer.param_groups[0]["max_lr"] == pytest.approx(expected_peak)
+
+    def test_an_unnamed_lone_group_still_takes_the_global_peak(self, tmp_path: Path) -> None:
+        """Arms whose optimizer carries no per-group peak keep the configured one."""
+        cfg = _config_with_scheduler(tmp_path, dict(ONECYCLE_BLOCK))
+        optimizer = torch.optim.AdamW([nn.Parameter(torch.zeros(1))], lr=1.0e-4)
+        _build_scheduler(optimizer, cfg, warmup_steps=0, total_steps=100)
+        assert optimizer.param_groups[0]["max_lr"] == pytest.approx(1.0e-4)
+
     def test_step_scheduler_tolerates_overshoot(self, tmp_path: Path) -> None:
         """Stepping past total_steps holds the final LR instead of crashing."""
         cfg = _config_with_scheduler(tmp_path, dict(ONECYCLE_BLOCK))

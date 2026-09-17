@@ -578,6 +578,10 @@ def _build_scheduler(
     ``steps_per_epoch * epochs`` is not a valid substitute — callers derive the
     exact sum from the precomputed per-epoch plans.
 
+    An optimizer group carrying its own ``max_lr`` keeps that peak whether or not
+    it shares the optimizer with other groups; a group without one takes
+    ``scheduler.max_lr``.
+
     Args:
         optimizer: The prepared optimizer to schedule.
         cfg: The full training config.
@@ -615,11 +619,12 @@ def _build_scheduler(
         scheduler_cfg.final_div_factor,
         scheduler_cfg.anneal_strategy,
     )
-    max_lr: float | list[float] = scheduler_cfg.max_lr
-    if len(optimizer.param_groups) > 1:
-        max_lr = [
-            float(group.get("max_lr", scheduler_cfg.max_lr)) for group in optimizer.param_groups
-        ]
+    # Every group's own peak is honoured whatever the group count. A frozen
+    # generator (``gate_mode: mean_graph``) or a Stage I arm leaves exactly one
+    # named group, and passing the global peak there would train it at ten times
+    # its configured rate. Groups that carry no peak still take the global one, so
+    # this is the previous behaviour for every arm with a plain optimizer.
+    max_lr = [float(group.get("max_lr", scheduler_cfg.max_lr)) for group in optimizer.param_groups]
     return torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=max_lr,

@@ -82,7 +82,11 @@ def test_every_motif_config_runs_the_full_fifteen_epoch_cycle(name: str) -> None
     assert cfg.optim.lr == 1e-4 == cfg.optim.scheduler.max_lr
     assert cfg.optim.weight_decay == 1e-2
     assert cfg.optim.grad_clip == 1.0
-    assert cfg.optim.groups == {"generator": 1e-4, "interface": 1e-5}
+    # Stage I has no generator, so the interface is its only optimizer group and
+    # trains the whole reader at spec section 7.2's 1e-4; the 0.1x interface rate
+    # belongs to section 7.5's Stage II schedule.
+    interface = 1e-4 if _block(name)["stage"] == "one" else 1e-5
+    assert cfg.optim.groups == {"generator": 1e-4, "interface": interface}
 
 
 def test_stage_one_is_a_ceiling_diagnostic_and_stage_two_is_deployable() -> None:
