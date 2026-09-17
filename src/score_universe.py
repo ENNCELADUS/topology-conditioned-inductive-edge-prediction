@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import json
 import logging
@@ -106,6 +107,7 @@ if TYPE_CHECKING:
     # import is erased at runtime (`from __future__ import annotations` makes
     # every annotation a string), so it exists for mypy only.
     from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
+    from src.model.egostitch.classifier.motif_prompt import V3_1MotifPrompt
     from src.model.egostitch.classifier.prefix import V3_1Prefix
     from src.model.egostitch.composite import E2ENodeState, EgoStitchModel
     from src.model.egostitch.generator.full_oracle import FullEgoGraph
@@ -138,7 +140,21 @@ PREFIX_INTERVENTIONS: tuple[str, ...] = (
     "mean_relation",
     "mean_context",
     "slot_gates_open",
+    # `v3_1_motif_prompt` only (spec section 8): whole-universe graph transplant,
+    # independent closure-correspondence permutation for one endpoint, and bridge
+    # rewiring relative to the endpoint attachments.
+    "shuffle_graph",
+    "permute_closure",
+    "rewire_bridge",
 )
+#: The three motif-prompt interventions that substitute the *graph*, not a model mode.
+MOTIF_GRAPH_INTERVENTIONS: frozenset[str] = frozenset(
+    {"shuffle_graph", "permute_closure", "rewire_bridge"}
+)
+MOTIF_PROMPT_FAMILY = "v3_1_motif_prompt"
+#: The fixed motif-template edge count (`src.data.motif_template.N_EDGES`), inlined
+#: so this module never imports the GRIT-backed model package to score another family.
+N_MOTIF_EDGES = 96
 #: `derive_val_region_split`'s parameters for `_load_val_region_split`'s
 #: production re-derivation; the test seam a small monkeypatched value lets
 #: synthetic fixtures satisfy (`ValRegionParams`'s own defaults assume a
@@ -1216,6 +1232,16 @@ def _build_v3_1_coord_gen(model_config: dict[str, object]) -> nn.Module:
     return V3_1CoordGen(**cast(dict[str, Any], model_config))
 
 
+def _build_v3_1_motif_prompt(model_config: dict[str, object]) -> nn.Module:
+    """Rebuild a ``v3_1_motif_prompt`` checkpoint's model from its embedded config."""
+    from src.model.egostitch.classifier.motif_prompt import V3_1MotifPrompt
+
+    return V3_1MotifPrompt(
+        base=cast(Mapping[str, object], model_config["base"]),
+        motif_prompt=cast(Mapping[str, object], model_config["motif_prompt"]),
+    )
+
+
 def _build_egostitch_e2e(model_config: dict[str, object]) -> nn.Module:
     """Build an `EgoStitchModel` from its checkpointed config (design rev 3).
 
@@ -1320,6 +1346,7 @@ MODEL_BUILDERS: dict[str, Callable[[dict[str, object]], nn.Module]] = {
     "v3_1_prefix": _build_v3_1_prefix,
     "v3_1_topo_prompt": _build_v3_1_topo_prompt,
     "v3_1_coord_gen": _build_v3_1_coord_gen,
+    "v3_1_motif_prompt": _build_v3_1_motif_prompt,
     "egostitch_e2e": _build_egostitch_e2e,
     "cazi_mbn": _build_cazi_mbn,
     "official_ppi": _build_official_ppi,
@@ -1984,6 +2011,56 @@ def _check_row_coords(row_coords: torch.Tensor | None, num_rows: int) -> None:
         )
 
 
+def _check_row_templates(row_templates: torch.Tensor | None, num_rows: int) -> None:
+    """Fail closed unless the motif template bank covers every row being scored.
+
+    Args:
+        row_templates: The bank, or ``None``.
+        num_rows: Rows this process scores.
+
+    Raises:
+        SystemExit: If ``row_templates`` is given and does not have ``num_rows`` rows.
+    """
+    if row_templates is not None and int(row_templates.shape[0]) != num_rows:
+        raise SystemExit(
+            f"motif templates cover {int(row_templates.shape[0])} rows, expected {num_rows}"
+        )
+
+
+def _motif_source_weights(
+    source_batches: Sequence[Sequence[int]],
+    predict_batch: Callable[[Sequence[int]], torch.Tensor],
+    *,
+    num_rows: int,
+) -> torch.Tensor:
+    """Build the ``--prefix-intervention shuffle_graph`` predicted-graph bank (spec section 8).
+
+    The sibling of `_coord_gen_source_coords` one family over: pass 1 runs the
+    *generator* over the source pairs and keeps the predicted 96-edge graph, pass
+    2 scores each row's own endpoints while the frozen reader reads another row's
+    predicted graph. The transplant preserves the universe's distribution of
+    predicted graphs and destroys only the pairing between a row and its own, so
+    it is the row-dependence null the ``mean`` intervention is not.
+
+    Args:
+        source_batches: Batch index lists over the source pairs; an index is a
+            row position, since source ``i`` serves row ``i``.
+        predict_batch: Encodes one batch of source pairs and returns its
+            ``(B, 96)`` predicted graph.
+        num_rows: Rows this process scores.
+
+    Returns:
+        The row-aligned ``(num_rows, 96)`` fp32 CPU weight bank.
+    """
+    bank = torch.zeros((num_rows, N_MOTIF_EDGES), dtype=torch.float32)
+    for batch_indices in source_batches:
+        predicted = predict_batch(batch_indices)
+        bank[torch.as_tensor(list(batch_indices), dtype=torch.int64)] = (
+            predicted.detach().to(torch.float32).cpu()
+        )
+    return bank
+
+
 def _prefix_source_conditions(
     model: V3_1Prefix,
     source_batches: Sequence[Sequence[int]],
@@ -2028,6 +2105,92 @@ def _prefix_source_conditions(
             z_batch.detach().to(torch.float32).cpu()
         )
     return z_bank
+
+
+def _is_motif_prompt(model: nn.Module) -> bool:
+    """Whether this scorer is a motif-prompt model, without importing its module.
+
+    `src.model.egostitch.classifier.motif_prompt` transitively pulls in
+    `torch_geometric` through the vendored GRIT stack, a cost plain ``v3_1``
+    scoring must never pay, so the family is recognised by the published class
+    attribute instead.
+
+    Args:
+        model: The built scorer.
+
+    Returns:
+        ``True`` for a `V3_1MotifPrompt`.
+    """
+    return getattr(model, "name", "") == MOTIF_PROMPT_FAMILY
+
+
+def _motif_permute_closure(weights: torch.Tensor, *, seed: int) -> torch.Tensor:
+    """Permute the closure attachments of endpoint ``u`` independently (spec section 8).
+
+    Slots are anonymous within a role and both the reader and ``L_slot`` are
+    invariant to a *joint* within-role permutation, so moving one endpoint's half
+    alone is what breaks the wedge correspondence. It preserves the closure weight
+    multiset and both family totals, but not every node's weighted degree; the
+    caller reports the changed degree marginals.
+
+    Args:
+        weights: ``(n, 96)`` predicted edge weights.
+        seed: ``--prefix-intervention-seed``.
+
+    Returns:
+        A new ``(n, 96)`` tensor with the ``u``-side closure slots permuted.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(8, generator=generator)
+    out = weights.clone()
+    out[:, 0:8] = weights[:, 0:8][:, order]
+    return out
+
+
+def _motif_rewire_bridge(weights: torch.Tensor, *, seed: int) -> torch.Tensor:
+    """Rewire the interior block relative to the endpoint attachments (spec section 8).
+
+    The 16 attachment weights stay put while the ``8 x 8`` interior block is
+    permuted on both sides, so the bridge weight multiset and the family totals
+    survive and only the attachment-to-interior correspondence is destroyed.
+
+    Args:
+        weights: ``(n, 96)`` predicted edge weights.
+        seed: ``--prefix-intervention-seed``.
+
+    Returns:
+        A new ``(n, 96)`` tensor with the interior block rewired.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    left = torch.randperm(8, generator=generator)
+    right = torch.randperm(8, generator=generator)
+    out = weights.clone()
+    interior = weights[:, 32:].reshape(-1, 8, 8)
+    out[:, 32:] = interior[:, left][:, :, right].reshape(-1, 64)
+    return out
+
+
+def _assert_motif_scoring_contract(*, stage: str, allow_oracle_diagnostic: bool) -> None:
+    """Fail closed on a motif-prompt stage / diagnostic-flag mismatch.
+
+    Args:
+        stage: The checkpoint's ``motif_prompt.stage``.
+        allow_oracle_diagnostic: Whether ``--allow-oracle-diagnostic`` was passed.
+
+    Raises:
+        ValueError: On Stage I without the acknowledgement, or Stage II with it.
+    """
+    if stage == "one" and not allow_oracle_diagnostic:
+        raise ValueError(
+            "checkpoint family v3_1_motif_prompt stage 'one' reads compiled true templates by "
+            "construction; pass --allow-oracle-diagnostic to acknowledge this is a ceiling "
+            "diagnostic, never a formal result"
+        )
+    if stage == "two" and allow_oracle_diagnostic:
+        raise ValueError(
+            "v3_1_motif_prompt stage 'two' is deployable and scores from (x_u, x_v) alone; "
+            "--allow-oracle-diagnostic does not apply"
+        )
 
 
 def _coord_gen_source_coords(
@@ -2082,6 +2245,8 @@ def _score_v3_1(
     token_budget: int,
     shuffle_sources: Sequence[tuple[str, str]] | None = None,
     row_coords: torch.Tensor | None = None,
+    row_templates: torch.Tensor | None = None,
+    motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> NDArray[np.float32]:
     """Score pairs with a `V3_1` model via the length-bucketed batching machinery.
 
@@ -2109,45 +2274,69 @@ def _score_v3_1(
             substituting ``row_coords`` instead.
         row_coords: ``(len(pairs), COORD_DIM)`` structural coordinates of the rows
             (``v3_1_topo_prompt`` only), attached to each batch as ``struct_coords``.
+        row_templates: ``(len(pairs), 96)`` motif graphs the trunk must read
+            (``v3_1_motif_prompt`` only): Stage I's compiled true templates, a
+            labelled ceiling diagnostic. Stage II leaves this ``None`` and the
+            generator predicts the graph from ``(x_u, x_v)`` alone.
+        motif_weight_transform: ``--prefix-intervention permute_closure`` /
+            ``rewire_bridge``: a row-local transform of the graph the trunk reads.
 
     Returns:
         Shape ``(len(pairs),)`` float32 logits in input row order.
+
+    Raises:
+        ValueError: If a Stage I motif checkpoint is scored without its templates.
     """
     lengths = probe_lengths(store, pairs)
     dataset = TokenPairDataset(pairs, None, store, lengths=lengths)
     sampler = LengthBucketedBatchSampler(lengths, token_budget=token_budget, shuffle=False)
     batches = [list(batch) for batch in sampler]
     _check_row_coords(row_coords, len(pairs))
+    _check_row_templates(row_templates, len(pairs))
+    motif = _is_motif_prompt(model)
+    motif_model = cast("V3_1MotifPrompt", model) if motif else None
+    if motif_model is not None and motif_model.cfg.stage == "one" and row_templates is None:
+        raise ValueError(
+            "v3_1_motif_prompt stage 'one' requires compiled row templates; it never scores "
+            "a pair without one (spec section 7.2)"
+        )
 
+    encode_model: V3_1Prefix | V3_1CoordGen | V3_1MotifPrompt | None = (
+        motif_model if motif else None
+    )
     shuffle_model: V3_1Prefix | V3_1CoordGen | None = None
 
     def _encode(
         source: TokenPairDataset, batch_indices: Sequence[int]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the frozen encoder over one batch of `source` (shuffle path only)."""
-        assert shuffle_model is not None
+        """Run the frozen encoder over one batch of `source`."""
+        assert encode_model is not None
         batch = collate_token_pairs([source[i] for i in batch_indices])
         batch = {key: tensor.to(device) for key, tensor in batch.items()}
         with torch.inference_mode(), _autocast_context(device, amp):
-            encoded_a = shuffle_model.encoder(batch["emb_a"], batch["len_a"])
-            encoded_b = shuffle_model.encoder(batch["emb_b"], batch["len_b"])
+            encoded_a = encode_model.encoder(batch["emb_a"], batch["len_a"])
+            encoded_b = encode_model.encoder(batch["emb_b"], batch["len_b"])
         return encoded_a, encoded_b, batch["len_a"], batch["len_b"]
 
     z_bank: torch.Tensor | None = None
     coord_bank: torch.Tensor | None = None
+    motif_bank: torch.Tensor | None = None
     if shuffle_sources is not None:
         from src.model.egostitch.classifier.coord_gen import V3_1CoordGen as _V3_1CoordGen
         from src.model.egostitch.classifier.prefix import V3_1Prefix as _V3_1Prefix
 
-        if not isinstance(model, (_V3_1Prefix, _V3_1CoordGen)):
+        if not (motif or isinstance(model, (_V3_1Prefix, _V3_1CoordGen))):
             raise SystemExit(
-                "--prefix-intervention shuffle requires a v3_1_prefix or v3_1_coord_gen checkpoint"
+                "--prefix-intervention shuffle requires a v3_1_prefix, v3_1_coord_gen or "
+                "v3_1_motif_prompt checkpoint"
             )
         if len(shuffle_sources) != len(pairs):
             raise SystemExit(
                 f"shuffle sources cover {len(shuffle_sources)} rows, expected {len(pairs)}"
             )
-        shuffle_model = model
+        if not motif:
+            shuffle_model = cast("V3_1Prefix | V3_1CoordGen", model)
+            encode_model = shuffle_model
         source_lengths = probe_lengths(store, shuffle_sources)
         source_dataset = TokenPairDataset(shuffle_sources, None, store, lengths=source_lengths)
         source_sampler = LengthBucketedBatchSampler(
@@ -2155,7 +2344,17 @@ def _score_v3_1(
         )
         source_batches = [list(batch) for batch in source_sampler]
 
-        if isinstance(model, _V3_1Prefix):
+        if motif_model is not None:
+            source_model = motif_model
+
+            def _graph(batch_indices: Sequence[int]) -> torch.Tensor:
+                """Pass 1: the generator's predicted graph for one batch of sources."""
+                encoded_a, encoded_b, len_a, len_b = _encode(source_dataset, batch_indices)
+                with torch.inference_mode(), _autocast_context(device, "off"):
+                    return source_model.predict_weights(encoded_a, encoded_b, len_a, len_b)
+
+            motif_bank = _motif_source_weights(source_batches, _graph, num_rows=len(pairs))
+        elif isinstance(model, _V3_1Prefix):
             prefix_model = model
 
             def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
@@ -2168,7 +2367,7 @@ def _score_v3_1(
                 prefix_model, source_batches, _condition, num_rows=len(pairs)
             )
         else:
-            coord_model = model
+            coord_model = cast("V3_1CoordGen", model)
 
             def _coords(batch_indices: Sequence[int]) -> torch.Tensor:
                 """Pass 1: the generator's prediction for one batch of source pairs."""
@@ -2183,7 +2382,25 @@ def _score_v3_1(
     out: NDArray[np.float32] = np.empty(len(pairs), dtype=np.float32)
     processed = 0
     for batch_indices in batches:
-        if z_bank is None and coord_bank is None:
+        if motif_model is not None:
+            # The pair pass runs with autocast disabled: the reader's RRWP
+            # arithmetic requires fp32, and the pinned precision contract of
+            # spec section 9 records `pair_autocast: False`.
+            encoded_a, encoded_b, len_a, len_b = _encode(dataset, batch_indices)
+            rows = torch.as_tensor(batch_indices, dtype=torch.int64)
+            with torch.inference_mode(), _autocast_context(device, "off"):
+                supplied = motif_bank if motif_bank is not None else row_templates
+                weights = (
+                    supplied[rows].to(device=encoded_a.device, dtype=encoded_a.dtype)
+                    if supplied is not None
+                    else motif_model.predict_weights(encoded_a, encoded_b, len_a, len_b)
+                )
+                if motif_weight_transform is not None:
+                    weights = motif_weight_transform(weights)
+                logits = motif_model.logits_from_encoded(
+                    encoded_a, encoded_b, len_a, len_b, weights=weights
+                )
+        elif z_bank is None and coord_bank is None:
             batch = collate_token_pairs([dataset[i] for i in batch_indices])
             batch = {key: tensor.to(device) for key, tensor in batch.items()}
             if row_coords is not None:
@@ -2233,6 +2450,8 @@ def _score_v3_1_packed(
     token_budget: int,
     shuffle_sources: Sequence[tuple[str, str]] | None = None,
     row_coords: torch.Tensor | None = None,
+    row_templates: torch.Tensor | None = None,
+    motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> NDArray[np.float32]:
     """Score V3.1 pairs with packed features and cached per-node encodings.
 
@@ -2241,20 +2460,34 @@ def _score_v3_1_packed(
     `_coord_gen_source_coords` for ``v3_1_coord_gen``), reading both passes out
     of the per-node encoding cache built here, which therefore also covers the
     source pairs' nodes; a ``v3_1_topo_prompt`` checkpoint is shuffled by the
-    caller substituting ``row_coords`` instead.
+    caller substituting ``row_coords`` instead, and a ``v3_1_motif_prompt`` one
+    through `_motif_source_weights`, the same two passes one family over.
+
+    Raises:
+        TypeError: On a model of an unsupported family.
+        ValueError: If a topology-prompt or Stage I motif checkpoint is scored
+            without the truth it reads by construction.
     """
     from src.model.egostitch.classifier.coord_gen import V3_1CoordGen
     from src.model.egostitch.classifier.prefix import V3_1Prefix
     from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
-    if not isinstance(model, (V3_1, V3_1Prefix, V3_1TopoPrompt, V3_1CoordGen)):
+    motif = _is_motif_prompt(model)
+    if not (motif or isinstance(model, (V3_1, V3_1Prefix, V3_1TopoPrompt, V3_1CoordGen))):
         raise TypeError(
-            "packed V3.1 scoring requires V3_1, V3_1Prefix, V3_1TopoPrompt or V3_1CoordGen, "
-            f"got {type(model).__name__}"
+            "packed V3.1 scoring requires V3_1, V3_1Prefix, V3_1TopoPrompt, V3_1CoordGen "
+            f"or V3_1MotifPrompt, got {type(model).__name__}"
         )
     if isinstance(model, V3_1TopoPrompt) and row_coords is None:
         raise ValueError("packed scoring of a v3_1_topo_prompt checkpoint needs row_coords")
+    motif_model = cast("V3_1MotifPrompt", model) if motif else None
+    if motif_model is not None and motif_model.cfg.stage == "one" and row_templates is None:
+        raise ValueError(
+            "v3_1_motif_prompt stage 'one' requires compiled row templates; it never scores "
+            "a pair without one (spec section 7.2)"
+        )
     _check_row_coords(row_coords, len(pairs))
+    _check_row_templates(row_templates, len(pairs))
     if shuffle_sources is not None and len(shuffle_sources) != len(pairs):
         raise SystemExit(
             f"shuffle sources cover {len(shuffle_sources)} rows, expected {len(pairs)}"
@@ -2302,9 +2535,12 @@ def _score_v3_1_packed(
     # own first parameter (registered before `base`, per its own docstring) --
     # a freshly-initialized fp32 tensor, which matches the frozen base's own
     # dtype, so this still selects the right cache dtype.
+    encoder_model = cast(
+        "V3_1 | V3_1Prefix | V3_1TopoPrompt | V3_1CoordGen | V3_1MotifPrompt", model
+    )
     cache_dtype = next(model.parameters()).dtype
     encoded = torch.zeros(
-        (len(table.manifest.nodes), max_boundary, model.d_model),
+        (len(table.manifest.nodes), max_boundary, encoder_model.d_model),
         dtype=cache_dtype,
         device=device,
     )
@@ -2325,7 +2561,7 @@ def _score_v3_1_packed(
             if amp == "off":
                 raw_tokens = raw_tokens.to(cache_dtype)
             with torch.inference_mode(), _autocast_context(device, amp):
-                node_encoded = model.encoder(raw_tokens, node_lengths)
+                node_encoded = encoder_model.encoder(raw_tokens, node_lengths)
             device_indices = indices.to(device)
             encoded[device_indices, :boundary] = node_encoded.to(cache_dtype)
             encoded_nodes += len(indices)
@@ -2362,17 +2598,30 @@ def _score_v3_1_packed(
 
     z_bank: torch.Tensor | None = None
     coord_bank: torch.Tensor | None = None
+    motif_bank: torch.Tensor | None = None
     if shuffle_sources is not None:
-        if not isinstance(model, (V3_1Prefix, V3_1CoordGen)):
+        if not (motif or isinstance(model, (V3_1Prefix, V3_1CoordGen))):
             raise SystemExit(
-                "--prefix-intervention shuffle requires a v3_1_prefix or v3_1_coord_gen checkpoint"
+                "--prefix-intervention shuffle requires a v3_1_prefix, v3_1_coord_gen or "
+                "v3_1_motif_prompt checkpoint"
             )
         source_sampler = LengthBucketedBatchSampler(
             source_lengths, token_budget=token_budget, shuffle=False
         )
         source_batches = [list(batch) for batch in source_sampler]
 
-        if isinstance(model, V3_1Prefix):
+        if motif_model is not None:
+            source_motif = motif_model
+
+            def _graph(batch_indices: Sequence[int]) -> torch.Tensor:
+                """Pass 1: the generator's predicted graph for one batch of sources."""
+                with torch.inference_mode(), _autocast_context(device, "off"):
+                    return source_motif.predict_weights(
+                        *_gather(batch_indices, source_a, source_b, source_lengths)
+                    )
+
+            motif_bank = _motif_source_weights(source_batches, _graph, num_rows=len(pairs))
+        elif isinstance(model, V3_1Prefix):
             prefix_model = model
 
             def _condition(batch_indices: Sequence[int]) -> torch.Tensor | None:
@@ -2386,7 +2635,7 @@ def _score_v3_1_packed(
                 prefix_model, source_batches, _condition, num_rows=len(pairs)
             )
         else:
-            coord_model = model
+            coord_model = cast("V3_1CoordGen", model)
 
             def _coords(batch_indices: Sequence[int]) -> torch.Tensor:
                 """Pass 1: the generator's prediction for one batch of source pairs."""
@@ -2406,6 +2655,28 @@ def _score_v3_1_packed(
     for batch_indices in batches:
         encoded_a, encoded_b, len_a, len_b = _gather(batch_indices, node_a, node_b, lengths)
         rows = torch.as_tensor(batch_indices, dtype=torch.int64)
+        if motif_model is not None:
+            # Autocast disabled for the pair pass: the reader's RRWP arithmetic
+            # needs fp32 and the pinned contract of spec section 9 says so.
+            with torch.inference_mode(), _autocast_context(device, "off"):
+                supplied = motif_bank if motif_bank is not None else row_templates
+                weights = (
+                    supplied[rows].to(device=encoded_a.device, dtype=encoded_a.dtype)
+                    if supplied is not None
+                    else motif_model.predict_weights(encoded_a, encoded_b, len_a, len_b)
+                )
+                if motif_weight_transform is not None:
+                    weights = motif_weight_transform(weights)
+                motif_logits = motif_model.logits_from_encoded(
+                    encoded_a, encoded_b, len_a, len_b, weights=weights
+                )
+            out[np.asarray(batch_indices, dtype=np.int64)] = (
+                motif_logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
+            )
+            processed += len(batch_indices)
+            batch_count += 1
+            _log_progress(processed, len(pairs), len(batch_indices))
+            continue
         with torch.inference_mode(), _autocast_context(device, pair_amp or amp):
             if row_coords is not None:
                 logits = cast(V3_1TopoPrompt, model).logits_from_encoded(
@@ -3647,10 +3918,17 @@ def _run_score(args: argparse.Namespace) -> None:
         from src.model.egostitch.classifier.prefix import V3_1Prefix
         from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 
-        if not isinstance(model, (V3_1Prefix, V3_1TopoPrompt, V3_1CoordGen)):
+        if not (
+            _is_motif_prompt(model) or isinstance(model, (V3_1Prefix, V3_1TopoPrompt, V3_1CoordGen))
+        ):
             raise SystemExit(
-                "--prefix-intervention requires a v3_1_prefix, v3_1_topo_prompt or "
-                "v3_1_coord_gen checkpoint"
+                "--prefix-intervention requires a v3_1_prefix, v3_1_topo_prompt, "
+                "v3_1_coord_gen or v3_1_motif_prompt checkpoint"
+            )
+        if args.prefix_intervention in MOTIF_GRAPH_INTERVENTIONS and not _is_motif_prompt(model):
+            raise SystemExit(
+                f"--prefix-intervention {args.prefix_intervention} substitutes a motif graph "
+                "and requires a v3_1_motif_prompt checkpoint"
             )
         # `shuffle` is not a model-level mode: it gives every row the condition
         # or coordinates of another row of the whole universe, which only the
@@ -3660,7 +3938,9 @@ def _run_score(args: argparse.Namespace) -> None:
         # `v3_1_coord_gen` the source pair's *predicted* coordinates through
         # `_coord_gen_source_coords`). The model stays on `"none"`; the artifact
         # meta below still records the request.
-        if args.prefix_intervention != "shuffle":
+        # The three motif graph substitutions are universe-level for the same
+        # reason `shuffle` is, so the model stays on `"none"` for them too.
+        if args.prefix_intervention not in ({"shuffle"} | MOTIF_GRAPH_INTERVENTIONS):
             model.intervention = args.prefix_intervention
 
     cazi_context = _resolve_cazi_context(args) if model_family == "cazi_mbn" else None
@@ -3693,13 +3973,28 @@ def _run_score(args: argparse.Namespace) -> None:
     # (query edge removed) from the universe's truth graph: the same ceiling-
     # diagnostic contract as the oracle generators, gated by the same flag.
     is_topo_prompt = model_family == "v3_1_topo_prompt"
-    if args.allow_oracle_diagnostic and not (is_oracle_generator or is_topo_prompt):
+    # Stage I of the motif prompt reads a compiled true template as its input, so
+    # it is a ceiling diagnostic under the same flag; Stage II is deployable and
+    # compiles nothing (spec section 8).
+    is_motif_prompt = model_family == MOTIF_PROMPT_FAMILY
+    motif_stage = cast("V3_1MotifPrompt", model).cfg.stage if is_motif_prompt else None
+    if args.allow_oracle_diagnostic and not (
+        is_oracle_generator or is_topo_prompt or is_motif_prompt
+    ):
         raise ValueError(
             "--allow-oracle-diagnostic is valid only when the checkpoint's "
             "egostitch_e2e generator is oracle_struct or full_ego_oracle, or the "
-            "checkpoint is a v3_1_topo_prompt"
+            "checkpoint is a v3_1_topo_prompt or a stage-one v3_1_motif_prompt"
         )
     oracle_truth_graph: nx.Graph | None = None
+    if motif_stage is not None:
+        _assert_motif_scoring_contract(
+            stage=motif_stage, allow_oracle_diagnostic=args.allow_oracle_diagnostic
+        )
+        if motif_stage == "one":
+            oracle_truth_graph = _oracle_truth_graph_for_scoring(
+                args.pairs, args.data_root, args.strategy
+            )
     if is_topo_prompt:
         if not args.allow_oracle_diagnostic:
             raise ValueError(
@@ -3836,15 +4131,51 @@ def _run_score(args: argparse.Namespace) -> None:
     if full_oracle_telemetry is not None and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     score_started = perf_counter()
-    if model_family in ("v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen"):
+    if model_family in (
+        "v3_1",
+        "v3_1_prefix",
+        "v3_1_topo_prompt",
+        "v3_1_coord_gen",
+        MOTIF_PROMPT_FAMILY,
+    ):
         row_coords: torch.Tensor | None = None
+        row_templates: torch.Tensor | None = None
+        motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
         # `shuffle`: one seeded permutation of the whole universe, sliced to this
         # shard, so every shard reads the same source map (`_shuffle_source_rows`).
         shuffle_sources: list[tuple[str, str]] | None = None
-        if args.prefix_intervention == "shuffle":
+        if args.prefix_intervention in ("shuffle", "shuffle_graph"):
             source_rows = _shuffle_source_rows(total_rows, int(args.prefix_intervention_seed))
             shuffle_sources = [pairs[int(index)] for index in source_rows[start:end]]
             meta_extra["prefix_shuffle_scope"] = "universe"
+        if is_motif_prompt:
+            meta_extra["motif_stage"] = motif_stage
+            if args.prefix_intervention == "permute_closure":
+                motif_weight_transform = functools.partial(
+                    _motif_permute_closure, seed=int(args.prefix_intervention_seed)
+                )
+            elif args.prefix_intervention == "rewire_bridge":
+                motif_weight_transform = functools.partial(
+                    _motif_rewire_bridge, seed=int(args.prefix_intervention_seed)
+                )
+            if motif_stage == "one":
+                from src.data.motif_template import MotifTemplateTable
+
+                assert oracle_truth_graph is not None  # gated above
+                templates_started = perf_counter()
+                template_pairs = row_pairs if shuffle_sources is None else shuffle_sources
+                row_templates = torch.from_numpy(
+                    MotifTemplateTable(oracle_truth_graph).weights(template_pairs)
+                )
+                logger.info(
+                    "compiled motif templates for %d rows%s on the %s truth graph in %.1fs",
+                    len(row_pairs),
+                    "" if shuffle_sources is None else " (each row's transplant source pair)",
+                    args.pairs,
+                    perf_counter() - templates_started,
+                )
+                # The substitution is complete: the trunk still scores its own rows.
+                shuffle_sources = None
         if is_topo_prompt:
             from src.data.struct_coords import StructCoordinateTable
             from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
@@ -3876,6 +4207,8 @@ def _run_score(args: argparse.Namespace) -> None:
                 token_budget=args.token_budget,
                 shuffle_sources=shuffle_sources,
                 row_coords=row_coords,
+                row_templates=row_templates,
+                motif_weight_transform=motif_weight_transform,
             )
         else:
             logits = _score_v3_1_packed(
@@ -3888,6 +4221,8 @@ def _run_score(args: argparse.Namespace) -> None:
                 token_budget=args.token_budget,
                 shuffle_sources=shuffle_sources,
                 row_coords=row_coords,
+                row_templates=row_templates,
+                motif_weight_transform=motif_weight_transform,
             )
     elif model_family == "f0_mlp":
         logits = _score_f0_mlp(
