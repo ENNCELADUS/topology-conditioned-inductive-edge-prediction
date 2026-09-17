@@ -128,7 +128,15 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.optimizer_parameter_groups(1e-3, 1e-4, 1e-2))
     prepared, optimizer = accelerator.prepare(model, optimizer)
-    _set_motif_prompt_training_stage(prepared, optimizer, epoch=1)
+    # The production schedule: the warm-up hook reads it to restore the
+    # interface LR when the group opens, so the smoke drives the real pair.
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[float(group["max_lr"]) for group in optimizer.param_groups],
+        total_steps=15,
+        cycle_momentum=False,
+    )
+    _set_motif_prompt_training_stage(prepared, optimizer, scheduler, epoch=1)
 
     local_rows = list(range(rank, len(pairs), 2))
     batch = _batch(local_rows)

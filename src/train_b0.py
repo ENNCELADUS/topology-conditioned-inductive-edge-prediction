@@ -752,7 +752,11 @@ def _set_topo_gen_training_stage(
 
 
 def _set_motif_prompt_training_stage(
-    model: nn.Module, optimizer: torch.optim.Optimizer, *, epoch: int
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    *,
+    epoch: int,
 ) -> None:
     """Open the motif-prompt interface group after its warm-up epochs (spec section 7.5).
 
@@ -761,23 +765,40 @@ def _set_motif_prompt_training_stage(
     freeze is the ``interface`` group's learning rate, which AdamW's decoupled
     weight decay also multiplies, making ``lr = 0`` an exact freeze. The gate is
     applied after every scheduler step, because OneCycleLR rewrites
-    ``group["lr"]`` on each step. Every other family is left untouched.
+    ``group["lr"]`` on each step.
+
+    The opening transition puts the schedule back before the first optimizer
+    update of the epoch that owns it. The zeroing overwrites the schedule's last
+    write of the warm-up's final step, and nothing rewrites ``group["lr"]`` until
+    *after* that update, so without this the interface would still be frozen
+    through the whole first step of epoch 3 -- including on a continuation of the
+    two-epoch teachability pilot (spec section 7.4), which restores exactly the
+    zeroed group. The scheduler captures ``get_last_lr`` inside its own step,
+    before this hook runs, and carries it through ``state_dict``, so it is the
+    schedule's own value in both cases. Every other family is left untouched.
 
     Args:
         model: The (possibly DDP-wrapped) model.
         optimizer: The prepared optimizer.
+        scheduler: The LR scheduler driving `optimizer`; its last LRs are
+            index-aligned with `optimizer`'s parameter groups.
         epoch: The 1-based epoch about to run.
     """
     raw_model = _unwrapped_model(model)
     if not isinstance(raw_model, V3_1MotifPrompt):
         return
     warmup = raw_model.cfg.interface_warmup_epochs
+    was_open = raw_model.interface_open
     raw_model.interface_open = (
         True if raw_model.cfg.stage == "one" else warmup is not None and epoch > warmup
     )
-    for group in optimizer.param_groups:
-        if group.get("name") == "interface" and not raw_model.interface_open:
-            group["lr"] = 0.0
+    if raw_model.interface_open and was_open:
+        return
+    scheduled = scheduler.get_last_lr()
+    for index, group in enumerate(optimizer.param_groups):
+        if group.get("name") != "interface":
+            continue
+        group["lr"] = float(scheduled[index]) if raw_model.interface_open else 0.0
 
 
 def _motif_stream_rows(
@@ -2085,7 +2106,7 @@ def train_loop(
             epoch=epoch,
             total_epochs=cfg.optim.epochs,
         )
-        _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
+        _set_motif_prompt_training_stage(model, optimizer, scheduler, epoch=epoch)
         last_epoch = epoch
         model.train()
         losses: list[float] = []
@@ -2106,7 +2127,7 @@ def train_loop(
                 epoch=epoch,
                 total_epochs=cfg.optim.epochs,
             )
-            _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
+            _set_motif_prompt_training_stage(model, optimizer, scheduler, epoch=epoch)
             global_step += 1
             losses.append(float(loss.detach().float().item()))
             if global_step % 50 == 0:
@@ -6002,7 +6023,7 @@ def train_ddp_loop(
             epoch=epoch,
             total_epochs=cfg.optim.epochs,
         )
-        _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
+        _set_motif_prompt_training_stage(model, optimizer, scheduler, epoch=epoch)
         model.train()
         local_loss_sum = 0.0
         local_loss_weight = 0.0
@@ -6222,7 +6243,7 @@ def train_ddp_loop(
                 total_epochs=cfg.optim.epochs,
             )
             # After the scheduler, which has just rewritten every group's LR.
-            _set_motif_prompt_training_stage(model, optimizer, epoch=epoch)
+            _set_motif_prompt_training_stage(model, optimizer, scheduler, epoch=epoch)
             if start_event is not None and end_event is not None:
                 end_event.record()  # type: ignore[no-untyped-call]
                 cuda_event_pairs.append((start_event, end_event))
