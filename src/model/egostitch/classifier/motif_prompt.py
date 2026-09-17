@@ -55,6 +55,7 @@ INTERVENTIONS = (
 )
 STAGES = ("one", "two")
 TOKEN_SOURCES = ("graph", "direct")
+COUNT_FEATURES = ("all", "degree")
 GATE_MODES = ("learned", "per_type", "mean_graph")
 FAMILIES = ("closure", "bridge")
 LOSS_TERM_NAMES = ("task", "slot", "topo")
@@ -121,6 +122,7 @@ class MotifPromptConfig:
     families: tuple[str, ...] = FAMILIES
     token_source: str = "graph"
     gate_mode: str = "learned"
+    count_features: str = "all"
     interface_warmup_epochs: int | None = 2
     w_slot: float = 1.0
     w_topo: float = 0.1
@@ -158,6 +160,8 @@ class MotifPromptConfig:
             raise ValueError(f"motif_prompt.token_source must be one of {list(TOKEN_SOURCES)}")
         if self.gate_mode not in GATE_MODES:
             raise ValueError(f"motif_prompt.gate_mode must be one of {list(GATE_MODES)}")
+        if self.count_features not in COUNT_FEATURES:
+            raise ValueError(f"motif_prompt.count_features must be one of {list(COUNT_FEATURES)}")
         if self.interface_warmup_epochs is not None and self.interface_warmup_epochs < 0:
             raise ValueError("motif_prompt.interface_warmup_epochs must be non-negative or null")
         for name in ("w_slot", "w_topo", "beta_p", "beta_q", "beta_a", "beta_i"):
@@ -213,16 +217,23 @@ class MotifCountHead(nn.Module):
     the sum and the absolute difference of the two ``log1p`` degrees. The degree
     pair never enters as ``[deg_u, deg_v]``, which would not be invariant under
     ``u<->v``.
+
+    ``degree_only`` zeroes the two mass entries, leaving the symmetric degree
+    pair as the only content of ``topo_cnt``. It is the section 8 degree-only
+    control: a separately trained arm, identical in every other respect, whose
+    prompt carries only degree -- never a degree-marginal re-thresholding.
     """
 
-    def __init__(self, width: int) -> None:
+    def __init__(self, width: int, *, degree_only: bool = False) -> None:
         """Build the single linear map.
 
         Args:
             width: Token width.
+            degree_only: Zero ``wedge_mass`` and ``bridge_mass`` in the token.
         """
         super().__init__()
         self.proj = nn.Linear(4, width)
+        self.degree_only = degree_only
 
     def forward(self, weights: torch.Tensor) -> torch.Tensor:
         """Return the ``(B, width)`` count token, always in float32.
@@ -241,10 +252,11 @@ class MotifCountHead(nn.Module):
             stats = count_statistics(weights.float())
             log_u = torch.log1p(stats["deg_u"])
             log_v = torch.log1p(stats["deg_v"])
+            zero = torch.zeros_like(log_u)
             features = torch.stack(
                 [
-                    torch.log1p(stats["wedge_mass"]),
-                    torch.log1p(stats["bridge_mass"]),
+                    zero if self.degree_only else torch.log1p(stats["wedge_mass"]),
+                    zero if self.degree_only else torch.log1p(stats["bridge_mass"]),
                     log_u + log_v,
                     (log_u - log_v).abs(),
                 ],
@@ -905,7 +917,9 @@ class V3_1MotifPrompt(nn.Module):
         self.kd_struct_head = None
         self.topo_gen = None
         self.reader = MotifGritReader(self.cfg.reader, self.cfg.width)
-        self.count_head = MotifCountHead(self.cfg.width)
+        self.count_head = MotifCountHead(
+            self.cfg.width, degree_only=self.cfg.count_features == "degree"
+        )
         self.direct_head = (
             nn.Sequential(
                 nn.LayerNorm(2 * self.d_model),
@@ -1431,6 +1445,7 @@ class V3_1MotifPrompt(nn.Module):
 
 
 __all__ = [
+    "COUNT_FEATURES",
     "FAMILIES",
     "FIELD_ORDER",
     "GATE_MODES",

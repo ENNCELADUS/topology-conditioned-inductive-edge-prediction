@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,69 @@ def test_stage_one_and_stage_two_differ_only_in_the_expected_keys() -> None:
     # The plan's draft listed only {stage, bundle_checkpoint}; the two schedule
     # keys above are part of the same stage difference and must differ too.
     assert diff == {"stage", "bundle_checkpoint", "interface_warmup_epochs", "w_topo"}
+
+
+_CONTROLS: dict[str, dict[str, Any]] = {
+    "motif_prompt_count_only": {"fields": ["topo_cnt"]},
+    "motif_prompt_grit_only": {"fields": ["topo_self", "topo_partner", "topo_rel"]},
+    # Spec v9: the trained reading of the section 8 degree-only control -- the
+    # symmetric degree pair from the *predicted* adjacency, the two mass entries
+    # zeroed in topo_cnt, the GRIT fields removed by per-field row masking.
+    "motif_prompt_degree_only": {"fields": ["topo_cnt"], "count_features": "degree"},
+    "motif_prompt_direct_prefix": {"token_source": "direct"},
+    "motif_prompt_per_type": {"gate_mode": "per_type"},
+    "motif_prompt_mean_graph": {"gate_mode": "mean_graph"},
+    "motif_prompt_freeze_forever": {"interface_warmup_epochs": None},
+    "motif_prompt_closure_only": {"families": ["closure"]},
+    "motif_prompt_bridge_only": {"families": ["bridge"]},
+    "motif_prompt_no_slot": {"w_slot": 0.0},
+    "motif_prompt_no_topo": {"w_topo": 0.0},
+}
+
+
+@pytest.mark.parametrize(("name", "overrides"), sorted(_CONTROLS.items()))
+def test_each_control_edits_only_its_own_keys_of_stage_two(
+    name: str, overrides: dict[str, Any]
+) -> None:
+    base, control = _raw("motif_prompt_stage2.yaml"), _raw(f"{name}.yaml")
+    assert control["output_dir"] == f"outputs/split_seed42/{name}"
+    assert control["model"]["config"]["motif_prompt"] == {
+        **base["model"]["config"]["motif_prompt"],
+        **overrides,
+    }
+    for block in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert control[block] == base[block]
+
+
+def test_every_control_names_the_question_it_answers() -> None:
+    for name in _CONTROLS:
+        header = (CONFIG_DIR / f"{name}.yaml").read_text(encoding="utf-8")
+        assert "spec section 8" in header
+        assert "Read against motif_prompt_stage2 on the pre-registered panel" in header
+        assert "+/-0.01 GS and +/-0.5 MMD ratio are not read" in header
+
+
+def test_the_count_only_and_grit_only_arms_are_separately_trained_not_masked() -> None:
+    # Zeroing a field's token values leaves its keys in the prefix softmax
+    # denominator, and deleting its rows renormalises the others, so neither
+    # reproduces a model trained without the field (spec section 6).
+    count_only = load_config(CONFIG_DIR / "motif_prompt_count_only.yaml")
+    grit_only = load_config(CONFIG_DIR / "motif_prompt_grit_only.yaml")
+    assert count_only.output_dir != grit_only.output_dir
+    assert count_only.optim.epochs == grit_only.optim.epochs == 15
+
+
+def test_the_degree_only_control_is_the_trained_arm_not_a_rethresholding() -> None:
+    parsed = MotifPromptConfig.from_mapping(_block("motif_prompt_degree_only.yaml"))
+    assert parsed.stage == "two"
+    assert parsed.fields == ("topo_cnt",)
+    assert parsed.count_features == "degree"
+    # It differs from count_only by the count-head restriction alone.
+    count_only = MotifPromptConfig.from_mapping(_block("motif_prompt_count_only.yaml"))
+    assert count_only.count_features == "all"
+    assert replace(count_only, count_features="degree") == parsed
+    header = (CONFIG_DIR / "motif_prompt_degree_only.yaml").read_text(encoding="utf-8")
+    assert "NOT a" in header and "degree-marginal re-thresholding" in header
 
 
 def test_the_three_seed_replicates_differ_only_in_seed_and_output_dir() -> None:

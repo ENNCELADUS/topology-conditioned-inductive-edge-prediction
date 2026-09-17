@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from src.data.motif_template import SWAP_PERM, role_permutation
+from src.data.motif_template import SWAP_PERM, count_statistics, role_permutation
 from src.model.egostitch.classifier.motif_prompt import (
     FIELD_ORDER,
     GATE_MODES,
@@ -60,6 +60,8 @@ def test_config_validation_rejects_illegal_blocks() -> None:
         MotifPromptConfig(stage="one", base_checkpoint="b.pt", families=())
     with pytest.raises(ValueError, match="motif_prompt.gate_mode"):
         MotifPromptConfig(stage="one", base_checkpoint="b.pt", gate_mode="hard_topk")
+    with pytest.raises(ValueError, match="motif_prompt.count_features"):
+        MotifPromptConfig(stage="one", base_checkpoint="b.pt", count_features="degrees")
     with pytest.raises(ValueError, match="reader.dim"):
         MotifPromptConfig(stage="one", base_checkpoint="b.pt", reader=ReaderConfig(dim=97, heads=4))
     with pytest.raises(ValueError, match="reader.rrwp_k"):
@@ -107,6 +109,27 @@ def test_count_head_under_autocast_is_bit_identical_to_the_autocast_free_token()
         naive = head.proj(torch.zeros(weights.size(0), 4))
     assert torch.equal(guarded, reference)
     assert naive.dtype == torch.bfloat16
+
+
+def test_degree_only_count_head_carries_the_symmetric_degree_pair_alone() -> None:
+    # The section 8 degree-only control (spec v9): the prompt carries only
+    # [log1p(deg_u) + log1p(deg_v), |log1p(deg_u) - log1p(deg_v)|] from the
+    # *predicted* adjacency, with the two mass entries zeroed inside topo_cnt.
+    torch.manual_seed(0)
+    head = MotifCountHead(width=16, degree_only=True)
+    weights = _weights(seed=7)
+    features = torch.zeros(weights.size(0), 4)
+    stats = count_statistics(weights)
+    log_u, log_v = torch.log1p(stats["deg_u"]), torch.log1p(stats["deg_v"])
+    features[:, 2] = log_u + log_v
+    features[:, 3] = (log_u - log_v).abs()
+    torch.testing.assert_close(head(weights), head.proj(features), rtol=0, atol=1e-6)
+    assert torch.equal(head(weights), head(weights[:, list(SWAP_PERM)]))
+    # Degree still reaches the generator; the masses no longer do.
+    live = weights.clone().requires_grad_(True)
+    head(live).sum().backward()
+    assert live.grad is not None and torch.isfinite(live.grad).all()
+    assert float(live.grad.abs().sum()) > 0.0
 
 
 def test_dense_adjacency_is_symmetric_with_a_zero_diagonal_and_no_uv_entry() -> None:
