@@ -542,7 +542,7 @@ class MotifGenerator(nn.Module):
     """
 
     incidence: torch.Tensor
-    fixed_logits: torch.Tensor
+    fixed_weights: torch.Tensor
 
     def __init__(self, d_model: int, cfg: MotifPromptConfig) -> None:
         """Build the attention, the gate MPNN and the three typed heads.
@@ -575,15 +575,19 @@ class MotifGenerator(nn.Module):
             output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
             nn.init.normal_(output.weight, std=1e-3)
             nn.init.zeros_(output.bias)
-        self.register_buffer("fixed_logits", torch.zeros(N_EDGES))
+        self.register_buffer("fixed_weights", torch.zeros(N_EDGES))
         self.register_buffer("incidence", _candidate_incidence())
 
     @torch.no_grad()
     def init_biases(self, mean_weights: torch.Tensor) -> None:
-        """Set each head's output bias from the training mean weight of its type.
+        """Publish the training mean and set each head's output bias from it.
 
-        The mean is clipped to ``[0.01, 0.99]`` before the logit so no head
-        starts in a saturated region of the sigmoid (spec section 4).
+        The clip to ``[0.01, 0.99]`` exists so no trainable sigmoid head starts in
+        a saturated region (spec section 4); it belongs to the bias alone. The
+        ``mean_graph`` control has no sigmoid to saturate and must return the
+        adjacency that was actually installed -- clipping it would turn zero and
+        rare edges positive, move both motif masses, and make the control
+        disagree with the ``mean`` intervention over the same graph.
 
         Args:
             mean_weights: ``(96,)`` training-corpus mean edge weights.
@@ -595,7 +599,7 @@ class MotifGenerator(nn.Module):
             raise ValueError(f"mean weights must be a ({N_EDGES},) vector")
         low, high = _BIAS_CLIP
         clipped = mean_weights.float().clamp(low, high)
-        self.fixed_logits.copy_(torch.logit(clipped))
+        self.fixed_weights.copy_(mean_weights.float())
         for edge_type, head in enumerate(self.heads):
             mask = _TYPE_MASKS[edge_type]
             output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
@@ -661,7 +665,7 @@ class MotifGenerator(nn.Module):
         """
         batch = encoded_u.size(0)
         if self.cfg.gate_mode == "mean_graph":
-            return torch.sigmoid(self.fixed_logits).unsqueeze(0).expand(batch, -1)
+            return self.fixed_weights.unsqueeze(0).expand(batch, -1)
         h = self._slot_states(encoded_u, encoded_v, lengths_u, lengths_v)
         for layer in self.message_layers:
             h = layer(h, self.incidence)
@@ -1188,13 +1192,28 @@ class V3_1MotifPrompt(nn.Module):
         """
         self.corruption_seed = seed + step * 104729
 
-    def _corrupt(self, weights: torch.Tensor) -> torch.Tensor:
-        """Mix half the nonself Stage I rows towards ``Abar`` (spec section 3)."""
+    def _corrupt(self, weights: torch.Tensor, nonself: torch.Tensor | None) -> torch.Tensor:
+        """Mix half the nonself Stage I rows towards ``Abar`` (spec section 3).
+
+        Self rows keep the explicit empty template the compiler gives them and are
+        never corrupted: mixing one towards the training mean would hand it
+        nonzero topology in training while evaluation still reads it empty.
+
+        Args:
+            weights: ``(B, 96)`` compiled templates.
+            nonself: ``(B,)`` 1/0 nonself mask, or ``None`` when the batch carries
+                none, in which case every row is treated as nonself.
+
+        Returns:
+            The possibly corrupted templates.
+        """
         cfg = self.cfg.corruption
         if not self.training or self.cfg.stage != "one" or cfg.prob == 0.0:
             return weights
         rng = torch.Generator(device=weights.device).manual_seed(self.corruption_seed)
         selected = torch.rand((weights.size(0), 1), device=weights.device, generator=rng) < cfg.prob
+        if nonself is not None:
+            selected = selected & (nonself.reshape(-1, 1).to(weights) > 0.0)
         span = cfg.lambda_max - cfg.lambda_min
         lam = cfg.lambda_min + span * torch.rand(
             (weights.size(0), 1), device=weights.device, generator=rng
@@ -1436,7 +1455,8 @@ class V3_1MotifPrompt(nn.Module):
             )
         # The corruption mixes towards the ungated corpus mean, so the family
         # gate is applied last and holds in both stages (spec section 8).
-        return self._gate_families(self._corrupt(target.to(encoded_a)))
+        nonself = merged.get(TEMPLATE_MASK_KEY)
+        return self._gate_families(self._corrupt(target.to(encoded_a), nonself))
 
     def forward(
         self, batch: dict[str, torch.Tensor] | None = None, **kwargs: torch.Tensor
@@ -1504,11 +1524,17 @@ class V3_1MotifPrompt(nn.Module):
         is the model's *input*, so comparing it against itself would add a constant
         with no gradient path (spec sections 7.2 and 7.5). Self rows carry task BCE
         but are excluded from both terms through ``batch['motif_mask']``.
+
+        The target is family-gated exactly as the prediction is: a closure-only or
+        bridge-only arm may not emit an inactive family's edge, so leaving it in
+        the target would charge ``L_slot`` for unavoidable error and let the
+        teacher read topology the generator is forbidden to produce -- and that the
+        matching Stage I reader never received either.
         """
         target = merged.get(TEMPLATE_KEY)
         if self.cfg.stage != "two" or target is None:
             return None, None
-        target = target.to(weights)
+        target = self._gate_families(target.to(weights))
         mask = merged.get(TEMPLATE_MASK_KEY)
         row_mask = torch.ones_like(weights[:, 0]) if mask is None else mask.reshape(-1).to(weights)
         slot_row = (

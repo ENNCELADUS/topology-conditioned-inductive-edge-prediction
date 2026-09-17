@@ -452,6 +452,70 @@ def test_mean_intervention_substitutes_the_published_training_mean_graph() -> No
     )
 
 
+def test_the_mean_graph_control_installs_the_unclipped_training_mean() -> None:
+    # The head biases are clipped to [0.01, 0.99] so no sigmoid starts saturated,
+    # but the fixed-graph control has no sigmoid: clipping its graph turns zero
+    # and rare edges positive, changes both motif masses, and makes the control
+    # disagree with the `mean` intervention over the same buffer.
+    model = _model("two", gate_mode="mean_graph").eval().requires_grad_(False)
+    mean = torch.full((96,), 0.5)
+    mean[:8] = 0.0
+    mean[8:16] = 1.0
+    model.install_mean_template(mean)
+    batch = _pair_batch(n=3)
+    encoded_a = model.base.encoder(batch["emb_a"], batch["len_a"])
+    encoded_b = model.base.encoder(batch["emb_b"], batch["len_b"])
+
+    predicted = model.predict_weights(encoded_a, encoded_b, batch["len_a"], batch["len_b"])
+
+    expected = mean.unsqueeze(0).expand(3, -1)
+    torch.testing.assert_close(predicted, expected, rtol=0, atol=0)
+    # The same graph the `mean` intervention substitutes, over the same buffer.
+    model.intervention = "mean"
+    torch.testing.assert_close(model(batch)["predicted_weights"], expected, rtol=0, atol=0)
+
+
+def test_stage_one_corruption_leaves_self_rows_empty() -> None:
+    # Spec section 3: self rows carry an explicit empty template and corruption is
+    # nonself-only. Corrupting one gives it nonzero training-mean topology in
+    # training while evaluation keeps it empty.
+    model = _model("one", corruption={"prob": 1.0, "lambda_min": 1.0, "lambda_max": 1.0})
+    model.install_mean_template(torch.full((96,), 0.7))
+    model.train()
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = torch.zeros(4, 96)
+    batch["motif_mask"] = torch.tensor([1.0, 0.0, 1.0, 1.0])
+    encoded_a = model.base.encoder(batch["emb_a"], batch["len_a"])
+    encoded_b = model.base.encoder(batch["emb_b"], batch["len_b"])
+
+    read = model.resolve_weights(batch, encoded_a, encoded_b, batch["len_a"], batch["len_b"])
+
+    assert float(read[1].abs().sum()) == 0.0
+    assert float(read[0].abs().sum()) > 0.0
+    assert float(read[2].abs().sum()) > 0.0
+
+
+def test_an_inactive_family_is_masked_out_of_the_supervision_targets() -> None:
+    # Closure-only Stage II may not emit a bridge edge, so a bridge edge in the
+    # compiled target is unavoidable error in `L_slot` and topology the teacher
+    # reads but the generator is forbidden to produce.
+    model = _model("two", families=["closure"])
+    model.initialize_teacher()
+    _open_gates(model)
+    batch = _pair_batch(n=3)
+    batch[TEMPLATE_KEY] = torch.rand(3, 96, generator=torch.Generator().manual_seed(2))
+    gated = dict(batch)
+    gated[TEMPLATE_KEY] = batch[TEMPLATE_KEY] * model.family_mask
+
+    full = {key: value.detach() for key, value in model(batch).items()}
+    masked = {key: value.detach() for key, value in model(gated).items()}
+
+    torch.testing.assert_close(full["slot_loss_rows"], masked["slot_loss_rows"], rtol=0, atol=0)
+    torch.testing.assert_close(full["topo_loss_rows"], masked["topo_loss_rows"], rtol=0, atol=0)
+    # The supervision is still live; the masking is not a way of zeroing it.
+    assert float(full["slot_loss_rows"].abs().sum()) > 0.0
+
+
 def test_self_row_masking_is_confined_to_the_slot_and_topo_terms() -> None:
     model = _model("two")
     model.initialize_teacher()
