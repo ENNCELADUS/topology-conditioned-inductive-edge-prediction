@@ -450,14 +450,51 @@ def test_a_bundle_checkpoint_of_another_family_is_refused(tmp_path: Path) -> Non
         )
 
 
+def test_a_bundle_missing_one_of_its_members_is_refused(tmp_path: Path) -> None:
+    from src.train_b0 import build_model
+
+    base_path = tmp_path / "base.pt"
+    _base_checkpoint(base_path)
+    stage_one = build_model(
+        _motif_cfg({"motif_prompt": _motif_config(stage="one", base_checkpoint=str(base_path))})
+    )
+    # A non-strict load would leave a bundle without its adapter at the random
+    # initialisation, so the bundle's members are checked by name.
+    partial = {
+        key: value
+        for key, value in stage_one.state_dict().items()
+        if not key.startswith("adapter.")
+    }
+    bundle_path = tmp_path / "bundle.pt"
+    torch.save(
+        {"model_family": "v3_1_motif_prompt", "model_config": {}, "model_state": partial},
+        bundle_path,
+    )
+    with pytest.raises(ValueError, match="missing .* member"):
+        build_model(
+            _motif_cfg(
+                {
+                    "motif_prompt": _motif_config(
+                        stage="two",
+                        base_checkpoint=str(base_path),
+                        bundle_checkpoint=str(bundle_path),
+                    ),
+                }
+            )
+        )
+
+
 def test_run_metadata_records_the_motif_provenance(tmp_path: Path) -> None:
     from src.train_b0 import _run_metadata, resolve_model_kwargs
 
     base_path = tmp_path / "base.pt"
     _base_checkpoint(base_path)
     cfg = _motif_cfg({"motif_prompt": _motif_config(stage="one", base_checkpoint=str(base_path))})
+    result = _empty_train_result()
+    templates = {"train_rows": 3, "stats_rows": 3, "compile_seconds_per_10k": 0.2}
+    result.runtime_profile["motif_templates"] = templates
     metadata = _run_metadata(
-        _empty_train_result(),
+        result,
         cfg,
         resolve_model_kwargs(cfg.model),
         {},
@@ -469,6 +506,7 @@ def test_run_metadata_records_the_motif_provenance(tmp_path: Path) -> None:
     assert isinstance(block["base_checkpoint_sha256"], str)
     assert block["bundle_checkpoint"] is None
     assert block["families"] == ["closure", "bridge"]
+    assert block["templates"] == templates
 
 
 # ------------------------------------------- per-row templates and stage guards (task 17)
@@ -599,7 +637,11 @@ _PILOT_STEPS = 3
 def _onecycle(
     optimizer: torch.optim.Optimizer, *, total_steps: int
 ) -> torch.optim.lr_scheduler.OneCycleLR:
-    """The production schedule: one peak per named group, sized over the whole run."""
+    """A one-cycle with one peak per named group, sized over the whole run.
+
+    Torch's default shape, not `_build_scheduler`'s configured one: these tests
+    exercise the gate's interaction with a per-step LR rewrite, not the shape.
+    """
     return torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=[float(cast(float, group["max_lr"])) for group in optimizer.param_groups],

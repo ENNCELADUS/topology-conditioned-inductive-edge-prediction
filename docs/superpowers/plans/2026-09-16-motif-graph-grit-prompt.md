@@ -464,7 +464,6 @@ class MotifPromptConfig:
     beta_a: float = 1.0
     beta_i: float = 1.0
     huber_delta: float = 1.0
-    cache_templates: bool = False
 
     def __post_init__(self) -> None:
         """Validate the block.
@@ -4523,7 +4522,6 @@ model:
       beta_a: 1.0
       beta_i: 1.0
       huber_delta: 1.0
-      cache_templates: false
 data:
   root: data
   strategy: breadth_first
@@ -5483,11 +5481,17 @@ hpc/run.sh train configs/split_seed42/motif_prompt_stage2_seed1.yaml --worker-mo
 hpc/run.sh train configs/split_seed42/motif_prompt_stage2_seed2.yaml --worker-module src.train_b0
 ```
 
-**6. The §8 controls**, each a full formal lane:
+**6. The §8 controls**, each a full formal lane. The two family ablations zero the inactive
+family in **both** stages, so each first trains its own family-matched Stage I bundle (a ceiling
+diagnostic like `motif_prompt_stage1`) that its Stage II config loads:
 
 ```bash
+for family in closure bridge; do
+  hpc/run.sh train configs/split_seed42/motif_prompt_stage1_${family}_only.yaml \
+    --worker-module src.train_b0 --run-kind diagnostic
+done
 for arm in count_only grit_only direct_prefix per_type mean_graph freeze_forever \
-           closure_only bridge_only no_slot no_topo; do
+           closure_only bridge_only no_slot no_topo degree_only; do
   hpc/run.sh train configs/split_seed42/motif_prompt_${arm}.yaml --worker-module src.train_b0
 done
 ```
@@ -5502,7 +5506,7 @@ for mode in gates_off mean shuffle_graph permute_closure rewire_bridge; do
 done
 ```
 
-`shuffle_graph` permutes globally before shard division, never inside a shard: the 1:1 pair lists are label-sorted, so a shard is label-pure. These interventions preserve weight multisets and family totals but **not** every node's weighted degree — report the changed degree marginals.
+`shuffle_graph` permutes globally before shard division, never inside a shard: the 1:1 pair lists are label-sorted, so a shard is label-pure. These interventions preserve weight multisets and family totals but **not** every node's weighted degree; the scorer records the changed degree marginals per slot role (sorted within-role profiles, sums merged exactly across shards) under `motif_degree_marginals` in the artifact meta. The transplant is requested as `shuffle_graph`; plain `shuffle` is refused on this family so the artifact is never filed under the wrong name.
 
 **8. The output-density control**, reported alongside the protocol's V_val-selected threshold, never instead of it:
 

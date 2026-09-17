@@ -61,6 +61,10 @@ GATE_MODES = ("learned", "per_type", "mean_graph")
 FAMILIES = ("closure", "bridge")
 LOSS_TERM_NAMES = ("task", "slot", "topo")
 _GRAPH_INTERVENTIONS = ("shuffle_graph", "permute_closure", "rewire_bridge")
+_READER_FIELDS = frozenset({"topo_self", "topo_partner", "topo_rel"})
+#: Reader and prefix parameters train at this fraction of the generator's LR
+#: once the Stage II warm-up opens them (spec section 7.5).
+STAGE_TWO_INTERFACE_LR_SCALE = 0.1
 
 
 @dataclass(frozen=True)
@@ -132,7 +136,6 @@ class MotifPromptConfig:
     beta_a: float = 1.0
     beta_i: float = 1.0
     huber_delta: float = 1.0
-    cache_templates: bool = False
 
     def __post_init__(self) -> None:
         """Validate the block.
@@ -583,9 +586,10 @@ class MotifGenerator(nn.Module):
     def init_biases(self, mean_weights: torch.Tensor) -> None:
         """Publish the training mean and set each head's output bias from it.
 
-        The clip to ``[0.01, 0.99]`` exists so no trainable sigmoid head starts in
-        a saturated region (spec section 4); it belongs to the bias alone. The
-        ``mean_graph`` control has no sigmoid to saturate and must return the
+        Each head's bias is the logit of its edge type's mean training weight,
+        clipped to ``[0.01, 0.99]`` so no trainable sigmoid head starts in a
+        saturated region (spec section 4); the clip belongs to the bias alone.
+        The ``mean_graph`` control has no sigmoid to saturate and must return the
         adjacency that was actually installed -- clipping it would turn zero and
         rare edges positive, move both motif masses, and make the control
         disagree with the ``mean`` intervention over the same graph.
@@ -599,12 +603,12 @@ class MotifGenerator(nn.Module):
         if tuple(mean_weights.shape) != (N_EDGES,):
             raise ValueError(f"mean weights must be a ({N_EDGES},) vector")
         low, high = _BIAS_CLIP
-        clipped = mean_weights.float().clamp(low, high)
-        self.fixed_weights.copy_(mean_weights.float())
+        mean = mean_weights.float()
+        self.fixed_weights.copy_(mean)
         for edge_type, head in enumerate(self.heads):
-            mask = _TYPE_MASKS[edge_type]
+            type_mean = mean[_TYPE_MASKS[edge_type]].mean().clamp(low, high)
             output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
-            output.bias.fill_(float(torch.logit(clipped[mask].mean())))
+            output.bias.fill_(float(torch.logit(type_mean)))
 
     def _read(
         self, queries: torch.Tensor, states: torch.Tensor, pad: torch.Tensor | None
@@ -662,7 +666,7 @@ class MotifGenerator(nn.Module):
             lengths_v: True residue lengths of ``v``.
 
         Returns:
-            ``(B, 96)`` weights in ``[0, 1]``.
+            ``(B, 96)`` weights in ``[0, 1]``, always in float32.
         """
         batch = encoded_u.size(0)
         if self.cfg.gate_mode == "mean_graph":
@@ -674,16 +678,22 @@ class MotifGenerator(nn.Module):
         rows = _EDGE_ROWS.to(h.device).reshape(-1)
         cols = _EDGE_COLS.to(h.device).reshape(-1)
         h_i, h_j = h[:, rows], h[:, cols]
-        features = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1)
-        logits = features.new_zeros(batch, N_EDGES)
-        for edge_type, head in enumerate(self.heads):
-            mask = _TYPE_MASKS[edge_type].to(h.device)
-            block = features[:, mask]
-            if self.cfg.gate_mode == "per_type":
-                logits[:, mask] = head(block.mean(dim=1)).expand(-1, int(block.size(1)))
-            else:
-                logits[:, mask] = head(block).squeeze(-1)
-        return torch.sigmoid(logits)
+        # The gate heads run in fp32 with autocast disabled: the weights they
+        # emit are the inputs of the fp32 count and RRWP arithmetic, and a
+        # bf16 sigmoid would quantise them before that arithmetic ever sees
+        # them (the `assemble.py` trap, spec section 5). Under autocast the
+        # slot states arrive in bf16 and are promoted here.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            features = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1).float()
+            logits = features.new_zeros(batch, N_EDGES)
+            for edge_type, head in enumerate(self.heads):
+                mask = _TYPE_MASKS[edge_type].to(h.device)
+                block = features[:, mask]
+                if self.cfg.gate_mode == "per_type":
+                    logits[:, mask] = head(block.mean(dim=1)).expand(-1, int(block.size(1)))
+                else:
+                    logits[:, mask] = head(block).squeeze(-1)
+            return torch.sigmoid(logits)
 
 
 def pool_residues(states: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -1033,6 +1043,15 @@ class V3_1MotifPrompt(nn.Module):
             MotifPromptCrossAttentionLayer(cast(CrossAttentionLayer, layer), index, self.adapter)
             for index, layer in enumerate(trunk.layers)
         )
+        # Which student-side graph readers the prompt actually uses: a field
+        # removed from the prefix by `MotifPromptAdapter` never reads its
+        # module, so that module is frozen and skipped rather than run for a
+        # token that is discarded (spec section 8's count-only / GRIT-only /
+        # degree-only arms).
+        self.student_reads_graph = self.cfg.token_source == "graph" and bool(
+            _READER_FIELDS & set(self.cfg.fields)
+        )
+        self.student_counts = "topo_cnt" in self.cfg.fields
         self._freeze_permanently_frozen()
         self.register_buffer("mean_template", torch.zeros(N_EDGES))
         # Derived from `cfg.families` on every construction, so a checkpoint can
@@ -1041,12 +1060,50 @@ class V3_1MotifPrompt(nn.Module):
         self.teacher: nn.Module | None = None
         self.intervention: str = "none"
         self.corruption_seed = 42
-        self.interface_open = self.cfg.stage == "one" or self.cfg.interface_warmup_epochs == 0
+        self.interface_open = self.interface_open_at(1)
 
     @property
     def encoder(self) -> nn.Module:
         """The frozen base's per-node encoder (packed scoring caches its output)."""
         return self.base.encoder
+
+    @property
+    def generator_trainable(self) -> bool:
+        """Whether any generator parameter trains in this configuration."""
+        return self.generator is not None and any(
+            param.requires_grad for param in self.generator.parameters()
+        )
+
+    def interface_open_at(self, epoch: int) -> bool:
+        """Whether the interface group trains in the 1-based ``epoch``.
+
+        Stage I trains the interface throughout. Stage II holds it for the
+        ``interface_warmup_epochs`` in which the generator trains alone (spec
+        section 7.5); ``null`` never opens it (the freeze-forever control). A
+        configuration whose generator never trains -- ``gate_mode='mean_graph'``
+        -- has nothing to warm up: holding its only optimiser group would waste
+        the epochs and open it on the one-cycle's annealing tail, so the
+        interface trains from epoch 1 there, on the full cycle.
+
+        Args:
+            epoch: The 1-based epoch about to run.
+
+        Returns:
+            ``True`` when the interface group's learning rate follows the schedule.
+        """
+        if self.cfg.stage == "one" or not self.generator_trainable:
+            return True
+        warmup = self.cfg.interface_warmup_epochs
+        return warmup is not None and epoch > warmup
+
+    @property
+    def interface_lr_scale(self) -> float:
+        """The interface group's peak LR as a fraction of the generator's.
+
+        Stage I trains the interface at the run's LR; Stage II opens it at 0.1x
+        the generator's instantaneous LR (spec sections 7.2 and 7.5).
+        """
+        return 1.0 if self.cfg.stage == "one" else STAGE_TWO_INTERFACE_LR_SCALE
 
     def train(self, mode: bool = True) -> V3_1MotifPrompt:
         """Switch the wrapper's mode while the frozen base and teacher stay in eval.
@@ -1070,9 +1127,11 @@ class V3_1MotifPrompt(nn.Module):
     def _freeze_permanently_frozen(self) -> None:
         """Drop every parameter this configuration can never train.
 
-        Two section 8 controls bypass a whole module: ``token_source='direct'``
+        Several section 8 controls bypass a whole module: ``token_source='direct'``
         never calls the student reader (the immutable teacher reads the graph
-        through its own frozen copy), and ``gate_mode='mean_graph'`` returns the
+        through its own frozen copy), a field list without the three GRIT fields
+        never reads the student reader either, one without ``topo_cnt`` never
+        reads the count head, and ``gate_mode='mean_graph'`` returns the
         installed mean adjacency without touching a generator parameter. Stage II
         additionally freezes the reader's role/input embeddings and every block
         but the last for the whole run (spec section 7.5). Production DDP wraps
@@ -1080,11 +1139,13 @@ class V3_1MotifPrompt(nn.Module):
         that never receives a gradient aborts the second iteration: the freeze
         happens here, at construction, before any wrapping.
         """
-        if self.cfg.token_source == "direct":
+        if not self.student_reads_graph:
             self.reader.requires_grad_(False)
         elif self.cfg.stage == "two":
             for module in self.reader.frozen_stage_two_modules():
                 module.requires_grad_(False)
+        if not self.student_counts:
+            self.count_head.requires_grad_(False)
         if self.cfg.gate_mode == "mean_graph" and self.generator is not None:
             self.generator.requires_grad_(False)
 
@@ -1096,14 +1157,19 @@ class V3_1MotifPrompt(nn.Module):
         the group (spec section 7.5), so the earlier blocks and the role/input
         embeddings -- frozen outright in `_freeze_permanently_frozen` -- are not
         members of it and opening the group cannot reach them.
+
+        The direct-prefix control's token head is deliberately *not* a member:
+        it is the student's token producer, the counterpart of the generator
+        rather than of the Stage I-trained reader it replaces, and no bundle
+        carries a trained one. Holding it at its random initialisation behind
+        gates trained open for two epochs, then opening it at a tenth of the
+        generator's rate, would handicap the control against the main arm; it
+        trains in the generator group instead.
         """
         reader_modules: list[nn.Module] = (
             [self.reader] if self.cfg.stage == "one" else self.reader.adaptable_modules()
         )
-        modules: list[nn.Module] = [*reader_modules, self.count_head, self.adapter]
-        if self.direct_head is not None:
-            modules.append(self.direct_head)
-        return modules
+        return [*reader_modules, self.count_head, self.adapter]
 
     def optimizer_parameter_groups(
         self, generator_lr: float, interface_lr: float, weight_decay: float
@@ -1244,24 +1310,33 @@ class V3_1MotifPrompt(nn.Module):
         lengths_u: torch.Tensor,
         lengths_v: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Read one graph through the student path or through the immutable teacher."""
-        if bundle is None:
-            reader, count_head = self.reader, self.count_head
-            direct_head: nn.Module | None = self.direct_head
-        else:
-            # `R_T` always reads the graph, in every arm: `initialize_teacher`
-            # never puts a direct head in the bundle, so `L_topo` stays sensitive
-            # to the adjacency even for the direct-prefix control.
+        """Read one graph through the student path or through the immutable teacher.
+
+        The teacher always reads every field from the graph: `initialize_teacher`
+        never puts a direct head in the bundle, so `L_topo` stays sensitive to
+        the adjacency even for the direct-prefix control. The student reads only
+        the fields its prefix keeps; a masked field's token is an exact zero that
+        the adapter removes before the branch softmax.
+        """
+        if bundle is not None:
             reader = cast(MotifGritReader, bundle["reader"])
-            count_head = cast(MotifCountHead, bundle["count_head"])
-            direct_head = None
-        if direct_head is None:
             tokens: dict[str, torch.Tensor] = reader(weights)
-        else:
-            tokens = cast(MotifDirectTokens, direct_head)(
+            tokens["topo_cnt"] = cast(MotifCountHead, bundle["count_head"])(weights)
+            return tokens
+        if self.direct_head is not None:
+            tokens = self.direct_head(
                 pool_residues(encoded_u, lengths_u), pool_residues(encoded_v, lengths_v)
             )
-        tokens["topo_cnt"] = count_head(weights)
+        elif self.student_reads_graph:
+            tokens = self.reader(weights)
+        else:
+            zero = weights.new_zeros(weights.size(0), self.cfg.width, dtype=torch.float32)
+            tokens = {"topo_u": zero, "topo_v": zero, "topo_rel": zero}
+        tokens["topo_cnt"] = (
+            self.count_head(weights)
+            if self.student_counts
+            else weights.new_zeros(weights.size(0), self.cfg.width, dtype=torch.float32)
+        )
         return tokens
 
     def tokens_from_weights(
@@ -1468,10 +1543,14 @@ class V3_1MotifPrompt(nn.Module):
                 "v3_1_motif_prompt stage 'one' requires batch['motif_weights']; this stage "
                 "never scores a pair without its compiled template"
             )
+        # The compiled weights stay fp32 whatever precision the trunk runs in:
+        # they feed the fp32 count and RRWP arithmetic, and casting them to the
+        # encoder's bf16 first would quantise them on the way (spec section 5).
         # The corruption mixes towards the ungated corpus mean, so the family
         # gate is applied last and holds in both stages (spec section 8).
         nonself = merged.get(TEMPLATE_MASK_KEY)
-        return self._gate_families(self._corrupt(target.to(encoded_a), nonself))
+        template = target.to(device=encoded_a.device, dtype=torch.float32)
+        return self._gate_families(self._corrupt(template, nonself))
 
     def forward(
         self, batch: dict[str, torch.Tensor] | None = None, **kwargs: torch.Tensor
@@ -1578,7 +1657,7 @@ class V3_1MotifPrompt(nn.Module):
         target = merged.get(TEMPLATE_KEY)
         if self.cfg.stage != "two" or target is None:
             return None, None
-        target = self._gate_families(target.to(weights))
+        target = self._gate_families(target.to(device=weights.device, dtype=torch.float32))
         mask = merged.get(TEMPLATE_MASK_KEY)
         row_mask = torch.ones_like(weights[:, 0]) if mask is None else mask.reshape(-1).to(weights)
         slot_row = (
@@ -1649,6 +1728,7 @@ class V3_1MotifPrompt(nn.Module):
 
 __all__ = [
     "COUNT_FEATURES",
+    "STAGE_TWO_INTERFACE_LR_SCALE",
     "FAMILIES",
     "FIELD_ORDER",
     "GATE_MODES",

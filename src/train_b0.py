@@ -685,7 +685,14 @@ def _build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.AdamW:
     raw_model = _unwrapped_model(model)
     group_getter = getattr(raw_model, "optimizer_parameter_groups", None)
     if callable(group_getter):
-        peaks = cfg.optim.groups or {"generator": cfg.optim.lr, "interface": cfg.optim.lr}
+        # Without an explicit ``optim.groups`` block the interface peak follows
+        # the model's own rule -- 0.1x the generator's in motif-prompt Stage II
+        # (spec section 7.5), 1x wherever the model states no other scale.
+        interface_scale = float(getattr(raw_model, "interface_lr_scale", 1.0))
+        peaks = cfg.optim.groups or {
+            "generator": cfg.optim.lr,
+            "interface": cfg.optim.lr * interface_scale,
+        }
         groups = group_getter(peaks["generator"], peaks["interface"], cfg.optim.weight_decay)
         return torch.optim.AdamW(groups, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
     for getter_name in ("trainable_parameters", "prefix_parameters"):
@@ -787,11 +794,8 @@ def _set_motif_prompt_training_stage(
     raw_model = _unwrapped_model(model)
     if not isinstance(raw_model, V3_1MotifPrompt):
         return
-    warmup = raw_model.cfg.interface_warmup_epochs
     was_open = raw_model.interface_open
-    raw_model.interface_open = (
-        True if raw_model.cfg.stage == "one" else warmup is not None and epoch > warmup
-    )
+    raw_model.interface_open = raw_model.interface_open_at(epoch)
     if raw_model.interface_open and was_open:
         return
     scheduled = scheduler.get_last_lr()
@@ -799,6 +803,31 @@ def _set_motif_prompt_training_stage(
         if group.get("name") != "interface":
             continue
         group["lr"] = float(scheduled[index]) if raw_model.interface_open else 0.0
+
+
+def _drop_closed_interface_gradients(model: nn.Module, optimizer: torch.optim.Optimizer) -> None:
+    """Make the motif-prompt warm-up an exact freeze (spec section 7.5).
+
+    Zeroing the ``interface`` group's learning rate already pins its parameter
+    values, but AdamW would still feed the group's gradients into its moment
+    estimates, so the first open step would carry momentum accumulated while
+    the generator was somewhere else. Dropping the gradients after the DDP
+    all-reduce (which has already happened inside ``backward``) keeps the
+    optimiser state untouched too, and keeps the closed group out of the global
+    gradient-norm clip. A no-op for every other family and once the group is open.
+
+    Args:
+        model: The (possibly DDP-wrapped) model.
+        optimizer: The prepared optimizer holding the named groups.
+    """
+    raw_model = _unwrapped_model(model)
+    if not isinstance(raw_model, V3_1MotifPrompt) or raw_model.interface_open:
+        return
+    for group in optimizer.param_groups:
+        if group.get("name") != "interface":
+            continue
+        for param in cast(list[torch.nn.Parameter], group["params"]):
+            param.grad = None
 
 
 def _motif_stream_rows(
@@ -1526,6 +1555,9 @@ def _resolve_coord_gen_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     return {"reader": reader_config, "coord_gen": block.to_dict()}
 
 
+_MOTIF_BUNDLE_PREFIXES = ("reader.", "count_head.", "adapter.")
+
+
 def _load_motif_bundle(path: Path) -> tuple[Mapping[str, object], str]:
     """Load a published ``v3_1_motif_prompt`` Stage I bundle and digest the file.
 
@@ -1695,10 +1727,24 @@ def build_model(cfg: Config) -> nn.Module:
         if bundle:
             # The whole Stage I bundle initialises both roles: `R_S` and the
             # adapter train on, `R_T` is the immutable eval-mode copy (spec 7.4).
+            # The load is non-strict because a Stage I checkpoint carries no
+            # generator, so the bundle's own members are checked by name: a
+            # bundle missing any of them would silently leave that member at
+            # its random initialisation.
             stage_one, _ = _load_motif_bundle(Path(bundle))
-            motif_model.load_state_dict(
-                cast(Mapping[str, Any], stage_one["model_state"]), strict=False
-            )
+            bundle_state = cast(Mapping[str, Any], stage_one["model_state"])
+            expected = {
+                key
+                for key in motif_model.state_dict()
+                if key.startswith(_MOTIF_BUNDLE_PREFIXES) or key == "mean_template"
+            }
+            missing = sorted(expected - set(bundle_state))
+            if missing:
+                raise ValueError(
+                    f"{bundle}: Stage I bundle is missing {len(missing)} member "
+                    f"tensor(s), first {missing[:3]}"
+                )
+            motif_model.load_state_dict(bundle_state, strict=False)
             motif_model.initialize_teacher()
         _validate_topo_gen_distill_contract(motif_model, cfg.distill)
         return motif_model
@@ -2136,7 +2182,7 @@ def train_loop(
                     epoch,
                     global_step,
                     losses[-1],
-                    scheduler.get_last_lr()[0],
+                    float(optimizer.param_groups[0]["lr"]),
                 )
             if max_steps is not None and global_step >= max_steps:
                 reached_max_steps = True
@@ -2189,6 +2235,11 @@ def train_loop(
                     evals_without_improvement,
                 )
         if stopped_early or reached_max_steps:
+            break
+        if cfg.optim.stop_after_epoch is not None and epoch >= cfg.optim.stop_after_epoch:
+            logger.info(
+                "halting after epoch %d of %d (optim.stop_after_epoch)", epoch, cfg.optim.epochs
+            )
             break
 
     if best_state is None or best_metrics is None or last_metrics is None:
@@ -2316,6 +2367,9 @@ def _run_metadata(
             "base_checkpoint_sha256": motif_kwargs.get("base_checkpoint_sha256"),
             "bundle_checkpoint": motif_kwargs.get("bundle_checkpoint") or None,
             "bundle_checkpoint_sha256": motif_kwargs.get("bundle_checkpoint_sha256"),
+            # The compiled-template provenance and the measured compile rate
+            # behind the once-per-run compilation (spec section 3).
+            "templates": result.runtime_profile.get("motif_templates"),
         }
     if "virtual_graph" in result.runtime_profile:
         run_metadata["virtual_graph"] = result.runtime_profile["virtual_graph"]
@@ -6231,6 +6285,7 @@ def train_ddp_loop(
 
             optimizer.zero_grad()
             accelerator.backward(loss)
+            _drop_closed_interface_gradients(model, optimizer)
             if cfg.optim.grad_clip > 0:
                 accelerator.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
             optimizer.step()
@@ -6269,7 +6324,7 @@ def train_ddp_loop(
                     cfg.optim.epochs,
                     global_step,
                     float(local_mean_loss.detach().float().item()),
-                    float(scheduler.get_last_lr()[0]),
+                    float(optimizer.param_groups[0]["lr"]),
                 )
                 last_heartbeat = heartbeat_now
 
@@ -6443,7 +6498,9 @@ def train_ddp_loop(
             "attempt_id": artifact_dir.name,
             "global_step": global_step,
             "timestamp": datetime.now(UTC).isoformat(),
-            "learning_rate": float(scheduler.get_last_lr()[0]),
+            # The effective LR of group 0 after every per-epoch gate, which can
+            # differ from the scheduler's own value while a group is held.
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "train_loss": train_loss,
             "val_auroc": metrics.auroc,
             "val_auprc": metrics.auprc,
@@ -7667,6 +7724,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         try:
             if virtual_metadata is not None:
                 result.runtime_profile["virtual_graph"] = virtual_metadata
+            if motif_rows is not None:
+                result.runtime_profile["motif_templates"] = motif_rows.summary()
             write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
             result.runtime_profile["status"] = "complete"
             _write_json_atomic(args.profile_output, result.runtime_profile)
@@ -7731,6 +7790,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError(
             "v3_1_coord_gen runs only through the DDP pipeline path "
             "(hpc/run.sh train <config>); the direct debug CLI has no coordinate targets"
+        )
+    if cfg.model.family == MOTIF_PROMPT_FAMILY:
+        raise ValueError(
+            "v3_1_motif_prompt runs only through the DDP pipeline path "
+            "(hpc/run.sh train <config>); the direct debug CLI attaches no compiled "
+            "templates, no structural stream and no L_slot / L_topo terms"
         )
 
     set_seed(cfg.seed)

@@ -277,6 +277,20 @@ def test_output_biases_start_at_the_clipped_training_mean_in_logit_space() -> No
     assert 0.2 < float(weights[:, 16:32].mean()) < 0.8
 
 
+def test_generator_weights_are_fp32_under_autocast_and_match_the_fp32_heads() -> None:
+    # The gate heads run with autocast disabled: a bf16 sigmoid would quantise
+    # the weights before the fp32 count and RRWP arithmetic reads them.
+    generator = _generator()
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        weights = generator(h_u, h_v, len_u, len_v)
+        naive = generator.heads[0](torch.zeros(2, 192))
+    assert weights.dtype == torch.float32
+    assert naive.dtype == torch.bfloat16
+    assert torch.isfinite(weights).all()
+
+
 def test_per_type_and_mean_graph_gate_modes_realise_their_controls() -> None:
     per_type = _generator(gate_mode="per_type")
     h_u, len_u = _states(seed=1)
@@ -475,6 +489,44 @@ def test_the_mean_graph_control_installs_the_unclipped_training_mean() -> None:
     torch.testing.assert_close(model(batch)["predicted_weights"], expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("stage", ["one", "two"])
+def test_the_trunk_reads_fp32_weights_in_training_under_autocast(
+    stage: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Stage I casts the compiled template and Stage II the predicted graph to
+    # fp32 before the trunk, the count head and the reader see them; the
+    # encoder states themselves arrive in bf16 under the run's autocast.
+    model = _model(stage)
+    if stage == "two":
+        model.initialize_teacher()
+    model.train()
+    seen: dict[str, torch.dtype] = {}
+    original = model.logits_from_encoded
+
+    def spy(
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+        *,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        seen["weights"] = weights.dtype
+        seen["encoded"] = encoded_a.dtype
+        return original(encoded_a, encoded_b, lengths_a, lengths_b, weights=weights)
+
+    monkeypatch.setattr(model, "logits_from_encoded", spy)
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    batch["label"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = model(batch)
+    assert seen["encoded"] == torch.bfloat16
+    assert seen["weights"] == torch.float32
+    if stage == "two":
+        assert output["predicted_weights"].dtype == torch.float32
+
+
 def test_stage_one_corruption_leaves_self_rows_empty() -> None:
     # Spec section 3: self rows carry an explicit empty template and corruption is
     # nonself-only. Corrupting one gives it nonzero training-mean topology in
@@ -644,6 +696,64 @@ def _trainable_without_gradient(model: V3_1MotifPrompt, **batch_extra: torch.Ten
 
 def test_every_trainable_parameter_is_reached_by_one_backward() -> None:
     assert _trainable_without_gradient(_model("two")) == []
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [("topo_cnt",), ("topo_self", "topo_partner", "topo_rel"), ("topo_self", "topo_cnt")],
+)
+def test_a_masked_field_freezes_and_skips_the_module_it_would_have_read(
+    fields: tuple[str, ...],
+) -> None:
+    model = _model("two", fields=list(fields))
+    model.initialize_teacher()
+    reads_graph = bool({"topo_self", "topo_partner", "topo_rel"} & set(fields))
+    counts = "topo_cnt" in fields
+    assert model.student_reads_graph is reads_graph and model.student_counts is counts
+    assert any(p.requires_grad for p in model.reader.parameters()) is reads_graph
+    assert any(p.requires_grad for p in model.count_head.parameters()) is counts
+    tokens = model.tokens_from_weights(
+        _weights(n=3),
+        torch.zeros(3, 5, 32),
+        torch.zeros(3, 5, 32),
+        torch.full((3,), 5),
+        torch.full((3,), 5),
+    )
+    assert bool(tokens["topo_rel"].abs().sum() > 0) is reads_graph
+    assert bool(tokens["topo_cnt"].abs().sum() > 0) is counts
+    # The teacher still reads every field from the graph for L_topo.
+    teacher = model._tokens(  # noqa: SLF001
+        cast(torch.nn.ModuleDict, model.teacher),
+        _weights(n=3),
+        torch.zeros(3, 5, 32),
+        torch.zeros(3, 5, 32),
+        torch.full((3,), 5),
+        torch.full((3,), 5),
+    )
+    assert all(bool(teacher[name].abs().sum() > 0) for name in ("topo_rel", "topo_cnt"))
+    assert _trainable_without_gradient(model) == []
+
+
+def test_the_warm_up_is_vacuous_when_no_generator_parameter_trains() -> None:
+    # `mean_graph` freezes the whole generator, so holding its only group would
+    # waste the warm-up and open it on the cycle's annealing tail.
+    assert _model("two", gate_mode="mean_graph").interface_open_at(1) is True
+    assert _model("two").interface_open_at(1) is False
+    assert _model("two").interface_open_at(3) is True
+    assert _model("two", interface_warmup_epochs=None).interface_open_at(15) is False
+    assert _model("one").interface_lr_scale == 1.0
+    assert _model("two").interface_lr_scale == 0.1
+
+
+def test_the_direct_token_head_trains_in_the_generator_group() -> None:
+    model = _model("two", token_source="direct")
+    groups = {
+        str(group["name"]): {id(p) for p in cast(list[torch.nn.Parameter], group["params"])}
+        for group in model.optimizer_parameter_groups(1e-4, 1e-5, 1e-2)
+    }
+    head = cast(torch.nn.Module, model.direct_head)
+    assert all(id(p) in groups["generator"] for p in head.parameters())
+    assert not any(id(p) in groups["interface"] for p in head.parameters())
 
 
 def _teacher_tokens(

@@ -25,6 +25,8 @@ model:
       token_source: graph
       gate_mode: learned
       interface_warmup_epochs: 0 # the interface is what Stage I trains; no warm-up
+      # L_slot and L_topo are Stage II terms: in Stage I the compiled template is the
+      # model's input, so w_slot, w_topo, beta_* and huber_delta are inert here (spec 7.2).
       w_slot: 1.0
       w_topo: 0.0 # no teacher exists in Stage I, so L_topo has no target
       beta_p: 1.0
@@ -32,7 +34,6 @@ model:
       beta_a: 1.0
       beta_i: 1.0
       huber_delta: 1.0
-      cache_templates: false
 data:
   root: data
   strategy: breadth_first

@@ -7,8 +7,9 @@
 # Trained from scratch on the Stage II schedule, identical to motif_prompt_stage2 in
 # every other key, including its chunking and batching protocol (spec section 7.1):
 #   hpc/run.sh train configs/split_seed42/motif_prompt_bridge_only.yaml
-# bundle_checkpoint tracks motif_prompt_stage2's: replace it with the section 7.4
-# teachability winner before the wave, in this file and in the main arm together.
+# bundle_checkpoint is the bridge-only Stage I bundle (motif_prompt_stage1_bridge_only),
+# trained with the closure family zeroed, so both stages are family-matched; replace it
+# with that lane's own section 7.4 teachability winner before the wave.
 # Split: seed 42, root node_007630. No key selects another.
 # Spec: docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md
 model:
@@ -17,7 +18,7 @@ model:
     motif_prompt:
       stage: two
       base_checkpoint: outputs/split_seed42/prefix_base/best.pt
-      bundle_checkpoint: outputs/split_seed42/motif_prompt_stage1/best.pt
+      bundle_checkpoint: outputs/split_seed42/motif_prompt_stage1_bridge_only/best.pt
       width: 128
       slots_per_field: 2
       reader: {layers: 3, dim: 96, heads: 4, rrwp_k: 4}
@@ -34,7 +35,6 @@ model:
       beta_a: 1.0
       beta_i: 1.0
       huber_delta: 1.0
-      cache_templates: false
 data:
   root: data
   strategy: breadth_first

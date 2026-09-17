@@ -1,34 +1,37 @@
-# w_slot = 0 (spec section 8): which supervision contributes? The order-statistics
-# loss is off; task BCE, the structural stream and L_topo are unchanged.
-# Read against motif_prompt_stage2 on the pre-registered panel: BFS-macro GS and RD
-# plus the degree, clustering and spectral MMD ratios at the ONE V_val-selected fixed
-# threshold, with AUROC/AUPRC and Accuracy/F1/MCC beside them. Single-seed differences
-# inside +/-0.01 GS and +/-0.5 MMD ratio are not read.
-# Trained from scratch on the Stage II schedule, identical to motif_prompt_stage2 in
-# every other key, including its chunking and batching protocol (spec section 7.1):
-#   hpc/run.sh train configs/split_seed42/motif_prompt_no_slot.yaml
-# bundle_checkpoint tracks motif_prompt_stage2's: replace it with the section 7.4
-# teachability winner before the wave, in this file and in the main arm together.
+# Stage I of the closure-only ablation (spec section 8): the bridge family is
+# zeroed in BOTH stages, so the closure-only Stage II arm loads a reader, count head
+# and adapter that never saw a bridge edge. Identical to motif_prompt_stage1 in every
+# other key; it is the same ceiling diagnostic and is launched the same way:
+#   hpc/run.sh train configs/split_seed42/motif_prompt_stage1_closure_only.yaml --run-kind diagnostic
+# The base Stage I of the motif-graph GRIT prompt teaches the reader and the interface on a
+# bounded TRUE graph. The prefix_base trunk, its encoder and its head stay frozen;
+# the GRIT reader, the count head, the token projections, the role embeddings and
+# the prefix adapter/gates train. Compiled templates come from the legal training
+# graph minus the queried edge; V_val templates are held-out truth, so this is a
+# CEILING DIAGNOSTIC, never a deployable arm:
+#   hpc/run.sh train configs/split_seed42/motif_prompt_stage1.yaml --run-kind diagnostic
+# and it scores with --allow-oracle-diagnostic. Stage I success proves only that a
+# bounded true graph is usable through this interface; it is not evidence of
+# endpoint-only transfer (spec section 7.2).
 # Split: seed 42, root node_007630. No key selects another.
 # Spec: docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md
 model:
   family: v3_1_motif_prompt
   config:
     motif_prompt:
-      stage: two
+      stage: one
       base_checkpoint: outputs/split_seed42/prefix_base/best.pt
-      bundle_checkpoint: outputs/split_seed42/motif_prompt_stage1/best.pt
       width: 128
       slots_per_field: 2
       reader: {layers: 3, dim: 96, heads: 4, rrwp_k: 4}
       corruption: {prob: 0.5, lambda_min: 0.0, lambda_max: 1.0}
       fields: [topo_self, topo_partner, topo_rel, topo_cnt]
-      families: [closure, bridge]
+      families: [closure]
       token_source: graph
       gate_mode: learned
-      interface_warmup_epochs: 2 # G alone for epochs 1-2 (spec section 7.5)
-      w_slot: 0.0 # no order-statistics supervision
-      w_topo: 0.1 # representation term towards the immutable teacher R_T
+      interface_warmup_epochs: 0 # the interface is what Stage I trains; no warm-up
+      w_slot: 1.0
+      w_topo: 0.0 # no teacher exists in Stage I, so L_topo has no target
       beta_p: 1.0
       beta_q: 1.0
       beta_a: 1.0
@@ -58,7 +61,10 @@ optim:
     anneal_strategy: cos
   groups:
     generator: {max_lr: 1.0e-4}
-    interface: {max_lr: 1.0e-5} # 0.1x the generator peak (spec section 7.5)
+    # Stage I has no generator, so the interface is the only optimizer group and
+    # it trains the whole reader at spec section 7.2's 1e-4. The 0.1x interface
+    # rate is section 7.5's Stage II rule and does not apply here.
+    interface: {max_lr: 1.0e-4}
 eval:
   patience: null # full 15-epoch schedule, no early stopping (spec section 7.2)
   eval_every: 1
@@ -78,7 +84,7 @@ runtime:
   probe_warmup_steps: 10
   probe_timed_steps: 30
 seed: 0
-output_dir: outputs/split_seed42/motif_prompt_no_slot
+output_dir: outputs/split_seed42/motif_prompt_stage1_closure_only
 mixed_precision: "bf16"
 struct:
   nodes: 40

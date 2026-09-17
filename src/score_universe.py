@@ -1204,9 +1204,20 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
     merged_logit: NDArray[np.float32] = np.concatenate([shard.logit for shard in ordered])
     merged_meta = dict(reference.meta)
     if reference.meta.get("model_family") == MOTIF_PROMPT_FAMILY:
-        # The diagnostics describe the column they travel with and the merge
-        # replaces it, so shard zero's would contradict the merged artifact.
-        merged_meta["score_resolution"] = {"logit": score_resolution_diagnostics(merged_logit)}
+        # `score_resolution` describes the column it travels with; `save_scores`
+        # recomputes it from the merged column when the artifact is written, so
+        # it is not touched here. The degree marginals are additive sums and
+        # are merged exactly.
+        marginals = [shard.meta.get("motif_degree_marginals") for shard in ordered]
+        if any(entry is not None for entry in marginals):
+            if not all(isinstance(entry, dict) for entry in marginals):
+                raise ValueError(
+                    "merge inputs disagree on meta 'motif_degree_marginals': only some shards "
+                    f"carry it (files: {[str(shard.path) for shard in ordered]})"
+                )
+            merged_meta["motif_degree_marginals"] = _merge_degree_marginals(
+                [cast(Mapping[str, object], entry) for entry in marginals]
+            )
     if reference.meta.get("model_family") == "egostitch_e2e" and isinstance(
         reference.meta.get("test_access_ledger"), dict
     ):
@@ -2097,7 +2108,36 @@ def _shuffle_source_rows(total_rows: int, seed: int) -> NDArray[np.int64]:
         raise SystemExit(
             f"--prefix-intervention shuffle needs at least 2 scored rows, got {total_rows}"
         )
-    return np.random.default_rng(seed).permutation(total_rows).astype(np.int64)
+    # A derangement: a fixed point would hand that row its own condition or
+    # graph, so the draw is repeated (about e draws in expectation) until no
+    # row sources itself. Deterministic in the seed.
+    rng = np.random.default_rng(seed)
+    identity = np.arange(total_rows)
+    while True:
+        perm = rng.permutation(total_rows)
+        if not (perm == identity).any():
+            return perm.astype(np.int64)
+
+
+def _seeded_derangement(size: int, generator: torch.Generator) -> torch.Tensor:
+    """Draw a fixed-point-free permutation of ``range(size)`` from ``generator``.
+
+    The slot-level interventions permute anonymous slots; the identity draw
+    (probability ``1/size!``) would turn the intervention into a silent no-op,
+    so it is rejected and redrawn.
+
+    Args:
+        size: Number of slots, at least 2.
+        generator: The seeded generator, advanced by every draw.
+
+    Returns:
+        A ``(size,)`` int64 permutation with no fixed point.
+    """
+    identity = torch.arange(size)
+    while True:
+        order = torch.randperm(size, generator=generator)
+        if not bool((order == identity).any()):
+            return order
 
 
 def _check_row_coords(row_coords: torch.Tensor | None, num_rows: int) -> None:
@@ -2242,7 +2282,7 @@ def _motif_permute_closure(weights: torch.Tensor, *, seed: int) -> torch.Tensor:
         A new ``(n, 96)`` tensor with the ``u``-side closure slots permuted.
     """
     generator = torch.Generator().manual_seed(seed)
-    order = torch.randperm(8, generator=generator)
+    order = _seeded_derangement(8, generator).to(weights.device)
     out = weights.clone()
     out[:, 0:8] = weights[:, 0:8][:, order]
     return out
@@ -2263,12 +2303,145 @@ def _motif_rewire_bridge(weights: torch.Tensor, *, seed: int) -> torch.Tensor:
         A new ``(n, 96)`` tensor with the interior block rewired.
     """
     generator = torch.Generator().manual_seed(seed)
-    left = torch.randperm(8, generator=generator)
-    right = torch.randperm(8, generator=generator)
+    left = _seeded_derangement(8, generator).to(weights.device)
+    right = _seeded_derangement(8, generator).to(weights.device)
     out = weights.clone()
     interior = weights[:, 32:].reshape(-1, 8, 8)
     out[:, 32:] = interior[:, left][:, :, right].reshape(-1, 64)
     return out
+
+
+#: The five anonymous-slot roles of the motif template, as ``(name, start, stop)``
+#: slot ranges (`src.data.motif_template`: ``u``, ``v``, eight closure witnesses,
+#: eight left and eight right bridge intermediates).
+_MOTIF_SLOT_ROLES: tuple[tuple[str, int, int], ...] = (
+    ("u", 0, 1),
+    ("v", 1, 2),
+    ("closure", 2, 10),
+    ("left", 10, 18),
+    ("right", 18, 26),
+)
+
+
+def _motif_slot_incidence() -> torch.Tensor:
+    """Return the ``(26, 96)`` slot-edge incidence, so ``weights @ M.T`` is the weighted degree."""
+    from src.data.motif_template import EDGE_ENDPOINTS, N_EDGES, N_SLOTS
+
+    incidence = torch.zeros(N_SLOTS, N_EDGES, dtype=torch.float64)
+    for edge, (i, j) in enumerate(EDGE_ENDPOINTS):
+        incidence[i, edge] = 1.0
+        incidence[j, edge] = 1.0
+    return incidence
+
+
+class _MotifDegreeMarginals:
+    """Weighted slot degrees before and after a graph substitution (spec section 8).
+
+    The three graph interventions preserve the weight multisets and the family
+    totals but not every node's weighted degree, so the change is reported per
+    slot role. Slots are anonymous within a role, so each role's degrees are
+    compared as *sorted* profiles: the summed degree of the rows' own graphs and
+    of the graphs the reader actually read, the summed and the largest absolute
+    change of the sorted profile, over every scored row. The two endpoint
+    "profiles" are single degrees; a within-role permutation alone leaves every
+    endpoint degree unchanged, and the witness and intermediate roles are where
+    ``permute_closure`` and ``rewire_bridge`` move mass. Sums rather than means
+    travel in the shard meta so `merge_scores` combines shards exactly.
+    """
+
+    def __init__(self) -> None:
+        """Start with no rows recorded."""
+        self.rows = 0
+        self.own = {name: 0.0 for name, _, _ in _MOTIF_SLOT_ROLES}
+        self.read = {name: 0.0 for name, _, _ in _MOTIF_SLOT_ROLES}
+        self.abs_change = {name: 0.0 for name, _, _ in _MOTIF_SLOT_ROLES}
+        self.max_abs_change = {name: 0.0 for name, _, _ in _MOTIF_SLOT_ROLES}
+        self._incidence = _motif_slot_incidence()
+
+    def record(self, own: torch.Tensor, read: torch.Tensor) -> None:
+        """Accumulate one batch.
+
+        Args:
+            own: ``(B, 96)`` the rows' own graphs (predicted, or compiled in Stage I).
+            read: ``(B, 96)`` the graphs the reader read after the substitution.
+        """
+        incidence = self._incidence.to(own.device)
+        degree_own = own.detach().to(torch.float64) @ incidence.T
+        degree_read = read.detach().to(torch.float64) @ incidence.T
+        self.rows += int(degree_own.shape[0])
+        for name, start, stop in _MOTIF_SLOT_ROLES:
+            profile_own = degree_own[:, start:stop].sort(dim=1, descending=True).values
+            profile_read = degree_read[:, start:stop].sort(dim=1, descending=True).values
+            change = (profile_read - profile_own).abs()
+            self.own[name] += float(profile_own.sum())
+            self.read[name] += float(profile_read.sum())
+            self.abs_change[name] += float(change.sum())
+            self.max_abs_change[name] = max(self.max_abs_change[name], float(change.max()))
+
+    def summary(self) -> dict[str, object]:
+        """Return the artifact-meta payload: sums, the maximum and the derived per-slot means."""
+        return _degree_marginal_payload(
+            rows=self.rows,
+            own=self.own,
+            read=self.read,
+            abs_change=self.abs_change,
+            max_abs_change=self.max_abs_change,
+        )
+
+
+def _degree_marginal_payload(
+    *,
+    rows: int,
+    own: Mapping[str, float],
+    read: Mapping[str, float],
+    abs_change: Mapping[str, float],
+    max_abs_change: Mapping[str, float],
+) -> dict[str, object]:
+    """Lay out the degree-marginal sums and their per-slot means as JSON-ready meta."""
+    payload: dict[str, object] = {"rows": int(rows), "profile": "sorted_within_role"}
+    for name, start, stop in _MOTIF_SLOT_ROLES:
+        slots = stop - start
+        scale = 1.0 / (rows * slots) if rows > 0 else 0.0
+        payload[name] = {
+            "slots": slots,
+            "sum_own": float(own[name]),
+            "sum_read": float(read[name]),
+            "sum_abs_change": float(abs_change[name]),
+            "max_abs_change": float(max_abs_change[name]),
+            "mean_own": float(own[name]) * scale,
+            "mean_read": float(read[name]) * scale,
+            "mean_abs_change": float(abs_change[name]) * scale,
+        }
+    return payload
+
+
+def _merge_degree_marginals(shards: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Combine per-shard degree-marginal sums into the merged artifact's payload.
+
+    Args:
+        shards: Each shard's ``motif_degree_marginals`` meta.
+
+    Returns:
+        The exact whole-universe payload.
+    """
+    names = [name for name, _, _ in _MOTIF_SLOT_ROLES]
+
+    def role(shard: Mapping[str, object], name: str) -> Mapping[str, float]:
+        return cast(Mapping[str, float], shard[name])
+
+    def total(name: str, key: str) -> float:
+        return sum(float(role(shard, name)[key]) for shard in shards)
+
+    return _degree_marginal_payload(
+        rows=sum(int(cast(int, shard["rows"])) for shard in shards),
+        own={name: total(name, "sum_own") for name in names},
+        read={name: total(name, "sum_read") for name in names},
+        abs_change={name: total(name, "sum_abs_change") for name in names},
+        max_abs_change={
+            name: max(float(role(shard, name)["max_abs_change"]) for shard in shards)
+            for name in names
+        },
+    )
 
 
 def _assert_motif_scoring_contract(*, stage: str, allow_oracle_diagnostic: bool) -> None:
@@ -2336,6 +2509,68 @@ def _coord_gen_source_coords(
     return bank
 
 
+def _motif_read_graph(
+    motif_model: V3_1MotifPrompt,
+    rows: torch.Tensor,
+    endpoints: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    motif_bank: torch.Tensor | None,
+    row_templates: torch.Tensor | None,
+    own_templates: torch.Tensor | None,
+    transform: Callable[[torch.Tensor], torch.Tensor] | None,
+    marginals: _MotifDegreeMarginals | None,
+) -> torch.Tensor:
+    """Return the fp32 graph the reader reads for one batch, recording the intervention.
+
+    The row's *own* graph is the generator's prediction (Stage II) or its
+    compiled template (Stage I). ``motif_bank`` (a Stage II transplant) or
+    ``row_templates`` compiled from the transplant source pairs (Stage I, with
+    ``own_templates`` holding the rows' own) substitute another row's graph;
+    ``transform`` realises ``permute_closure`` / ``rewire_bridge``. When
+    ``marginals`` is given the own graph is always materialised so the changed
+    degree marginals can be reported (spec section 8).
+
+    Args:
+        motif_model: The unwrapped motif-prompt model in eval mode.
+        rows: ``(B,)`` row positions of this batch.
+        endpoints: ``(encoded_a, encoded_b, len_a, len_b)`` of the rows' own pairs.
+        motif_bank: Row-aligned transplant bank, or ``None``.
+        row_templates: Row-aligned compiled templates the reader reads, or ``None``.
+        own_templates: The rows' own compiled templates when ``row_templates``
+            are the transplant sources, else ``None``.
+        transform: The slot-level intervention, or ``None``.
+        marginals: The degree-marginal accumulator, or ``None``.
+
+    Returns:
+        The ``(B, 96)`` fp32 graph the trunk reads.
+    """
+    encoded_a, encoded_b, len_a, len_b = endpoints
+    device = encoded_a.device
+
+    def predict() -> torch.Tensor:
+        return motif_model.predict_weights(encoded_a, encoded_b, len_a, len_b).float()
+
+    own: torch.Tensor | None
+    if motif_bank is not None:
+        weights = motif_bank[rows].to(device=device, dtype=torch.float32)
+        own = predict() if marginals is not None else None
+    elif row_templates is not None:
+        weights = row_templates[rows].to(device=device, dtype=torch.float32)
+        own = (
+            weights
+            if own_templates is None
+            else own_templates[rows].to(device=device, dtype=torch.float32)
+        )
+    else:
+        weights = predict()
+        own = weights
+    if transform is not None:
+        weights = transform(weights)
+    if marginals is not None and own is not None:
+        marginals.record(own, weights)
+    return weights
+
+
 def _score_v3_1(
     model: nn.Module,
     pairs: Sequence[tuple[str, str]],
@@ -2348,6 +2583,8 @@ def _score_v3_1(
     row_coords: torch.Tensor | None = None,
     row_templates: torch.Tensor | None = None,
     motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    motif_own_templates: torch.Tensor | None = None,
+    motif_marginals: _MotifDegreeMarginals | None = None,
 ) -> NDArray[np.float32]:
     """Score pairs with a `V3_1` model via the length-bucketed batching machinery.
 
@@ -2381,6 +2618,10 @@ def _score_v3_1(
             generator predicts the graph from ``(x_u, x_v)`` alone.
         motif_weight_transform: ``--prefix-intervention permute_closure`` /
             ``rewire_bridge``: a row-local transform of the graph the trunk reads.
+        motif_own_templates: Stage I rows' own compiled templates when
+            ``row_templates`` hold the transplant sources (`_motif_read_graph`).
+        motif_marginals: Accumulator of the changed degree marginals under a
+            graph intervention, or ``None``.
 
     Returns:
         Shape ``(len(pairs),)`` float32 logits in input row order.
@@ -2495,14 +2736,16 @@ def _score_v3_1(
             encoded_a, encoded_b = encoded_a.float(), encoded_b.float()
             rows = torch.as_tensor(batch_indices, dtype=torch.int64)
             with torch.inference_mode(), _autocast_context(device, "off"):
-                supplied = motif_bank if motif_bank is not None else row_templates
-                weights = (
-                    supplied[rows].to(device=encoded_a.device, dtype=encoded_a.dtype)
-                    if supplied is not None
-                    else motif_model.predict_weights(encoded_a, encoded_b, len_a, len_b)
+                weights = _motif_read_graph(
+                    motif_model,
+                    rows,
+                    (encoded_a, encoded_b, len_a, len_b),
+                    motif_bank=motif_bank,
+                    row_templates=row_templates,
+                    own_templates=motif_own_templates,
+                    transform=motif_weight_transform,
+                    marginals=motif_marginals,
                 )
-                if motif_weight_transform is not None:
-                    weights = motif_weight_transform(weights)
                 logits = motif_model.logits_from_encoded(
                     encoded_a, encoded_b, len_a, len_b, weights=weights
                 )
@@ -2558,6 +2801,8 @@ def _score_v3_1_packed(
     row_coords: torch.Tensor | None = None,
     row_templates: torch.Tensor | None = None,
     motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    motif_own_templates: torch.Tensor | None = None,
+    motif_marginals: _MotifDegreeMarginals | None = None,
 ) -> NDArray[np.float32]:
     """Score V3.1 pairs with packed features and cached per-node encodings.
 
@@ -2765,14 +3010,16 @@ def _score_v3_1_packed(
             # Autocast disabled for the pair pass: the reader's RRWP arithmetic
             # needs fp32 and the pinned contract of spec section 9 says so.
             with torch.inference_mode(), _autocast_context(device, "off"):
-                supplied = motif_bank if motif_bank is not None else row_templates
-                weights = (
-                    supplied[rows].to(device=encoded_a.device, dtype=encoded_a.dtype)
-                    if supplied is not None
-                    else motif_model.predict_weights(encoded_a, encoded_b, len_a, len_b)
+                weights = _motif_read_graph(
+                    motif_model,
+                    rows,
+                    (encoded_a, encoded_b, len_a, len_b),
+                    motif_bank=motif_bank,
+                    row_templates=row_templates,
+                    own_templates=motif_own_templates,
+                    transform=motif_weight_transform,
+                    marginals=motif_marginals,
                 )
-                if motif_weight_transform is not None:
-                    weights = motif_weight_transform(weights)
                 motif_logits = motif_model.logits_from_encoded(
                     encoded_a, encoded_b, len_a, len_b, weights=weights
                 )
@@ -3887,8 +4134,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=PREFIX_INTERVENTIONS,
         default="none",
         help=(
-            "v3_1_prefix / v3_1_topo_prompt scoring-time intervention (prefix spec §7; the "
-            "mean_* field variants apply to the topology prompt only)"
+            "scoring-time intervention of the prefix families: gates_off/mean/shuffle for "
+            "v3_1_prefix, the mean_* field variants for v3_1_topo_prompt, shuffle for "
+            "v3_1_coord_gen, and for v3_1_motif_prompt the graph substitutions "
+            "shuffle_graph / permute_closure / rewire_bridge, which also record the changed "
+            "degree marginals in the artifact meta"
         ),
     )
     score.add_argument("--prefix-intervention-seed", type=int, default=0)
@@ -4035,6 +4285,15 @@ def _run_score(args: argparse.Namespace) -> None:
             raise SystemExit(
                 f"--prefix-intervention {args.prefix_intervention} substitutes a motif graph "
                 "and requires a v3_1_motif_prompt checkpoint"
+            )
+        if args.prefix_intervention == "shuffle" and _is_motif_prompt(model):
+            # The artifact meta and `test_protocol` file rows under the
+            # requested name, so the graph transplant must be asked for by its
+            # own name rather than aliased and mislabelled.
+            raise SystemExit(
+                "--prefix-intervention shuffle is the condition/coordinate transplant of the "
+                "prefix families; a v3_1_motif_prompt checkpoint transplants its graph under "
+                "--prefix-intervention shuffle_graph"
             )
         # `shuffle` is not a model-level mode: it gives every row the condition
         # or coordinates of another row of the whole universe, which only the
@@ -4257,7 +4516,13 @@ def _run_score(args: argparse.Namespace) -> None:
     ):
         row_coords: torch.Tensor | None = None
         row_templates: torch.Tensor | None = None
+        motif_own_templates: torch.Tensor | None = None
         motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+        motif_marginals = (
+            _MotifDegreeMarginals()
+            if is_motif_prompt and args.prefix_intervention in MOTIF_GRAPH_INTERVENTIONS
+            else None
+        )
         # `shuffle`: one seeded permutation of the whole universe, sliced to this
         # shard, so every shard reads the same source map (`_shuffle_source_rows`).
         shuffle_sources: list[tuple[str, str]] | None = None
@@ -4281,9 +4546,10 @@ def _run_score(args: argparse.Namespace) -> None:
                 assert oracle_truth_graph is not None  # gated above
                 templates_started = perf_counter()
                 template_pairs = row_pairs if shuffle_sources is None else shuffle_sources
-                row_templates = torch.from_numpy(
-                    MotifTemplateTable(oracle_truth_graph).weights(template_pairs)
-                )
+                truth_table = MotifTemplateTable(oracle_truth_graph)
+                row_templates = torch.from_numpy(truth_table.weights(template_pairs))
+                if shuffle_sources is not None and motif_marginals is not None:
+                    motif_own_templates = torch.from_numpy(truth_table.weights(row_pairs))
                 logger.info(
                     "compiled motif templates for %d rows%s on the %s truth graph in %.1fs",
                     len(row_pairs),
@@ -4326,6 +4592,8 @@ def _run_score(args: argparse.Namespace) -> None:
                 row_coords=row_coords,
                 row_templates=row_templates,
                 motif_weight_transform=motif_weight_transform,
+                motif_own_templates=motif_own_templates,
+                motif_marginals=motif_marginals,
             )
         else:
             logits = _score_v3_1_packed(
@@ -4340,7 +4608,11 @@ def _run_score(args: argparse.Namespace) -> None:
                 row_coords=row_coords,
                 row_templates=row_templates,
                 motif_weight_transform=motif_weight_transform,
+                motif_own_templates=motif_own_templates,
+                motif_marginals=motif_marginals,
             )
+        if motif_marginals is not None:
+            meta_extra["motif_degree_marginals"] = motif_marginals.summary()
     elif model_family == "f0_mlp":
         logits = _score_f0_mlp(
             model,

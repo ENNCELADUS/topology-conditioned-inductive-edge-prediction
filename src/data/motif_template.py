@@ -396,10 +396,11 @@ class MotifTemplateTable:
 
         Measured once on the real seed-42 training graph (7,203 nodes, 36,857
         positives), single-threaded CPU: 18.5 us/row on the round-robin mix and
-        235.5 us/row on the denser positive rows. The whole 15-epoch corpus
-        therefore recompiles in about 13 minutes at worst, and caching saves
-        about 3.3 minutes of it, so this arm recomputes per epoch and
-        ``motif_prompt.cache_templates`` defaults to false.
+        235.5 us/row on the denser positive rows, so the whole corpus compiles
+        in under ten minutes and its 96 fp32 weights per row fit in host memory.
+        The trainer therefore compiles each row once per run and keeps the
+        table; recompiling per epoch would only redraw the within-role slot
+        permutation, to which both the reader and ``L_slot`` are invariant.
 
         Returns:
             The node count, the fixed edge count and the measured seconds per

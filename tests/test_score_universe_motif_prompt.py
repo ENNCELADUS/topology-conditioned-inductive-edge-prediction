@@ -350,6 +350,96 @@ def test_graph_transplant_uses_one_seeded_universe_permutation() -> None:
     assert not (rows == np.arange(6)).any()
 
 
+@pytest.mark.parametrize("seed", range(24))
+def test_no_seed_draws_an_identity_or_a_self_sourcing_row(seed: int) -> None:
+    # A fixed point would hand a row its own graph and an identity draw would
+    # turn a slot-level intervention into a silent no-op.
+    for size in (2, 3, 9):
+        rows = score_universe._shuffle_source_rows(size, seed)
+        assert sorted(rows.tolist()) == list(range(size))
+        assert not (rows == np.arange(size)).any()
+    generator = torch.Generator().manual_seed(seed)
+    for _ in range(3):
+        order = score_universe._seeded_derangement(8, generator)
+        assert sorted(order.tolist()) == list(range(8))
+        assert not bool((order == torch.arange(8)).any())
+
+
+def _role(summary: dict[str, object], name: str) -> dict[str, float]:
+    """One slot role's entry of a degree-marginal payload."""
+    return cast(dict[str, float], summary[name])
+
+
+def test_degree_marginals_report_the_sorted_profile_change_per_role_and_merge_exactly() -> None:
+    weights = torch.rand((5, 96), generator=torch.Generator().manual_seed(1))
+    # Endpoint sums are invariant under both slot-level interventions: only the
+    # witness and intermediate roles move, which is what the report has to show.
+    closure = score_universe._motif_permute_closure(weights, seed=0)
+    marginals = score_universe._MotifDegreeMarginals()
+    marginals.record(weights[:2], closure[:2])
+    marginals.record(weights[2:], closure[2:])
+    summary = marginals.summary()
+    assert summary["rows"] == 5
+    for endpoint in ("u", "v"):
+        assert _role(summary, endpoint)["mean_abs_change"] == pytest.approx(0.0, abs=1e-9)
+        assert _role(summary, endpoint)["mean_own"] == pytest.approx(
+            _role(summary, endpoint)["mean_read"]
+        )
+    assert _role(summary, "closure")["mean_abs_change"] > 0.0
+    assert _role(summary, "left")["mean_abs_change"] == pytest.approx(0.0, abs=1e-9)
+    rewired = score_universe._motif_rewire_bridge(weights, seed=0)
+    bridge = score_universe._MotifDegreeMarginals()
+    bridge.record(weights, rewired)
+    assert _role(bridge.summary(), "left")["mean_abs_change"] > 0.0
+    assert _role(bridge.summary(), "closure")["mean_abs_change"] == pytest.approx(0.0, abs=1e-9)
+    # Shard sums merge to the whole-universe payload exactly.
+    whole = score_universe._MotifDegreeMarginals()
+    whole.record(weights, closure)
+    left, right = score_universe._MotifDegreeMarginals(), score_universe._MotifDegreeMarginals()
+    left.record(weights[:3], closure[:3])
+    right.record(weights[3:], closure[3:])
+    merged = score_universe._merge_degree_marginals([left.summary(), right.summary()])
+    for role in ("u", "v", "closure", "left", "right"):
+        for key in ("sum_own", "sum_read", "sum_abs_change", "max_abs_change", "mean_abs_change"):
+            assert _role(merged, role)[key] == pytest.approx(_role(whole.summary(), role)[key])
+
+
+def test_scoring_under_an_intervention_records_the_changed_marginals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import functools
+
+    _, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=4)
+    store = FeatureStore(tmp_path / "features")
+    model = _motif_model()
+    kwargs = {"device": torch.device("cpu"), "amp": "off", "token_budget": 512}
+    bank = _templates(len(pairs))
+    marginals = score_universe._MotifDegreeMarginals()
+    score_universe._score_v3_1(
+        model,
+        pairs,
+        store,
+        row_templates=bank,
+        motif_weight_transform=functools.partial(score_universe._motif_rewire_bridge, seed=0),
+        motif_marginals=marginals,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    summary = marginals.summary()
+    assert summary["rows"] == len(pairs)
+    assert _role(summary, "left")["mean_abs_change"] > 0.0
+    # A transplant materialises each row's own predicted graph beside the source's.
+    transplant = score_universe._MotifDegreeMarginals()
+    score_universe._score_v3_1(
+        model,
+        pairs,
+        store,
+        shuffle_sources=list(reversed(pairs)),
+        motif_marginals=transplant,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert transplant.summary()["rows"] == len(pairs)
+
+
 def test_permute_closure_and_rewire_bridge_preserve_the_family_multisets() -> None:
     weights = torch.rand((3, 96), generator=torch.Generator().manual_seed(0))
     closure = score_universe._motif_permute_closure(weights, seed=0)
@@ -640,14 +730,12 @@ def test_a_freshly_scored_motif_artifact_passes_its_own_precision_validator(
 def test_a_merged_multi_shard_motif_artifact_passes_the_same_validator(
     tmp_path: Path,
 ) -> None:
-    # The fan-out merge changes the row set, so the diagnostics must be
-    # recomputed over the merged logits instead of inherited from one shard.
+    # The fan-out merge changes the row set, so the written artifact's
+    # diagnostics must describe the merged logits, not one shard's.
     left, right = _clean_logits(12, seed=6), _clean_logits(20, seed=7)
     shards = [tmp_path / "s0.npz", tmp_path / "s1.npz"]
     _write_motif_shard(shards[0], left, row_start=0, num_rows=32)
     _write_motif_shard(shards[1], right, row_start=12, num_rows=32)
-    merged = score_universe.merge_scores(shards)
-    score_universe.validate_artifact_precision(merged, label="merged")
 
     output = tmp_path / "merged.npz"
     score_universe.main(

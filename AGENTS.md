@@ -81,6 +81,23 @@ selected method. Every piece of writing must explain how its context helps decid
   `virtual_graph.w_attach: 1.0`, training rows only) beside the coordinate loss. Its targets
   ride on the training batch as `attach_targets`, so forwards without them (struct stream,
   throughput probe, scoring) are unchanged. v0.5 checkpoints do not load into it.
+- Motif-graph GRIT prompt (`model.family: v3_1_motif_prompt`, spec
+  `docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md`, plan
+  `docs/superpowers/plans/2026-09-16-motif-graph-grit-prompt.md`): the intended deployable
+  topology arm. A fixed 26-slot, 96-edge motif template (`src/data/motif_template.py`: eight
+  shared-neighbour wedges, eight-by-eight degree-normalised bridges) is read by a small GRIT reader
+  and a closed-form count head into four gated KV prefix fields on the frozen `prefix_base` trunk
+  (`src/model/egostitch/classifier/motif_prompt.py`). Stage I (`motif_prompt_stage1`, ceiling
+  diagnostic: `--run-kind diagnostic`, score with `--allow-oracle-diagnostic`) reads compiled true
+  templates; Stage II (`motif_prompt_stage2`, deployable) trains a residue-conditioned generator
+  under task BCE, the structural stream, `L_slot` and `L_topo` (`src/distill/motif_losses.py`),
+  with the interface held for two epochs and then opened at 0.1x the generator LR. The section 8
+  controls are separately trained configs (`configs/split_seed42/motif_prompt_*.yaml`; the
+  closure/bridge ablations load their own family-matched Stage I bundles); scoring interventions
+  `gates_off`, `mean`, `shuffle_graph`, `permute_closure`, `rewire_bridge` record the changed
+  degree marginals; the output-density control is `python -m src.experiments.motif_density_control`.
+  Edge weights, the count head and the RRWP stack are fp32 by construction; the family runs only
+  through `hpc/run.sh train`, never the debug CLI.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

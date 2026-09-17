@@ -129,8 +129,16 @@ _CONTROLS: dict[str, dict[str, Any]] = {
     "motif_prompt_per_type": {"gate_mode": "per_type"},
     "motif_prompt_mean_graph": {"gate_mode": "mean_graph"},
     "motif_prompt_freeze_forever": {"interface_warmup_epochs": None},
-    "motif_prompt_closure_only": {"families": ["closure"]},
-    "motif_prompt_bridge_only": {"families": ["bridge"]},
+    # The inactive family is zeroed in BOTH stages (spec section 8), so each
+    # family ablation loads its own family-matched Stage I bundle.
+    "motif_prompt_closure_only": {
+        "families": ["closure"],
+        "bundle_checkpoint": "outputs/split_seed42/motif_prompt_stage1_closure_only/best.pt",
+    },
+    "motif_prompt_bridge_only": {
+        "families": ["bridge"],
+        "bundle_checkpoint": "outputs/split_seed42/motif_prompt_stage1_bridge_only/best.pt",
+    },
     "motif_prompt_no_slot": {"w_slot": 0.0},
     "motif_prompt_no_topo": {"w_topo": 0.0},
 }
@@ -148,6 +156,22 @@ def test_each_control_edits_only_its_own_keys_of_stage_two(
     }
     for block in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
         assert control[block] == base[block]
+
+
+@pytest.mark.parametrize("family", ["closure", "bridge"])
+def test_each_family_ablation_has_a_family_matched_stage_one(family: str) -> None:
+    base, lane = _raw("motif_prompt_stage1.yaml"), _raw(f"motif_prompt_stage1_{family}_only.yaml")
+    assert lane["output_dir"] == f"outputs/split_seed42/motif_prompt_stage1_{family}_only"
+    assert lane["model"]["config"]["motif_prompt"] == {
+        **base["model"]["config"]["motif_prompt"],
+        "families": [family],
+    }
+    for block in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert lane[block] == base[block]
+    two = _raw(f"motif_prompt_{family}_only.yaml")["model"]["config"]["motif_prompt"]
+    assert two["bundle_checkpoint"] == f"{lane['output_dir']}/best.pt"
+    header = (CONFIG_DIR / f"motif_prompt_stage1_{family}_only.yaml").read_text(encoding="utf-8")
+    assert "--run-kind diagnostic" in header
 
 
 def test_every_control_names_the_question_it_answers() -> None:
