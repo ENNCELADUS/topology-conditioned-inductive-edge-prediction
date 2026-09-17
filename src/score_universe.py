@@ -949,6 +949,15 @@ def save_scores(
             logit, meta=stored_meta, label=str(path), extra_arrays=extra_arrays
         )
         validate_test_access_ledger_binding(stored_meta, artifact_path=path, label=str(path))
+    elif stored_meta.get("model_family") == MOTIF_PROMPT_FAMILY:
+        # `_validate_motif_prompt_precision` requires these diagnostics of every
+        # artifact it is handed, and `run_test_protocol` validates the first one
+        # it loads, so the producer has to generate them or the family can never
+        # be evaluated. They are recomputed from the column actually being
+        # written, which is what makes a merged fan-out artifact describe its own
+        # merged rows rather than inherit one shard's.
+        stored_meta["score_resolution"] = {"logit": score_resolution_diagnostics(logit)}
+        validate_score_precision(logit, meta=stored_meta, label=str(path))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if f_logit is None and full_logit is None:
@@ -1192,7 +1201,12 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         u_parts.append(mapping[shard.u_idx] if len(shard.u_idx) else shard.u_idx)
         v_parts.append(mapping[shard.v_idx] if len(shard.v_idx) else shard.v_idx)
 
+    merged_logit: NDArray[np.float32] = np.concatenate([shard.logit for shard in ordered])
     merged_meta = dict(reference.meta)
+    if reference.meta.get("model_family") == MOTIF_PROMPT_FAMILY:
+        # The diagnostics describe the column they travel with and the merge
+        # replaces it, so shard zero's would contradict the merged artifact.
+        merged_meta["score_resolution"] = {"logit": score_resolution_diagnostics(merged_logit)}
     if reference.meta.get("model_family") == "egostitch_e2e" and isinstance(
         reference.meta.get("test_access_ledger"), dict
     ):
@@ -1268,7 +1282,7 @@ def merge_scores(inputs: Sequence[Path]) -> ScoresArtifact:
         node_ids=node_ids,
         u_idx=np.concatenate(u_parts) if u_parts else np.empty(0, dtype=np.int32),
         v_idx=np.concatenate(v_parts) if v_parts else np.empty(0, dtype=np.int32),
-        logit=np.concatenate([shard.logit for shard in ordered]),
+        logit=merged_logit,
         label=np.concatenate([shard.label for shard in ordered]),
         meta=merged_meta,
         f_logit=extra.get("f_logit"),

@@ -576,3 +576,109 @@ def test_every_other_family_keeps_its_previous_validator_behaviour() -> None:
         score_universe.validate_score_precision(
             logit, meta={"model_family": "egostitch"}, label="artifact"
         )
+
+
+def _produced_motif_meta(rows: int, *, num_rows: int | None = None) -> dict[str, object]:
+    """Exactly the metadata `score_universe._run_score` hands `save_scores` here.
+
+    Nothing in it is a diagnostic: the producer supplies provenance only, which is
+    why the family's own validator has to be satisfied by `save_scores` itself.
+    """
+    return {
+        "checkpoint_id": "abc123abc123abcd",
+        "model_family": "v3_1_motif_prompt",
+        "pairs_source": "val_topology",
+        "strategy": "breadth_first",
+        "num_rows": rows if num_rows is None else num_rows,
+        "created_utc": "2026-09-16T00:00:00+00:00",
+        "torch_version": str(torch.__version__),
+        "score_precision": {
+            "contract": "v3_1_motif_prompt_pair_fp32_v1",
+            "encode_autocast": "off",
+            "pair_autocast": False,
+            "pair_compute_dtype": "float32",
+            "logit_storage_dtype": "float32",
+        },
+        "topo_gen_control": None,
+        "prefix_intervention": "none",
+        "prefix_intervention_seed": 42,
+        "motif_stage": "two",
+    }
+
+
+def _write_motif_shard(path: Path, logit: np.ndarray, *, row_start: int, num_rows: int) -> None:
+    """Write one motif shard through the real producer."""
+    rows = len(logit)
+    score_universe.save_scores(
+        path,
+        node_ids=["node_a", "node_b"],
+        u_idx=np.zeros(rows, dtype=np.int32),
+        v_idx=np.ones(rows, dtype=np.int32),
+        logit=logit,
+        label=np.full(rows, -1, dtype=np.int8),
+        row_start=row_start,
+        meta=_produced_motif_meta(rows, num_rows=num_rows),
+    )
+
+
+def test_a_freshly_scored_motif_artifact_passes_its_own_precision_validator(
+    tmp_path: Path,
+) -> None:
+    # `run_test_protocol` validates the very first artifact it loads, so a
+    # producer that omits the diagnostics its own validator demands blocks the
+    # whole evaluation. Every earlier test here hand-built the metadata.
+    logit = _clean_logits(48, seed=5)
+    path = tmp_path / "scores.npz"
+    _write_motif_shard(path, logit, row_start=0, num_rows=48)
+    artifact = score_universe.load_scores(path)
+    score_universe.validate_artifact_precision(artifact, label=str(path))
+    assert artifact.meta["score_resolution"] == {
+        "logit": score_universe.score_resolution_diagnostics(logit)
+    }
+
+
+def test_a_merged_multi_shard_motif_artifact_passes_the_same_validator(
+    tmp_path: Path,
+) -> None:
+    # The fan-out merge changes the row set, so the diagnostics must be
+    # recomputed over the merged logits instead of inherited from one shard.
+    left, right = _clean_logits(12, seed=6), _clean_logits(20, seed=7)
+    shards = [tmp_path / "s0.npz", tmp_path / "s1.npz"]
+    _write_motif_shard(shards[0], left, row_start=0, num_rows=32)
+    _write_motif_shard(shards[1], right, row_start=12, num_rows=32)
+    merged = score_universe.merge_scores(shards)
+    score_universe.validate_artifact_precision(merged, label="merged")
+
+    output = tmp_path / "merged.npz"
+    score_universe.main(
+        ["merge", "--inputs", *[str(path) for path in shards], "--output", str(output)]
+    )
+    reloaded = score_universe.load_scores(output)
+    score_universe.validate_artifact_precision(reloaded, label=str(output))
+    assert reloaded.meta["score_resolution"] == {
+        "logit": score_universe.score_resolution_diagnostics(np.concatenate([left, right]))
+    }
+
+
+def test_the_producer_leaves_every_other_family_untouched(tmp_path: Path) -> None:
+    # `save_scores` is shared by b0_v31, prefix, topo_prompt, coord_gen and
+    # struct_*: none of them has a resolution contract and none may acquire one.
+    logit = _bf16_logits(16, seed=3)
+    for family in ("v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen"):
+        meta = _produced_motif_meta(16)
+        meta["model_family"] = family
+        meta.pop("motif_stage")
+        path = tmp_path / f"{family}.npz"
+        score_universe.save_scores(
+            path,
+            node_ids=["node_a", "node_b"],
+            u_idx=np.zeros(16, dtype=np.int32),
+            v_idx=np.ones(16, dtype=np.int32),
+            logit=logit,
+            label=np.full(16, -1, dtype=np.int8),
+            row_start=0,
+            meta=meta,
+        )
+        artifact = score_universe.load_scores(path)
+        assert "score_resolution" not in artifact.meta
+        score_universe.validate_artifact_precision(artifact, label=str(path))
