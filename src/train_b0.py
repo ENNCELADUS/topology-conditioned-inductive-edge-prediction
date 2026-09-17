@@ -4624,6 +4624,7 @@ class StructStream:
         val_sampler: StructSampler | None = None,
         coordinates: TopoPromptRows | None = None,
         templates: MotifTemplateTable | None = None,
+        val_templates: MotifTemplateTable | None = None,
         autocast: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         if token_budget < 1:
@@ -4635,6 +4636,7 @@ class StructStream:
         self._val_sampler = val_sampler
         self._coordinates = coordinates
         self._motif_table = templates
+        self._val_motif_table = val_templates
         # The teacher is called as a child module, outside the autocast wrapper
         # Accelerate installs on the prepared model's forward; the caller passes
         # `accelerator.autocast` so the pass sees the run's mixed precision.
@@ -4688,6 +4690,42 @@ class StructStream:
         return len(self._positions(size, rank=self._rank, steps=steps, step=step))
 
     # ------------------------------------------------------------ forward
+
+    def _motif_table_for(
+        self, model: V3_1MotifPrompt, sampler: StructSampler
+    ) -> MotifTemplateTable | None:
+        """The template table this subgraph is scored against, or ``None`` for no template.
+
+        Training subgraphs come from the training graph and read the training
+        table. Validation subgraphs come from the V_val graph, whose nodes are
+        node-disjoint from the training universe, so the training table cannot
+        index one of them: Stage I needs its own V_val table, the labelled oracle
+        diagnostic of spec section 8. Stage II is deployable and predicts the
+        graph from the endpoints, so its validation subgraphs carry no template
+        at all -- there the compiled template is a supervision target, and V_val
+        truth is never one.
+
+        Args:
+            model: The unwrapped motif-prompt model.
+            sampler: The sampler that produced the subgraph being scored.
+
+        Returns:
+            The table to compile from, or ``None`` when no template is read.
+
+        Raises:
+            RuntimeError: If the table this subgraph needs was not supplied.
+        """
+        if sampler is self._sampler:
+            if self._motif_table is None:
+                raise RuntimeError("motif-prompt structural stream requires a template table")
+            return self._motif_table
+        if model.cfg.stage == "two":
+            return None
+        if self._val_motif_table is None:
+            raise RuntimeError(
+                "motif-prompt stage 'one' structural validation requires a V_val template table"
+            )
+        return self._val_motif_table
 
     def _score(
         self,
@@ -4747,14 +4785,13 @@ class StructStream:
             ).to(device)
         pair_templates: torch.Tensor | None = None
         if isinstance(raw_model, V3_1MotifPrompt):
-            if self._motif_table is None:
-                raise RuntimeError("motif-prompt structural stream requires a template table")
-            motif_table = self._motif_table
-            left = [motif_table.index[subgraph.nodes[i]] for i, _ in pairs]
-            right = [motif_table.index[subgraph.nodes[j]] for _, j in pairs]
-            pair_templates = torch.from_numpy(
-                motif_table.weights_by_index(np.asarray(left), np.asarray(right))
-            ).to(device)
+            motif_table = self._motif_table_for(raw_model, sampler)
+            if motif_table is not None:
+                left = [motif_table.index[subgraph.nodes[i]] for i, _ in pairs]
+                right = [motif_table.index[subgraph.nodes[j]] for _, j in pairs]
+                pair_templates = torch.from_numpy(
+                    motif_table.weights_by_index(np.asarray(left), np.asarray(right))
+                ).to(device)
 
         rank_cost = [0] * self._world_size
         for boundary, rows in buckets.items():
@@ -4927,6 +4964,11 @@ class StructStream:
         zero = next(model.parameters()).sum() * 0.0
         self.last_terms = {}
         self.last_subgraph = None
+        # Cleared here and not only in `_score`: a step this rank scores no
+        # subgraph on must not leave the previous step's rows behind, or the
+        # trainer folds tensors whose graph has already been backwarded into the
+        # composite and autograd raises on the second pass through it.
+        self.last_motif_rows = {}
         stats: dict[str, float] = {"struct_pairs": 0.0, "struct_subgraphs": 0.0}
         if not positions:
             return zero, stats
@@ -7327,6 +7369,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             val_sampler=val_struct_sampler,
             coordinates=topo_rows,
             templates=motif_rows.train_table if motif_rows is not None else None,
+            val_templates=motif_rows.val_table if motif_rows is not None else None,
             autocast=accelerator.autocast,
         )
         if accelerator.is_main_process:

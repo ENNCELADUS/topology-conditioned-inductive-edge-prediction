@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 import torch
 from src.data.motif_template import MotifTemplateTable
-from src.data.struct_sampler import StructSubgraph
+from src.data.packed_features import PackedFeatureTable
+from src.data.struct_sampler import StructSampler, StructSubgraph
 from src.model.egostitch.classifier.b0_v31 import V3_1
 from src.model.egostitch.classifier.motif_prompt import TEMPLATE_KEY, V3_1MotifPrompt
 from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
@@ -49,25 +50,24 @@ def _empty_train_result() -> TrainResult:
     )
 
 
-def _motif_model(*, with_teacher: bool = True) -> V3_1MotifPrompt:
-    """A Stage II motif-prompt model with open gates over the tiny frozen base."""
+def _motif_model(*, with_teacher: bool = True, stage: str = "two") -> V3_1MotifPrompt:
+    """A motif-prompt model with open gates over the tiny frozen base."""
     torch.manual_seed(0)
-    model = V3_1MotifPrompt(
-        base=_tiny_base_config(),
-        motif_prompt={
-            "stage": "two",
-            "base_checkpoint": "base.pt",
-            "bundle_checkpoint": "bundle.pt",
-            "width": 16,
-            "slots_per_field": 2,
-            "reader": {"layers": 2, "dim": 16, "heads": 4, "rrwp_k": 4},
-        },
-    )
+    block: dict[str, object] = {
+        "stage": stage,
+        "base_checkpoint": "base.pt",
+        "width": 16,
+        "slots_per_field": 2,
+        "reader": {"layers": 2, "dim": 16, "heads": 4, "rrwp_k": 4},
+    }
+    if stage == "two":
+        block["bundle_checkpoint"] = "bundle.pt"
+    model = V3_1MotifPrompt(base=_tiny_base_config(), motif_prompt=block)
     model.install_mean_template(torch.full((96,), 0.1))
     gen = torch.Generator().manual_seed(1)
     with torch.no_grad():
         model.adapter.gates.copy_(torch.randn(model.adapter.gates.shape, generator=gen))
-    if with_teacher:
+    if with_teacher and stage == "two":
         model.initialize_teacher()
     return model
 
@@ -133,6 +133,96 @@ def test_a_stream_without_a_template_table_refuses_to_score_the_motif_family() -
     subgraph = stream._epoch_plan(epoch=1, steps=1).subgraphs[0]  # noqa: SLF001
     with pytest.raises(RuntimeError, match="requires a template table"):
         stream._score(_motif_model(), subgraph, sampler)  # noqa: SLF001
+
+
+# --------------------------------------- structural validation across the V_val boundary
+
+
+def _node_disjoint_streams() -> tuple[StructSampler, PackedFeatureTable, nx.Graph, nx.Graph]:
+    """Training and V_val graphs that share no node, as the split contract requires."""
+    sampler, table, _ = _topo_prompt_fixture()
+    val_graph = sampler.graph
+    train_graph = val_graph.subgraph(sorted(set(val_graph) - {"n0", "n1"})).copy()
+    return sampler, table, train_graph, val_graph
+
+
+def _validation_stream(
+    stage: str, *, with_val_table: bool = True
+) -> tuple[StructStream, V3_1MotifPrompt, StructSampler, StructSubgraph]:
+    """A stream whose validation sampler covers V_val nodes absent from the training table."""
+    sampler, table, train_graph, val_graph = _node_disjoint_streams()
+    val_sampler = StructSampler(
+        val_graph,
+        nodes=8,
+        background_nodes=2,
+        mix={"bfs": 0.5, "motif": 0.25, "bridge": 0.25},
+        v_val=frozenset(),
+        exclude_nodes=frozenset(),
+    )
+    stream = _stream(
+        sampler,
+        table,
+        token_budget=64,
+        val_sampler=val_sampler,
+        templates=MotifTemplateTable(train_graph),
+        val_templates=MotifTemplateTable(val_graph) if with_val_table else None,
+    )
+    subgraph = StructSubgraph(kind="bfs", nodes=("n0", "n1", "n2", "n3"), background=0)
+    return stream, _motif_model(stage=stage), val_sampler, subgraph
+
+
+def test_stage_one_structural_validation_reads_the_v_val_template_table() -> None:
+    # `_motif_table` is the training table and V_val nodes are node-disjoint from
+    # it, so scoring a validation subgraph against it raises `KeyError`.
+    stream, model, val_sampler, subgraph = _validation_stream("one")
+    with torch.no_grad():
+        logits, target, mask = stream._score(model, subgraph, val_sampler)  # noqa: SLF001
+    assert logits.shape == target.shape == mask.shape
+    assert torch.isfinite(logits).all()
+    # The V_val table really was read: one compiled row per legal validation pair.
+    assert stream.last_motif_rows["slot"].numel() == int(torch.triu(mask, diagonal=1).sum())
+
+
+def test_stage_two_structural_validation_predicts_without_any_template() -> None:
+    # Stage II is deployable: V_val truth is neither an input nor a target there
+    # (spec section 8), so validation subgraphs carry no compiled template at all.
+    stream, model, val_sampler, subgraph = _validation_stream("two", with_val_table=False)
+    with torch.no_grad():
+        logits, _, _ = stream._score(model, subgraph, val_sampler)  # noqa: SLF001
+    assert torch.isfinite(logits).all()
+    assert stream.last_motif_rows == {}
+
+
+def test_stage_one_structural_validation_without_a_v_val_table_fails_closed() -> None:
+    stream, model, val_sampler, subgraph = _validation_stream("one", with_val_table=False)
+    with pytest.raises(RuntimeError, match="V_val template table"), torch.no_grad():
+        stream._score(model, subgraph, val_sampler)  # noqa: SLF001
+
+
+def test_a_skipped_structural_step_clears_the_previous_steps_motif_rows() -> None:
+    # `struct.subgraphs_per_epoch: 0.5` leaves steps without a subgraph. The
+    # trainer folds `last_motif_rows` into the composite on every step, so a
+    # stale row tensor is backwarded a second time through a freed graph.
+    sampler, table, _ = _topo_prompt_fixture()
+    stream = _stream(
+        sampler,
+        table,
+        token_budget=64,
+        templates=MotifTemplateTable(sampler.graph),
+        weights={"bce": 1.0, "rank": 1.0, "degree": 0.1, "motif": 0.1},
+    )
+    stream.config = replace(stream.config, subgraphs_per_epoch=0.5)
+    model = _motif_model()
+    scheduled, _ = stream.loss(model, epoch=1, step=0, steps=2)
+    rows = stream.last_motif_rows
+    assert rows["slot"].numel() > 0
+    (scheduled + rows["slot"].sum() + rows["topo"].sum()).backward()  # type: ignore[no-untyped-call]
+
+    skipped, _ = stream.loss(model, epoch=1, step=1, steps=2)
+
+    assert stream.last_motif_rows == {}
+    # Without the reset the trainer would backward through the freed graph above.
+    skipped.backward()  # type: ignore[no-untyped-call]
 
 
 # ------------------------------------------------- the other arms are untouched

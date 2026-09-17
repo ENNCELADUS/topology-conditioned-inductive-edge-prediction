@@ -182,6 +182,7 @@ def _stream(
     val_sampler: StructSampler | None = None,
     coordinates: TopoPromptRows | None = None,
     templates: MotifTemplateTable | None = None,
+    val_templates: MotifTemplateTable | None = None,
 ) -> StructStream:
     config = StructConfig.from_mapping(
         {
@@ -204,6 +205,7 @@ def _stream(
         val_sampler=val_sampler,
         coordinates=coordinates,
         templates=templates,
+        val_templates=val_templates,
     )
 
 
