@@ -1250,3 +1250,43 @@ def test_task_stub_counts_match_the_rows_the_forward_emits(stage: str) -> None:
         0.0,
         0.0,
     ]
+
+
+@pytest.mark.parametrize("stage", ["one", "two"])
+def test_every_parameter_the_structural_pass_reaches_is_reached_by_the_task_pass(
+    stage: str,
+) -> None:
+    # The structural backward runs before the task forward through the unwrapped
+    # model, so DDP (find_unused_parameters=False) only ever marks parameters ready
+    # in the task backward: a parameter trained by structural chunks alone would
+    # never be reduced and the next step would fail. Structural chunks carry no
+    # label and no mask; the task batch carries both.
+    from src.model.egostitch.classifier.motif_prompt import TEMPLATE_MASK_KEY
+
+    def reached(model: V3_1MotifPrompt, batch: dict[str, torch.Tensor]) -> set[str]:
+        model.zero_grad(set_to_none=True)
+        output = model(batch)
+        total = output["logits"].float().sum()
+        for key in ("slot_loss_rows", "topo_loss_rows", "loss"):
+            if key in output:
+                total = total + output[key].float().sum()
+        total.backward()
+        return {
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad and param.grad is not None
+        }
+
+    model = _model(stage)
+    if stage == "two":
+        model.initialize_teacher()
+    _open_gates(model)
+    model.train()
+    struct_batch = _pair_batch(n=4)
+    del struct_batch["label"]
+    struct_batch[TEMPLATE_KEY] = _weights(n=4)
+    task_batch = _pair_batch(n=4)
+    task_batch[TEMPLATE_KEY] = _weights(n=4)
+    task_batch[TEMPLATE_MASK_KEY] = torch.tensor([1.0, 1.0, 0.0, 1.0])
+    struct_only = reached(model, struct_batch) - reached(model, task_batch)
+    assert struct_only == set()

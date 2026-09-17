@@ -6248,6 +6248,10 @@ def train_ddp_loop(
             # inert between iterations, so its gradients simply wait in `.grad`
             # until the task pass's synced backward all-reduces the accumulated
             # sum -- the same parameter gradient one joint backward produced.
+            # Invariant this ordering adds: every trainable parameter the
+            # structural forward reaches must also be reached by the task
+            # forward, or DDP never marks it ready and the next step fails
+            # (`find_unused_parameters=False`); the motif guard test holds it.
             motif_global_counts: list[float] | None = None
             motif_struct_term: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None = None
             if struct_stream is not None:
@@ -6571,6 +6575,8 @@ def train_ddp_loop(
             struct_seconds = accelerator.gather(
                 torch.tensor([epoch_struct_seconds], device=accelerator.device, dtype=torch.float64)
             )
+            # Since the split structural pass this spans the structural forward,
+            # its probes and its backward; earlier rows counted the forward only.
             epoch_struct_telemetry["struct_seconds"] = float(struct_seconds.max().item())
             struct_keys = sorted(set(gather_object(list(grad_norm_struct))))
             if struct_keys:

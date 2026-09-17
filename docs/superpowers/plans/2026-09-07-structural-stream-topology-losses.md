@@ -1730,7 +1730,7 @@ git commit -m "feat(struct): StructStream forwards one subgraph per step under c
 
 **Interfaces:**
 - Consumes: `StructStream` (Task 4), `_grad_norm`.
-- Produces: `train_ddp_loop(..., struct_stream: StructStream | None = None)`; `metrics.jsonl` keys `train_struct_loss`, `struct_<key>_loss`, `grad_norm_struct_<key>`, `struct_pairs`, `struct_seconds`, `struct_wall_fraction`, the `struct_*` sampler statistics, `struct_positive_coverage`, `struct_positive_reuse`, and on topology-due epochs `val_struct_*`.
+- Produces: `train_ddp_loop(..., struct_stream: StructStream | None = None)`; `metrics.jsonl` keys `train_struct_loss`, `struct_<key>_loss`, `grad_norm_struct_<key>`, `struct_pairs`, `struct_seconds` (since 2026-09-17 the structural forward *and* its backward, which runs before the task forward; earlier rows counted the forward only), `struct_wall_fraction`, the `struct_*` sampler statistics, `struct_positive_coverage`, `struct_positive_reuse`, and on topology-due epochs `val_struct_*`.
 
 - [ ] **Step 1: Write the failing loop tests**
 
