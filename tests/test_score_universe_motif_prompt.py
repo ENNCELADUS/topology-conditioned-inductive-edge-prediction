@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -289,3 +290,115 @@ def _collate(store: FeatureStore, pairs: list[tuple[str, str]]) -> dict[str, tor
 
     dataset = TokenPairDataset(pairs, None, store)
     return collate_token_pairs([dataset[i] for i in range(len(pairs))])
+
+
+# ------------------------------------------------------------------ precision contract
+
+
+def _bf16_logits(rows: int = 64, seed: int = 7) -> np.ndarray:
+    """A logit column that passed through bf16 and was widened back to fp32."""
+    values = torch.randn(rows, generator=torch.Generator().manual_seed(seed))
+    return np.asarray(values.to(torch.bfloat16).float().numpy(), dtype=np.float32)
+
+
+def _clean_logits(rows: int = 64, seed: int = 1) -> np.ndarray:
+    """An honest fp32 logit column."""
+    return np.asarray(np.random.default_rng(seed).standard_normal(rows), dtype=np.float32)
+
+
+def _motif_meta(logit: np.ndarray) -> dict[str, object]:
+    """Artifact metadata carrying the pinned motif-prompt precision contract."""
+    return {
+        "model_family": "v3_1_motif_prompt",
+        "score_precision": {
+            "contract": "v3_1_motif_prompt_pair_fp32_v1",
+            "encode_autocast": "off",
+            "pair_autocast": False,
+            "pair_compute_dtype": "float32",
+            "logit_storage_dtype": "float32",
+        },
+        "score_resolution": {"logit": score_universe.score_resolution_diagnostics(logit)},
+    }
+
+
+def _motif_artifact(logit: np.ndarray) -> score_universe.ScoresArtifact:
+    """A minimal loaded artifact of this family."""
+    rows = len(logit)
+    return score_universe.ScoresArtifact(
+        node_ids=[f"node_{i:02d}" for i in range(rows + 1)],
+        u_idx=np.arange(rows, dtype=np.int32),
+        v_idx=np.arange(1, rows + 1, dtype=np.int32),
+        logit=logit,
+        label=np.zeros(rows, dtype=np.int8),
+        meta=_motif_meta(logit),
+    )
+
+
+def test_a_bf16_contaminated_motif_artifact_is_rejected() -> None:
+    contaminated = _bf16_logits()
+    honest = _motif_meta(contaminated)
+    # An honestly recorded bf16 pair pass contradicts the pinned contract.
+    cast(dict[str, object], honest["score_precision"])["pair_autocast"] = True
+    with pytest.raises(ValueError, match="score_precision"):
+        score_universe.validate_score_precision(contaminated, meta=honest, label="artifact")
+    # And a forged fp32 provenance with self-consistent diagnostics is caught by
+    # the grid itself: this is the landmine, a contaminated artifact that would
+    # otherwise analyse cleanly.
+    with pytest.raises(ValueError, match="bf16 grid"):
+        score_universe.validate_score_precision(
+            contaminated, meta=_motif_meta(contaminated), label="artifact"
+        )
+    with pytest.raises(ValueError, match="bf16 grid"):
+        score_universe.validate_artifact_precision(_motif_artifact(contaminated))
+
+
+def test_a_clean_motif_artifact_validates_through_the_artifact_wrapper() -> None:
+    score_universe.validate_artifact_precision(_motif_artifact(_clean_logits()), label="artifact")
+
+
+def test_missing_provenance_fails_closed_for_this_family() -> None:
+    with pytest.raises(ValueError, match="missing score_precision provenance"):
+        score_universe.validate_score_precision(
+            np.zeros(8, dtype=np.float32),
+            meta={"model_family": "v3_1_motif_prompt"},
+            label="artifact",
+        )
+
+
+def test_a_non_float32_motif_logit_column_fails_closed() -> None:
+    logit = _clean_logits()
+    meta = _motif_meta(logit)
+    with pytest.raises(ValueError, match="stored as float32"):
+        score_universe.validate_score_precision(
+            logit.astype(np.float64),
+            meta=meta,
+            label="artifact",
+        )
+
+
+def test_inconsistent_score_resolution_diagnostics_fail_closed() -> None:
+    logit = _clean_logits(32, seed=2)
+    meta = _motif_meta(logit)
+    cast(dict[str, object], meta["score_resolution"])["logit"] = {"n_rows": 32, "n_unique": 1}
+    with pytest.raises(ValueError, match="score_resolution"):
+        score_universe.validate_score_precision(logit, meta=meta, label="artifact")
+
+
+def test_a_degenerate_constant_column_is_not_mistaken_for_contamination() -> None:
+    # Every constant column sits on the bf16 grid trivially; only a column with
+    # more than one distinct value is evidence of a bf16 pair pass.
+    logit = np.zeros(16, dtype=np.float32)
+    score_universe.validate_score_precision(logit, meta=_motif_meta(logit), label="artifact")
+
+
+def test_every_other_family_keeps_its_previous_validator_behaviour() -> None:
+    # The dispatch must not start validating families that never had a contract.
+    logit = _bf16_logits()
+    score_universe.validate_score_precision(logit, meta={"model_family": "v3_1"}, label="artifact")
+    score_universe.validate_score_precision(
+        logit, meta={"model_family": "v3_1_coord_gen"}, label="artifact"
+    )
+    with pytest.raises(ValueError, match="retired"):
+        score_universe.validate_score_precision(
+            logit, meta={"model_family": "egostitch"}, label="artifact"
+        )

@@ -160,6 +160,7 @@ N_MOTIF_EDGES = 96
 #: synthetic fixtures satisfy (`ValRegionParams`'s own defaults assume a
 #: real-package-scale train universe).
 _VAL_REGION_PARAMS = ValRegionParams()
+_MOTIF_PROMPT_PRECISION_CONTRACT = "v3_1_motif_prompt_pair_fp32_v1"
 _EGOSTITCH_E2E_PAIR_PRECISION_CONTRACT = "egostitch_e2e_pair_fp32_v1"
 _EGOSTITCH_E2E_ARRAY_KEYS = ("full", "f_logit")
 _SCORES_META_VERSION = "egostitch_e2e_scores_v4"
@@ -443,11 +444,11 @@ def validate_score_precision(
             Ignored for every other family.
 
     Raises:
-        ValueError: If an EgoStitch-E2E artifact lacks or contradicts its
-            pinned pair-pass fp32 contract, is missing its ``f_logit``
-            decomposition array, or its stored diagnostics are inconsistent;
-            or if the artifact belongs to the retired frozen-s0 ``egostitch``
-            family, whose validator was removed with its scorer.
+        ValueError: If an EgoStitch-E2E or ``v3_1_motif_prompt`` artifact lacks
+            or contradicts its pinned pair-pass fp32 contract, is missing its
+            ``f_logit`` decomposition array, or its stored diagnostics are
+            inconsistent; or if the artifact belongs to the retired frozen-s0
+            ``egostitch`` family, whose validator was removed with its scorer.
     """
     family = meta.get("model_family")
     if family == "egostitch":
@@ -461,6 +462,11 @@ def validate_score_precision(
             "precision contract were removed. Re-analyse legacy artifacts from a "
             "pre-excision commit."
         )
+    if family == MOTIF_PROMPT_FAMILY:
+        _validate_motif_prompt_precision(
+            logit, meta=meta, label=label, require_diagnostics=require_diagnostics
+        )
+        return
     if family != "egostitch_e2e":
         return
     _validate_egostitch_e2e_precision(
@@ -470,6 +476,77 @@ def validate_score_precision(
         require_diagnostics=require_diagnostics,
         extra_arrays=extra_arrays or {},
     )
+
+
+def _validate_motif_prompt_precision(
+    logit: NDArray[np.float32],
+    *,
+    meta: Mapping[str, object],
+    label: str,
+    require_diagnostics: bool,
+) -> None:
+    """Validate the ``v3_1_motif_prompt`` single-array pair-pass fp32 contract.
+
+    Without this the family would inherit :func:`validate_score_precision`'s early
+    return for every non-``egostitch_e2e`` family, and a bf16-contaminated artifact
+    would analyse cleanly (spec section 9). The reader's RRWP arithmetic already
+    requires autocast off, so the pair pass is fp32 by construction and a logit
+    column that lies *entirely* on the bf16 grid while carrying more than one
+    distinct value is contamination, not chance: an honest fp32 column puts each
+    row on that grid with probability 2^-16.
+
+    Args:
+        logit: The artifact's primary logit column.
+        meta: Parsed artifact metadata.
+        label: Human-readable artifact label used in errors.
+        require_diagnostics: Require the persisted descriptive diagnostics.
+
+    Raises:
+        ValueError: If the artifact lacks or contradicts the pinned contract, is
+            not stored as float32, sits on the bf16 grid, or its stored
+            diagnostics are inconsistent.
+    """
+    precision = meta.get("score_precision")
+    if not isinstance(precision, dict):
+        raise ValueError(
+            f"{label}: motif-prompt artifact is missing score_precision provenance; "
+            "rescore with the pair-pass fp32 contract"
+        )
+    expected = {
+        "contract": _MOTIF_PROMPT_PRECISION_CONTRACT,
+        "pair_compute_dtype": "float32",
+        "pair_autocast": False,
+        "logit_storage_dtype": "float32",
+    }
+    mismatches = {
+        key: (precision.get(key), value)
+        for key, value in expected.items()
+        if precision.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"{label}: invalid motif-prompt score_precision provenance: {mismatches}")
+    values = np.asarray(logit)
+    if values.dtype != np.float32:
+        raise ValueError(f"{label}: motif-prompt logits must be stored as float32")
+    actual = score_resolution_diagnostics(values)
+    if actual["n_unique"] > 1 and actual["bf16_grid_fraction"] == 1.0:
+        raise ValueError(
+            f"{label}: motif-prompt logits lie entirely on the bf16 grid "
+            f"({actual['n_unique']} distinct values); the pair pass runs with autocast "
+            "disabled, so this artifact is bf16-contaminated and must be rescored"
+        )
+    if not require_diagnostics:
+        return
+    recorded = meta.get("score_resolution")
+    if not isinstance(recorded, dict):
+        raise ValueError(
+            f"{label}: score_resolution diagnostics are missing or not a per-array mapping"
+        )
+    if recorded.get("logit") != actual:
+        raise ValueError(
+            f"{label}: score_resolution['logit'] diagnostics are missing or inconsistent; "
+            f"recorded={recorded.get('logit')!r}, actual={actual!r}"
+        )
 
 
 def validate_artifact_precision(artifact: ScoresArtifact, *, label: str = "artifact") -> None:
@@ -4125,6 +4202,17 @@ def _run_score(args: argparse.Namespace) -> None:
         "prefix_intervention": args.prefix_intervention,
         "prefix_intervention_seed": int(args.prefix_intervention_seed),
     }
+    if is_motif_prompt:
+        # The reader's RRWP arithmetic runs with autocast disabled, so the pair
+        # pass is fp32 by construction; pinning it is what lets
+        # `validate_artifact_precision` reject a contaminated artifact (spec 9).
+        meta_extra["score_precision"] = {
+            "contract": _MOTIF_PROMPT_PRECISION_CONTRACT,
+            "encode_autocast": args.amp,
+            "pair_autocast": False,
+            "pair_compute_dtype": "float32",
+            "logit_storage_dtype": "float32",
+        }
     f_logit: NDArray[np.float32] | None = None
     full_logit: NDArray[np.float32] | None = None
     full_oracle_telemetry = _FullOracleScoreTelemetry() if is_full_ego_family else None

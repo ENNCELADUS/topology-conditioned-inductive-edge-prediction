@@ -769,3 +769,58 @@ def test_a_stage_one_batch_folds_a_differentiable_zero() -> None:
     assert any(
         p.grad is not None and float(p.grad.abs().sum()) > 0.0 for p in model.reader.parameters()
     )
+
+
+# ------------------------------------------- DDP prerequisites (task 22)
+
+
+def test_every_rank_builds_bit_identical_templates_and_means() -> None:
+    # `MotifTemplateRows` is built independently on every rank and never
+    # broadcast, so determinism is what keeps the ranks in agreement.
+    from src.train_b0 import MotifTemplateRows
+
+    graph = _tiny_training_graph()
+    pairs = [("a", "b"), ("a", "c"), ("b", "d"), ("a", "a")]
+    built = [
+        MotifTemplateRows(
+            train_graph=_tiny_training_graph(),
+            train_pairs=list(pairs),
+            stats_rows=np.asarray([0, 1, 2]),
+            device=torch.device("cpu"),
+            seed=47,
+        )
+        for _ in range(2)
+    ]
+    assert graph.number_of_nodes() == 4
+    torch.testing.assert_close(built[0].train, built[1].train, rtol=0, atol=0)
+    torch.testing.assert_close(built[0].mean, built[1].mean, rtol=0, atol=0)
+    torch.testing.assert_close(built[0].train_mask, built[1].train_mask, rtol=0, atol=0)
+
+
+def test_every_trainable_parameter_receives_a_gradient_in_one_step() -> None:
+    # `build_ddp_accelerator` pins `find_unused_parameters=False`, so a trainable
+    # parameter this arm leaves out of the forward would abort the real run.
+    from src.train_b0 import _motif_stream_terms
+
+    model = _model("two")
+    model.initialize_teacher()
+    _open_gates(model)
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    batch["motif_mask"] = torch.tensor([1.0, 0.0, 1.0, 1.0])
+    output = model(batch)
+    slot, topo = _motif_stream_terms(
+        task=(
+            {"slot": output["slot_loss_rows"], "topo": output["topo_loss_rows"]},
+            batch["motif_mask"],
+        ),
+        struct=None,
+        like=output["loss"],
+    )
+    (output["loss"] + model.cfg.w_slot * slot + model.cfg.w_topo * topo).backward()
+    missing = [
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad and param.grad is None
+    ]
+    assert missing == []
