@@ -681,6 +681,81 @@ class MotifGenerator(nn.Module):
         return torch.sigmoid(logits)
 
 
+def pool_residues(states: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Mean-pool one endpoint's inner residues under its true length.
+
+    The encoder's padding mask keeps padded positions out of attention but does
+    not zero the states it writes at them, so an unmasked mean makes the same
+    pair's prompt depend on the padding length of whatever batch it was collated
+    with -- and packed scoring gathers different padding than training does. The
+    inner-token convention (BOS/EOS excluded) is the one the generator and
+    `V3_1Prefix` already pool under.
+
+    Args:
+        states: ``(B, L, d_model)`` encoder output.
+        lengths: ``(B,)`` true sequence lengths.
+
+    Returns:
+        ``(B, d_model)`` pooled states.
+    """
+    padding = _build_padding_mask(lengths, states.size(1))
+    return masked_mean(states, inner_token_mask(x=states, padding_mask=padding))
+
+
+class MotifDirectTokens(nn.Module):
+    """The section 8 direct-prefix control's three topology tokens, read off the residues.
+
+    It answers "does a graph bottleneck help beyond a conditional adapter?", so it
+    replaces the reader and never sees a motif graph -- but it has to keep the
+    interface's symmetries or it is not comparing like with like. The endpoint map
+    is shared and reads its own endpoint beside the swap-invariant context
+    ``[p_u + p_v, |p_u - p_v|]``, so swapping the endpoints exchanges ``topo_u``
+    and ``topo_v`` exactly as `MotifGritReader`'s shared ``node_proj`` does, and
+    the relation token is a function of the context alone and is therefore
+    swap-invariant like ``topo_rel``. The AB/BA aggregation of spec section 6
+    cannot repair an order-dependent token, because both orientations reuse the
+    tokens computed from the original ordering.
+    """
+
+    def __init__(self, d_model: int, width: int) -> None:
+        """Build the shared endpoint map and the relation map.
+
+        Args:
+            d_model: Frozen trunk width the pooled residue states arrive in.
+            width: Token width.
+        """
+        super().__init__()
+        self.node = nn.Sequential(
+            nn.LayerNorm(3 * d_model),
+            nn.Linear(3 * d_model, 4 * width),
+            nn.GELU(),
+            nn.Linear(4 * width, width),
+        )
+        self.relation = nn.Sequential(
+            nn.LayerNorm(2 * d_model),
+            nn.Linear(2 * d_model, 4 * width),
+            nn.GELU(),
+            nn.Linear(4 * width, width),
+        )
+
+    def forward(self, pooled_u: torch.Tensor, pooled_v: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return the three tokens of one batch of pairs.
+
+        Args:
+            pooled_u: ``(B, d_model)`` masked pooled residues of ``u``.
+            pooled_v: ``(B, d_model)`` masked pooled residues of ``v``.
+
+        Returns:
+            ``topo_u``, ``topo_v`` and the swap-invariant ``topo_rel``.
+        """
+        context = torch.cat([pooled_u + pooled_v, (pooled_u - pooled_v).abs()], dim=-1)
+        return {
+            "topo_u": self.node(torch.cat([pooled_u, context], dim=-1)),
+            "topo_v": self.node(torch.cat([pooled_v, context], dim=-1)),
+            "topo_rel": self.relation(context),
+        }
+
+
 _FIELD_TO_TOKEN = {
     "topo_self": ("topo_u", "topo_v"),
     "topo_partner": ("topo_v", "topo_u"),
@@ -937,12 +1012,7 @@ class V3_1MotifPrompt(nn.Module):
             self.cfg.width, degree_only=self.cfg.count_features == "degree"
         )
         self.direct_head = (
-            nn.Sequential(
-                nn.LayerNorm(2 * self.d_model),
-                nn.Linear(2 * self.d_model, 4 * self.cfg.width),
-                nn.GELU(),
-                nn.Linear(4 * self.cfg.width, 3 * self.cfg.width),
-            )
+            MotifDirectTokens(self.d_model, self.cfg.width)
             if self.cfg.token_source == "direct"
             else None
         )
@@ -1138,6 +1208,8 @@ class V3_1MotifPrompt(nn.Module):
         weights: torch.Tensor,
         encoded_u: torch.Tensor,
         encoded_v: torch.Tensor,
+        lengths_u: torch.Tensor,
+        lengths_v: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Read one graph through the student path or through the immutable teacher."""
         if bundle is None:
@@ -1152,14 +1224,19 @@ class V3_1MotifPrompt(nn.Module):
         if direct_head is None:
             tokens: dict[str, torch.Tensor] = reader(weights)
         else:
-            pooled = torch.cat([encoded_u.mean(dim=1), encoded_v.mean(dim=1)], dim=-1)
-            parts = cast(torch.Tensor, direct_head(pooled)).chunk(3, dim=-1)
-            tokens = {"topo_u": parts[0], "topo_v": parts[1], "topo_rel": parts[2]}
+            tokens = cast(MotifDirectTokens, direct_head)(
+                pool_residues(encoded_u, lengths_u), pool_residues(encoded_v, lengths_v)
+            )
         tokens["topo_cnt"] = count_head(weights)
         return tokens
 
     def tokens_from_weights(
-        self, weights: torch.Tensor, encoded_u: torch.Tensor, encoded_v: torch.Tensor
+        self,
+        weights: torch.Tensor,
+        encoded_u: torch.Tensor,
+        encoded_v: torch.Tensor,
+        lengths_u: torch.Tensor,
+        lengths_v: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Return the four token fields for one batch of motif graphs.
 
@@ -1167,11 +1244,14 @@ class V3_1MotifPrompt(nn.Module):
             weights: ``(B, 96)`` edge weights.
             encoded_u: Residue states of ``u`` (used only by ``token_source='direct'``).
             encoded_v: Residue states of ``v``.
+            lengths_u: True residue lengths of ``u``, so the direct control pools
+                under the mask rather than over the batch's padding.
+            lengths_v: True residue lengths of ``v``.
 
         Returns:
             ``topo_u``, ``topo_v``, ``topo_rel`` and ``topo_cnt``.
         """
-        return self._tokens(None, weights, encoded_u, encoded_v)
+        return self._tokens(None, weights, encoded_u, encoded_v, lengths_u, lengths_v)
 
     def predict_weights(
         self,
@@ -1302,7 +1382,7 @@ class V3_1MotifPrompt(nn.Module):
         if self.intervention != "none" and self.training:
             raise ValueError("motif_prompt interventions are scoring-time only; call eval() first")
         weights, gate_scale = self._apply_intervention(weights)
-        tokens = self.tokens_from_weights(weights, encoded_a, encoded_b)
+        tokens = self.tokens_from_weights(weights, encoded_a, encoded_b, lengths_a, lengths_b)
         view_a, view_b = self.adapter.views(tokens)
         prefixes_a = [self.adapter.prefix(i, view_a) for i in range(len(self.prompt_layers))]
         prefixes_b = [self.adapter.prefix(i, view_b) for i in range(len(self.prompt_layers))]
@@ -1397,7 +1477,9 @@ class V3_1MotifPrompt(nn.Module):
             # `_apply_intervention` may have substituted the graph the trunk read;
             # report what was actually read, not what the generator emitted.
             output["predicted_weights"] = self._apply_intervention(weights)[0]
-        slot_row, topo_row = self._supervision_rows(merged, weights, encoded_a, encoded_b)
+        slot_row, topo_row = self._supervision_rows(
+            merged, weights, encoded_a, encoded_b, lengths_a, lengths_b
+        )
         if slot_row is not None:
             output["slot_loss_rows"] = slot_row
         if topo_row is not None:
@@ -1413,6 +1495,8 @@ class V3_1MotifPrompt(nn.Module):
         weights: torch.Tensor,
         encoded_a: torch.Tensor,
         encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return the masked per-row ``L_slot`` and ``L_topo`` of this batch.
 
@@ -1444,9 +1528,11 @@ class V3_1MotifPrompt(nn.Module):
         bundle = cast(nn.ModuleDict, self.teacher)
         # Both sides run through the immutable teacher: `R_T(Ahat)` keeps autograd
         # so the term reaches the generator, `R_T(A*)` is detached (spec 7.5).
-        student_tokens = self._tokens(bundle, weights, encoded_a, encoded_b)
+        student_tokens = self._tokens(bundle, weights, encoded_a, encoded_b, lengths_a, lengths_b)
         with torch.no_grad():
-            teacher_tokens = self._tokens(bundle, target, encoded_a, encoded_b)
+            teacher_tokens = self._tokens(
+                bundle, target, encoded_a, encoded_b, lengths_a, lengths_b
+            )
         return slot_row, topo_loss_rows(student_tokens, teacher_tokens) * row_mask
 
     def _add_composite_loss(
@@ -1504,6 +1590,7 @@ __all__ = [
     "TOKEN_SOURCES",
     "CorruptionConfig",
     "MotifCountHead",
+    "MotifDirectTokens",
     "MotifGenerator",
     "MotifGritReader",
     "MotifPromptAdapter",
@@ -1512,6 +1599,7 @@ __all__ = [
     "ReaderConfig",
     "V3_1MotifPrompt",
     "dense_adjacency",
+    "pool_residues",
     "motif_rrwp",
     "typed_adjacency",
 ]

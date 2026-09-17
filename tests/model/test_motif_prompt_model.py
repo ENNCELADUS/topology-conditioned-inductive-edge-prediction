@@ -494,6 +494,70 @@ def test_interface_parameters_are_registered_trainable_but_gated_by_interface_op
     assert _model("one").interface_open is True
 
 
+def _swapped(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The same pairs with the endpoints exchanged."""
+    out = dict(batch)
+    out["emb_a"], out["emb_b"] = batch["emb_b"], batch["emb_a"]
+    out["len_a"], out["len_b"] = batch["len_b"], batch["len_a"]
+    return out
+
+
+def _padded(batch: dict[str, torch.Tensor], extra: int = 3) -> dict[str, torch.Tensor]:
+    """The same pairs with longer padding and unchanged true lengths."""
+    out = {key: value.clone() for key, value in batch.items()}
+    gen = torch.Generator().manual_seed(5)
+    for key in ("emb_a", "emb_b"):
+        tokens = batch[key]
+        tail = torch.randn(tokens.size(0), extra, tokens.size(2), generator=gen)
+        out[key] = torch.cat([tokens, tail], dim=1)
+    return out
+
+
+@pytest.mark.parametrize("token_source", ["graph", "direct"])
+def test_the_same_pair_scores_the_same_whatever_its_padding(token_source: str) -> None:
+    # Encoder padding masks do not zero the padded output states, so an unmasked
+    # pool makes a pair's tokens depend on the batch it was collated with; packed
+    # scoring gathers different padding than training does.
+    model = _model("two", token_source=token_source).eval().requires_grad_(False)
+    _open_gates(model)
+    batch = _pair_batch(n=4)
+    torch.testing.assert_close(
+        model(_padded(batch))["logits"], model(batch)["logits"], rtol=0, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("token_source", ["graph", "direct"])
+def test_the_prompt_scores_u_v_and_v_u_alike(token_source: str) -> None:
+    # The AB/BA aggregation cannot repair an order-dependent token: both
+    # orientations reuse the tokens computed from the original ordering.
+    model = _model("two", token_source=token_source).eval().requires_grad_(False)
+    _open_gates(model)
+    batch = _pair_batch(n=4)
+    torch.testing.assert_close(
+        model(_swapped(batch))["logits"], model(batch)["logits"], rtol=0, atol=1e-5
+    )
+
+
+def test_direct_tokens_exchange_the_endpoints_and_fix_the_relation() -> None:
+    model = _model("two", token_source="direct").eval().requires_grad_(False)
+    batch = _pair_batch(n=4)
+    encoded_a = model.base.encoder(batch["emb_a"], batch["len_a"])
+    encoded_b = model.base.encoder(batch["emb_b"], batch["len_b"])
+    weights = _weights(n=4)
+    forward = model.tokens_from_weights(
+        weights, encoded_a, encoded_b, batch["len_a"], batch["len_b"]
+    )
+    swapped = model.tokens_from_weights(
+        weights[:, list(SWAP_PERM)], encoded_b, encoded_a, batch["len_b"], batch["len_a"]
+    )
+    torch.testing.assert_close(swapped["topo_u"], forward["topo_v"], rtol=0, atol=1e-6)
+    torch.testing.assert_close(swapped["topo_v"], forward["topo_u"], rtol=0, atol=1e-6)
+    torch.testing.assert_close(swapped["topo_rel"], forward["topo_rel"], rtol=0, atol=1e-6)
+    torch.testing.assert_close(swapped["topo_cnt"], forward["topo_cnt"], rtol=0, atol=1e-6)
+    # The control really is endpoint-conditioned: the two tokens differ.
+    assert not torch.allclose(forward["topo_u"], forward["topo_v"])
+
+
 def _trainable_without_gradient(model: V3_1MotifPrompt, **batch_extra: torch.Tensor) -> list[str]:
     """Names of trainable parameters one forward/backward never reaches.
 
