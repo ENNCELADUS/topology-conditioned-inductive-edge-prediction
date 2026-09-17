@@ -1071,7 +1071,8 @@ class V3_1MotifPrompt(nn.Module):
         """Drop every parameter this configuration can never train.
 
         Two section 8 controls bypass a whole module: ``token_source='direct'``
-        never calls the reader, and ``gate_mode='mean_graph'`` returns the
+        never calls the student reader (the immutable teacher reads the graph
+        through its own frozen copy), and ``gate_mode='mean_graph'`` returns the
         installed mean adjacency without touching a generator parameter. Stage II
         additionally freezes the reader's role/input embeddings and every block
         but the last for the whole run (spec section 7.5). Production DDP wraps
@@ -1174,15 +1175,27 @@ class V3_1MotifPrompt(nn.Module):
         inside them and the prefix adapter with its gates (spec section 7.4), so
         the student never starts from a different Stage I checkpoint than its
         teacher.
+
+        The direct-token head is deliberately not a member. It is a student-side
+        substitution for the *prompt*, no Stage I checkpoint carries a trained
+        one, and a teacher routed through it would read the endpoints alone: both
+        ``_supervision_rows`` calls would then return identical ``topo_u``,
+        ``topo_v`` and ``topo_rel``, zeroing three of the four terms of
+        ``L_topo`` whatever the predicted and true adjacency, while spec section
+        8 advertises the ``token_source='direct'`` control as carrying the same
+        ``L_topo`` as the main arm.
         """
-        members: dict[str, nn.Module] = {
-            "reader": deepcopy(self.reader),
-            "count_head": deepcopy(self.count_head),
-            "adapter": deepcopy(self.adapter),
-        }
-        if self.direct_head is not None:
-            members["direct_head"] = deepcopy(self.direct_head)
-        self.teacher = nn.ModuleDict(members).requires_grad_(False).eval()
+        self.teacher = (
+            nn.ModuleDict(
+                {
+                    "reader": deepcopy(self.reader),
+                    "count_head": deepcopy(self.count_head),
+                    "adapter": deepcopy(self.adapter),
+                }
+            )
+            .requires_grad_(False)
+            .eval()
+        )
 
     def set_corruption_step(self, step: int, seed: int = 42) -> None:
         """Set reproducible Stage I corruption for this global training step.
@@ -1236,11 +1249,12 @@ class V3_1MotifPrompt(nn.Module):
             reader, count_head = self.reader, self.count_head
             direct_head: nn.Module | None = self.direct_head
         else:
+            # `R_T` always reads the graph, in every arm: `initialize_teacher`
+            # never puts a direct head in the bundle, so `L_topo` stays sensitive
+            # to the adjacency even for the direct-prefix control.
             reader = cast(MotifGritReader, bundle["reader"])
             count_head = cast(MotifCountHead, bundle["count_head"])
-            # `nn.ModuleDict` is not a `Mapping`, so membership is the only read.
-            has_direct = "direct_head" in bundle
-            direct_head = bundle["direct_head"] if has_direct else None
+            direct_head = None
         if direct_head is None:
             tokens: dict[str, torch.Tensor] = reader(weights)
         else:

@@ -646,6 +646,51 @@ def test_every_trainable_parameter_is_reached_by_one_backward() -> None:
     assert _trainable_without_gradient(_model("two")) == []
 
 
+def _teacher_tokens(
+    model: V3_1MotifPrompt, weights: torch.Tensor, batch: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """The immutable teacher's four token fields for one adjacency."""
+    encoded_a = model.base.encoder(batch["emb_a"], batch["len_a"])
+    encoded_b = model.base.encoder(batch["emb_b"], batch["len_b"])
+    bundle = cast(torch.nn.ModuleDict, model.teacher)
+    return model._tokens(  # noqa: SLF001
+        bundle, weights, encoded_a, encoded_b, batch["len_a"], batch["len_b"]
+    )
+
+
+def test_the_direct_control_reads_the_teachers_graph_for_every_token_field() -> None:
+    # Spec section 8 advertises this control as carrying the *same* `L_topo`.
+    # A teacher that routes through a direct head reads the endpoints alone, so
+    # `R_T(Ahat)` and `R_T(A*)` coincide on the three GRIT fields and three of
+    # the four representation constraints vanish whatever the adjacency.
+    model = _model("two", token_source="direct").eval().requires_grad_(False)
+    model.initialize_teacher()
+    batch = _pair_batch(n=4)
+    predicted = _teacher_tokens(model, _weights(n=4, seed=0), batch)
+    true = _teacher_tokens(model, _weights(n=4, seed=9), batch)
+    for field in ("topo_u", "topo_v", "topo_rel", "topo_cnt"):
+        assert not torch.allclose(predicted[field], true[field]), field
+
+
+def test_the_direct_controls_topo_term_is_not_the_count_field_alone() -> None:
+    from src.distill.motif_losses import TOPO_FIELDS, topo_loss_rows
+
+    model = _model("two", token_source="direct").eval().requires_grad_(False)
+    model.initialize_teacher()
+    batch = _pair_batch(n=4)
+    predicted = _teacher_tokens(model, _weights(n=4, seed=0), batch)
+    true = _teacher_tokens(model, _weights(n=4, seed=9), batch)
+    assert TOPO_FIELDS == ("topo_u", "topo_v", "topo_rel", "topo_cnt")
+    counts_only = {
+        field: (true[field] if field != "topo_cnt" else predicted[field]) for field in TOPO_FIELDS
+    }
+    full = topo_loss_rows(predicted, true)
+    assert (full > 0.0).all()
+    # Every token field carries part of the term, so masking the three graph
+    # fields out must change it.
+    assert not torch.allclose(full, topo_loss_rows(counts_only, true))
+
+
 def test_the_direct_token_control_freezes_the_bypassed_reader() -> None:
     # `token_source='direct'` never calls the reader, so leaving it trainable
     # kills the control on the second DDP iteration.
