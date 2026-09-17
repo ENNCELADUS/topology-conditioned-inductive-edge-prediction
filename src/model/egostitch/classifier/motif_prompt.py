@@ -1632,6 +1632,24 @@ class V3_1MotifPrompt(nn.Module):
             return nullcontext()
         return torch.autocast(device_type=device.type, enabled=False)
 
+    def supervises(self, batch: Mapping[str, torch.Tensor]) -> tuple[bool, bool]:
+        """Whether a forward over ``batch`` emits ``slot_loss_rows`` and ``topo_loss_rows``.
+
+        The trainer reads this before the task forward: the structural pass
+        backpropagates first, and its share of the per-stream composite needs
+        the task stream's global row count, which exists only if the task rows
+        will carry the term at all (spec section 7.5).
+
+        Args:
+            batch: The batch as the forward will see it.
+
+        Returns:
+            ``(slot, topo)`` flags.
+        """
+        slot = self.cfg.stage == "two" and TEMPLATE_KEY in batch
+        topo = slot and self.teacher is not None and self.cfg.w_topo != 0.0
+        return slot, topo
+
     def _supervision_rows(
         self,
         merged: Mapping[str, torch.Tensor],
@@ -1654,10 +1672,12 @@ class V3_1MotifPrompt(nn.Module):
         teacher read topology the generator is forbidden to produce -- and that the
         matching Stage I reader never received either.
         """
-        target = merged.get(TEMPLATE_KEY)
-        if self.cfg.stage != "two" or target is None:
+        emits_slot, emits_topo = self.supervises(merged)
+        if not emits_slot:
             return None, None
-        target = self._gate_families(target.to(device=weights.device, dtype=torch.float32))
+        target = self._gate_families(
+            merged[TEMPLATE_KEY].to(device=weights.device, dtype=torch.float32)
+        )
         mask = merged.get(TEMPLATE_MASK_KEY)
         row_mask = torch.ones_like(weights[:, 0]) if mask is None else mask.reshape(-1).to(weights)
         slot_row = (
@@ -1672,7 +1692,7 @@ class V3_1MotifPrompt(nn.Module):
             )
             * row_mask
         )
-        if self.teacher is None or self.cfg.w_topo == 0.0:
+        if not emits_topo:
             return slot_row, None
         bundle = cast(nn.ModuleDict, self.teacher)
         # Both sides run through the immutable teacher: `R_T(Ahat)` keeps autograd

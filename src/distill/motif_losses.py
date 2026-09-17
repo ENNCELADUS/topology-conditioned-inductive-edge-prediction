@@ -164,8 +164,8 @@ def stream_row_counts(rows: Sequence[torch.Tensor], masks: Sequence[torch.Tensor
     """Each stream's rank-local valid-row count, in stream order.
 
     A stream this rank holds no rows for counts zero, whatever its mask says: the
-    structural stream's chunks are distributed by token cost, so a rank can be
-    left without any of them.
+    structural stream's pairs are striped over the ranks per token boundary, so a
+    bucket with fewer pairs than ranks leaves a rank without any of them.
 
     Args:
         rows: One ``(n_s,)`` per-row tensor per stream.
@@ -201,9 +201,10 @@ def stream_mean(
     differentiable zero rather than dropping out of the graph, so DDP sees the
     same parameters on every rank (spec section 7.5).
 
-    Under DDP the per-stream mean has to be a *global* mean. Structural chunks are
-    distributed by token cost, so ranks hold unequal counts and a rank can hold no
-    structural row at all; dividing by rank-local counts and letting DDP average
+    Under DDP the per-stream mean has to be a *global* mean. Structural pairs are
+    striped over the ranks, so ranks hold counts that differ by up to one pair per
+    boundary and a rank can hold no structural row at all; dividing by rank-local
+    counts and letting DDP average
     the ranks equally then weights the streams by where their rows happened to
     land. The caller reduces `stream_row_counts` across ranks and passes them as
     ``global_counts``: each rank contributes its local sum over the global count,

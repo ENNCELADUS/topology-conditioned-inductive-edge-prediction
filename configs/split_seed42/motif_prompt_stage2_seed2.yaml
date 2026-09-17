@@ -95,16 +95,21 @@ struct:
   mmd_sigma: 1.25
   mmd_bins: 48
   val_subgraphs: 32
-  # The only legal memory lever (spec section 7.1): it chunks the sampled
-  # subgraph's pair scoring, so every legal pair is still scored exactly once
-  # into the same assembled logit matrix and the objective is unchanged.
-  # 98304 = one task batch per chunk (runtime.token_budget counts both sides of
-  # a pair, this budget one side), so one checkpointed chunk is recomputed
-  # beside the task batch's live graph. Measured 2026-09-17 on the H20: 8192
-  # gave 8-16 pairs per chunk against 512-1024-token nodes (~25 trunk forwards
-  # per rank per step) at 46 GiB/rank and ~19 steps/min; 98304 gives ~3 chunks
-  # per rank at 65-71 GiB/rank (nvidia-smi, 4 ranks) and ~27 steps/min.
+  # The memory levers (spec section 7.1); neither touches the objective, because
+  # every legal pair of the sampled subgraph is still scored exactly once into
+  # the same assembled logit matrix. The structural pass runs and backpropagates
+  # before the task forward, with the subgraph's pairs striped evenly over the
+  # ranks. token_budget chunks a rank's share (98304 = one task batch per chunk,
+  # one side, as runtime.token_budget counts both sides); resident_tokens is how
+  # many chunk tokens (both sides) a rank holds without activation checkpointing
+  # before the remaining chunks fall back to checkpoint-and-recompute.
+  # Measured 2026-09-17 on the H20 (4 ranks): the original 8192 gave 8-16 pairs
+  # per chunk against 512-1024-token nodes (~25 trunk forwards per rank per
+  # step) at 46 GiB/rank and ~19 steps/min; 98304 with the joint backward gave
+  # ~3 chunks per rank at 65-71 GiB/rank and ~27 steps/min. The split pass with
+  # 196608 resident tokens targets ~80 GiB/rank under the 85 GiB limit.
   # Neither subgraphs_per_epoch nor runtime.max_pairs_per_rank may be traded for
   # wall time: the first halves structural supervision, the second changes the
   # global batch, the optimizer-step count and hence the structural-subgraph count.
   token_budget: 98304
+  resident_tokens: 196608

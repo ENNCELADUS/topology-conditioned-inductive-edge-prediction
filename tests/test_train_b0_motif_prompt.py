@@ -1178,3 +1178,75 @@ def test_every_trainable_parameter_receives_a_gradient_in_one_step() -> None:
         if param.requires_grad and param.grad is None
     ]
     assert missing == []
+
+
+# ------------------------------------------- the composite split across the two backward passes
+
+
+def test_split_composite_shares_sum_to_the_joint_composite() -> None:
+    from src.train_b0 import _empty_motif_stream, _motif_stream_counts, _motif_stream_terms
+
+    gen = torch.Generator().manual_seed(3)
+    like = torch.zeros((), requires_grad=True)
+    task = (
+        {"slot": torch.rand(6, generator=gen), "topo": torch.rand(6, generator=gen)},
+        torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0]),
+    )
+    struct = (
+        {"slot": torch.rand(4, generator=gen), "topo": torch.rand(4, generator=gen)},
+        torch.ones(4),
+    )
+    counts = [2.0 * value for value in _motif_stream_counts(task=task, struct=struct)]
+    joint = _motif_stream_terms(
+        task=task, struct=struct, like=like, global_counts=counts, world_size=2
+    )
+    struct_share = _motif_stream_terms(
+        task=_empty_motif_stream(like), struct=struct, like=like, global_counts=counts, world_size=2
+    )
+    task_share = _motif_stream_terms(
+        task=task, struct=_empty_motif_stream(like), like=like, global_counts=counts, world_size=2
+    )
+    for whole, first, second in zip(joint, struct_share, task_share, strict=True):
+        torch.testing.assert_close(whole, first + second)
+    assert float(struct_share[0]) > 0.0 and float(task_share[0]) > 0.0
+    # The stand-in keeps the stream count at two: neither share is the lone-stream mean.
+    alone = _motif_stream_terms(
+        task=task, struct=None, like=like, global_counts=counts[::2], world_size=2
+    )
+    assert float(alone[0]) != pytest.approx(float(task_share[0]))
+
+
+@pytest.mark.parametrize("stage", ["one", "two"])
+def test_task_stub_counts_match_the_rows_the_forward_emits(stage: str) -> None:
+    from src.model.egostitch.classifier.motif_prompt import TEMPLATE_MASK_KEY
+    from src.train_b0 import _motif_stream_counts, _motif_task_stub
+
+    model = _model(stage)
+    if stage == "two":
+        model.initialize_teacher()
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    batch[TEMPLATE_MASK_KEY] = torch.tensor([1.0, 1.0, 0.0, 1.0])
+    output = model(batch)
+    like = output["loss"]
+    emitted = (
+        {
+            "slot": output.get("slot_loss_rows", like.new_zeros(0)),
+            "topo": output.get("topo_loss_rows", like.new_zeros(0)),
+        },
+        batch[TEMPLATE_MASK_KEY],
+    )
+    stub = _motif_task_stub(model, batch, like=like)
+    assert _motif_stream_counts(task=stub, struct=None) == _motif_stream_counts(
+        task=emitted, struct=None
+    )
+    if stage == "two":
+        assert _motif_stream_counts(task=stub, struct=None)[0] == 3.0
+    else:
+        assert _motif_stream_counts(task=stub, struct=None) == [0.0, 0.0]
+    # Without a template the forward emits no rows, and the stub says so too.
+    bare = _pair_batch(n=4)
+    assert _motif_stream_counts(task=_motif_task_stub(model, bare, like=like), struct=None) == [
+        0.0,
+        0.0,
+    ]

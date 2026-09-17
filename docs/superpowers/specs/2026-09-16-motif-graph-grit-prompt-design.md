@@ -429,7 +429,11 @@ Two streams, as in the established two-stage recipe:
 
   The one true chunking lever is **`struct.token_budget`**: it sets `per_chunk` within a subgraph's pair
   scoring only, so every legal pair of the sampled subgraph is still scored exactly once into the same
-  assembled logit matrix and the objective is unchanged. Take memory there first. If `max_pairs_per_rank` must
+  assembled logit matrix and the objective is unchanged. Take memory there first. Since 2026-09-17 the
+  structural pass forwards and backpropagates *before* the task forward, with the subgraph's pairs striped
+  evenly over the ranks, and **`struct.resident_tokens`** sets how many chunk tokens a rank holds without
+  checkpoint recompute; both are compute and memory details that leave the objective unchanged (the pair
+  logits are all-reduced with autograd, so the parameter gradient equals the joint backward's). If `max_pairs_per_rank` must
   still move, treat it as a batching-protocol change: either hold the logical batch and the per-step structural
   draw fixed with gradient accumulation, or apply the identical cap to **every** control in §8 and say so in the
   result note. The same rule governs a frequency change, which may additionally be compensated by scaling the

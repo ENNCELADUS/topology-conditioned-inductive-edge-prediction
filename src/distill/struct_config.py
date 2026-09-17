@@ -16,7 +16,9 @@ from dataclasses import dataclass, field, fields
 
 WEIGHT_KEYS: tuple[str, ...] = ("bce", "gs", "rd", "deg_mmd", "rank", "degree", "motif")
 KINDS: tuple[str, ...] = ("bfs", "motif", "bridge")
-_INT_FIELDS = frozenset({"nodes", "background_nodes", "mmd_bins", "val_subgraphs"})
+_INT_FIELDS = frozenset(
+    {"nodes", "background_nodes", "mmd_bins", "val_subgraphs", "resident_tokens"}
+)
 _FLOAT_FIELDS = frozenset({"rank_margin", "rank_temperature", "huber_delta", "mmd_sigma", "scale"})
 
 
@@ -47,9 +49,15 @@ class StructConfig:
         mmd_bins: Number of degree histogram centres on ``[0, n-1]``.
         val_subgraphs: Fixed V_val diagnostic subgraph count.
         token_budget: Token budget per forwarded chunk of subgraph pairs; ``None``
-            uses ``data.token_budget``. A smaller chunk lowers the stream's peak
-            memory (the checkpointed chunk lives beside the task batch) without
-            touching the task stream's epoch plan.
+            uses ``data.token_budget``. A smaller chunk lowers the peak of the
+            structural pass (one recomputed chunk at a time) without touching the
+            task stream's epoch plan.
+        resident_tokens: Chunk tokens this rank forwards per structural step
+            *without* activation checkpointing, counting both sides of a pair as
+            ``runtime.token_budget`` does; the chunks beyond it are checkpointed
+            and recomputed in the backward. ``0`` checkpoints every chunk. The
+            structural pass runs and backpropagates before the task forward, so
+            its resident activations never sit beside the task batch's.
     """
 
     nodes: int = 40
@@ -65,6 +73,7 @@ class StructConfig:
     mmd_bins: int = 48
     val_subgraphs: int = 32
     token_budget: int | None = None
+    resident_tokens: int = 0
 
     def __post_init__(self) -> None:
         """Validate ranges, the kind mix, and the weight pattern.
@@ -96,6 +105,8 @@ class StructConfig:
             isinstance(self.token_budget, bool) or self.token_budget < 1
         ):
             raise ValueError("struct.token_budget must be a positive integer or null")
+        if isinstance(self.resident_tokens, bool) or self.resident_tokens < 0:
+            raise ValueError("struct.resident_tokens must be a non-negative integer")
         unknown = sorted(set(self.weights) - set(WEIGHT_KEYS))
         if unknown:
             raise ValueError(f"unknown struct weight keys: {unknown}")

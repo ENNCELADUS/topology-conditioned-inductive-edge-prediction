@@ -65,11 +65,13 @@ def test_every_motif_config_runs_the_retained_structural_stream(name: str) -> No
 
 @pytest.mark.parametrize("name", ARMS)
 def test_every_motif_config_shares_one_chunking_and_batching_protocol(name: str) -> None:
-    # struct.token_budget is the only pure memory lever; subgraphs_per_epoch and
-    # runtime.max_pairs_per_rank change the objective or the batching protocol,
-    # so a single value of each covers the whole family (spec section 7.1).
+    # struct.token_budget and struct.resident_tokens are the pure memory levers;
+    # subgraphs_per_epoch and runtime.max_pairs_per_rank change the objective or
+    # the batching protocol, so a single value of each covers the whole family
+    # (spec section 7.1).
     cfg = load_config(CONFIG_DIR / name)
-    assert cfg.struct is not None and cfg.struct.token_budget == 8192
+    assert cfg.struct is not None and cfg.struct.token_budget == 98304
+    assert cfg.struct.resident_tokens == 196608
     assert cfg.runtime is not None and cfg.runtime.max_pairs_per_rank == 1536
 
 

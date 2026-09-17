@@ -16,6 +16,7 @@ import yaml
 from accelerate import Accelerator
 from src.data.motif_template import MotifTemplateTable
 from src.data.packed_features import PackedFeatureManifest, PackedFeatureTable, PackedNodeRecord
+from src.data.pairs import BUCKET_BOUNDARIES
 from src.data.struct_sampler import StructSampler
 from src.distill.struct_config import StructConfig
 from src.distill.struct_losses import struct_anchor_kl, struct_total
@@ -26,6 +27,7 @@ from src.train_b0 import (
     TopoPromptRows,
     ValidationOutcome,
     _grad_norm,
+    _stripe_struct_chunks,
     _struct_grad_norm,
     config_to_dict,
     load_config,
@@ -89,10 +91,12 @@ class _StructToy(nn.Module):
         self.weight = nn.Parameter(torch.tensor(0.1))
         self.forward_calls = 0
         self.batch_sizes: list[int] = []
+        self.boundaries: list[int] = []
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         self.forward_calls += 1
         self.batch_sizes.append(int(batch["emb_a"].shape[0]))
+        self.boundaries.append(int(batch["emb_a"].shape[1]))
         a = batch["emb_a"].sum(dim=(1, 2))
         b = batch["emb_b"].sum(dim=(1, 2))
         return {"logits": self.weight * (a - b).square() - 1.0}
@@ -209,6 +213,95 @@ def _stream(
     )
 
 
+def _struct_chunk_plans(world_size: int, token_budget: int) -> list[list[tuple[int, list[int]]]]:
+    """Every rank's striped chunk plan for the subgraph `_run_distributed_struct_step` scores."""
+    sampler, table = _struct_fixture()
+    stream = _stream(sampler, table, world_size=world_size, token_budget=token_budget)
+    subgraph = stream._epoch_plan(epoch=2, steps=1).subgraphs[0]
+    mask = sampler.legal_mask(subgraph)
+    index = table.manifest.node_index()
+    n = len(subgraph.nodes)
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n) if mask[i, j] > 0]
+    buckets: dict[int, list[int]] = {boundary: [] for boundary in BUCKET_BOUNDARIES}
+    for row, (i, j) in enumerate(pairs):
+        length = max(
+            table.manifest.nodes[index[subgraph.nodes[i]]].length,
+            table.manifest.nodes[index[subgraph.nodes[j]]].length,
+        )
+        buckets[next(b for b in BUCKET_BOUNDARIES if length <= b)].append(row)
+    return [
+        _stripe_struct_chunks(buckets, rank=rank, world_size=world_size, token_budget=token_budget)
+        for rank in range(world_size)
+    ]
+
+
+def test_striped_chunks_balance_every_bucket_and_cover_each_row_once() -> None:
+    buckets = {1: list(range(5)), 2: list(range(5, 12)), 3: list(range(12, 15))}
+    plans = [
+        _stripe_struct_chunks(buckets, rank=rank, world_size=4, token_budget=6) for rank in range(4)
+    ]
+    rows = sorted(row for plan in plans for _, chunk in plan for row in chunk)
+    assert rows == list(range(15))
+    for plan in plans:
+        for boundary, chunk in plan:
+            assert 1 <= len(chunk) <= max(1, 6 // boundary)
+    per_bucket = {
+        boundary: [sum(len(chunk) for b, chunk in plan if b == boundary) for plan in plans]
+        for boundary in buckets
+    }
+    assert all(max(counts) - min(counts) <= 1 for counts in per_bucket.values())
+    # Three rows at boundary 3 over four ranks: the last rank holds none of them.
+    assert per_bucket[3] == [1, 1, 1, 0]
+    # Bucket order is kept, so a rank's chunks run from the cheapest boundary up.
+    assert [boundary for boundary, _ in plans[0]] == sorted(boundary for boundary, _ in plans[0])
+    whole = _stripe_struct_chunks(buckets, rank=0, world_size=1, token_budget=1 << 20)
+    assert [row for _, chunk in whole for row in chunk] == list(range(15))
+    assert len(whole) == 3
+
+
+def test_resident_tokens_hold_leading_chunks_without_recompute() -> None:
+    sampler, table = _struct_fixture()
+
+    def run(resident_tokens: int) -> tuple[_StructToy, int]:
+        stream = _stream(sampler, table, token_budget=3)  # many chunks
+        stream.config = replace(stream.config, resident_tokens=resident_tokens)
+        model = _StructToy()
+        loss, _ = stream.loss(model, epoch=1, step=0, steps=4)
+        chunks = model.forward_calls
+        loss.backward()  # type: ignore[no-untyped-call]
+        return model, chunks
+
+    checkpointed, chunks = run(0)
+    assert chunks > 1
+    assert checkpointed.forward_calls == 2 * chunks  # every chunk recomputed in the backward
+    first_chunk_tokens = 2 * checkpointed.batch_sizes[0] * checkpointed.boundaries[0]
+    partial, resident_chunks = run(first_chunk_tokens)
+    assert resident_chunks == chunks
+    assert partial.forward_calls == 2 * chunks - 1  # exactly the first chunk was kept
+    resident, all_chunks = run(1 << 20)
+    assert all_chunks == chunks
+    assert resident.forward_calls == chunks  # nothing recomputed
+    # Residency changes recompute only, never the gradient.
+    assert checkpointed.weight.grad is not None and resident.weight.grad is not None
+    torch.testing.assert_close(resident.weight.grad, checkpointed.weight.grad)
+    assert partial.weight.grad is not None
+    torch.testing.assert_close(partial.weight.grad, checkpointed.weight.grad)
+
+
+def test_a_rank_beyond_every_bucket_still_scores_a_differentiable_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampler, table = _struct_fixture()
+    monkeypatch.setattr("src.train_b0.differentiable_all_reduce", lambda flat, op: flat)
+    stream = _stream(sampler, table, rank=63, world_size=64)
+    model = _StructToy()
+    loss, stats = stream.loss(model, epoch=1, step=0, steps=1)
+    assert model.forward_calls == 0
+    assert stats["struct_pairs"] > 0  # the subgraph exists; this rank just holds no chunk
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert model.weight.grad is not None
+
+
 def test_stream_assembles_the_same_logits_as_a_direct_forward() -> None:
     sampler, table = _struct_fixture()
     stream = _stream(sampler, table, token_budget=3)  # forces many small chunks
@@ -275,10 +368,7 @@ def test_four_rank_plan_replicates_each_global_subgraph(count: int) -> None:
     stream = _stream(sampler, table, world_size=4)
     steps = 272
     schedules = [
-        [
-            stream._positions(count, rank=rank, steps=steps, step=step)
-            for step in range(steps)
-        ]
+        [stream._positions(count, rank=rank, steps=steps, step=step) for step in range(steps)]
         for rank in range(4)
     ]
     assert all(schedule == schedules[0] for schedule in schedules[1:])
@@ -511,9 +601,7 @@ def _run_distributed_struct_step(
         positive_weight=5.0,
         label_smoothing=0.0,
     )
-    term_norms = {
-        key: _struct_grad_norm(term, model, world_size) for key, term in terms.items()
-    }
+    term_norms = {key: _struct_grad_norm(term, model, world_size) for key, term in terms.items()}
     total.backward()  # type: ignore[no-untyped-call]
     gradient = (
         torch.zeros_like(model.weight)
@@ -812,27 +900,32 @@ def _struct_ddp_worker(
 @pytest.mark.parametrize(
     ("world_size", "count", "token_budget"),
     [(2, None, 128), (4, 1, 1 << 20)],
-    ids=["two-rank-chunked", "four-rank-empty-workers"],
+    ids=["two-rank-chunked", "four-rank-striped"],
 )
 def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
     tmp_path: Path, world_size: int, count: int | None, token_budget: int
 ) -> None:
-    # The second case gives the whole subgraph one chunk, so ranks 1-3 must still
-    # participate in the score and grad-norm collectives before shared task backward.
+    # Pairs are striped over the ranks per token boundary; a rank left without a
+    # chunk of some bucket still joins the score and grad-norm collectives, and
+    # the structural backward runs before the synced task backward.
     spawn(  # type: ignore[no-untyped-call]
         _struct_ddp_worker,
         args=(world_size, str(tmp_path / "init"), str(tmp_path), count, token_budget),
         nprocs=world_size,
         join=True,
     )
-    expected_step = _run_distributed_struct_step(
-        rank=0, world_size=1, token_budget=token_budget
-    )
+    expected_step = _run_distributed_struct_step(rank=0, world_size=1, token_budget=token_budget)
     expected_coord_gen = (
         _run_coord_gen_anchor_step(rank=0, world_size=1) if world_size == 4 else None
     )
     expected = _run_struct_ddp_fixture(tmp_path / "serial", rank=0, world_size=1, count=count)
-    forward_calls = 0
+    plans = _struct_chunk_plans(world_size, token_budget)
+    serial_chunks = len(_struct_chunk_plans(1, token_budget)[0])
+    assert sum(len(plan) for plan in plans) >= serial_chunks
+    # Every chunk is checkpointed (no resident budget): one forward, then one
+    # recompute per grad-norm probe term and one for the backward.
+    forwards_per_chunk, remainder = divmod(expected_step["forward_calls"], serial_chunks)
+    assert remainder == 0 and forwards_per_chunk == 2 + len(expected_step["terms"])
     stochastic_reference: dict[str, torch.Tensor] | None = None
     ddp_prompt_reference: dict[str, torch.Tensor] | None = None
     for rank in range(world_size):
@@ -842,9 +935,7 @@ def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
             observed_step["logits"], expected_step["logits"], rtol=1e-4, atol=1e-6
         )
         for key, value in expected_step["terms"].items():
-            torch.testing.assert_close(
-                observed_step["terms"][key], value, rtol=1e-4, atol=1e-6
-            )
+            torch.testing.assert_close(observed_step["terms"][key], value, rtol=1e-4, atol=1e-6)
             assert observed_step["term_norms"][key] == pytest.approx(
                 expected_step["term_norms"][key], rel=1e-4, abs=1e-6
             )
@@ -854,7 +945,7 @@ def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
         torch.testing.assert_close(
             observed_step["weight"], expected_step["weight"], rtol=1e-4, atol=1e-6
         )
-        forward_calls += observed_step["forward_calls"]
+        assert observed_step["forward_calls"] == forwards_per_chunk * len(plans[rank])
         observed = payload["state"]
         for key in expected:
             torch.testing.assert_close(observed[key], expected[key], rtol=1e-4, atol=1e-6)
@@ -897,16 +988,6 @@ def test_real_ddp_struct_training_and_sparse_telemetry_match_serial(
                     torch.testing.assert_close(
                         payload["stochastic_state"][key], value, rtol=1e-4, atol=1e-6
                     )
-    assert forward_calls == expected_step["forward_calls"]
-    if world_size == 4:
-        assert torch.load(tmp_path / "rank-0.pt", weights_only=True)["step"]["forward_calls"] > 0
-        for rank in range(1, world_size):
-            assert (
-                torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True)["step"][
-                    "forward_calls"
-                ]
-                == 0
-            )
     ddp_row = json.loads((tmp_path / "ddp" / "metrics.jsonl").read_text().splitlines()[-1])
     serial_row = json.loads((tmp_path / "serial" / "metrics.jsonl").read_text().splitlines()[-1])
     for key in ("train_struct_loss", "struct_bce_loss", "struct_motif_loss", "struct_pairs"):

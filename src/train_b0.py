@@ -852,7 +852,7 @@ def _motif_stream_counts(
     """This rank's valid-row counts: every stream's ``L_slot``, then every ``L_topo``.
 
     The caller sums the vector across ranks and hands it back to
-    `_motif_stream_terms`: structural chunks are distributed by token cost, so a
+    `_motif_stream_terms`: structural pairs are striped over the ranks, so a
     rank-local count is not the count the per-stream mean needs (spec 7.5).
 
     Args:
@@ -906,6 +906,74 @@ def _motif_stream_terms(
         stream_mean(slot_rows, masks, like=like, global_counts=slot_counts, world_size=world_size),
         stream_mean(topo_rows, masks, like=like, global_counts=topo_counts, world_size=world_size),
     )
+
+
+def _empty_motif_stream(like: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """A stream with no rows on this rank: it keeps its place in the composite.
+
+    With the structural and task streams backpropagated separately, each pass
+    hands `_motif_stream_terms` the other stream as this stand-in: under the
+    shared global counts the stand-in contributes an exact zero, so the two
+    passes' shares sum to the joint composite.
+
+    Args:
+        like: A tensor supplying dtype and device.
+
+    Returns:
+        ``(rows, mask)`` with empty ``slot`` and ``topo`` rows and an empty mask.
+    """
+    empty = like.new_zeros(0)
+    return {"slot": empty, "topo": empty}, empty
+
+
+def _motif_task_stub(
+    model: V3_1MotifPrompt, batch: Mapping[str, torch.Tensor], *, like: torch.Tensor
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Stand-in for the task stream's rows before its forward has run.
+
+    `_motif_stream_counts` reads only whether a stream holds rows and its mask,
+    so placeholder rows shaped like the ones the forward will emit give the
+    structural pass the task count the composite needs.
+
+    Args:
+        model: The unwrapped motif-prompt model.
+        batch: The task batch, with its template mask attached.
+        like: A tensor supplying dtype and device.
+
+    Returns:
+        ``(rows, mask)`` in `_motif_stream_terms`'s task-stream form.
+    """
+    mask = batch.get(TEMPLATE_MASK_KEY, like.new_zeros(0)).reshape(-1)
+    emits_slot, emits_topo = model.supervises(batch)
+    return (
+        {
+            "slot": torch.ones_like(mask) if emits_slot else like.new_zeros(0),
+            "topo": torch.ones_like(mask) if emits_topo else like.new_zeros(0),
+        },
+        mask,
+    )
+
+
+def _reduce_motif_counts(
+    local_counts: Sequence[float], accelerator: Accelerator, *, world_size: int
+) -> list[float]:
+    """Sum `_motif_stream_counts` over ranks (one collective; rank-uniform by construction).
+
+    Args:
+        local_counts: This rank's counts.
+        accelerator: The run's accelerator.
+        world_size: Ranks in the run; a single rank returns the counts unchanged.
+
+    Returns:
+        The global counts.
+    """
+    if world_size <= 1:
+        return [float(value) for value in local_counts]
+    reduced = accelerator.reduce(
+        torch.tensor(list(local_counts), device=accelerator.device, dtype=torch.float64),
+        reduction="sum",
+    )
+    return [float(value) for value in reduced.tolist()]
 
 
 def _motif_epoch_telemetry(*, slot_sum: float, topo_sum: float, steps: int) -> dict[str, float]:
@@ -4732,15 +4800,48 @@ def _coordinate_fit_metrics(
     return result
 
 
+def _stripe_struct_chunks(
+    buckets: Mapping[int, Sequence[int]], *, rank: int, world_size: int, token_budget: int
+) -> list[tuple[int, list[int]]]:
+    """This rank's structural chunks as ``(boundary, rows)``, striped per bucket.
+
+    Every bucket's rows are dealt round-robin over the ranks, so each rank holds
+    the same share of every token boundary to within one pair and the ranks
+    finish the structural pass together; only then is a rank's share cut to
+    ``token_budget // boundary`` pairs per chunk. The plan depends on the bucket
+    contents alone, so every rank derives the same global plan, and a bucket
+    with fewer rows than ranks leaves the higher ranks without a chunk of it.
+
+    Args:
+        buckets: Pair rows per token boundary, in boundary order.
+        rank: This rank.
+        world_size: Ranks sharing the subgraph (``1`` scores it whole).
+        token_budget: One-sided token budget per chunk.
+
+    Returns:
+        The chunks in bucket order, each at most ``token_budget // boundary`` rows.
+    """
+    chunks: list[tuple[int, list[int]]] = []
+    for boundary, rows in buckets.items():
+        share = list(rows[rank::world_size])
+        per_chunk = max(1, token_budget // boundary)
+        for start in range(0, len(share), per_chunk):
+            chunks.append((boundary, share[start : start + per_chunk]))
+    return chunks
+
+
 class StructStream:
     """One sampled training subgraph per optimizer step, scored as a logit matrix.
 
     Sibling of :class:`KDContextStream`: the plan for ``(seed, epoch)`` is
     identical on every rank. Subgraphs are spread over global optimizer steps
-    first, then each subgraph's chunks are distributed over the ranks. Legal pairs
-    are bucketed by token boundary, chunked to the token budget, and forwarded
-    through the unwrapped model under activation checkpointing; the loss is
-    computed on the assembled ``n x n`` matrix (`src/distill/struct_losses.py`).
+    first, then each subgraph's legal pairs are bucketed by token boundary,
+    striped over the ranks (`_stripe_struct_chunks`) and chunked to the token
+    budget. Chunks are forwarded through the unwrapped model; the first
+    ``struct.resident_tokens`` tokens of them keep their activations and the rest
+    are activation-checkpointed. The loss is computed on the assembled ``n x n``
+    matrix (`src/distill/struct_losses.py`), whose logits are all-reduced with
+    autograd, so the striping is a compute detail and never touches the objective.
     """
 
     def __init__(
@@ -4927,132 +5028,136 @@ class StructStream:
                     motif_table.weights_by_index(np.asarray(left), np.asarray(right))
                 ).to(device)
 
-        rank_cost = [0] * self._world_size
-        for boundary, rows in buckets.items():
-            per_chunk = max(1, self._token_budget // boundary)
-            for start in range(0, len(rows), per_chunk):
-                chunk = rows[start : start + per_chunk]
-                if distributed:
-                    owner = min(range(self._world_size), key=lambda rank: rank_cost[rank])
-                    rank_cost[owner] += len(chunk) * boundary * boundary
-                    if owner != self._rank:
-                        continue
-                coords = pair_coords[chunk] if pair_coords is not None else None
-                templates = pair_templates[chunk] if pair_templates is not None else None
-                anchor = torch.as_tensor(
-                    [packed[pairs[r][0]] for r in chunk], dtype=torch.int64, device=device
-                )
-                partner = torch.as_tensor(
-                    [packed[pairs[r][1]] for r in chunk], dtype=torch.int64, device=device
+        chunks = _stripe_struct_chunks(
+            buckets,
+            rank=self._rank if distributed else 0,
+            world_size=self._world_size if distributed else 1,
+            token_budget=self._token_budget,
+        )
+        resident_left = int(self.config.resident_tokens)
+        for boundary, chunk in chunks:
+            # Checkpoint (and recompute in the backward) only the chunks beyond
+            # the resident token budget; both sides of a pair count.
+            recompute = torch.is_grad_enabled()
+            if recompute and 2 * len(chunk) * boundary <= resident_left:
+                resident_left -= 2 * len(chunk) * boundary
+                recompute = False
+            coords = pair_coords[chunk] if pair_coords is not None else None
+            templates = pair_templates[chunk] if pair_templates is not None else None
+            anchor = torch.as_tensor(
+                [packed[pairs[r][0]] for r in chunk], dtype=torch.int64, device=device
+            )
+            partner = torch.as_tensor(
+                [packed[pairs[r][1]] for r in chunk], dtype=torch.int64, device=device
+            )
+
+            def chunk_batch(
+                anchor: torch.Tensor,
+                partner: torch.Tensor,
+                boundary: int,
+                coords: torch.Tensor | None,
+                templates: torch.Tensor | None,
+            ) -> dict[str, torch.Tensor]:
+                # `boundary` is explicit: a closure over the loop variable
+                # would recompute every chunk at the last bucket.
+                emb_a, len_a = self._table.gather_nodes(anchor, boundary)
+                emb_b, len_b = self._table.gather_nodes(partner, boundary)
+                batch = {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
+                if isinstance(raw_model, V3_1TopoPrompt):
+                    assert coords is not None
+                    batch[COORDS_KEY] = coords
+                if templates is not None:
+                    batch[TEMPLATE_KEY] = templates
+                return batch
+
+            def forward(
+                anchor: torch.Tensor,
+                partner: torch.Tensor,
+                boundary: int,
+                coords: torch.Tensor | None,
+            ) -> torch.Tensor:
+                batch = chunk_batch(anchor, partner, boundary, coords, None)
+                output = cast(dict[str, torch.Tensor], raw_model(batch))
+                out = output["logits"]
+                if out.dim() > 1 and out.size(-1) == 1:
+                    out = out.squeeze(-1)
+                return out.float()
+
+            def motif_forward(
+                anchor: torch.Tensor,
+                partner: torch.Tensor,
+                boundary: int,
+                templates: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                """Score one chunk; motif rows also carry their L_slot/L_topo terms.
+
+                The rows are computed inside the checkpointed region, so they
+                have to leave it as outputs: an intermediate stashed on the
+                model would be freed and recomputed with no path back to G.
+                Only this family takes this branch; every other arm keeps the
+                single-tensor ``forward`` above unchanged.
+                """
+                batch = chunk_batch(anchor, partner, boundary, None, templates)
+                output = cast(dict[str, torch.Tensor], raw_model(batch))
+                out = output["logits"]
+                if out.dim() > 1 and out.size(-1) == 1:
+                    out = out.squeeze(-1)
+                out = out.float()
+                # A row tensor is always returned, so an arm without a teacher
+                # (or with ``w_topo == 0``) still contributes a differentiable
+                # zero and every rank stacks the same shapes.
+                zero = out.new_zeros(out.shape[0]) + out.sum() * 0.0
+                return (
+                    out,
+                    output.get("slot_loss_rows", zero).float(),
+                    output.get("topo_loss_rows", zero).float(),
                 )
 
-                def chunk_batch(
-                    anchor: torch.Tensor,
-                    partner: torch.Tensor,
-                    boundary: int,
-                    coords: torch.Tensor | None,
-                    templates: torch.Tensor | None,
-                ) -> dict[str, torch.Tensor]:
-                    # `boundary` is explicit: a closure over the loop variable
-                    # would recompute every chunk at the last bucket.
+            if templates is not None:
+                motif_out = (
+                    cast(
+                        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                        checkpoint(
+                            motif_forward,
+                            anchor,
+                            partner,
+                            boundary,
+                            templates,
+                            use_reentrant=False,
+                        ),
+                    )
+                    if recompute
+                    else motif_forward(anchor, partner, boundary, templates)
+                )
+                chunk_logits = motif_out[0]
+                slot_parts.append(motif_out[1])
+                topo_parts.append(motif_out[2])
+            elif recompute:
+                chunk_logits = cast(
+                    torch.Tensor,
+                    checkpoint(forward, anchor, partner, boundary, coords, use_reentrant=False),
+                )
+            else:
+                chunk_logits = forward(anchor, partner, boundary, coords)
+            parts.append(chunk_logits)
+            # The teacher pass feeds only the anchor KD; arms with w_anchor == 0
+            # (factorial A and C) skip it so the matched pairs cost the same.
+            if needs_teacher:
+                assert isinstance(raw_model, V3_1CoordGen) and coords is not None
+                with torch.no_grad(), self._autocast():
                     emb_a, len_a = self._table.gather_nodes(anchor, boundary)
                     emb_b, len_b = self._table.gather_nodes(partner, boundary)
-                    batch = {"emb_a": emb_a, "emb_b": emb_b, "len_a": len_a, "len_b": len_b}
-                    if isinstance(raw_model, V3_1TopoPrompt):
-                        assert coords is not None
-                        batch[COORDS_KEY] = coords
-                    if templates is not None:
-                        batch[TEMPLATE_KEY] = templates
-                    return batch
-
-                def forward(
-                    anchor: torch.Tensor,
-                    partner: torch.Tensor,
-                    boundary: int,
-                    coords: torch.Tensor | None,
-                ) -> torch.Tensor:
-                    batch = chunk_batch(anchor, partner, boundary, coords, None)
-                    output = cast(dict[str, torch.Tensor], raw_model(batch))
-                    out = output["logits"]
-                    if out.dim() > 1 and out.size(-1) == 1:
-                        out = out.squeeze(-1)
-                    return out.float()
-
-                def motif_forward(
-                    anchor: torch.Tensor,
-                    partner: torch.Tensor,
-                    boundary: int,
-                    templates: torch.Tensor,
-                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                    """Score one chunk; motif rows also carry their L_slot/L_topo terms.
-
-                    The rows are computed inside the checkpointed region, so they
-                    have to leave it as outputs: an intermediate stashed on the
-                    model would be freed and recomputed with no path back to G.
-                    Only this family takes this branch; every other arm keeps the
-                    single-tensor ``forward`` above unchanged.
-                    """
-                    batch = chunk_batch(anchor, partner, boundary, None, templates)
-                    output = cast(dict[str, torch.Tensor], raw_model(batch))
-                    out = output["logits"]
-                    if out.dim() > 1 and out.size(-1) == 1:
-                        out = out.squeeze(-1)
-                    out = out.float()
-                    # A row tensor is always returned, so an arm without a teacher
-                    # (or with ``w_topo == 0``) still contributes a differentiable
-                    # zero and every rank stacks the same shapes.
-                    zero = out.new_zeros(out.shape[0]) + out.sum() * 0.0
-                    return (
-                        out,
-                        output.get("slot_loss_rows", zero).float(),
-                        output.get("topo_loss_rows", zero).float(),
+                    teacher_output = raw_model.teacher(
+                        {
+                            "emb_a": emb_a,
+                            "emb_b": emb_b,
+                            "len_a": len_a,
+                            "len_b": len_b,
+                            COORDS_KEY: coords,
+                        }
                     )
-
-                if templates is not None:
-                    motif_out = (
-                        cast(
-                            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                            checkpoint(
-                                motif_forward,
-                                anchor,
-                                partner,
-                                boundary,
-                                templates,
-                                use_reentrant=False,
-                            ),
-                        )
-                        if torch.is_grad_enabled()
-                        else motif_forward(anchor, partner, boundary, templates)
-                    )
-                    chunk_logits = motif_out[0]
-                    slot_parts.append(motif_out[1])
-                    topo_parts.append(motif_out[2])
-                elif torch.is_grad_enabled():
-                    chunk_logits = cast(
-                        torch.Tensor,
-                        checkpoint(forward, anchor, partner, boundary, coords, use_reentrant=False),
-                    )
-                else:
-                    chunk_logits = forward(anchor, partner, boundary, coords)
-                parts.append(chunk_logits)
-                # The teacher pass feeds only the anchor KD; arms with w_anchor == 0
-                # (factorial A and C) skip it so the matched pairs cost the same.
-                if needs_teacher:
-                    assert isinstance(raw_model, V3_1CoordGen) and coords is not None
-                    with torch.no_grad(), self._autocast():
-                        emb_a, len_a = self._table.gather_nodes(anchor, boundary)
-                        emb_b, len_b = self._table.gather_nodes(partner, boundary)
-                        teacher_output = raw_model.teacher(
-                            {
-                                "emb_a": emb_a,
-                                "emb_b": emb_b,
-                                "len_a": len_a,
-                                "len_b": len_b,
-                                COORDS_KEY: coords,
-                            }
-                        )
-                        teacher_parts.append(teacher_output["logits"].reshape(-1).float())
-                local_rows.extend(chunk)
+                    teacher_parts.append(teacher_output["logits"].reshape(-1).float())
+            local_rows.extend(chunk)
         # Connect an empty rank to a trainable parameter so autograd.grad probes
         # also traverse the collective (an independent leaf would be pruned).
         dependency = next(p for p in raw_model.parameters() if p.requires_grad).sum() * 0.0
@@ -6136,6 +6241,74 @@ def train_ddp_loop(
             if isinstance(raw_training_model, (V3_1TopoPrompt, V3_1MotifPrompt)):
                 raw_training_model.set_corruption_step(global_step, seed=cfg.seed)
             start_event, end_event = _maybe_cuda_events(use_cuda)
+            optimizer.zero_grad()
+            # The structural pass forwards and backpropagates before the task
+            # forward, so its activations never sit beside the task batch's. It
+            # runs through the unwrapped model, and DDP's gradient hooks are
+            # inert between iterations, so its gradients simply wait in `.grad`
+            # until the task pass's synced backward all-reduces the accumulated
+            # sum -- the same parameter gradient one joint backward produced.
+            motif_global_counts: list[float] | None = None
+            motif_struct_term: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None = None
+            if struct_stream is not None:
+                struct_start = time.monotonic()
+                struct_loss, struct_stats = struct_stream.loss(
+                    model, epoch=epoch, step=epoch_steps, steps=epoch_step_count
+                )
+                for key, value in struct_stats.items():
+                    epoch_struct_sums[key] = epoch_struct_sums.get(key, 0.0) + value
+                if not grad_norm_struct and struct_stream.last_terms:
+                    # Probe each rank's first live subgraph, which need not be
+                    # step zero. These are raw term norms, before weights/scaling.
+                    grad_norm_struct = {
+                        key: _struct_grad_norm(term, model, world_size)
+                        for key, term in struct_stream.last_terms.items()
+                    }
+                epoch_struct_loss_sum += float(struct_loss.detach().float().item())
+                if isinstance(raw_training_model, V3_1MotifPrompt):
+                    if struct_stream.last_motif_rows:
+                        motif_struct_term = (
+                            struct_stream.last_motif_rows,
+                            torch.ones_like(struct_stream.last_motif_rows["slot"]),
+                        )
+                    # One count reduction per step, shared by both backward
+                    # passes: the composite's per-stream mean divides by the
+                    # count summed over ranks (spec 7.5), and the task stream's
+                    # count is known from the rows its forward will emit.
+                    motif_global_counts = _reduce_motif_counts(
+                        _motif_stream_counts(
+                            task=_motif_task_stub(raw_training_model, batch, like=struct_loss),
+                            struct=motif_struct_term,
+                        ),
+                        accelerator,
+                        world_size=world_size,
+                    )
+                    if motif_struct_term is not None:
+                        # The structural stream's share of the composite; the
+                        # task stream keeps its place through an empty stand-in
+                        # and adds its own share after its forward.
+                        slot_share, topo_share = _motif_stream_terms(
+                            task=_empty_motif_stream(struct_loss),
+                            struct=motif_struct_term,
+                            like=struct_loss,
+                            global_counts=motif_global_counts,
+                            world_size=world_size,
+                        )
+                        cfg_motif = raw_training_model.cfg
+                        struct_loss = (
+                            struct_loss
+                            + cfg_motif.w_slot * slot_share
+                            + cfg_motif.w_topo * topo_share
+                        )
+                        epoch_motif_slot_sum += float(slot_share.detach().float().item())
+                        epoch_motif_topo_sum += float(topo_share.detach().float().item())
+                if not _all_ranks_loss_finite(struct_loss, accelerator):
+                    raise RuntimeError(
+                        f"non-finite structural loss on at least one rank (epoch {epoch})"
+                    )
+                if struct_loss.requires_grad:
+                    accelerator.backward(struct_loss)
+                epoch_struct_seconds += time.monotonic() - struct_start
             output = model(batch)
             local_mean_loss = output["loss"]
             effective_weight = output.get("loss_weight_sum")
@@ -6212,39 +6385,11 @@ def train_ddp_loop(
                     grad_norm_task, grad_norm_kd = _term_grad_norms(loss, kd_loss, model)
                 loss = loss + kd_loss
                 epoch_kd_loss_sum += float(kd_loss.detach().float().item())
-            if struct_stream is not None:
-                struct_start = time.monotonic()
-                struct_loss, struct_stats = struct_stream.loss(
-                    model, epoch=epoch, step=epoch_steps, steps=epoch_step_count
-                )
-                for key, value in struct_stats.items():
-                    epoch_struct_sums[key] = epoch_struct_sums.get(key, 0.0) + value
-                if not grad_norm_struct and struct_stream.last_terms:
-                    # Probe each rank's first live subgraph, which need not be
-                    # step zero. These are raw term norms, before weights/scaling.
-                    grad_norm_struct = {
-                        key: _struct_grad_norm(term, model, world_size)
-                        for key, term in struct_stream.last_terms.items()
-                    }
-                loss = loss + struct_loss
-                epoch_struct_loss_sum += float(struct_loss.detach().float().item())
-                epoch_struct_seconds += time.monotonic() - struct_start
             if isinstance(raw_training_model, V3_1MotifPrompt):
-                # Both streams, averaged inside a stream first and then across
-                # streams, so the composite is added exactly once (spec 7.5).
-                struct_motif_rows = (
-                    struct_stream.last_motif_rows
-                    if struct_stream is not None and struct_stream.last_motif_rows
-                    else None
-                )
-                struct_term = (
-                    None
-                    if struct_motif_rows is None
-                    else (
-                        struct_motif_rows,
-                        torch.ones_like(struct_motif_rows["slot"]),
-                    )
-                )
+                # The task stream's share of the composite: both streams are
+                # averaged inside a stream first and then across streams, and
+                # the structural share already went out with the structural
+                # backward, so the composite is added exactly once (spec 7.5).
                 task_term = (
                     {
                         "slot": output.get("slot_loss_rows", loss.new_zeros(0)),
@@ -6252,27 +6397,17 @@ def train_ddp_loop(
                     },
                     batch.get(TEMPLATE_MASK_KEY, loss.new_zeros(0)),
                 )
-                # Structural chunks are distributed by token cost, so the
-                # per-stream mean divides by a count reduced over ranks, never by
-                # this rank's own (spec 7.5). One collective per step; the
-                # branch itself is rank-uniform.
-                local_counts = _motif_stream_counts(task=task_term, struct=struct_term)
-                global_counts = local_counts
-                if world_size > 1:
-                    global_counts = [
-                        float(value)
-                        for value in accelerator.reduce(
-                            torch.tensor(
-                                local_counts, device=accelerator.device, dtype=torch.float64
-                            ),
-                            reduction="sum",
-                        ).tolist()
-                    ]
+                if motif_global_counts is None:
+                    motif_global_counts = _reduce_motif_counts(
+                        _motif_stream_counts(task=task_term, struct=None),
+                        accelerator,
+                        world_size=world_size,
+                    )
                 slot_term, topo_term = _motif_stream_terms(
                     task=task_term,
-                    struct=struct_term,
+                    struct=None if motif_struct_term is None else _empty_motif_stream(loss),
                     like=loss,
-                    global_counts=global_counts,
+                    global_counts=motif_global_counts,
                     world_size=world_size,
                 )
                 cfg_motif = raw_training_model.cfg
@@ -6283,7 +6418,6 @@ def train_ddp_loop(
             if not _all_ranks_loss_finite(loss, accelerator):
                 raise RuntimeError(f"non-finite training loss on at least one rank (epoch {epoch})")
 
-            optimizer.zero_grad()
             accelerator.backward(loss)
             _drop_closed_interface_gradients(model, optimizer)
             if cfg.optim.grad_clip > 0:
