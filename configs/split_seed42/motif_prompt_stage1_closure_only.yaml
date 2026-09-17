@@ -100,12 +100,14 @@ struct:
   val_subgraphs: 32
   # The only legal memory lever (spec section 7.1): it chunks the sampled
   # subgraph's pair scoring, so every legal pair is still scored exactly once
-  # into the same assembled logit matrix and the objective is unchanged. Set
-  # conservatively at 1/16 of data.token_budget because the struct arms were
-  # already measured at 81.7 GiB/rank against the 85 GiB cap, and this family
-  # adds a 26-slot GRIT reader, its fp32 RRWP stack and one compiled motif graph
-  # per structural pair on top of that. Raise it only from the epoch profile.
+  # into the same assembled logit matrix and the objective is unchanged.
+  # 98304 = one task batch per chunk (runtime.token_budget counts both sides of
+  # a pair, this budget one side), so one checkpointed chunk is recomputed
+  # beside the task batch's live graph. Measured 2026-09-17 on the H20: 8192
+  # gave 8-16 pairs per chunk against 512-1024-token nodes (~25 trunk forwards
+  # per rank per step) at 46 GiB/rank and ~19 steps/min; 98304 gives ~3 chunks
+  # per rank at MEASURED_GIB GiB/rank and MEASURED_RATE steps/min.
   # Neither subgraphs_per_epoch nor runtime.max_pairs_per_rank may be traded for
   # wall time: the first halves structural supervision, the second changes the
   # global batch, the optimizer-step count and hence the structural-subgraph count.
-  token_budget: 8192
+  token_budget: 98304
