@@ -637,3 +637,135 @@ def test_schedule_total_steps_ignores_stop_after_epoch() -> None:
     assert _count_single_process_steps(factory, stopped) == _count_single_process_steps(
         factory, cfg
     )
+
+
+# ------------------------------------------- composite loss folding (task 20)
+
+
+def test_l_slot_and_l_topo_are_added_once_across_the_two_streams() -> None:
+    from src.train_b0 import _motif_stream_terms
+
+    anchor = torch.zeros((), requires_grad=True)
+    task_rows = {
+        "slot": torch.tensor([1.0, 3.0]) + anchor,
+        "topo": torch.tensor([2.0, 4.0]) + anchor,
+    }
+    task_mask = torch.tensor([1.0, 1.0])
+    struct_rows = {"slot": torch.tensor([5.0]) + anchor, "topo": torch.tensor([7.0]) + anchor}
+    struct_mask = torch.tensor([1.0])
+    slot, topo = _motif_stream_terms(
+        task=(task_rows, task_mask), struct=(struct_rows, struct_mask), like=anchor
+    )
+    # Per-stream means 2.0 and 5.0, then the mean across streams.
+    assert float(slot) == pytest.approx(3.5)
+    assert float(topo) == pytest.approx(5.0)
+    assert slot.requires_grad
+
+
+def test_an_absent_structural_stream_leaves_the_task_stream_alone() -> None:
+    from src.train_b0 import _motif_stream_terms
+
+    anchor = torch.zeros((), requires_grad=True)
+    rows = {"slot": torch.tensor([1.0, 3.0]) + anchor, "topo": torch.tensor([2.0, 4.0]) + anchor}
+    slot, topo = _motif_stream_terms(
+        task=(rows, torch.tensor([1.0, 1.0])), struct=None, like=anchor
+    )
+    assert float(slot) == pytest.approx(2.0)
+    assert float(topo) == pytest.approx(3.0)
+
+
+def test_a_self_only_batch_contributes_a_differentiable_zero() -> None:
+    from src.train_b0 import _motif_stream_terms
+
+    anchor = torch.zeros((), requires_grad=True)
+    rows = {"slot": torch.tensor([0.0, 0.0]) + anchor, "topo": torch.tensor([0.0, 0.0]) + anchor}
+    slot, topo = _motif_stream_terms(task=(rows, torch.zeros(2)), struct=None, like=anchor)
+    assert float(slot.detach()) == 0.0
+    assert float(topo.detach()) == 0.0
+    assert slot.requires_grad and topo.requires_grad
+
+
+def test_epoch_telemetry_reports_both_terms() -> None:
+    from src.train_b0 import _motif_epoch_telemetry
+
+    telemetry = _motif_epoch_telemetry(slot_sum=4.0, topo_sum=2.0, steps=2)
+    assert telemetry == {"train_motif_slot_loss": 2.0, "train_motif_topo_loss": 1.0}
+    assert _motif_epoch_telemetry(slot_sum=0.0, topo_sum=0.0, steps=0) == {}
+
+
+def test_the_model_returns_task_bce_only_and_leaves_the_composite_to_the_trainer() -> None:
+    model = _model("two")
+    model.initialize_teacher()
+    _open_gates(model)
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    out = model(batch)
+    # `loss` is the weighted task BCE alone: the trainer owns the per-stream
+    # average of L_slot and L_topo, which only it can see (spec section 7.5).
+    torch.testing.assert_close(out["loss"].detach(), out["task_loss"])
+    assert float(out["slot_loss_rows"].detach().sum()) > 0.0
+    assert out["slot_loss_rows"].requires_grad and out["topo_loss_rows"].requires_grad
+    assert float(out["loss_term_slot"].detach()) == pytest.approx(
+        model.cfg.w_slot * float(out["slot_loss_rows"].detach().mean())
+    )
+    assert float(out["loss_term_topo"].detach()) == pytest.approx(
+        model.cfg.w_topo * float(out["topo_loss_rows"].detach().mean())
+    )
+
+
+def test_the_trainer_fold_reaches_the_generator_through_both_streams() -> None:
+    # The exact composition the DDP step performs: the task stream's rows from
+    # the forward output, the structural stream's from `last_motif_rows`.
+    from src.train_b0 import _motif_stream_terms
+
+    stream, model, subgraph = _tiny_struct_stream()
+    stream._score(model, subgraph, stream._sampler)  # noqa: SLF001
+    struct_rows = stream.last_motif_rows
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    batch["motif_mask"] = torch.tensor([1.0, 0.0, 1.0, 1.0])
+    output = model(batch)
+    slot, topo = _motif_stream_terms(
+        task=(
+            {"slot": output["slot_loss_rows"], "topo": output["topo_loss_rows"]},
+            batch["motif_mask"],
+        ),
+        struct=(struct_rows, torch.ones_like(struct_rows["slot"])),
+        like=output["loss"],
+    )
+    (output["loss"] + model.cfg.w_slot * slot + model.cfg.w_topo * topo).backward()
+    assert model.generator is not None
+    grads = [p.grad for p in model.generator.parameters()]
+    assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
+    assert any(float(g.abs().sum()) > 0.0 for g in grads if g is not None)
+    assert all(p.grad is None for p in model.base.parameters())
+
+
+def test_a_stage_one_batch_folds_a_differentiable_zero() -> None:
+    # Stage I reads the compiled template as its input, so it has no graph
+    # supervision: the fold must still stay in the graph on every rank.
+    from src.train_b0 import _motif_stream_terms
+
+    model = _model("one")
+    _open_gates(model)
+    batch = _pair_batch(n=4)
+    batch[TEMPLATE_KEY] = _weights(n=4)
+    batch["motif_mask"] = torch.ones(4)
+    output = model(batch)
+    assert "slot_loss_rows" not in output
+    slot, topo = _motif_stream_terms(
+        task=(
+            {
+                "slot": output.get("slot_loss_rows", output["loss"].new_zeros(0)),
+                "topo": output.get("topo_loss_rows", output["loss"].new_zeros(0)),
+            },
+            batch["motif_mask"],
+        ),
+        struct=None,
+        like=output["loss"],
+    )
+    assert float(slot.detach()) == 0.0 and float(topo.detach()) == 0.0
+    (output["loss"] + slot + topo).backward()
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0.0 for p in model.reader.parameters()
+    )

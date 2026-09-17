@@ -1309,9 +1309,11 @@ class V3_1MotifPrompt(nn.Module):
         Returns:
             ``logits`` always; ``predicted_weights`` in Stage II; in Stage II with
             ``motif_weights`` also ``slot_loss_rows`` and, once a teacher is
-            snapshotted, ``topo_loss_rows``; with ``label`` the weighted composite
-            ``loss``, its ``loss_weight_sum``, the detached ``task_loss`` and the
-            undetached ``loss_term_*`` summands of `LOSS_TERM_NAMES`.
+            snapshotted, ``topo_loss_rows`` -- undetached, unscaled and self-row
+            masked; with ``label`` the weighted task-BCE ``loss``, its
+            ``loss_weight_sum``, the detached ``task_loss`` and the undetached
+            ``loss_term_*`` shares of `LOSS_TERM_NAMES`. The trainer folds the two
+            graph terms in, because only it sees both streams (spec section 7.5).
 
         Raises:
             ValueError: If Stage I is called without ``batch['motif_weights']``,
@@ -1394,7 +1396,13 @@ class V3_1MotifPrompt(nn.Module):
         slot_row: torch.Tensor | None,
         topo_row: torch.Tensor | None,
     ) -> None:
-        """Fold the task BCE, ``L_slot`` and ``L_topo`` into one weighted objective."""
+        """Return the weighted task BCE and each term's share of the objective.
+
+        ``loss`` is the task BCE alone. ``L_slot`` and ``L_topo`` are averaged
+        over valid nonself rows *per stream* and then across streams (spec
+        section 7.5), and only the trainer sees both streams, so it owns the
+        composite and this class hands it the undetached, unscaled per-row terms.
+        """
         flat = logits.reshape(-1).float()
         labels = label.reshape(-1).float()
         smoothing = float(self.base.label_smoothing)
@@ -1402,30 +1410,24 @@ class V3_1MotifPrompt(nn.Module):
         bce_row = F.binary_cross_entropy_with_logits(flat, targets, reduction="none")
         row_weights = 1.0 + (float(self.base.positive_weight) - 1.0) * labels
         weight_sum = row_weights.sum().detach()
-        total_row = bce_row
-        if slot_row is not None:
-            total_row = total_row + self.cfg.w_slot * slot_row
-        if topo_row is not None:
-            total_row = total_row + self.cfg.w_topo * topo_row
-        output["loss"] = (row_weights * total_row).sum() / weight_sum
+        output["loss"] = (row_weights * bce_row).sum() / weight_sum
         output["loss_weight_sum"] = weight_sum
-        output["task_loss"] = ((row_weights * bce_row).sum() / weight_sum).detach()
+        output["task_loss"] = output["loss"].detach()
+        zero = torch.zeros((), dtype=logits.dtype, device=logits.device)
 
-        def weighted(row: torch.Tensor | None, scale: float) -> torch.Tensor:
-            """The composite objective's share of one term, undetached."""
+        def stream_share(row: torch.Tensor | None, scale: float) -> torch.Tensor:
+            """This stream's share of one graph term, undetached and unreduced."""
             if row is None or scale == 0.0:
-                return torch.zeros((), dtype=logits.dtype, device=logits.device)
-            return scale * (row_weights * row).sum() / weight_sum
+                return zero
+            return scale * row.mean()
 
-        # The per-epoch gradient probe attributes each term to a parameter group;
-        # these are the exact summands of `loss`, so they must not be detached and
-        # must be emitted on every rank.
-        for name, row, scale in (
-            ("task", bce_row, 1.0),
-            ("slot", slot_row, self.cfg.w_slot),
-            ("topo", topo_row, self.cfg.w_topo),
-        ):
-            output[f"loss_term_{name}"] = weighted(row, float(scale))
+        # The per-epoch gradient probe attributes each term to a parameter group.
+        # ``task`` is the exact `loss`; ``slot``/``topo`` are this stream's share
+        # of the composite the trainer forms. None is detached and every rank
+        # emits all three.
+        output["loss_term_task"] = output["loss"]
+        output["loss_term_slot"] = stream_share(slot_row, float(self.cfg.w_slot))
+        output["loss_term_topo"] = stream_share(topo_row, float(self.cfg.w_topo))
 
 
 __all__ = [

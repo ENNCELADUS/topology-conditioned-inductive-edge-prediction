@@ -103,6 +103,7 @@ from src.distill.losses import (
     kd_rep_loss,
     kd_struct_loss,
 )
+from src.distill.motif_losses import stream_mean
 from src.distill.struct_config import StructConfig
 from src.distill.struct_losses import (
     hard_struct_errors,
@@ -772,6 +773,50 @@ def _set_motif_prompt_training_stage(
     for group in optimizer.param_groups:
         if group.get("name") == "interface" and not raw_model.interface_open:
             group["lr"] = 0.0
+
+
+def _motif_stream_terms(
+    *,
+    task: tuple[Mapping[str, torch.Tensor], torch.Tensor],
+    struct: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None,
+    like: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Average ``L_slot`` and ``L_topo`` per stream, then across streams (spec 7.5).
+
+    Args:
+        task: The task stream's per-row terms and its valid-nonself mask.
+        struct: The structural stream's, or ``None`` when the stream is absent.
+        like: A tensor supplying dtype, device and the autograd connection.
+
+    Returns:
+        ``(slot, topo)`` scalars; an empty stream contributes a differentiable zero.
+    """
+    streams = [task] + ([] if struct is None else [struct])
+    masks = [mask for _, mask in streams]
+    return (
+        stream_mean([rows["slot"] for rows, _ in streams], masks, like=like),
+        stream_mean([rows["topo"] for rows, _ in streams], masks, like=like),
+    )
+
+
+def _motif_epoch_telemetry(*, slot_sum: float, topo_sum: float, steps: int) -> dict[str, float]:
+    """Return the per-epoch motif telemetry, or an empty mapping for an empty epoch.
+
+    Args:
+        slot_sum: Sum of the epoch's per-step ``L_slot`` scalars, already reduced
+            across ranks and divided by the world size.
+        topo_sum: The same for ``L_topo``.
+        steps: Optimizer steps this epoch.
+
+    Returns:
+        The ``train_motif_*`` telemetry row.
+    """
+    if steps <= 0:
+        return {}
+    return {
+        "train_motif_slot_loss": slot_sum / float(steps),
+        "train_motif_topo_loss": topo_sum / float(steps),
+    }
 
 
 def _count_single_process_steps(factory: LoaderFactory, cfg: Config) -> int:
@@ -5860,6 +5905,8 @@ def train_ddp_loop(
         epoch_kd_sums: dict[str, float] = {}
         epoch_struct_loss_sum = 0.0
         epoch_struct_sums: dict[str, float] = {}
+        epoch_motif_slot_sum = 0.0
+        epoch_motif_topo_sum = 0.0
         epoch_online_sums: dict[str, float] = {}
         epoch_online_weight = 0.0
         epoch_struct_seconds = 0.0
@@ -6002,6 +6049,37 @@ def train_ddp_loop(
                 loss = loss + struct_loss
                 epoch_struct_loss_sum += float(struct_loss.detach().float().item())
                 epoch_struct_seconds += time.monotonic() - struct_start
+            if isinstance(raw_training_model, V3_1MotifPrompt):
+                # Both streams, averaged inside a stream first and then across
+                # streams, so the composite is added exactly once (spec 7.5).
+                struct_motif_rows = (
+                    struct_stream.last_motif_rows
+                    if struct_stream is not None and struct_stream.last_motif_rows
+                    else None
+                )
+                struct_term = (
+                    None
+                    if struct_motif_rows is None
+                    else (
+                        struct_motif_rows,
+                        torch.ones_like(struct_motif_rows["slot"]),
+                    )
+                )
+                slot_term, topo_term = _motif_stream_terms(
+                    task=(
+                        {
+                            "slot": output.get("slot_loss_rows", loss.new_zeros(0)),
+                            "topo": output.get("topo_loss_rows", loss.new_zeros(0)),
+                        },
+                        batch.get(TEMPLATE_MASK_KEY, loss.new_zeros(0)),
+                    ),
+                    struct=struct_term,
+                    like=loss,
+                )
+                cfg_motif = raw_training_model.cfg
+                loss = loss + cfg_motif.w_slot * slot_term + cfg_motif.w_topo * topo_term
+                epoch_motif_slot_sum += float(slot_term.detach().float().item())
+                epoch_motif_topo_sum += float(topo_term.detach().float().item())
 
             if not _all_ranks_loss_finite(loss, accelerator):
                 raise RuntimeError(f"non-finite training loss on at least one rank (epoch {epoch})")
@@ -6177,6 +6255,21 @@ def train_ddp_loop(
                     epoch_struct_telemetry[f"grad_norm_struct_{key}"] = float(
                         (struct_norms[index, 0] / struct_norms[index, 1]).item()
                     )
+        epoch_motif_telemetry: dict[str, float] = {}
+        if isinstance(_unwrapped_model(model), V3_1MotifPrompt) and epoch_steps > 0:
+            motif_sums = accelerator.reduce(
+                torch.tensor(
+                    [epoch_motif_slot_sum, epoch_motif_topo_sum],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                ),
+                reduction="sum",
+            )
+            epoch_motif_telemetry = _motif_epoch_telemetry(
+                slot_sum=float(motif_sums[0].item()) / float(world_size),
+                topo_sum=float(motif_sums[1].item()) / float(world_size),
+                steps=epoch_steps,
+            )
         validation_start = time.monotonic()
         run_topology = _topology_due(
             epoch,
@@ -6241,6 +6334,7 @@ def train_ddp_loop(
         if train_kd_loss is not None:
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
+        entry.update(epoch_motif_telemetry)
         if epoch_struct_telemetry:
             epoch_wall = max(time.monotonic() - epoch_wall_start, 1e-9)
             epoch_struct_telemetry["struct_wall_fraction"] = (
