@@ -1060,8 +1060,10 @@ def _run_pipeline_unlocked(
             if source_status.get("status") == "running":
                 source_status.update({"status": "abandoned", "abandoned_by_attempt_id": attempt_id})
                 _write_json_atomic(resume_attempt / "status.json", source_status)
-            elif source_status.get("status") not in {"failed", "abandoned"}:
-                raise ValueError("resume attempt must be failed, abandoned, or orphaned running")
+            elif source_status.get("status") not in {"failed", "abandoned", "complete"}:
+                raise ValueError(
+                    "resume attempt must be failed, abandoned, complete, or orphaned running"
+                )
             state_path = resume_attempt / "training_state.pt"
             metrics_path = resume_attempt / "metrics.jsonl"
             checkpoints_dir = resume_attempt / "checkpoints"
@@ -1103,6 +1105,16 @@ def _run_pipeline_unlocked(
                 or not 1 <= completed_epoch <= cfg.optim.epochs
             ):
                 raise ValueError("training_state.pt epoch is not resumable for this config")
+            if source_status.get("status") == "complete" and completed_epoch >= cfg.optim.epochs:
+                # A `train_b0` attempt halted by `optim.stop_after_epoch` is
+                # published and marked complete, and the teachability pilots of the
+                # motif spec's section 7.4 continue that prefix rather than restart
+                # it. A run that reached the end of its schedule is complete for the
+                # other reason and has no remainder to continue.
+                raise ValueError(
+                    "a complete resume attempt must be an intentionally halted prefix, "
+                    f"but epoch {completed_epoch} ends the {cfg.optim.epochs}-epoch schedule"
+                )
             if not isinstance(state["global_step"], int) or state["global_step"] <= 0:
                 raise ValueError("training_state.pt global_step is invalid")
             for field in ("rng_by_rank", "runtime_by_rank"):

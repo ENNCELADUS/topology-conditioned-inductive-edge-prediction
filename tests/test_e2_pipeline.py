@@ -985,6 +985,92 @@ class TestRunPipelineSuccess:
         assert prior_status["status"] == "abandoned"
         assert prior_status["abandoned_by_attempt_id"] == complete["attempt_id"]
 
+    def _seed_resume_source(self, output_dir: Path, name: str, *, status: str, epoch: int) -> Path:
+        """Write a resumable prior attempt covering epochs ``1..epoch``."""
+        prior = output_dir / "attempts" / name
+        checkpoints = prior / "checkpoints"
+        checkpoints.mkdir(parents=True)
+        (prior / "status.json").write_text(json.dumps({"status": status}))
+        metric_rows = [{"epoch": index} for index in range(1, epoch + 1)]
+        (prior / "metrics.jsonl").write_text("".join(json.dumps(row) + "\n" for row in metric_rows))
+        for row in metric_rows:
+            torch.save(
+                {"epoch": row["epoch"], "selection_metrics": row},
+                checkpoints / f"epoch-{row['epoch']:04d}.pt",
+            )
+        torch.save(
+            {
+                "resume_supported": True,
+                "config": {},
+                "model_state": {},
+                "optimizer": {},
+                "scheduler": {},
+                "world_size": 4,
+                "warmup_steps": 1,
+                "schedule_total_steps": 25,
+                "epoch": epoch,
+                "global_step": 4 * epoch,
+                "rng_by_rank": [{} for _ in range(4)],
+                "runtime_by_rank": [{} for _ in range(4)],
+                "per_epoch_profiles": [{} for _ in range(epoch)],
+                "evals_without_improvement": 0,
+                "stop_epoch": None,
+            },
+            prior / "training_state.pt",
+        )
+        return prior
+
+    def test_resume_continues_an_intentionally_halted_pilot(self, tmp_path: Path) -> None:
+        """A `optim.stop_after_epoch` pilot publishes ``status: "complete"``.
+
+        Spec section 7.4 picks the teacher with three two-epoch pilots and then
+        CONTINUES the winner, which is only valid because the pilot is a true
+        prefix of the full schedule. Rejecting a successfully halted source here
+        would strand that continuation before the relaxed config comparison ever
+        ran, and direct worker invocation is debug-only.
+        """
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = self._seed_resume_source(output_dir, "halted-pilot", status="complete", epoch=1)
+        base_runner = _make_fake_runner()
+
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+            new_attempt = Path(_arg_value(command, "--output-dir"))
+            assert _arg_value(command, "--resume-attempt") == str(prior)
+            assert (new_attempt / "metrics.jsonl").read_text() == '{"epoch": 1}\n'
+            assert (new_attempt / "checkpoints" / "epoch-0001.pt").is_file()
+            return base_runner(command, log_path)
+
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+        assert run_pipeline(resumed_args, training_command_runner=runner) == 0
+        complete = json.loads((output_dir / "complete.json").read_text())
+        new_status = json.loads(
+            (output_dir / "attempts" / complete["attempt_id"] / "status.json").read_text()
+        )
+        assert new_status["resumed_from_attempt_id"] == prior.name
+        # A successfully halted prefix is continued, not abandoned.
+        assert json.loads((prior / "status.json").read_text())["status"] == "complete"
+
+    def test_resume_refuses_a_complete_attempt_that_ran_the_whole_schedule(
+        self, tmp_path: Path
+    ) -> None:
+        """Only a halted prefix has a remainder; a finished run has nothing to continue."""
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = self._seed_resume_source(output_dir, "finished-run", status="complete", epoch=2)
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+
+        assert run_pipeline(resumed_args, training_command_runner=_make_fake_runner()) == 2
+
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "train"
+        assert "halted" in failure["message"]
+
+        # The admission set widened by exactly one status, not to any sentinel.
+        debug = self._seed_resume_source(output_dir, "debug", status="debug_complete", epoch=1)
+        debug_args = PipelineArgs(**{**vars(args), "resume_attempt": debug})
+        assert run_pipeline(debug_args, training_command_runner=_make_fake_runner()) == 2
+        message = json.loads((output_dir / "failure.json").read_text())["message"]
+        assert "failed, abandoned, complete, or orphaned running" in message
+
     def test_resume_accepts_completed_snapshot_for_finalization_only(self, tmp_path: Path) -> None:
         args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
         prior = output_dir / "attempts" / "completed-training"
