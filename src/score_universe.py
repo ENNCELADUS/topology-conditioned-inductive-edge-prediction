@@ -1586,6 +1586,16 @@ def _load_checkpoint(
         # the strict `load_state_dict` below rather than being reconstructed
         # under a config it was never trained with.
     model = build_model(model_family, model_config)
+    if model_family == MOTIF_PROMPT_FAMILY and any(
+        key.startswith("teacher.") for key in model_state
+    ):
+        # Stage II snapshots the loaded Stage I bundle as the immutable teacher
+        # `R_T` before the first step (spec section 7.4), so every trained Stage II
+        # checkpoint carries `teacher.*`. The builder starts from a fresh bundle, so
+        # the submodule has to be reconstructed here -- from the model itself, never
+        # by reopening the Stage I bundle the checkpoint was initialised from -- or
+        # the strict load below rejects the checkpoint outright.
+        cast("V3_1MotifPrompt", model).initialize_teacher()
     model.load_state_dict(model_state)
     model.eval()
     return model, model_family, _checkpoint_id(model_state)
@@ -2428,7 +2438,9 @@ def _score_v3_1(
                 """Pass 1: the generator's predicted graph for one batch of sources."""
                 encoded_a, encoded_b, len_a, len_b = _encode(source_dataset, batch_indices)
                 with torch.inference_mode(), _autocast_context(device, "off"):
-                    return source_model.predict_weights(encoded_a, encoded_b, len_a, len_b)
+                    return source_model.predict_weights(
+                        encoded_a.float(), encoded_b.float(), len_a, len_b
+                    )
 
             motif_bank = _motif_source_weights(source_batches, _graph, num_rows=len(pairs))
         elif isinstance(model, _V3_1Prefix):
@@ -2462,8 +2474,11 @@ def _score_v3_1(
         if motif_model is not None:
             # The pair pass runs with autocast disabled: the reader's RRWP
             # arithmetic requires fp32, and the pinned precision contract of
-            # spec section 9 records `pair_autocast: False`.
+            # spec section 9 records `pair_autocast: False`. Disabling autocast
+            # does not promote states the encoder already returned in bf16 under
+            # `--amp bf16`, so the promotion is explicit here.
             encoded_a, encoded_b, len_a, len_b = _encode(dataset, batch_indices)
+            encoded_a, encoded_b = encoded_a.float(), encoded_b.float()
             rows = torch.as_tensor(batch_indices, dtype=torch.int64)
             with torch.inference_mode(), _autocast_context(device, "off"):
                 supplied = motif_bank if motif_bank is not None else row_templates

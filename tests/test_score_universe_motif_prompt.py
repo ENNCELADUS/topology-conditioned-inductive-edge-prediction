@@ -37,13 +37,20 @@ def _model_config(stage: str = "two") -> dict[str, object]:
 
 
 def _motif_model(stage: str = "two", seed: int = 0) -> V3_1MotifPrompt:
-    """A tiny motif-prompt model with open gates, in eval mode."""
+    """A tiny motif-prompt model with open gates, in eval mode.
+
+    Stage II snapshots the Stage I bundle as the immutable teacher during
+    training (`src.train_b0.build_model`), so a trained Stage II checkpoint
+    always carries ``teacher.*`` parameters; the fixture mirrors that.
+    """
     torch.manual_seed(seed)
     model = V3_1MotifPrompt(**_model_config(stage))  # type: ignore[arg-type]
     model.install_mean_template(torch.full((96,), 0.1))
     gen = torch.Generator().manual_seed(seed + 1)
     with torch.no_grad():
         model.adapter.gates.copy_(torch.randn(model.adapter.gates.shape, generator=gen))
+    if stage == "two":
+        model.initialize_teacher()
     return model.eval()
 
 
@@ -62,12 +69,51 @@ def test_the_family_is_registered_and_builds_from_a_checkpoint_config() -> None:
     assert model.name == "v3_1_motif_prompt"
 
 
-def test_the_builder_round_trips_a_checkpoint_state_dict() -> None:
+def test_a_trained_stage_two_checkpoint_round_trips_through_the_loader(tmp_path: Path) -> None:
+    """Stage II training snapshots ``R_T``, so the published state dict has ``teacher.*``.
+
+    The strict load in `_load_checkpoint` rejects those keys unless the builder
+    reconstructs the teacher submodule first -- which would reject every trained
+    Stage II checkpoint.
+    """
     model = _motif_model()
-    rebuilt = score_universe.MODEL_BUILDERS["v3_1_motif_prompt"](_model_config())
-    rebuilt.load_state_dict(model.state_dict(), strict=True)
+    assert any(key.startswith("teacher.") for key in model.state_dict())
+    path = tmp_path / "best.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "model_family": "v3_1_motif_prompt",
+            "model_config": _model_config(),
+        },
+        path,
+    )
+
+    rebuilt, family, _ = score_universe._load_checkpoint(path)
+
+    assert family == "v3_1_motif_prompt"
     assert isinstance(rebuilt, V3_1MotifPrompt)
+    assert rebuilt.teacher is not None
     torch.testing.assert_close(rebuilt.mean_template, model.mean_template, rtol=0, atol=0)
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(rebuilt.state_dict()[key], value, rtol=0, atol=0)
+
+
+def test_a_stage_one_checkpoint_has_no_teacher_to_rebuild(tmp_path: Path) -> None:
+    model = _motif_model("one")
+    assert not any(key.startswith("teacher.") for key in model.state_dict())
+    path = tmp_path / "best.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "model_family": "v3_1_motif_prompt",
+            "model_config": _model_config("one"),
+        },
+        path,
+    )
+
+    rebuilt, _, _ = score_universe._load_checkpoint(path)
+
+    assert cast(V3_1MotifPrompt, rebuilt).teacher is None
 
 
 # ------------------------------------------------------------------ truth-free scoring
@@ -160,6 +206,58 @@ def test_scoring_is_batch_and_shard_independent(
     first = score_universe._score_v3_1(model, pairs[:2], store, **kwargs)  # type: ignore[arg-type]
     second = score_universe._score_v3_1(model, pairs[2:], store, **kwargs)  # type: ignore[arg-type]
     np.testing.assert_allclose(np.concatenate([first, second]), whole, rtol=1e-6, atol=1e-6)
+
+
+def test_bf16_amp_scores_stage_two_and_stage_one_without_a_dtype_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--amp bf16`` encodes in bf16; the pair pass runs fp32 and must promote.
+
+    Disabling autocast does not promote a tensor that is already bf16, so the
+    fp32 reader and generator weights meet bf16 activations.
+    """
+    _, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=4)
+    store = FeatureStore(tmp_path / "features")
+    kwargs = {"device": torch.device("cpu"), "token_budget": 512}
+    stage_two = _motif_model()
+    reference = score_universe._score_v3_1(
+        stage_two,
+        pairs,
+        store,
+        amp="off",
+        **kwargs,  # type: ignore[arg-type]
+    )
+    amped = score_universe._score_v3_1(
+        stage_two,
+        pairs,
+        store,
+        amp="bf16",
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert np.isfinite(amped).all()
+    np.testing.assert_allclose(amped, reference, rtol=0.0, atol=5e-2)
+
+    # The shuffle source pass predicts a graph from bf16 states too.
+    transplanted = score_universe._score_v3_1(
+        stage_two,
+        pairs,
+        store,
+        shuffle_sources=list(reversed(pairs)),
+        amp="bf16",
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert np.isfinite(transplanted).all()
+
+    stage_one = _motif_model("one")
+    stage_one_logits = score_universe._score_v3_1(
+        stage_one,
+        pairs,
+        store,
+        amp="bf16",
+        row_templates=_templates(len(pairs)),
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert np.isfinite(stage_one_logits).all()
 
 
 # ------------------------------------------------------------------ interventions
