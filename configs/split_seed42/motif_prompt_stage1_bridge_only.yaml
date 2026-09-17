@@ -106,7 +106,7 @@ struct:
   # beside the task batch's live graph. Measured 2026-09-17 on the H20: 8192
   # gave 8-16 pairs per chunk against 512-1024-token nodes (~25 trunk forwards
   # per rank per step) at 46 GiB/rank and ~19 steps/min; 98304 gives ~3 chunks
-  # per rank at MEASURED_GIB GiB/rank and MEASURED_RATE steps/min.
+  # per rank at 65-71 GiB/rank (nvidia-smi, 4 ranks) and ~27 steps/min.
   # Neither subgraphs_per_epoch nor runtime.max_pairs_per_rank may be traded for
   # wall time: the first halves structural supervision, the second changes the
   # global batch, the optimizer-step count and hence the structural-subgraph count.
