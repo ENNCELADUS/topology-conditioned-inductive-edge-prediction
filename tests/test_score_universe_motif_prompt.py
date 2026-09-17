@@ -59,6 +59,40 @@ def _templates(rows: int, seed: int = 3) -> torch.Tensor:
     return torch.rand((rows, 96), generator=torch.Generator().manual_seed(seed))
 
 
+def _assert_validation_forward_reproduces_the_scorer(
+    model: V3_1MotifPrompt,
+    pairs: list[tuple[str, str]],
+    store: FeatureStore,
+    batch: dict[str, torch.Tensor],
+    *,
+    row_templates: torch.Tensor | None = None,
+) -> None:
+    """Fail unless an autocast-wrapped validation forward gives the scorer's logits.
+
+    Accelerate wraps a prepared model's whole forward -- trunk and output head --
+    in the run's bf16 autocast, so `src.train_b0._evaluate_val_universe` calls it
+    exactly as this helper does; a bare `torch.autocast` is the substitution the
+    other loop tests already use for that wrapper. Scoring pins
+    ``pair_autocast: False``, and validation freezes the checkpoint and the ONE
+    V_val topology threshold that `test_protocol` later replays on the scorer's
+    logits, so the two must agree bit for bit and not merely both run. One
+    oversized batch forces the scorer to pad exactly as `_collate` does, leaving
+    the pair pass as the only difference under test.
+    """
+    scored = score_universe._score_v3_1(
+        model,
+        pairs,
+        store,
+        device=torch.device("cpu"),
+        amp="bf16",
+        token_budget=1 << 16,
+        row_templates=row_templates,
+    )
+    with torch.inference_mode(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        validated = model(batch)["logits"].float().numpy().reshape(-1)
+    np.testing.assert_array_equal(validated, scored)
+
+
 # ------------------------------------------------------------------ registration
 
 
@@ -157,6 +191,48 @@ def test_stage_two_scoring_matches_the_models_own_forward(
     with torch.inference_mode():
         reference = model(batch)["logits"].numpy().reshape(-1)
     np.testing.assert_allclose(logits, reference, rtol=0.0, atol=1e-5)
+    _assert_validation_forward_reproduces_the_scorer(model, pairs, store, batch)
+
+
+def test_the_fp32_validation_pair_pass_is_confined_to_this_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the motif family disables pair autocast at scoring time, so only it may here.
+
+    ``v3_1`` and ``v3_1_prefix`` score with ``pair_autocast`` following ``--amp``.
+    Promoting their validation forward would move every threshold those arms have
+    already published instead of pinning it, so their autocast-wrapped forward must
+    still return the run's reduced precision while the motif family returns fp32.
+    """
+    from src.model.egostitch.classifier.b0_v31 import V3_1
+
+    from tests.test_score_universe import _tiny_v3_1_prefix
+
+    _, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=4)
+    store = FeatureStore(tmp_path / "features")
+    batch = _collate(store, pairs)
+    unchanged: list[torch.dtype] = []
+    for other in (_tiny_v3_1_prefix(), V3_1(**_tiny_base_config()).eval()):
+        with torch.inference_mode(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            unchanged.append(other(batch)["logits"].dtype)
+    assert unchanged == [torch.bfloat16, torch.bfloat16]
+    with torch.inference_mode(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        assert _motif_model()(batch)["logits"].dtype is torch.float32
+
+
+def test_stage_one_validation_forward_reproduces_the_scorers_pair_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage I freezes a threshold through the same autocast-wrapped forward."""
+    _, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=4)
+    store = FeatureStore(tmp_path / "features")
+    model = _motif_model("one")
+    templates = _templates(len(pairs))
+    batch = _collate(store, pairs)
+    batch[TEMPLATE_KEY] = templates
+    _assert_validation_forward_reproduces_the_scorer(
+        model, pairs, store, batch, row_templates=templates
+    )
 
 
 def test_stage_one_scoring_reads_the_supplied_true_templates(

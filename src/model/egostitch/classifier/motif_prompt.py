@@ -10,6 +10,7 @@ from ``(x_u, x_v)`` alone, read through the identical interface.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import cast
@@ -1488,26 +1489,55 @@ class V3_1MotifPrompt(nn.Module):
         with torch.no_grad():
             encoded_a = self.base.encoder(emb_a, lengths_a)
             encoded_b = self.base.encoder(emb_b, lengths_b)
-        weights = self.resolve_weights(merged, encoded_a, encoded_b, lengths_a, lengths_b)
-        logits = self.logits_from_encoded(
-            encoded_a, encoded_b, lengths_a, lengths_b, weights=weights
-        )
-        output: dict[str, torch.Tensor] = {"logits": logits}
-        if self.cfg.stage == "two":
-            # `_apply_intervention` may have substituted the graph the trunk read;
-            # report what was actually read, not what the generator emitted.
-            output["predicted_weights"] = self._apply_intervention(weights)[0]
-        slot_row, topo_row = self._supervision_rows(
-            merged, weights, encoded_a, encoded_b, lengths_a, lengths_b
-        )
-        if slot_row is not None:
-            output["slot_loss_rows"] = slot_row
-        if topo_row is not None:
-            output["topo_loss_rows"] = topo_row
-        if "label" not in merged:
+        with self._eval_pair_precision(encoded_a.device):
+            if not self.training:
+                encoded_a, encoded_b = encoded_a.float(), encoded_b.float()
+            weights = self.resolve_weights(merged, encoded_a, encoded_b, lengths_a, lengths_b)
+            logits = self.logits_from_encoded(
+                encoded_a, encoded_b, lengths_a, lengths_b, weights=weights
+            )
+            output: dict[str, torch.Tensor] = {"logits": logits}
+            if self.cfg.stage == "two":
+                # `_apply_intervention` may have substituted the graph the trunk read;
+                # report what was actually read, not what the generator emitted.
+                output["predicted_weights"] = self._apply_intervention(weights)[0]
+            slot_row, topo_row = self._supervision_rows(
+                merged, weights, encoded_a, encoded_b, lengths_a, lengths_b
+            )
+            if slot_row is not None:
+                output["slot_loss_rows"] = slot_row
+            if topo_row is not None:
+                output["topo_loss_rows"] = topo_row
+            if "label" not in merged:
+                return output
+            self._add_composite_loss(output, logits, merged["label"], slot_row, topo_row)
             return output
-        self._add_composite_loss(output, logits, merged["label"], slot_row, topo_row)
-        return output
+
+    def _eval_pair_precision(self, device: torch.device) -> AbstractContextManager[None]:
+        """Return the pair pass's precision context for this mode.
+
+        Training keeps the run's mixed precision. Evaluation must instead
+        reproduce the published scorer exactly: `src.score_universe` promotes the
+        cached encoder states to fp32 and drives the generator, the trunk and the
+        output head with autocast disabled, and pins that as ``pair_autocast:
+        False`` in the artifact's precision contract (spec section 9), because the
+        reader's RRWP arithmetic needs fp32.
+
+        Accelerate wraps this whole forward -- output head included -- in the
+        run's autocast, so without this context validation would freeze the
+        checkpoint and the ONE V_val-selected topology threshold on bf16-quantized
+        logits that `test_protocol` then replays on the scorer's fp32 logits, and
+        the same row can land on the other side of the threshold.
+
+        Args:
+            device: The device the encoder states live on.
+
+        Returns:
+            A no-op during training, otherwise an autocast-disabling context.
+        """
+        if self.training:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, enabled=False)
 
     def _supervision_rows(
         self,

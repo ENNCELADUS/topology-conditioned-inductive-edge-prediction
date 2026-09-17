@@ -10,6 +10,7 @@ import networkx as nx
 import numpy as np
 import pytest
 import torch
+from accelerate import Accelerator
 from src.data.motif_template import MotifTemplateTable
 from src.data.packed_features import PackedFeatureTable
 from src.data.struct_sampler import StructSampler, StructSubgraph
@@ -667,6 +668,75 @@ def test_the_stage_hook_ignores_every_other_family() -> None:
     optimizer.param_groups[0]["lr"] = 5e-4
     _set_motif_prompt_training_stage(model, optimizer, epoch=1)
     assert optimizer.param_groups[0]["lr"] == 5e-4
+
+
+# ------------------------------------------- V_val universe precision
+
+
+class _MotifUniverseTable:
+    """Duck-typed packed table returning real, node-keyed token sequences."""
+
+    def __init__(self, dim: int, nodes: int = 6) -> None:
+        generator = torch.Generator().manual_seed(11)
+        self._tokens = torch.randn((nodes, 3, dim), generator=generator)
+
+    def gather_nodes(
+        self, node_indices: torch.Tensor, boundary: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(B, boundary, dim)`` tokens plus their true lengths."""
+        tokens = self._tokens.index_select(0, node_indices)
+        padded = torch.zeros((tokens.shape[0], boundary, tokens.shape[2]))
+        padded[:, : tokens.shape[1]] = tokens
+        lengths = torch.full((tokens.shape[0],), tokens.shape[1], dtype=torch.long)
+        return padded, lengths
+
+
+def test_the_v_val_universe_pass_selects_on_unquantized_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The universe pass must not freeze a threshold on bf16-grid logits.
+
+    Accelerate runs the whole validation forward -- output head included -- under
+    the run's bf16 autocast, and `torch.autocast` here is the same substitution
+    for that wrapper the other loop tests use. The ONE V_val-selected topology
+    threshold this pass freezes is replayed by `test_protocol` on
+    `score_universe`'s fp32 pair pass (``pair_autocast: False``), so logits landing
+    on the bf16 grid would move edge decisions between selection and replay.
+    """
+    from src.eval.checkpoint_selection import TopologyValidationMetrics
+    from src.eval.val_topology import ValTopologyReference, ValTopologyResult
+    from src.train_b0 import _evaluate_val_universe
+
+    monkeypatch.setattr(
+        "src.train_b0.val_region_topology_metrics",
+        lambda **_: ValTopologyResult(
+            metrics=TopologyValidationMetrics(
+                gs=1.0, rd=1.0, degree_mmd=0.0, clustering_mmd=0.0, spectral_mmd=0.0
+            ),
+            threshold=0.5,
+        ),
+    )
+    model = _motif_model()
+    rows = 6
+    captured: list[np.ndarray] = []
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        _evaluate_val_universe(
+            model,
+            Accelerator(),
+            table=cast(PackedFeatureTable, _MotifUniverseTable(model.input_dim)),
+            node_a_all=torch.arange(rows, dtype=torch.int64),
+            node_b_all=torch.arange(rows, dtype=torch.int64).flip(0),
+            boundary=4,
+            batch_pairs=rows,
+            u_idx=np.arange(rows, dtype=np.int32),
+            v_idx=np.arange(rows, dtype=np.int32)[::-1].copy(),
+            reference=cast(ValTopologyReference, None),
+            logits_sink=captured.append,
+        )
+    logits = captured[0]
+    assert logits.dtype == np.float32
+    quantized = torch.from_numpy(logits).to(torch.bfloat16).to(torch.float32).numpy()
+    assert not np.array_equal(logits, quantized)
 
 
 # ------------------------------------------- optim.stop_after_epoch (task 19)
