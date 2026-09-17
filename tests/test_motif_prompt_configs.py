@@ -177,6 +177,39 @@ def test_the_degree_only_control_is_the_trained_arm_not_a_rethresholding() -> No
     assert "NOT a" in header and "degree-marginal re-thresholding" in header
 
 
+@pytest.mark.parametrize("suffix", ["a", "b", "c"])
+def test_each_teachability_pilot_is_a_true_two_epoch_prefix(suffix: str) -> None:
+    cfg = load_config(CONFIG_DIR / f"motif_prompt_teach_{suffix}.yaml")
+    # "The first two epochs" is literal: epochs stays 15 so the one-cycle shape,
+    # the trainability mask and the data order are the full run's (spec 7.4).
+    assert cfg.optim.epochs == 15
+    assert cfg.optim.stop_after_epoch == 2
+    base, pilot = _block("motif_prompt_stage2.yaml"), _block(f"motif_prompt_teach_{suffix}.yaml")
+    differing = {key for key in base if base[key] != pilot[key]}
+    assert differing == {"bundle_checkpoint"}
+    assert set(pilot) == set(base)
+
+
+def test_the_teachability_pilots_name_three_distinct_stage_one_candidates() -> None:
+    bundles = {_block(f"motif_prompt_teach_{suffix}.yaml")["bundle_checkpoint"] for suffix in "abc"}
+    assert len(bundles) == 3
+    for bundle in bundles:
+        assert bundle.startswith("outputs/split_seed42/motif_prompt_stage1/checkpoints/epoch-")
+    header = (CONFIG_DIR / "motif_prompt_teach_a.yaml").read_text(encoding="utf-8")
+    # Selection is downstream utility under predicted inputs, on V_val only, and
+    # the winner is continued rather than restarted (spec section 7.4).
+    assert "DOWNSTREAM UTILITY UNDER PREDICTED INPUTS" in header
+    assert "geometric_rd_five_rank_v1" in header
+    assert "CONTINUED" in header and "PLACEHOLDER" in header
+
+
+@pytest.mark.parametrize("name", ARMS)
+def test_only_the_teachability_pilots_stop_early(name: str) -> None:
+    cfg = load_config(CONFIG_DIR / name)
+    expected = 2 if name.startswith("motif_prompt_teach_") else None
+    assert cfg.optim.stop_after_epoch == expected
+
+
 def test_the_three_seed_replicates_differ_only_in_seed_and_output_dir() -> None:
     base = _raw("motif_prompt_stage2.yaml")
     for index in (1, 2):
