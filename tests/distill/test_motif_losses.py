@@ -11,7 +11,13 @@ from src.data.motif_template import (
     count_statistics,
     role_permutation,
 )
-from src.distill.motif_losses import slot_loss, slot_loss_rows, stream_mean, topo_loss_rows
+from src.distill.motif_losses import (
+    slot_loss,
+    slot_loss_rows,
+    stream_mean,
+    stream_row_counts,
+    topo_loss_rows,
+)
 
 _BETAS = {"beta_p": 1.0, "beta_q": 1.0, "beta_a": 1.0, "beta_i": 1.0, "huber_delta": 1.0}
 _FAMILIES = ("beta_p", "beta_q", "beta_a", "beta_i")
@@ -350,3 +356,72 @@ def test_a_fully_masked_stream_drops_out_rather_than_dividing_by_zero() -> None:
     masked = stream_mean([rows, rows], [torch.ones(2), torch.zeros(2)], like=anchor)
     torch.testing.assert_close(masked, torch.tensor(2.0))
     assert float(stream_mean([rows], [torch.zeros(2)], like=anchor)) == 0.0
+
+
+def test_rank_local_counts_misweight_the_streams_and_global_counts_repair_it() -> None:
+    """DDP averages ranks equally, so the per-stream mean must use global counts.
+
+    Two ranks, task rows on both and structural rows on rank 0 only: with
+    rank-local counts the averaged objective weights task/structural 3:1 rather
+    than 1:1, and the two ranks do not even carry the task stream equally.
+    """
+    anchor = torch.zeros((), requires_grad=True)
+    task = [torch.tensor([1.0, 1.0]) + anchor, torch.tensor([3.0, 3.0]) + anchor]
+    struct = [torch.tensor([4.0, 4.0]) + anchor, anchor.new_zeros(0)]
+    masks = [torch.ones(2), torch.ones(2)]
+    empty_mask = torch.ones(0)
+    # Global valid-row counts: 4 task rows over both ranks, 2 structural rows.
+    counts = [4.0, 2.0]
+
+    per_rank = [
+        stream_mean(
+            [task[rank], struct[rank]],
+            [masks[rank], masks[0] if rank == 0 else empty_mask],
+            like=anchor,
+            global_counts=counts,
+            world_size=2,
+        )
+        for rank in (0, 1)
+    ]
+
+    # DDP averages the two ranks' gradients, so their mean is the realised objective.
+    realised = 0.5 * (per_rank[0] + per_rank[1])
+    # Global task mean 2.0, global structural mean 4.0, weighted 1:1.
+    torch.testing.assert_close(realised, torch.tensor(3.0))
+    # Rank-local counts land on 2.75 instead: (3/4) * 2.0 + (1/4) * 4.0.
+    local = [
+        stream_mean(
+            [task[rank], struct[rank]],
+            [masks[rank], masks[0] if rank == 0 else empty_mask],
+            like=anchor,
+            world_size=1,
+        )
+        for rank in (0, 1)
+    ]
+    torch.testing.assert_close(0.5 * (local[0] + local[1]), torch.tensor(2.75))
+    # A rank holding no structural row still carries a differentiable term.
+    assert per_rank[1].requires_grad
+    per_rank[1].backward()  # type: ignore[no-untyped-call]
+    assert anchor.grad is not None
+
+
+def test_a_stream_absent_on_every_rank_drops_out_of_the_global_average() -> None:
+    anchor = torch.zeros((), requires_grad=True)
+    rows = torch.tensor([1.0, 3.0]) + anchor
+    combined = stream_mean(
+        [rows, anchor.new_zeros(0)],
+        [torch.ones(2), torch.ones(0)],
+        like=anchor,
+        global_counts=[4.0, 0.0],
+        world_size=2,
+    )
+    # Only the task stream survives, scaled by the world size over its global count.
+    torch.testing.assert_close(combined, torch.tensor(2.0))
+
+
+def test_stream_row_counts_report_zero_for_a_stream_this_rank_never_saw() -> None:
+    rows = torch.tensor([1.0, 3.0])
+    assert stream_row_counts([rows, rows.new_zeros(0)], [torch.tensor([1.0, 0.0]), rows]) == [
+        1.0,
+        0.0,
+    ]

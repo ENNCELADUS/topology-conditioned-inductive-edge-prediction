@@ -160,10 +160,40 @@ def topo_loss_rows(
     return torch.stack(terms, dim=-1).mean(dim=-1)
 
 
+def stream_row_counts(rows: Sequence[torch.Tensor], masks: Sequence[torch.Tensor]) -> list[float]:
+    """Each stream's rank-local valid-row count, in stream order.
+
+    A stream this rank holds no rows for counts zero, whatever its mask says: the
+    structural stream's chunks are distributed by token cost, so a rank can be
+    left without any of them.
+
+    Args:
+        rows: One ``(n_s,)`` per-row tensor per stream.
+        masks: One ``(n_s,)`` valid-row mask per stream, aligned with ``rows``.
+
+    Returns:
+        One count per stream.
+
+    Raises:
+        ValueError: If ``rows`` and ``masks`` differ in length.
+    """
+    if len(rows) != len(masks):
+        raise ValueError(f"rows ({len(rows)}) and masks ({len(masks)}) must be aligned")
+    return [
+        0.0 if row.numel() == 0 else float(mask.to(row).sum().item())
+        for row, mask in zip(rows, masks, strict=True)
+    ]
+
+
 def stream_mean(
-    rows: Sequence[torch.Tensor], masks: Sequence[torch.Tensor], *, like: torch.Tensor
+    rows: Sequence[torch.Tensor],
+    masks: Sequence[torch.Tensor],
+    *,
+    like: torch.Tensor,
+    global_counts: Sequence[float] | None = None,
+    world_size: int = 1,
 ) -> torch.Tensor:
-    """Average per-stream row means, then average across the non-empty streams.
+    """Average per-stream row means, then average across the streams that exist.
 
     The task stream and the structural stream carry very different row counts, so
     the spec averages inside a stream first and weights the streams equally. An
@@ -171,28 +201,45 @@ def stream_mean(
     differentiable zero rather than dropping out of the graph, so DDP sees the
     same parameters on every rank (spec section 7.5).
 
+    Under DDP the per-stream mean has to be a *global* mean. Structural chunks are
+    distributed by token cost, so ranks hold unequal counts and a rank can hold no
+    structural row at all; dividing by rank-local counts and letting DDP average
+    the ranks equally then weights the streams by where their rows happened to
+    land. The caller reduces `stream_row_counts` across ranks and passes them as
+    ``global_counts``: each rank contributes its local sum over the global count,
+    scaled by ``world_size`` so DDP's averaging leaves the global stream mean.
+    With one rank the scale is 1 and the result is the plain local mean, exactly
+    as `src.train_b0.scale_ddp_mean_loss` treats the task loss.
+
     Args:
         rows: One ``(n_s,)`` per-row tensor per stream.
         masks: One ``(n_s,)`` valid-row mask per stream, aligned with ``rows``.
         like: A tensor supplying dtype, device and the autograd connection.
+        global_counts: Valid-row count per stream summed over ranks; rank-local
+            counts when omitted.
+        world_size: Ranks DDP averages.
 
     Returns:
         The scalar mean.
 
     Raises:
-        ValueError: If ``rows`` and ``masks`` differ in length.
+        ValueError: If ``rows``, ``masks`` and ``global_counts`` are not aligned,
+            or ``world_size`` is below one.
     """
-    if len(rows) != len(masks):
-        raise ValueError(f"rows ({len(rows)}) and masks ({len(masks)}) must be aligned")
+    if world_size < 1:
+        raise ValueError(f"world_size must be at least 1, got {world_size}")
+    counts = stream_row_counts(rows, masks) if global_counts is None else list(global_counts)
+    if len(counts) != len(rows):
+        raise ValueError(f"counts ({len(counts)}) and rows ({len(rows)}) must be aligned")
     zero = like.sum() * 0.0
-    means: list[torch.Tensor] = []
-    for row, mask in zip(rows, masks, strict=True):
-        if row.numel() == 0:
+    shares: list[torch.Tensor] = []
+    for row, mask, count in zip(rows, masks, counts, strict=True):
+        if count <= 0.0:
             continue
-        weight = mask.to(row).sum()
-        if float(weight) == 0.0:
-            continue
-        means.append((row * mask.to(row)).sum() / weight)
-    if not means:
+        # A rank with no row of a stream other ranks do hold still contributes a
+        # differentiable zero, so every rank stacks the same streams.
+        local = row.sum() if row.numel() == 0 else (row * mask.to(row)).sum()
+        shares.append(local / count)
+    if not shares:
         return zero
-    return zero + torch.stack(means).mean()
+    return zero + float(world_size) * torch.stack(shares).sum() / len(shares)

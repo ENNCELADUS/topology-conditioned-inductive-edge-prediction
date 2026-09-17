@@ -33,6 +33,7 @@ from src.model.egostitch.classifier.motif_prompt import (  # noqa: E402
 )
 from src.train_b0 import (  # noqa: E402
     MotifTemplateRows,
+    _motif_stream_counts,
     _motif_stream_terms,
     _set_motif_prompt_training_stage,
     build_ddp_accelerator,
@@ -133,13 +134,20 @@ def main() -> None:
     batch = _batch(local_rows)
     rows.attach_train(batch)
     output = prepared(batch)
+    task_term = (
+        {"slot": output["slot_loss_rows"], "topo": output["topo_loss_rows"]},
+        batch[TEMPLATE_MASK_KEY],
+    )
+    # The trainer's own reduction: the per-stream mean divides by the count
+    # summed over ranks, never by this rank's own (spec section 7.5).
+    counts = torch.tensor(_motif_stream_counts(task=task_term, struct=None), dtype=torch.float64)
+    dist.all_reduce(counts, op=dist.ReduceOp.SUM)
     slot, topo = _motif_stream_terms(
-        task=(
-            {"slot": output["slot_loss_rows"], "topo": output["topo_loss_rows"]},
-            batch[TEMPLATE_MASK_KEY],
-        ),
+        task=task_term,
         struct=None,
         like=output["loss"],
+        global_counts=[float(value) for value in counts.tolist()],
+        world_size=dist.get_world_size(),
     )
     loss = output["loss"] + model.cfg.w_slot * slot + model.cfg.w_topo * topo
     optimizer.zero_grad()

@@ -103,7 +103,7 @@ from src.distill.losses import (
     kd_rep_loss,
     kd_struct_loss,
 )
-from src.distill.motif_losses import stream_mean
+from src.distill.motif_losses import stream_mean, stream_row_counts
 from src.distill.struct_config import StructConfig
 from src.distill.struct_losses import (
     hard_struct_errors,
@@ -775,11 +775,49 @@ def _set_motif_prompt_training_stage(
             group["lr"] = 0.0
 
 
+def _motif_stream_rows(
+    *,
+    task: tuple[Mapping[str, torch.Tensor], torch.Tensor],
+    struct: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    """Split the present streams into ``(slot rows, topo rows, masks)``."""
+    streams = [task] + ([] if struct is None else [struct])
+    return (
+        [rows["slot"] for rows, _ in streams],
+        [rows["topo"] for rows, _ in streams],
+        [mask for _, mask in streams],
+    )
+
+
+def _motif_stream_counts(
+    *,
+    task: tuple[Mapping[str, torch.Tensor], torch.Tensor],
+    struct: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None,
+) -> list[float]:
+    """This rank's valid-row counts: every stream's ``L_slot``, then every ``L_topo``.
+
+    The caller sums the vector across ranks and hands it back to
+    `_motif_stream_terms`: structural chunks are distributed by token cost, so a
+    rank-local count is not the count the per-stream mean needs (spec 7.5).
+
+    Args:
+        task: The task stream's per-row terms and its valid-nonself mask.
+        struct: The structural stream's, or ``None`` when the stream is absent.
+
+    Returns:
+        ``2 * n_streams`` counts, slot streams first.
+    """
+    slot_rows, topo_rows, masks = _motif_stream_rows(task=task, struct=struct)
+    return stream_row_counts(slot_rows, masks) + stream_row_counts(topo_rows, masks)
+
+
 def _motif_stream_terms(
     *,
     task: tuple[Mapping[str, torch.Tensor], torch.Tensor],
     struct: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None,
     like: torch.Tensor,
+    global_counts: Sequence[float] | None = None,
+    world_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Average ``L_slot`` and ``L_topo`` per stream, then across streams (spec 7.5).
 
@@ -787,15 +825,31 @@ def _motif_stream_terms(
         task: The task stream's per-row terms and its valid-nonself mask.
         struct: The structural stream's, or ``None`` when the stream is absent.
         like: A tensor supplying dtype, device and the autograd connection.
+        global_counts: `_motif_stream_counts` summed over ranks; rank-local counts
+            when omitted, which is only correct at world size one.
+        world_size: Ranks DDP averages.
 
     Returns:
         ``(slot, topo)`` scalars; an empty stream contributes a differentiable zero.
+
+    Raises:
+        ValueError: If ``global_counts`` does not cover both terms of every stream.
     """
-    streams = [task] + ([] if struct is None else [struct])
-    masks = [mask for _, mask in streams]
+    slot_rows, topo_rows, masks = _motif_stream_rows(task=task, struct=struct)
+    if global_counts is None:
+        slot_counts: Sequence[float] | None = None
+        topo_counts: Sequence[float] | None = None
+    else:
+        if len(global_counts) != 2 * len(masks):
+            raise ValueError(
+                f"global_counts ({len(global_counts)}) must cover the slot and topo terms "
+                f"of all {len(masks)} streams"
+            )
+        slot_counts = list(global_counts[: len(masks)])
+        topo_counts = list(global_counts[len(masks) :])
     return (
-        stream_mean([rows["slot"] for rows, _ in streams], masks, like=like),
-        stream_mean([rows["topo"] for rows, _ in streams], masks, like=like),
+        stream_mean(slot_rows, masks, like=like, global_counts=slot_counts, world_size=world_size),
+        stream_mean(topo_rows, masks, like=like, global_counts=topo_counts, world_size=world_size),
     )
 
 
@@ -6107,16 +6161,35 @@ def train_ddp_loop(
                         torch.ones_like(struct_motif_rows["slot"]),
                     )
                 )
+                task_term = (
+                    {
+                        "slot": output.get("slot_loss_rows", loss.new_zeros(0)),
+                        "topo": output.get("topo_loss_rows", loss.new_zeros(0)),
+                    },
+                    batch.get(TEMPLATE_MASK_KEY, loss.new_zeros(0)),
+                )
+                # Structural chunks are distributed by token cost, so the
+                # per-stream mean divides by a count reduced over ranks, never by
+                # this rank's own (spec 7.5). One collective per step; the
+                # branch itself is rank-uniform.
+                local_counts = _motif_stream_counts(task=task_term, struct=struct_term)
+                global_counts = local_counts
+                if world_size > 1:
+                    global_counts = [
+                        float(value)
+                        for value in accelerator.reduce(
+                            torch.tensor(
+                                local_counts, device=accelerator.device, dtype=torch.float64
+                            ),
+                            reduction="sum",
+                        ).tolist()
+                    ]
                 slot_term, topo_term = _motif_stream_terms(
-                    task=(
-                        {
-                            "slot": output.get("slot_loss_rows", loss.new_zeros(0)),
-                            "topo": output.get("topo_loss_rows", loss.new_zeros(0)),
-                        },
-                        batch.get(TEMPLATE_MASK_KEY, loss.new_zeros(0)),
-                    ),
+                    task=task_term,
                     struct=struct_term,
                     like=loss,
+                    global_counts=global_counts,
+                    world_size=world_size,
                 )
                 cfg_motif = raw_training_model.cfg
                 loss = loss + cfg_motif.w_slot * slot_term + cfg_motif.w_topo * topo_term

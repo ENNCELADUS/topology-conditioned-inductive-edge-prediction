@@ -775,6 +775,68 @@ def test_a_self_only_batch_contributes_a_differentiable_zero() -> None:
     assert slot.requires_grad and topo.requires_grad
 
 
+def test_global_counts_weight_the_streams_equally_across_ranks() -> None:
+    # Structural chunks are distributed by token cost, so a rank can hold none.
+    # Dividing by rank-local counts and letting DDP average the ranks equally
+    # weights task/structural 3:1 instead of 1:1 (spec 7.5).
+    from src.train_b0 import _motif_stream_counts, _motif_stream_terms
+
+    anchor = torch.zeros((), requires_grad=True)
+    per_rank = [
+        (
+            {"slot": torch.tensor([1.0, 1.0]) + anchor, "topo": torch.zeros(2) + anchor},
+            torch.ones(2),
+            (
+                {"slot": torch.tensor([4.0, 4.0]) + anchor, "topo": torch.zeros(2) + anchor},
+                torch.ones(2),
+            ),
+        ),
+        (
+            {"slot": torch.tensor([3.0, 3.0]) + anchor, "topo": torch.zeros(2) + anchor},
+            torch.ones(2),
+            ({"slot": anchor.new_zeros(0), "topo": anchor.new_zeros(0)}, torch.ones(0)),
+        ),
+    ]
+    counts = [
+        _motif_stream_counts(task=(rows, mask), struct=struct) for rows, mask, struct in per_rank
+    ]
+    assert counts[0] == [2.0, 2.0, 2.0, 2.0]
+    assert counts[1] == [2.0, 0.0, 2.0, 0.0]
+    reduced = [a + b for a, b in zip(counts[0], counts[1], strict=True)]
+
+    slots = [
+        _motif_stream_terms(
+            task=(rows, mask),
+            struct=struct,
+            like=anchor,
+            global_counts=reduced,
+            world_size=2,
+        )[0]
+        for rows, mask, struct in per_rank
+    ]
+
+    # DDP averages the ranks, so their mean is the objective actually optimised:
+    # the global task mean 2.0 and the global structural mean 4.0, weighted 1:1.
+    assert float((0.5 * (slots[0] + slots[1])).detach()) == pytest.approx(3.0)
+    # Every rank still contributes a differentiable term for both streams.
+    assert all(term.requires_grad for term in slots)
+
+
+def test_mismatched_global_counts_fail_closed() -> None:
+    from src.train_b0 import _motif_stream_terms
+
+    anchor = torch.zeros((), requires_grad=True)
+    rows = {"slot": torch.ones(2) + anchor, "topo": torch.ones(2) + anchor}
+    with pytest.raises(ValueError, match="global_counts"):
+        _motif_stream_terms(
+            task=(rows, torch.ones(2)),
+            struct=None,
+            like=anchor,
+            global_counts=[2.0],
+            world_size=1,
+        )
+
+
 def test_epoch_telemetry_reports_both_terms() -> None:
     from src.train_b0 import _motif_epoch_telemetry
 
