@@ -79,6 +79,7 @@ from src.data.motif_template import (
     MotifTemplateTable,
     count_statistics,
 )
+from src.data.packed_features import load_packed_manifest
 from src.experiments.motif_pilot_b import (
     GraphLossWeights,
     fit_constant_template,
@@ -1246,6 +1247,46 @@ class Universe:
     pairs: list[Pair]
     target: torch.Tensor
     strata: list[str]
+    pool_rows: int
+    eligible_rows: int
+
+
+def packed_node_lengths(pack_dir: Path) -> dict[str, int]:
+    """Return each packed node's true residue length.
+
+    Args:
+        pack_dir: The packed feature directory.
+
+    Returns:
+        ``node id -> length`` over the pack's manifest.
+    """
+    manifest = load_packed_manifest(pack_dir)
+    return {record.node_id: int(record.length) for record in manifest.nodes}
+
+
+def _short_enough(pairs: Sequence[Pair], lengths: Mapping[str, int], cap: int) -> NDArray[np.bool_]:
+    """Return the mask of pairs whose two endpoints both fit under ``cap``.
+
+    The scorer sizes one fp32 encoding cache over the *whole* pack at the length
+    bucket of the longest node it is asked for, so a single 1002-residue row
+    costs 20 GiB of device memory while a training chain holds the rest of the
+    card. Capping the probe's rows at a lower bucket is what keeps the
+    measurement runnable beside a running job; the kept fraction is reported.
+
+    Args:
+        pairs: The candidate pairs.
+        lengths: The pack's node lengths.
+        cap: The longest packed node a probe row may touch; ``0`` keeps all.
+
+    Returns:
+        The boolean keep mask.
+    """
+    if cap <= 0:
+        return np.ones(len(pairs), dtype=bool)
+    return np.asarray(
+        [lengths.get(u, cap + 1) <= cap and lengths.get(v, cap + 1) <= cap for u, v in pairs],
+        dtype=bool,
+    )
 
 
 def _draw_universe(
@@ -1255,8 +1296,9 @@ def _draw_universe(
     *,
     rows: int,
     seed: int,
+    keep: NDArray[np.bool_],
 ) -> Universe:
-    """Draw one universe's stratified probe rows.
+    """Draw one universe's stratified probe rows from the eligible candidates.
 
     Args:
         name: Universe name.
@@ -1264,17 +1306,22 @@ def _draw_universe(
         target: ``(n, 96)`` compiled templates of the pool.
         rows: Rows to keep.
         seed: Sampling seed.
+        keep: Which candidates the length cap leaves eligible.
 
     Returns:
         The drawn universe.
     """
-    picked = stratified_sample(closure_counts(target), rows=rows, seed=seed)
+    eligible = np.flatnonzero(keep)
+    counts = closure_counts(target.index_select(0, torch.from_numpy(eligible)))
+    picked = eligible[stratified_sample(counts, rows=rows, seed=seed)]
     kept = target.index_select(0, torch.from_numpy(picked))
     return Universe(
         name=name,
         pairs=[pairs[int(index)] for index in picked],
         target=kept,
         strata=stratum_of(closure_counts(kept)),
+        pool_rows=int(len(pairs)),
+        eligible_rows=int(eligible.size),
     )
 
 
@@ -1286,6 +1333,8 @@ def _select_universes(
     seed: int,
     pool_rows: int,
     fit_rows: int,
+    node_lengths: Mapping[str, int],
+    max_node_length: int,
 ) -> tuple[list[Universe], torch.Tensor]:
     """Draw the stratified rows of both universes and the constant's fit targets.
 
@@ -1296,6 +1345,8 @@ def _select_universes(
         seed: Master seed.
         pool_rows: Candidate held-out training rows the strata are drawn from.
         fit_rows: Training rows the asymmetric constant is fitted on.
+        node_lengths: The pack's node lengths.
+        max_node_length: The longest packed node a probe row may touch.
 
     Returns:
         ``([held-out training, val_cls], fit targets)``.
@@ -1319,7 +1370,14 @@ def _select_universes(
     training_table = MotifTemplateTable(split.build_training_graph())
     fit_target = torch.from_numpy(training_table.weights(fit_pairs))
     pool_target = torch.from_numpy(training_table.weights(pool_pairs))
-    heldout = _draw_universe("heldout_train", pool_pairs, pool_target, rows=rows, seed=seed + 3)
+    heldout = _draw_universe(
+        "heldout_train",
+        pool_pairs,
+        pool_target,
+        rows=rows,
+        seed=seed + 3,
+        keep=_short_enough(pool_pairs, node_lengths, max_node_length),
+    )
 
     val_pairs, _ = su._resolve_pairs("val_cls", data_root, strategy)
     val_table = MotifTemplateTable(
@@ -1327,7 +1385,14 @@ def _select_universes(
     )
     nonself = [(u, v) for u, v in val_pairs if u != v]
     val_target = torch.from_numpy(val_table.weights(nonself))
-    val = _draw_universe("val_cls", nonself, val_target, rows=rows, seed=seed + 4)
+    val = _draw_universe(
+        "val_cls",
+        nonself,
+        val_target,
+        rows=rows,
+        seed=seed + 4,
+        keep=_short_enough(nonself, node_lengths, max_node_length),
+    )
     logger.info(
         "rows: held-out training %d of %d candidates, val_cls %d of %d nonself",
         len(heldout.pairs),
@@ -1350,6 +1415,7 @@ def run_probe(
     fit_rows: int,
     chunk: int,
     grad_rows: int,
+    max_node_length: int,
     device: torch.device,
     amp: str,
     token_budget: int,
@@ -1369,6 +1435,7 @@ def run_probe(
         fit_rows: Rows the asymmetric constant is fitted on.
         chunk: Rows per replayed batch.
         grad_rows: Rows in the gradient batch.
+        max_node_length: The longest packed node a probe row may touch.
         device: Compute device.
         amp: Encoder autocast mode of the capturing scoring pass.
         token_budget: Scoring token budget.
@@ -1392,6 +1459,7 @@ def run_probe(
     weights = GraphLossWeights.from_config(model.cfg)
     mean_template = model.mean_template.detach().float().cpu()
 
+    node_lengths = packed_node_lengths(pack_dir)
     universes, fit_target = _select_universes(
         data_root=data_root,
         strategy=strategy,
@@ -1399,6 +1467,8 @@ def run_probe(
         seed=seed,
         pool_rows=pool_rows,
         fit_rows=fit_rows,
+        node_lengths=node_lengths,
+        max_node_length=max_node_length,
     )
     logger.info("fitting the asymmetric constant template on %d rows", fit_target.size(0))
     fitted = fit_constant_template(fit_target, weights, steps=fit_steps, device=device)
@@ -1423,6 +1493,7 @@ def run_probe(
             "huber_delta": weights.huber_delta,
         },
         "precisions": precisions,
+        "max_node_length": max_node_length,
         "scoring_note": (
             "the formal packed path runs the generator with autocast off over an fp32 "
             "encoding cache, so the bf16 replay is the trainer's regime, not the scorer's"
@@ -1451,6 +1522,8 @@ def run_probe(
         row_block[universe.name] = {
             "rows": len(universe.pairs),
             "strata": counts,
+            "candidate_rows": universe.pool_rows,
+            "eligible_under_length_cap": universe.eligible_rows,
             "cached_input_dtype": cached.dtype,
             "cached_input_mib": cached.megabytes(),
         }
@@ -1548,16 +1621,21 @@ def markdown_summary(report: Mapping[str, object]) -> str:
         "",
         f"{report['scoring_note']}.",
         "",
-        "| universe | rows | strata 0 / 1-2 / 3-7 / 8 | cached dtype | cache MiB | "
-        "decomposition max |abs diff| |",
-        "|---|---|---|---|---|---|",
+        f"Rows touch only packed nodes of at most {report['max_node_length']} residues "
+        "(0 means no cap).",
+        "",
+        "| universe | rows | strata 0 / 1-2 / 3-7 / 8 | eligible / candidates | cached dtype | "
+        "cache MiB | decomposition max abs diff |",
+        "|---|---|---|---|---|---|---|",
     ]
     fidelity = cast(Mapping[str, float], report["decomposition_max_abs_diff"])
     for name, block in universes.items():
         strata = cast(Mapping[str, int], block["strata"])
         counts = " / ".join(str(strata.get(key, 0)) for key, _, _ in STRATA)
         lines.append(
-            f"| {name} | {block['rows']} | {counts} | `{block['cached_input_dtype']}` | "
+            f"| {name} | {block['rows']} | {counts} | "
+            f"{block['eligible_under_length_cap']} / {block['candidate_rows']} | "
+            f"`{block['cached_input_dtype']}` | "
             f"{_number(block['cached_input_mib'], 1)} | {_number(fidelity.get(name), 8)} |"
         )
 
@@ -1732,6 +1810,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fit-rows", type=int, default=20_000)
     parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--grad-rows", type=int, default=64)
+    parser.add_argument(
+        "--max-node-length",
+        type=int,
+        default=512,
+        help=(
+            "skip rows touching a longer packed node; the scorer's fp32 encoding cache "
+            "is sized by the longest node it is asked for (0 disables the cap)"
+        ),
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp", default="bf16", choices=["off", "bf16"])
     parser.add_argument("--token-budget", type=int, default=131_072)
@@ -1759,6 +1846,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         fit_rows=args.fit_rows,
         chunk=args.chunk,
         grad_rows=args.grad_rows,
+        max_node_length=args.max_node_length,
         device=su._resolve_device(args.device),
         amp=args.amp,
         token_budget=args.token_budget,
@@ -1791,6 +1879,7 @@ __all__ = [
     "main",
     "markdown_summary",
     "max_pairwise_distance",
+    "packed_node_lengths",
     "query_norms",
     "replay",
     "run_probe",

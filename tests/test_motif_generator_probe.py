@@ -8,6 +8,7 @@ import torch
 from src.experiments.motif_generator_probe import (
     STRATA,
     CachedInputs,
+    _short_enough,
     check_decomposition,
     closure_counts,
     decompose,
@@ -140,3 +141,11 @@ def test_replay_is_independent_of_the_chunk_padding_width() -> None:
     assert torch.allclose(alone[0], together[0], atol=1e-5)
     assert cached.rows() == 2
     assert cached.megabytes() > 0.0
+
+
+def test_short_enough_keeps_only_pairs_under_the_cap() -> None:
+    lengths = {"a": 100, "b": 500, "c": 900}
+    pairs = [("a", "b"), ("a", "c"), ("b", "c"), ("a", "missing")]
+    mask = _short_enough(pairs, lengths, 512)
+    assert mask.tolist() == [True, False, False, False]
+    assert _short_enough(pairs, lengths, 0).tolist() == [True] * 4
