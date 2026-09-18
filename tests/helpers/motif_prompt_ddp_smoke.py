@@ -35,6 +35,7 @@ from src.train_b0 import (  # noqa: E402
     MotifTemplateRows,
     _motif_stream_counts,
     _motif_stream_terms,
+    _motif_task_nonempty,
     _set_motif_prompt_training_stage,
     build_ddp_accelerator,
 )
@@ -143,7 +144,11 @@ def main() -> None:
     rows.attach_train(batch)
     output = prepared(batch)
     task_term = (
-        {"slot": output["slot_loss_rows"], "topo": output["topo_loss_rows"]},
+        {
+            "slot": output["slot_loss_rows"],
+            "topo": output["topo_loss_rows"],
+            "nonempty": _motif_task_nonempty(model, batch, like=output["loss"]),
+        },
         batch[TEMPLATE_MASK_KEY],
     )
     # The trainer's own reduction: the per-stream mean divides by the count

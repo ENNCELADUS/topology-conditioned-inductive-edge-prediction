@@ -88,8 +88,13 @@ selected method. Every piece of writing must explain how its context helps decid
   `python -m src.experiments.motif_pilot_b` (three pre-registered levels; level 1 or 2 failing stops the
   wave) and continued with `hpc/run.sh train configs/split_seed42/motif_prompt_stage2_v2{,_no_topo,_strong_graph}.yaml
   --resume-attempt <prefix attempt dir>`; `motif_prompt_stage2_v2_{initonly,lossonly}_prefix` attribute the
-  fix; `python -m src.experiments.motif_family_scaling` decides the wave-3 presence gate. The wave-1 configs
-  keep their meaning: `beta_c`, `closure_bias_init` and `warmup_losses` default to wave-1 behaviour.
+  fix; `python -m src.experiments.motif_family_scaling` decides the wave-3 presence gate. Wave-3 phase B asks
+  whether G hedges because the graph loss reads the task stream's 1:5 rows (~82% with an empty closure
+  family): `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` add only
+  `motif_prompt.graph_row_weighting: closure_balanced` (share `graph_row_positive_share`, counts reduced
+  across ranks, `graph_rows_closure_nonempty_frac` in `metrics.jsonl`) to the two wave-2 prefixes. The
+  wave-1 configs keep their meaning: `beta_c`, `closure_bias_init`, `warmup_losses` and
+  `graph_row_weighting` default to wave-1 behaviour.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

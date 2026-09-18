@@ -1075,8 +1075,10 @@ def test_global_counts_weight_the_streams_equally_across_ranks() -> None:
     counts = [
         _motif_stream_counts(task=(rows, mask), struct=struct) for rows, mask, struct in per_rank
     ]
-    assert counts[0] == [2.0, 2.0, 2.0, 2.0]
-    assert counts[1] == [2.0, 0.0, 2.0, 0.0]
+    # Two streams, three blocks: L_slot, L_topo, then the closure-non-empty rows
+    # (zero here -- these stand-in rows carry no indicator).
+    assert counts[0] == [2.0, 2.0, 2.0, 2.0, 0.0, 0.0]
+    assert counts[1] == [2.0, 0.0, 2.0, 0.0, 0.0, 0.0]
     reduced = [a + b for a, b in zip(counts[0], counts[1], strict=True)]
 
     slots = [
@@ -1112,12 +1114,122 @@ def test_mismatched_global_counts_fail_closed() -> None:
         )
 
 
+# ------------------------------------------- closure-balanced graph-loss rows
+
+
+def _mixed_template_batch(n: int = 6) -> dict[str, torch.Tensor]:
+    """A task batch whose first two rows are the only ones with a closure target."""
+    from src.model.egostitch.classifier.motif_prompt import TEMPLATE_MASK_KEY
+
+    batch = _pair_batch(n=n)
+    template = _weights(n=n)
+    template[2:, :16] = 0.0
+    batch[TEMPLATE_KEY] = template
+    batch[TEMPLATE_MASK_KEY] = torch.ones(n)
+    return batch
+
+
+def _task_stream(
+    model: V3_1MotifPrompt, batch: dict[str, torch.Tensor]
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Run the forward and build the task stream exactly as the trainer does."""
+    from src.model.egostitch.classifier.motif_prompt import TEMPLATE_MASK_KEY
+    from src.train_b0 import _motif_task_nonempty
+
+    output = model(batch)
+    like = output["loss"]
+    rows = {
+        "slot": output["slot_loss_rows"],
+        "topo": output["topo_loss_rows"],
+        "nonempty": _motif_task_nonempty(model, batch, like=like),
+    }
+    return rows, batch[TEMPLATE_MASK_KEY], like
+
+
+def test_uniform_graph_rows_are_the_composite_the_arm_already_had() -> None:
+    from src.train_b0 import _motif_row_share, _motif_stream_counts, _motif_stream_terms
+
+    model = _model("two")
+    model.initialize_teacher()
+    _open_gates(model)
+    rows, mask, like = _task_stream(model, _mixed_template_batch())
+    counts = _motif_stream_counts(task=(rows, mask), struct=None)
+    assert counts[:2] == [6.0, 6.0] and counts[2] == 2.0
+    unweighted = _motif_stream_terms(
+        task=(rows, mask), struct=None, like=like, global_counts=counts
+    )
+    weighted = _motif_stream_terms(
+        task=(rows, mask),
+        struct=None,
+        like=like,
+        global_counts=counts,
+        positive_share=_motif_row_share(model),
+    )
+    # The default arm asks for no weighting, so the fold is bit-for-bit the old one.
+    assert model.cfg.graph_row_weighting == "uniform"
+    assert _motif_row_share(model) is None
+    for old, new in zip(unweighted, weighted, strict=True):
+        torch.testing.assert_close(new, old, rtol=0, atol=0)
+
+
+def test_closure_balanced_rows_reweight_only_the_two_graph_terms() -> None:
+    from src.train_b0 import _motif_row_share, _motif_stream_counts, _motif_stream_terms
+
+    model = _model("two", graph_row_weighting="closure_balanced")
+    model.initialize_teacher()
+    _open_gates(model)
+    batch = _mixed_template_batch()
+    rows, mask, like = _task_stream(model, batch)
+    counts = _motif_stream_counts(task=(rows, mask), struct=None)
+    assert _motif_row_share(model) == pytest.approx(0.5)
+    slot, topo = _motif_stream_terms(
+        task=(rows, mask),
+        struct=None,
+        like=like,
+        global_counts=counts,
+        positive_share=_motif_row_share(model),
+    )
+    nonempty = rows["nonempty"] > 0
+    for term, name in ((slot, "slot"), (topo, "topo")):
+        raw = rows[name].detach()
+        expected = 0.5 * float(raw[nonempty].mean()) + 0.5 * float(raw[~nonempty].mean())
+        assert float(term.detach()) == pytest.approx(expected, rel=1e-5)
+        # The 4:2 row split really did move the term off its plain mean.
+        assert float(term.detach()) != pytest.approx(float(raw.mean()), rel=1e-5)
+    assert slot.requires_grad and topo.requires_grad
+    # The task BCE is untouched: only the rows of the graph loss are re-weighted.
+    torch.testing.assert_close(model(batch)["loss"].detach(), like.detach())
+
+
+def test_a_balanced_share_other_than_a_half_is_read_from_the_config() -> None:
+    from src.train_b0 import _motif_row_share
+
+    model = _model("two", graph_row_weighting="closure_balanced", graph_row_positive_share=0.75)
+    assert _motif_row_share(model) == pytest.approx(0.75)
+
+
+def test_a_weighted_stream_without_an_indicator_fails_closed() -> None:
+    from src.train_b0 import _motif_stream_terms
+
+    anchor = torch.zeros((), requires_grad=True)
+    rows = {"slot": torch.ones(2) + anchor, "topo": torch.ones(2) + anchor}
+    with pytest.raises(ValueError, match="closure indicator"):
+        _motif_stream_terms(
+            task=(rows, torch.ones(2)), struct=None, like=anchor, positive_share=0.5
+        )
+
+
 def test_epoch_telemetry_reports_both_terms() -> None:
     from src.train_b0 import _motif_epoch_telemetry
 
     telemetry = _motif_epoch_telemetry(slot_sum=4.0, topo_sum=2.0, steps=2)
     assert telemetry == {"train_motif_slot_loss": 2.0, "train_motif_topo_loss": 1.0}
     assert _motif_epoch_telemetry(slot_sum=0.0, topo_sum=0.0, steps=0) == {}
+    # The imbalance the balanced row weighting acts on is logged either way.
+    with_rows = _motif_epoch_telemetry(
+        slot_sum=4.0, topo_sum=2.0, steps=2, nonempty_sum=180.0, valid_sum=1000.0
+    )
+    assert with_rows["graph_rows_closure_nonempty_frac"] == pytest.approx(0.18)
 
 
 def test_the_model_returns_task_bce_only_and_leaves_the_composite_to_the_trainer() -> None:
@@ -1292,7 +1404,7 @@ def test_split_composite_shares_sum_to_the_joint_composite() -> None:
 @pytest.mark.parametrize("stage", ["one", "two"])
 def test_task_stub_counts_match_the_rows_the_forward_emits(stage: str) -> None:
     from src.model.egostitch.classifier.motif_prompt import TEMPLATE_MASK_KEY
-    from src.train_b0 import _motif_stream_counts, _motif_task_stub
+    from src.train_b0 import _motif_stream_counts, _motif_task_nonempty, _motif_task_stub
 
     model = _model(stage)
     if stage == "two":
@@ -1306,6 +1418,9 @@ def test_task_stub_counts_match_the_rows_the_forward_emits(stage: str) -> None:
         {
             "slot": output.get("slot_loss_rows", like.new_zeros(0)),
             "topo": output.get("topo_loss_rows", like.new_zeros(0)),
+            # The trainer builds the task term's indicator from the same batch
+            # the stub reads, so the two must agree row for row.
+            "nonempty": _motif_task_nonempty(model, batch, like=like),
         },
         batch[TEMPLATE_MASK_KEY],
     )
@@ -1316,10 +1431,11 @@ def test_task_stub_counts_match_the_rows_the_forward_emits(stage: str) -> None:
     if stage == "two":
         assert _motif_stream_counts(task=stub, struct=None)[0] == 3.0
     else:
-        assert _motif_stream_counts(task=stub, struct=None) == [0.0, 0.0]
+        assert _motif_stream_counts(task=stub, struct=None) == [0.0, 0.0, 0.0]
     # Without a template the forward emits no rows, and the stub says so too.
     bare = _pair_batch(n=4)
     assert _motif_stream_counts(task=_motif_task_stub(model, bare, like=like), struct=None) == [
+        0.0,
         0.0,
         0.0,
     ]

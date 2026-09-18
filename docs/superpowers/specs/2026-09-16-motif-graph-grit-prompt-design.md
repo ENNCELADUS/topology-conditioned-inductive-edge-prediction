@@ -1,6 +1,6 @@
 # Motif graph prompts read by GRIT
 
-**Date:** 2026-09-16, amended 2026-09-18. **Version:** v10 (supersedes v9; change log in §11).
+**Date:** 2026-09-16, amended 2026-09-18. **Version:** v11 (supersedes v10; change log in §11).
 **Status:** implemented and run once (wave 1, `686627d`, 2026-09-17/18): Stage I and its two family
 ablations, Stage II and its bridge-only / closure-only controls. Stage I gains (+0.066 test AUPRC, +0.08 GS
 over the frozen trunk); every Stage II row finished at the trunk. The wave-1 verdict
@@ -637,6 +637,16 @@ arm). Per-parameter-group gradient norms of G under each term, the gate-head pre
 predicted family masses are logged every epoch on the same probe batch, so a drift back towards the constant
 graph is visible during training.
 
+`L_G`'s rows are the streams' own rows by default (`graph_row_weighting: uniform`). Optionally
+(`graph_row_weighting: closure_balanced`) each stream's rows are re-weighted inside `L_G` so the rows whose
+closure target is non-empty carry `graph_row_positive_share` of its mass and the empty rows the rest: at the
+task stream's 1:5 ratio about 82% of rows have an empty closure family, so the uniform reading lets the
+marginal "predict almost nothing" dominate the graph gradient. The weights sum to the stream's valid-row
+count and are formed from counts summed over ranks in the same reduction that produces the per-stream row
+counts, so `L_G` keeps its scale and its global mean; the task stream, the sampler, the structural stream and
+every other loss are untouched, and `graph_rows_closure_nonempty_frac` logs the realised imbalance each epoch
+either way.
+
 `L_struct` is §7.1's structural stream. `L_topo` is the light representation term: with fixed non-affine
 LayerNorm `N`, `mean over fields and dimensions of (N(R_T(Ahat)) - stopgrad(N(R_T(A*))))^2`, over all four
 token fields, averaged over valid nonself rows per stream and then across streams; an empty stream
@@ -840,6 +850,7 @@ cannot instantiate this interface.
 
 | Version | Date | Changes |
 |---|---|---|
+| v11 | 2026-09-18 | Wave-3 phase B, one optional key pair, no default change: **§7.5** `motif_prompt.graph_row_weighting` (`uniform` / `closure_balanced`) with `graph_row_positive_share` re-weights the rows of `L_G` alone, so the closure-non-empty rows carry a fixed share of the graph loss instead of the ~18% they hold in the task stream's 1:5 rows; the weights sum to the valid-row count and use the rank-reduced counts, leaving every other loss, the sampler and both streams untouched. Read as `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` against the wave-2 prefixes they copy; `graph_rows_closure_nonempty_frac` is logged per epoch whatever the setting. |
 | v10 | 2026-09-18 | First measured run read (`docs/results/motif_prompt_verdict/README.md`): Stage I +0.066 test AUPRC / +0.08 GS, every Stage II row at the trunk; the interface converts a true template into the full gain (reader swap 0.0005 vs graph swap 0.086 AUPRC), the generator emits a near-constant slot-symmetric graph, and the cause is closure gate heads initialised into saturation by `logit(density)` plus a product-only closure supervision (closure-head slot gradient 1/1800 of the interior's) inside a composite whose task gradient dominates the graph term 5-18x (170-860x at init). Four amendments, owner-reviewed: **§4** closure bias from the training-corpus non-zero mean with a mass check, attach/interior unchanged; **§7.3** raw closure term `beta_c`, products kept, wedge-mass loss rejected as not removing the attenuation; **§7.5** graph-only warm-up with task, structural and topo terms detached from G, then `lambda_G` by gradient-norm balancing at the interface opening, the prefix continued under the guarded resume with the inert keys excluded; **§0.2** pilot B run as those two epochs with a three-level pre-registered reading and its stop rule, pilot A superseded by the wave-1 counterfactual; **§7.4** teachability pilots dropped; **§8** wave-2 arms, the family-scaling diagnostic that decides a presence gate, the self-row option, and no AUPRC margin. Corrections to the verdict itself: "failed to learn structure", not "never trained"; the integrated-gradients attribution withdrawn (completeness does not close); the test transplant's -0.008 AUPRC is a small single-seed signal, not "inside the margin". |
 | v9 | 2026-09-16 | Implementation-planning clarifications, no design change. §8's "degree-matched control" is renamed the **degree-only control** and given an algorithm: a trained arm whose prompt carries only the symmetric degree pair from the predicted adjacency, with the mass entries zeroed and the GRIT fields row-masked — not a degree-marginal re-thresholding, which this specification never uses as a matching target. Recorded because the plan could not write that control's config from the v8 text. Separately, §11 was lost from the file between the v8 edit and the planning pass and has been reconstructed from the edit scripts; the cause was not determined and the file is untracked, so no git history existed to recover from. |
 | v8 | 2026-09-16 | Sixth owner review; no architectural blocker found. Pilot B's **collapse control is withdrawn**: averaging predicted edge weights is not invariant to the anonymous-slot permutation §3 randomises, so two rows predicting the same wedge through different closure slots — each at zero loss, identical sorted profiles, wedge mass `0.25` — average to two half-strength wedges at mass `0.125` and loss `0.00244140625` (reproduced), which would have been misread as row-dependent prediction. Row-dependence is now tested by a **row-transplant control** reusing §8's seeded whole-graph transplant, which keeps each predicted graph intact and scores exactly zero on that fixture, alongside the retained asymmetric fixed-template baseline and profile dispersion (§0.2). |

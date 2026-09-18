@@ -36,7 +36,7 @@ from src.data.motif_template import (
     MotifTemplateStatistics,
     count_statistics,
 )
-from src.distill.motif_losses import slot_loss_rows, topo_loss_rows
+from src.distill.motif_losses import closure_nonempty, slot_loss_rows, topo_loss_rows
 from src.model.egostitch.classifier.b0_v31 import V3_1, unpack_pair_batch
 from src.model.egostitch.classifier.layers import (
     CrossAttentionLayer,
@@ -62,6 +62,10 @@ INTERVENTIONS = (
 STAGES = ("one", "two")
 CLOSURE_BIAS_INITS = ("density", "nonzero_mean")
 WARMUP_LOSSES = ("joint", "graph_only")
+#: How the rows of the graph loss are weighted. ``uniform`` is the row
+#: distribution of the stream itself; ``closure_balanced`` gives the rows whose
+#: closure family is non-empty a fixed share of L_G's mass (spec section 7.5).
+GRAPH_ROW_WEIGHTINGS = ("uniform", "closure_balanced")
 #: ``w_slot`` may be this string instead of a number: the weight is then fixed
 #: once, by gradient-norm balancing at the first interface-open step.
 BALANCED_W_SLOT = "balanced"
@@ -162,6 +166,8 @@ class MotifPromptConfig:
     beta_i: float = 1.0
     beta_c: float = 0.0
     closure_bias_init: str = "density"
+    graph_row_weighting: str = "uniform"
+    graph_row_positive_share: float = 0.5
     huber_delta: float = 1.0
 
     def __post_init__(self) -> None:
@@ -201,6 +207,12 @@ class MotifPromptConfig:
             raise ValueError(
                 f"motif_prompt.closure_bias_init must be one of {list(CLOSURE_BIAS_INITS)}"
             )
+        if self.graph_row_weighting not in GRAPH_ROW_WEIGHTINGS:
+            raise ValueError(
+                f"motif_prompt.graph_row_weighting must be one of {list(GRAPH_ROW_WEIGHTINGS)}"
+            )
+        if not 0.0 < self.graph_row_positive_share < 1.0:
+            raise ValueError("motif_prompt.graph_row_positive_share must lie in (0, 1)")
         if isinstance(self.w_slot, str):
             if self.w_slot != BALANCED_W_SLOT:
                 raise ValueError(
@@ -1614,6 +1626,24 @@ class V3_1MotifPrompt(nn.Module):
             return weights
         return weights * self.family_mask.to(weights)
 
+    def closure_nonempty_rows(self, target: torch.Tensor) -> torch.Tensor:
+        """``(B,)`` float indicator of a family-gated non-empty closure target.
+
+        The trainer sums these rows across ranks beside the per-stream row counts
+        and re-weights the graph loss with them when
+        ``motif_prompt.graph_row_weighting`` asks for it (spec section 7.5). The
+        family gating is `_supervision_rows`' own, so a bridge-only arm reports no
+        non-empty row and the weighting falls back to uniform.
+
+        Args:
+            target: ``(B, 96)`` compiled edge weights, as the batch carries them.
+
+        Returns:
+            ``(B,)`` float32, one where the row's closure family is non-empty.
+        """
+        gated = self._gate_families(target.to(dtype=torch.float32))
+        return closure_nonempty(gated).to(dtype=torch.float32)
+
     def _apply_intervention(self, weights: torch.Tensor) -> tuple[torch.Tensor, float]:
         """Return the (possibly substituted) graph and the gate scale.
 
@@ -1997,6 +2027,7 @@ __all__ = [
     "FAMILIES",
     "FIELD_ORDER",
     "GATE_MODES",
+    "GRAPH_ROW_WEIGHTINGS",
     "INTERVENTIONS",
     "LOSS_TERM_NAMES",
     "STAGES",

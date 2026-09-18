@@ -17,7 +17,7 @@ from collections.abc import Mapping, Sequence
 import torch
 from torch.nn import functional as F
 
-from src.data.motif_template import slot_profiles
+from src.data.motif_template import CLOSURE_U, CLOSURE_V, slot_profiles
 
 _TERMS: tuple[tuple[str, str], ...] = (
     ("p", "beta_p"),
@@ -140,6 +140,121 @@ def slot_loss(
         beta_c=beta_c,
         huber_delta=huber_delta,
     ).mean()
+
+
+def closure_nonempty(target: torch.Tensor) -> torch.Tensor:
+    """Which rows of a compiled template carry at least one closure edge.
+
+    A row's closure family is the 16 weights of `CLOSURE_U` and `CLOSURE_V`: the
+    eight shared-neighbour witnesses seen from each endpoint. At the task
+    stream's 1:5 positive:negative ratio most rows have none of them, so the
+    graph loss of spec section 7.5 is dominated by rows whose closure target is
+    exactly zero. This is the predicate `closure_balanced_row_weights` splits on.
+
+    Args:
+        target: ``(B, 96)`` compiled edge weights.
+
+    Returns:
+        ``(B,)`` boolean, true where any closure weight is positive.
+
+    Raises:
+        ValueError: If ``target`` is not ``(B, 96)``.
+    """
+    if target.dim() != 2 or target.size(1) != 96:
+        raise ValueError(f"target must be (B, 96), got {tuple(target.shape)}")
+    left = (target[:, CLOSURE_U] > 0).any(dim=1)
+    right = (target[:, CLOSURE_V] > 0).any(dim=1)
+    return left | right
+
+
+def balanced_row_weights(
+    nonempty: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    positive_share: float,
+    global_nonempty: float | None = None,
+    global_empty: float | None = None,
+) -> torch.Tensor:
+    """Row weights giving the non-empty rows a fixed share of the graph loss.
+
+    The weights sum to the valid-row count, so multiplying per-row losses by them
+    and reducing through `stream_mean` keeps a mean: only the row *distribution*
+    the generator's loss sees changes, never its scale, the task stream, the
+    sampler or any other loss.
+
+    Under DDP the shares have to be formed from the counts summed over ranks, or
+    each rank re-weights its own batch and DDP's averaging leaves a mixture of
+    per-rank distributions. The caller reduces the counts exactly where
+    `stream_mean`'s ``global_counts`` are reduced and passes them here.
+
+    Args:
+        nonempty: ``(B,)`` boolean, true on the rows to give ``positive_share``.
+        valid: ``(B,)`` boolean or 0/1 row mask; invalid rows weigh zero.
+        positive_share: Loss mass the non-empty rows carry, in ``(0, 1)``.
+        global_nonempty: Valid non-empty rows summed over ranks; rank-local when
+            omitted.
+        global_empty: Valid empty rows summed over ranks; rank-local when omitted.
+
+    Returns:
+        ``(B,)`` float32 weights, zero on invalid rows and uniform whenever one
+        of the two classes is empty.
+
+    Raises:
+        ValueError: If the two row tensors disagree in shape, ``positive_share``
+            lies outside ``(0, 1)``, or exactly one global count is given.
+    """
+    if nonempty.shape != valid.shape:
+        raise ValueError(
+            f"nonempty {tuple(nonempty.shape)} and valid {tuple(valid.shape)} must match"
+        )
+    if not 0.0 < positive_share < 1.0:
+        raise ValueError(f"positive_share must lie in (0, 1), got {positive_share}")
+    if (global_nonempty is None) != (global_empty is None):
+        raise ValueError("global_nonempty and global_empty are given together or not at all")
+    valid_row = (valid > 0).to(dtype=torch.float32)
+    nonempty_row = (nonempty > 0).to(dtype=torch.float32) * valid_row
+    if global_nonempty is None or global_empty is None:
+        count_nonempty = float(nonempty_row.sum().item())
+        count_empty = float(valid_row.sum().item()) - count_nonempty
+    else:
+        count_nonempty, count_empty = float(global_nonempty), float(global_empty)
+    if count_nonempty <= 0.0 or count_empty <= 0.0:
+        # One class alone carries the whole loss already; re-weighting it would
+        # only rescale the mean, which is not this intervention.
+        return valid_row
+    total = count_nonempty + count_empty
+    weight_nonempty = positive_share * total / count_nonempty
+    weight_empty = (1.0 - positive_share) * total / count_empty
+    return valid_row * (nonempty_row * (weight_nonempty - weight_empty) + weight_empty)
+
+
+def closure_balanced_row_weights(
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    positive_share: float,
+    global_nonempty: float | None = None,
+    global_empty: float | None = None,
+) -> torch.Tensor:
+    """`balanced_row_weights` over `closure_nonempty` of a compiled template.
+
+    Args:
+        target: ``(B, 96)`` compiled edge weights.
+        valid: ``(B,)`` boolean or 0/1 row mask.
+        positive_share: Loss mass the closure-non-empty rows carry, in ``(0, 1)``.
+        global_nonempty: Valid non-empty rows summed over ranks, or ``None``.
+        global_empty: Valid empty rows summed over ranks, or ``None``.
+
+    Returns:
+        ``(B,)`` float32 weights summing to the valid-row count.
+    """
+    return balanced_row_weights(
+        closure_nonempty(target),
+        valid,
+        positive_share=positive_share,
+        global_nonempty=global_nonempty,
+        global_empty=global_empty,
+    )
 
 
 TOPO_FIELDS: tuple[str, ...] = ("topo_u", "topo_v", "topo_rel", "topo_cnt")

@@ -108,7 +108,7 @@ from src.distill.losses import (
     kd_rep_loss,
     kd_struct_loss,
 )
-from src.distill.motif_losses import stream_mean, stream_row_counts
+from src.distill.motif_losses import balanced_row_weights, stream_mean, stream_row_counts
 from src.distill.struct_config import StructConfig
 from src.distill.struct_losses import (
     hard_struct_errors,
@@ -935,26 +935,63 @@ def _motif_stream_rows(
     )
 
 
-def _motif_stream_counts(
+def _motif_nonempty_rows(
     *,
     task: tuple[Mapping[str, torch.Tensor], torch.Tensor],
     struct: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None,
-) -> list[float]:
-    """This rank's valid-row counts: every stream's ``L_slot``, then every ``L_topo``.
+) -> list[torch.Tensor]:
+    """Each stream's per-row closure-non-empty indicator, in stream order.
 
-    The caller sums the vector across ranks and hands it back to
-    `_motif_stream_terms`: structural pairs are striped over the ranks, so a
-    rank-local count is not the count the per-stream mean needs (spec 7.5).
+    A stream that carries no indicator (Stage I, or a batch without templates)
+    reports an empty tensor, exactly as its rows do.
 
     Args:
         task: The task stream's per-row terms and its valid-nonself mask.
         struct: The structural stream's, or ``None`` when the stream is absent.
 
     Returns:
-        ``2 * n_streams`` counts, slot streams first.
+        One ``(n_s,)`` indicator per stream.
+    """
+    streams = [task] + ([] if struct is None else [struct])
+    return [rows.get("nonempty", rows["slot"].new_zeros(0)) for rows, _ in streams]
+
+
+def _motif_stream_counts(
+    *,
+    task: tuple[Mapping[str, torch.Tensor], torch.Tensor],
+    struct: tuple[Mapping[str, torch.Tensor], torch.Tensor] | None,
+) -> list[float]:
+    """This rank's row counts: every ``L_slot``, every ``L_topo``, every non-empty.
+
+    The caller sums the vector across ranks and hands it back to
+    `_motif_stream_terms`: structural pairs are striped over the ranks, so a
+    rank-local count is not the count the per-stream mean needs (spec 7.5). The
+    third block is the valid rows whose closure target is non-empty, which the
+    optional ``closure_balanced`` row weighting splits the loss mass on; it rides
+    this same vector so the step keeps its single collective.
+
+    Args:
+        task: The task stream's per-row terms and its valid-nonself mask.
+        struct: The structural stream's, or ``None`` when the stream is absent.
+
+    Returns:
+        ``3 * n_streams`` counts: slot streams, then topo streams, then the
+        non-empty counts.
     """
     slot_rows, topo_rows, masks = _motif_stream_rows(task=task, struct=struct)
-    return stream_row_counts(slot_rows, masks) + stream_row_counts(topo_rows, masks)
+    nonempty = _motif_nonempty_rows(task=task, struct=struct)
+    return (
+        stream_row_counts(slot_rows, masks)
+        + stream_row_counts(topo_rows, masks)
+        + [
+            # Counted in float64: a bf16 row tensor cannot hold an exact count
+            # past 256 rows, and this number divides the graph loss.
+            0.0
+            if row.numel() == 0
+            else float((row.to(dtype=torch.float64) * mask.to(dtype=torch.float64)).sum().item())
+            for row, mask in zip(nonempty, masks, strict=True)
+        ]
+    )
 
 
 def _motif_stream_terms(
@@ -964,8 +1001,15 @@ def _motif_stream_terms(
     like: torch.Tensor,
     global_counts: Sequence[float] | None = None,
     world_size: int = 1,
+    positive_share: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Average ``L_slot`` and ``L_topo`` per stream, then across streams (spec 7.5).
+
+    ``positive_share`` turns on the ``closure_balanced`` row weighting: inside
+    each stream the rows whose closure target is non-empty carry that share of
+    the graph loss and the empty ones the rest. The weights sum to the stream's
+    valid-row count, so this is a change of the row distribution G's loss sees
+    and not of its scale, and nothing outside the two graph terms moves.
 
     Args:
         task: The task stream's per-row terms and its valid-nonself mask.
@@ -974,29 +1018,113 @@ def _motif_stream_terms(
         global_counts: `_motif_stream_counts` summed over ranks; rank-local counts
             when omitted, which is only correct at world size one.
         world_size: Ranks DDP averages.
+        positive_share: ``motif_prompt.graph_row_positive_share`` when the arm
+            weights the graph-loss rows, otherwise ``None`` for uniform rows.
 
     Returns:
         ``(slot, topo)`` scalars; an empty stream contributes a differentiable zero.
 
     Raises:
-        ValueError: If ``global_counts`` does not cover both terms of every stream.
+        ValueError: If ``global_counts`` does not cover all three blocks of every
+            stream, or a weighted stream carries no aligned non-empty indicator.
     """
     slot_rows, topo_rows, masks = _motif_stream_rows(task=task, struct=struct)
     if global_counts is None:
         slot_counts: Sequence[float] | None = None
         topo_counts: Sequence[float] | None = None
+        nonempty_counts: Sequence[float] | None = None
     else:
-        if len(global_counts) != 2 * len(masks):
+        if len(global_counts) != 3 * len(masks):
             raise ValueError(
-                f"global_counts ({len(global_counts)}) must cover the slot and topo terms "
-                f"of all {len(masks)} streams"
+                f"global_counts ({len(global_counts)}) must cover the slot, topo and "
+                f"non-empty counts of all {len(masks)} streams"
             )
         slot_counts = list(global_counts[: len(masks)])
-        topo_counts = list(global_counts[len(masks) :])
+        topo_counts = list(global_counts[len(masks) : 2 * len(masks)])
+        nonempty_counts = list(global_counts[2 * len(masks) :])
+    if positive_share is not None:
+        weights = _motif_row_weights(
+            _motif_nonempty_rows(task=task, struct=struct),
+            masks,
+            rows=slot_rows,
+            positive_share=positive_share,
+            valid_counts=slot_counts,
+            nonempty_counts=nonempty_counts,
+        )
+        slot_rows = [row * weight for row, weight in zip(slot_rows, weights, strict=True)]
+        topo_rows = [
+            row if row.numel() == 0 else row * weight
+            for row, weight in zip(topo_rows, weights, strict=True)
+        ]
     return (
         stream_mean(slot_rows, masks, like=like, global_counts=slot_counts, world_size=world_size),
         stream_mean(topo_rows, masks, like=like, global_counts=topo_counts, world_size=world_size),
     )
+
+
+def _motif_row_weights(
+    nonempty: Sequence[torch.Tensor],
+    masks: Sequence[torch.Tensor],
+    *,
+    rows: Sequence[torch.Tensor],
+    positive_share: float,
+    valid_counts: Sequence[float] | None,
+    nonempty_counts: Sequence[float] | None,
+) -> list[torch.Tensor]:
+    """One ``closure_balanced`` weight vector per stream (spec section 7.5).
+
+    Args:
+        nonempty: Each stream's per-row closure-non-empty indicator.
+        masks: Each stream's valid-row mask.
+        rows: Each stream's ``L_slot`` rows, for the shape the weights must match.
+        positive_share: Loss mass the non-empty rows carry.
+        valid_counts: Each stream's valid-row count summed over ranks, or ``None``.
+        nonempty_counts: Each stream's non-empty count summed over ranks, or ``None``.
+
+    Returns:
+        One ``(n_s,)`` weight vector per stream; a stream with no rows gets an
+        empty one.
+
+    Raises:
+        ValueError: If a stream holds rows but no indicator aligned with them.
+    """
+    weights: list[torch.Tensor] = []
+    for index, (row, mask, flag) in enumerate(zip(rows, masks, nonempty, strict=True)):
+        if row.numel() == 0:
+            weights.append(row.new_zeros(0))
+            continue
+        if flag.shape != mask.shape:
+            raise ValueError(
+                f"stream {index} carries {tuple(row.shape)} rows but a "
+                f"{tuple(flag.shape)} closure indicator; the balanced graph-row "
+                "weighting needs one indicator per row"
+            )
+        valid = None if valid_counts is None or nonempty_counts is None else valid_counts[index]
+        share = None if nonempty_counts is None or valid is None else nonempty_counts[index]
+        weights.append(
+            balanced_row_weights(
+                flag,
+                mask,
+                positive_share=positive_share,
+                global_nonempty=share,
+                global_empty=None if valid is None or share is None else valid - share,
+            ).to(row)
+        )
+    return weights
+
+
+def _motif_row_share(model: V3_1MotifPrompt) -> float | None:
+    """The graph loss's balanced row share, or ``None`` for the stream's own rows.
+
+    Args:
+        model: The unwrapped motif-prompt model.
+
+    Returns:
+        ``motif_prompt.graph_row_positive_share`` under ``closure_balanced``.
+    """
+    if model.cfg.graph_row_weighting == "uniform":
+        return None
+    return float(model.cfg.graph_row_positive_share)
 
 
 def _empty_motif_stream(like: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -1011,10 +1139,11 @@ def _empty_motif_stream(like: torch.Tensor) -> tuple[dict[str, torch.Tensor], to
         like: A tensor supplying dtype and device.
 
     Returns:
-        ``(rows, mask)`` with empty ``slot`` and ``topo`` rows and an empty mask.
+        ``(rows, mask)`` with empty ``slot``, ``topo`` and ``nonempty`` rows and
+        an empty mask.
     """
     empty = like.new_zeros(0)
-    return {"slot": empty, "topo": empty}, empty
+    return {"slot": empty, "topo": empty, "nonempty": empty}, empty
 
 
 def _motif_task_stub(
@@ -1022,9 +1151,10 @@ def _motif_task_stub(
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     """Stand-in for the task stream's rows before its forward has run.
 
-    `_motif_stream_counts` reads only whether a stream holds rows and its mask,
-    so placeholder rows shaped like the ones the forward will emit give the
-    structural pass the task count the composite needs.
+    `_motif_stream_counts` reads only whether a stream holds rows, its mask and
+    its closure indicator, so placeholder rows shaped like the ones the forward
+    will emit give the structural pass the task counts the composite needs. The
+    indicator is the batch's own compiled templates, which the forward reads too.
 
     Args:
         model: The unwrapped motif-prompt model.
@@ -1040,9 +1170,30 @@ def _motif_task_stub(
         {
             "slot": torch.ones_like(mask) if emits_slot else like.new_zeros(0),
             "topo": torch.ones_like(mask) if emits_topo else like.new_zeros(0),
+            "nonempty": _motif_task_nonempty(model, batch, like=like),
         },
         mask,
     )
+
+
+def _motif_task_nonempty(
+    model: V3_1MotifPrompt, batch: Mapping[str, torch.Tensor], *, like: torch.Tensor
+) -> torch.Tensor:
+    """The task batch's per-row closure-non-empty indicator (empty when unsupervised).
+
+    Args:
+        model: The unwrapped motif-prompt model.
+        batch: The task batch, with its compiled templates attached.
+        like: A tensor supplying dtype and device.
+
+    Returns:
+        ``(B,)`` float indicator, or an empty tensor when the batch carries no
+        graph supervision.
+    """
+    template = batch.get(TEMPLATE_KEY)
+    if template is None or not model.supervises(batch)[0]:
+        return like.new_zeros(0)
+    return model.closure_nonempty_rows(template.to(device=like.device)).to(like)
 
 
 def _reduce_motif_counts(
@@ -1345,7 +1496,14 @@ def _share_motif_probe(
     return telemetry
 
 
-def _motif_epoch_telemetry(*, slot_sum: float, topo_sum: float, steps: int) -> dict[str, float]:
+def _motif_epoch_telemetry(
+    *,
+    slot_sum: float,
+    topo_sum: float,
+    steps: int,
+    nonempty_sum: float = 0.0,
+    valid_sum: float = 0.0,
+) -> dict[str, float]:
     """Return the per-epoch motif telemetry, or an empty mapping for an empty epoch.
 
     Args:
@@ -1353,16 +1511,25 @@ def _motif_epoch_telemetry(*, slot_sum: float, topo_sum: float, steps: int) -> d
             across ranks and divided by the world size.
         topo_sum: The same for ``L_topo``.
         steps: Optimizer steps this epoch.
+        nonempty_sum: Valid task-stream rows this epoch whose closure target is
+            non-empty, summed over steps and ranks.
+        valid_sum: Valid task-stream rows this epoch, summed the same way.
 
     Returns:
-        The ``train_motif_*`` telemetry row.
+        The ``train_motif_*`` telemetry row, plus the epoch's closure-non-empty
+        row fraction once the stream carried graph-supervised rows. That fraction
+        is what the ``closure_balanced`` row weighting re-weights, so it is read
+        whether or not the arm switches the weighting on.
     """
     if steps <= 0:
         return {}
-    return {
+    telemetry = {
         "train_motif_slot_loss": slot_sum / float(steps),
         "train_motif_topo_loss": topo_sum / float(steps),
     }
+    if valid_sum > 0.0:
+        telemetry["graph_rows_closure_nonempty_frac"] = nonempty_sum / valid_sum
+    return telemetry
 
 
 def _count_single_process_steps(factory: LoaderFactory, cfg: Config) -> int:
@@ -5547,6 +5714,11 @@ class StructStream:
             self.last_motif_rows = {
                 "slot": (torch.cat(slot_parts) if slot_parts else flat.new_zeros(0)) + anchor_zero,
                 "topo": (torch.cat(topo_parts) if topo_parts else flat.new_zeros(0)) + anchor_zero,
+                # `local_rows` is this rank's chunk order, the order the rows were
+                # concatenated in, so the indicator lines up row for row.
+                "nonempty": cast(V3_1MotifPrompt, raw_model).closure_nonempty_rows(
+                    pair_templates[row_index]
+                ),
             }
         if distributed:
             flat = differentiable_all_reduce(flat, op=dist.ReduceOp.SUM)  # type: ignore[no-untyped-call]
@@ -6570,6 +6742,8 @@ def train_ddp_loop(
         epoch_struct_sums: dict[str, float] = {}
         epoch_motif_slot_sum = 0.0
         epoch_motif_topo_sum = 0.0
+        epoch_motif_nonempty_sum = 0.0
+        epoch_motif_valid_sum = 0.0
         epoch_motif_probe: dict[str, float] = {}
         epoch_online_sums: dict[str, float] = {}
         epoch_online_weight = 0.0
@@ -6694,6 +6868,7 @@ def train_ddp_loop(
                             like=struct_loss,
                             global_counts=motif_global_counts,
                             world_size=world_size,
+                            positive_share=_motif_row_share(raw_training_model),
                         )
                         cfg_motif = raw_training_model.cfg
                         struct_loss = (
@@ -6795,6 +6970,7 @@ def train_ddp_loop(
                     {
                         "slot": output.get("slot_loss_rows", loss.new_zeros(0)),
                         "topo": output.get("topo_loss_rows", loss.new_zeros(0)),
+                        "nonempty": _motif_task_nonempty(raw_training_model, batch, like=loss),
                     },
                     batch.get(TEMPLATE_MASK_KEY, loss.new_zeros(0)),
                 )
@@ -6810,7 +6986,11 @@ def train_ddp_loop(
                     like=loss,
                     global_counts=motif_global_counts,
                     world_size=world_size,
+                    positive_share=_motif_row_share(raw_training_model),
                 )
+                streams = len(motif_global_counts) // 3
+                epoch_motif_valid_sum += motif_global_counts[0]
+                epoch_motif_nonempty_sum += motif_global_counts[2 * streams]
                 cfg_motif = raw_training_model.cfg
                 loss = (
                     loss
@@ -7000,7 +7180,14 @@ def train_ddp_loop(
         if isinstance(_unwrapped_model(model), V3_1MotifPrompt) and epoch_steps > 0:
             motif_sums = accelerator.reduce(
                 torch.tensor(
-                    [epoch_motif_slot_sum, epoch_motif_topo_sum],
+                    [
+                        epoch_motif_slot_sum,
+                        epoch_motif_topo_sum,
+                        # Already global (every rank accumulated the same reduced
+                        # counts), so the world-size division below restores them.
+                        epoch_motif_nonempty_sum,
+                        epoch_motif_valid_sum,
+                    ],
                     device=accelerator.device,
                     dtype=torch.float64,
                 ),
@@ -7010,6 +7197,8 @@ def train_ddp_loop(
                 slot_sum=float(motif_sums[0].item()) / float(world_size),
                 topo_sum=float(motif_sums[1].item()) / float(world_size),
                 steps=epoch_steps,
+                nonempty_sum=float(motif_sums[2].item()) / float(world_size),
+                valid_sum=float(motif_sums[3].item()) / float(world_size),
             )
         validation_start = time.monotonic()
         run_topology = _topology_due(

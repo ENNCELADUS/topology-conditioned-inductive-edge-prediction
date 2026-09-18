@@ -12,6 +12,9 @@ from src.data.motif_template import (
     role_permutation,
 )
 from src.distill.motif_losses import (
+    balanced_row_weights,
+    closure_balanced_row_weights,
+    closure_nonempty,
     slot_loss,
     slot_loss_rows,
     stream_mean,
@@ -506,3 +509,96 @@ def test_stream_row_counts_report_zero_for_a_stream_this_rank_never_saw() -> Non
         1.0,
         0.0,
     ]
+
+
+# ------------------------------------------- closure-balanced graph-loss rows
+
+
+def _mixed_targets() -> torch.Tensor:
+    """Six rows, the first two with a non-empty closure family."""
+    target = torch.zeros(6, 96)
+    target[0, CLOSURE_U.start] = 0.7
+    target[1, CLOSURE_V.stop - 1] = 0.3
+    # Attachment and interior mass on every row: only the closure family counts.
+    target[:, 16:] = 0.5
+    return target
+
+
+def test_closure_nonempty_reads_only_the_sixteen_closure_weights() -> None:
+    target = _mixed_targets()
+    assert closure_nonempty(target).tolist() == [True, True, False, False, False, False]
+    with pytest.raises(ValueError, match=r"\(B, 96\)"):
+        closure_nonempty(torch.zeros(3, 95))
+
+
+def test_closure_balanced_weights_split_the_mass_and_keep_the_mean() -> None:
+    target = _mixed_targets()
+    valid = torch.ones(6)
+    weights = closure_balanced_row_weights(target, valid, positive_share=0.5)
+    # Two non-empty rows carry half the mass, four empty rows the other half.
+    assert weights[:2].tolist() == [1.5, 1.5]
+    assert weights[2:].tolist() == [0.75] * 4
+    # Summing to the valid-row count is what keeps `stream_mean` a mean.
+    assert float(weights.sum()) == pytest.approx(6.0)
+    rows = torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+    assert float((weights * rows).sum() / 6.0) == pytest.approx(0.5)
+
+
+def test_a_share_other_than_a_half_moves_the_mass_it_says() -> None:
+    weights = closure_balanced_row_weights(_mixed_targets(), torch.ones(6), positive_share=0.8)
+    nonempty = closure_nonempty(_mixed_targets())
+    assert float(weights[nonempty].sum()) == pytest.approx(0.8 * 6.0)
+    assert float(weights[~nonempty].sum()) == pytest.approx(0.2 * 6.0)
+
+
+def test_invalid_rows_weigh_zero_and_leave_the_split_to_the_valid_ones() -> None:
+    target = _mixed_targets()
+    valid = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 0.0])
+    weights = closure_balanced_row_weights(target, valid, positive_share=0.5)
+    assert float(weights[1]) == 0.0 and float(weights[5]) == 0.0
+    # Four valid rows, one of them non-empty: it carries half of four.
+    assert float(weights[0]) == pytest.approx(2.0)
+    assert weights[2:5].tolist() == [pytest.approx(2.0 / 3.0)] * 3
+    assert float(weights.sum()) == pytest.approx(4.0)
+
+
+def test_one_absent_class_falls_back_to_uniform_rows() -> None:
+    valid = torch.tensor([1.0, 1.0, 0.0])
+    empty_only = closure_balanced_row_weights(torch.zeros(3, 96), valid, positive_share=0.5)
+    assert empty_only.tolist() == [1.0, 1.0, 0.0]
+    closure_only = torch.zeros(3, 96)
+    closure_only[:, CLOSURE_U.start] = 1.0
+    weights = closure_balanced_row_weights(closure_only, valid, positive_share=0.5)
+    assert weights.tolist() == [1.0, 1.0, 0.0]
+
+
+def test_global_counts_make_every_rank_weight_rows_the_same_way() -> None:
+    # Rank 1 holds no non-empty row at all; with rank-local counts it would fall
+    # back to uniform and DDP would average two different row distributions.
+    rank_0 = _mixed_targets()[:3]
+    rank_1 = _mixed_targets()[3:]
+    local = [
+        closure_balanced_row_weights(target, torch.ones(3), positive_share=0.5)
+        for target in (rank_0, rank_1)
+    ]
+    assert local[1].tolist() == [1.0, 1.0, 1.0]
+    globals_ = [
+        closure_balanced_row_weights(
+            target, torch.ones(3), positive_share=0.5, global_nonempty=2.0, global_empty=4.0
+        )
+        for target in (rank_0, rank_1)
+    ]
+    assert globals_[0].tolist() == [1.5, 1.5, 0.75]
+    assert globals_[1].tolist() == [0.75, 0.75, 0.75]
+    # Summed over the ranks the weights still add up to the global row count.
+    assert float(sum(weights.sum() for weights in globals_)) == pytest.approx(6.0)
+
+
+def test_balanced_row_weights_fail_closed_on_a_bad_argument() -> None:
+    nonempty = torch.tensor([True, False])
+    with pytest.raises(ValueError, match="positive_share"):
+        balanced_row_weights(nonempty, torch.ones(2), positive_share=1.0)
+    with pytest.raises(ValueError, match="must match"):
+        balanced_row_weights(nonempty, torch.ones(3), positive_share=0.5)
+    with pytest.raises(ValueError, match="global_nonempty"):
+        balanced_row_weights(nonempty, torch.ones(2), positive_share=0.5, global_nonempty=1.0)

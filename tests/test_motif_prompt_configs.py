@@ -335,3 +335,40 @@ def test_the_three_seed_replicates_differ_only_in_seed_and_output_dir() -> None:
         stripped.pop("seed")
         stripped.pop("output_dir")
         assert other == stripped
+
+
+#: The wave-3 phase-B prefixes and the wave-2 prefix each one re-weights the
+#: graph-loss rows of; nothing else may differ (the imbalance is the question).
+_WAVE_THREE_BALANCED: dict[str, str] = {
+    "motif_prompt_stage2_v3_balanced_initonly_prefix": "motif_prompt_stage2_v2_initonly_prefix",
+    "motif_prompt_stage2_v3_balanced_full_prefix": "motif_prompt_stage2_v2_prefix",
+}
+
+
+@pytest.mark.parametrize(("name", "source"), sorted(_WAVE_THREE_BALANCED.items()))
+def test_each_balanced_prefix_adds_only_the_graph_row_weighting(name: str, source: str) -> None:
+    base, balanced = _raw(f"{source}.yaml"), _raw(f"{name}.yaml")
+    assert balanced["output_dir"] == f"outputs/split_seed42/{name}"
+    assert balanced["model"]["config"]["motif_prompt"] == {
+        **base["model"]["config"]["motif_prompt"],
+        "graph_row_weighting": "closure_balanced",
+        "graph_row_positive_share": 0.5,
+    }
+    for section in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert balanced[section] == base[section]
+    parsed = MotifPromptConfig.from_mapping(_block(f"{name}.yaml"))
+    assert parsed.graph_row_weighting == "closure_balanced"
+    assert parsed.graph_row_positive_share == 0.5
+    header = (CONFIG_DIR / f"{name}.yaml").read_text(encoding="utf-8")
+    assert "graph_rows_closure_nonempty_frac" in header
+    assert f"hpc/run.sh train configs/split_seed42/{name}.yaml --skip-test" in header
+
+
+def test_every_other_motif_arm_keeps_the_streams_own_row_distribution() -> None:
+    # The weighting is opt-in: wave 1 and wave 2 keep uniform rows, so the two
+    # phase-B prefixes are the only rows that read differently.
+    for name in ARMS:
+        block = _block(name)
+        expected = "closure_balanced" if Path(name).stem in _WAVE_THREE_BALANCED else "uniform"
+        assert block.get("graph_row_weighting", "uniform") == expected
+        assert MotifPromptConfig.from_mapping(block).graph_row_weighting == expected
