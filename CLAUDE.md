@@ -107,9 +107,8 @@ selected method. Every piece of writing must explain how its context helps decid
   rsync/scp/tar working trees.
 - GPU work needs the H20 container. When a task reaches that point, finish everything local first
   (config, tests, commit, push) and end with the exact launch command; do not wait on a GPU you cannot reach.
-- One independent Codex review per implementation wave that changes `src/` (none for docs or config
-  edits). Run the recipe under Commands yourself, wait for it, fix the blockers, finish. The user may
-  instead invoke `/codex:review` or `/codex:adversarial-review`. No second round without new changes.
+- If user asks for Codex review, run the recipe under Commands yourself, wait for it, fix the blockers, finish. 
+  Don't launch if the implementation is small and you are confident. No second round without new changes.
 - `autoresearch/program.md` is human-owned. KD campaign trials (`/autoresearch`, the project skill)
   follow it exactly and never edit it, `src/autoresearch/`, `configs/sweep/`, or its frozen keys.
 - `src/vendor/` is the official GRIT and Set Transformer code; do not refactor or lint-fix it.

@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="./figures/method_overview.png" alt="Topology-conditioned inductive edge prediction" width="640">
-
 <h1 style="margin-top: 10px;">Topology-Conditioned Inductive Edge Prediction</h1>
 
 <h2>Decide <code>edge(u,v)</code> for two <i>unseen</i> nodes from <code>(x_u, x_v)</code> alone — and grade the graph those decisions assemble into, not just the pairs.</h2>
