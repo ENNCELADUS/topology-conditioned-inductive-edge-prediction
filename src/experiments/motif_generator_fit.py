@@ -27,8 +27,11 @@ generator that fits the closure family from one that has learnt to emit zero.
 
 Nothing here reimplements the trunk, the loss or the row selection: the split,
 the node-disjoint sides, the loss weights, the fitted-constant comparator and
-the transplant null all come from `src.experiments.motif_pilot_b`, and the input
-capture rides on the formal packed scoring pass.
+the transplant null all come from `src.experiments.motif_pilot_b`, and the
+capture encodes each node exactly once with the frozen trunk's own encoder,
+under the scorer's own length buckets, which is precisely the per-node cache
+`src.score_universe` slices per pair (`capture_node_states` says why it does not
+go through the scorer itself).
 """
 
 from __future__ import annotations
@@ -36,8 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,7 +49,6 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 from sklearn.metrics import roc_auc_score
-from torch import nn
 
 import src.score_universe as su
 from src.data.motif_template import (
@@ -63,12 +64,13 @@ from src.data.motif_template import (
     count_statistics,
     template_statistics,
 )
+from src.data.packed_features import PackedFeatureTable
+from src.data.pairs import BUCKET_BOUNDARIES
 from src.experiments.motif_pilot_b import (
     GraphLossWeights,
     fit_constant_template,
     gate_logit_summary,
     mass_report,
-    predicted_bank,
     rows_inside,
     split_training_nodes,
     transplant_permutations,
@@ -270,63 +272,81 @@ def _from_bits(bits: NDArray[np.int16]) -> torch.Tensor:
     return torch.from_numpy(bits).view(torch.bfloat16)
 
 
-@contextmanager
-def capture_generator_inputs(model: V3_1MotifPrompt) -> Iterator[dict[int, RowInputs]]:
-    """Record the generator's own inputs, row by row, during a scoring pass.
+def capture_node_states(
+    model: V3_1MotifPrompt,
+    nodes: Sequence[str],
+    pack_dir: Path,
+    *,
+    device: torch.device,
+    amp: str,
+    token_budget: int,
+) -> dict[str, NDArray[np.int16]]:
+    """Encode every node once with the frozen trunk and keep the states on the host.
 
-    `src.score_universe` hands the generator one padded batch at a time and has
-    no hook that names the rows in it, so the batch's row indices are taken from
-    the transplant-bank builder it already routes every Stage II prediction
-    through and the states from a forward pre-hook on the generator itself. The
-    two fire in lockstep, one call each per batch.
+    This is exactly the per-node encoding cache `src.score_universe` builds and
+    then slices per pair: the encoder sees one node at a time, padded to its own
+    length bucket, so a node's states are a function of the node alone and the
+    row a batch happens to put it in is irrelevant. It is not run through
+    `su._score_v3_1_packed` because that function allocates its cache for
+    *every* node of the pack in fp32 -- 19.9 GiB on top of the 12.7 GiB packed
+    token table -- which does not fit beside a training job on the same GPU. The
+    same buckets, the same batching rule and the same autocast context are used
+    here, and the states land on the host as bf16 bits.
 
     Args:
-        model: The Stage II checkpoint whose generator is about to run.
+        model: The Stage II checkpoint carrying the frozen trunk.
+        nodes: The node ids to encode.
+        pack_dir: The packed feature directory.
+        device: Compute device.
+        amp: Encoder autocast mode.
+        token_budget: Tokens per encode batch.
 
-    Yields:
-        A mapping from row index to that row's trimmed states; it is filled
-        during the pass and complete when the context exits.
+    Returns:
+        One ``(length, d_model)`` bf16-bit array per node id.
 
     Raises:
-        RuntimeError: If the checkpoint has no generator to hook.
+        ValueError: If a node is missing from the pack.
     """
-    if model.generator is None:
-        raise RuntimeError("capturing generator inputs needs a Stage II checkpoint")
-    store: dict[int, RowInputs] = {}
-    pending: dict[str, list[int]] = {"indices": []}
+    table = PackedFeatureTable.from_pack(pack_dir, device)
+    node_index = table.manifest.node_index()
+    missing = sorted({node for node in nodes if node not in node_index})
+    if missing:
+        raise ValueError(f"packed feature table is missing {len(missing)} nodes: {missing[:5]}")
+    wanted = sorted({node_index[node] for node in nodes})
+    states: dict[str, NDArray[np.int16]] = {}
+    previous = 0
+    for boundary in BUCKET_BOUNDARIES:
+        bucket = [
+            index for index in wanted if previous < table.manifest.nodes[index].length <= boundary
+        ]
+        previous = boundary
+        per_batch = max(token_budget // boundary, 1)
+        for start in range(0, len(bucket), per_batch):
+            indices = torch.tensor(bucket[start : start + per_batch], dtype=torch.int64)
+            raw_tokens, node_lengths = table.gather_nodes(indices, boundary)
+            with torch.inference_mode(), su._autocast_context(device, amp):
+                encoded = model.encoder(raw_tokens, node_lengths)
+            for position, index in enumerate(indices.tolist()):
+                record = table.manifest.nodes[int(index)]
+                states[record.node_id] = _to_bits(encoded[position, : record.length])
+    del table
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    logger.info("encoded %d nodes with the frozen trunk", len(states))
+    return states
 
-    def hook(_module: nn.Module, args: tuple[torch.Tensor, ...]) -> None:
-        """Record the rows of the batch the generator has just been handed."""
-        encoded_u, encoded_v, lengths_u, lengths_v = args[:4]
-        for position, row in enumerate(pending["indices"]):
-            store[int(row)] = RowInputs(
-                u=_to_bits(encoded_u[position, : int(lengths_u[position])]),
-                v=_to_bits(encoded_v[position, : int(lengths_v[position])]),
-            )
 
-    handle = model.generator.register_forward_pre_hook(hook)
-    original = su._motif_source_weights
+def row_inputs(pair: Pair, states: Mapping[str, NDArray[np.int16]]) -> RowInputs:
+    """Assemble one row's generator inputs from the per-node cache.
 
-    def spy(
-        source_batches: Sequence[Sequence[int]],
-        predict_batch: Callable[[Sequence[int]], torch.Tensor],
-        *,
-        num_rows: int,
-    ) -> torch.Tensor:
-        """Name each batch's rows before the generator sees it."""
+    Args:
+        pair: The row's endpoints.
+        states: The per-node cache.
 
-        def wrapped(batch_indices: Sequence[int]) -> torch.Tensor:
-            pending["indices"] = [int(index) for index in batch_indices]
-            return predict_batch(batch_indices)
-
-        return original(source_batches, wrapped, num_rows=num_rows)
-
-    su._motif_source_weights = spy
-    try:
-        yield store
-    finally:
-        su._motif_source_weights = original
-        handle.remove()
+    Returns:
+        The row's two endpoint state arrays.
+    """
+    return RowInputs(u=states[pair[0]], v=states[pair[1]])
 
 
 def _pad_side(sides: Sequence[NDArray[np.int16]], device: torch.device) -> torch.Tensor:
@@ -678,8 +698,7 @@ def build_generator(
 def _evaluate(
     generator: MotifGenerator,
     rows: RowSet,
-    cache: Mapping[int, RowInputs],
-    index: Mapping[Pair, int],
+    cache: Mapping[str, NDArray[np.int16]],
     *,
     device: torch.device,
     chunk: int,
@@ -689,8 +708,7 @@ def _evaluate(
     Args:
         generator: The generator to read.
         rows: The universe.
-        cache: The captured inputs, by row index of the capture pass.
-        index: Row index of every pair in the capture pass.
+        cache: The per-node trunk states.
         device: Compute device.
         chunk: Rows per forward.
 
@@ -702,7 +720,7 @@ def _evaluate(
     out: list[torch.Tensor] = []
     with torch.no_grad():
         for start in range(0, len(rows.pairs), chunk):
-            batch = [cache[index[pair]] for pair in rows.pairs[start : start + chunk]]
+            batch = [row_inputs(pair, cache) for pair in rows.pairs[start : start + chunk]]
             encoded_u, encoded_v, lengths_u, lengths_v = collate(batch, device)
             out.append(generator(encoded_u, encoded_v, lengths_u, lengths_v).float().cpu())
     generator.train(was_training)
@@ -727,13 +745,12 @@ def _per_stratum(
 def _dispersion_for(
     generator: MotifGenerator,
     rows: RowSet,
-    cache: Mapping[int, RowInputs],
-    index: Mapping[Pair, int],
+    cache: Mapping[str, NDArray[np.int16]],
     *,
     device: torch.device,
 ) -> dict[str, dict[str, float]]:
     """Measure the D(S) chain on the universe's first `DISPERSION_ROWS` rows."""
-    batch = [cache[index[pair]] for pair in rows.pairs[:DISPERSION_ROWS]]
+    batch = [row_inputs(pair, cache) for pair in rows.pairs[:DISPERSION_ROWS]]
     encoded_u, encoded_v, lengths_u, lengths_v = collate(batch, device)
     was_training = generator.training
     generator.eval()
@@ -859,35 +876,27 @@ def run_fit(
     )
 
     universes = (fit_set, heldout_set, val_set)
-    capture_pairs: list[Pair] = []
-    seen: set[Pair] = set()
-    for rows in universes:
-        for pair in rows.pairs:
-            if pair not in seen:
-                seen.add(pair)
-                capture_pairs.append(pair)
-    index = {pair: position for position, pair in enumerate(capture_pairs)}
-    logger.info("capturing generator inputs for %d distinct rows", len(capture_pairs))
-    with capture_generator_inputs(model) as cache:
-        _bank, _logits = predicted_bank(
-            model, capture_pairs, pack_dir, device=device, amp=amp, token_budget=token_budget
-        )
-    del _bank, _logits
-    missing = [pair for pair in capture_pairs if index[pair] not in cache]
-    if missing:
-        raise ValueError(f"{len(missing)} rows were never handed to the generator")
+    endpoints = sorted({node for rows in universes for pair in rows.pairs for node in pair})
+    logger.info(
+        "encoding %d distinct endpoints for %d rows",
+        len(endpoints),
+        sum(len(rows.pairs) for rows in universes),
+    )
+    cache = capture_node_states(
+        model, endpoints, pack_dir, device=device, amp=amp, token_budget=token_budget
+    )
     d_model = int(model.d_model)
     closure_bias_init = model.cfg.closure_bias_init
     cfg = model.cfg
     del model, loaded
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    logger.info("trunk released; cached %d rows", len(cache))
+    logger.info("trunk released; cached %d endpoints", len(cache))
 
     generator = build_generator(
         cfg, d_model=d_model, group=group, fit_target=fit_set.target, seed=seed + 21
     ).to(device)
-    sample = [cache[index[pair]] for pair in fit_set.pairs[:4]]
+    sample = [row_inputs(pair, cache) for pair in fit_set.pairs[:4]]
     sample_u, sample_v, sample_len_u, sample_len_v = collate(sample, device)
     assert_replay_matches(generator, sample_u, sample_v, sample_len_u, sample_len_v)
 
@@ -905,7 +914,7 @@ def run_fit(
     generator.train()
     for step in range(1, steps + 1):
         picks = sampler.integers(0, len(fit_set.pairs), size=min(batch_rows, len(fit_set.pairs)))
-        batch = [cache[index[fit_set.pairs[int(i)]]] for i in picks]
+        batch = [row_inputs(fit_set.pairs[int(i)], cache) for i in picks]
         encoded_u, encoded_v, lengths_u, lengths_v = collate(batch, device)
         target = fit_set.target.index_select(0, torch.from_numpy(picks.astype(np.int64))).to(device)
         predicted = generator(encoded_u, encoded_v, lengths_u, lengths_v)
@@ -918,9 +927,7 @@ def run_fit(
         if step % eval_every == 0 or step == steps:
             entry: dict[str, object] = {"step": step, "train_batch_L_G": float(value)}
             for rows in universes:
-                prediction = _evaluate(
-                    generator, rows, cache, index, device=device, chunk=eval_chunk
-                )
+                prediction = _evaluate(generator, rows, cache, device=device, chunk=eval_chunk)
                 entry[rows.name] = loss.mean(prediction, rows.target)
             curve.append(entry)
             logger.info("step %d: %s", step, entry)
@@ -929,7 +936,6 @@ def run_fit(
         generator=generator,
         universes=universes,
         cache=cache,
-        index=index,
         loss=loss,
         fitted_constant=fitted_constant,
         mean_template=mean_template,
@@ -985,8 +991,7 @@ def _final_report(
     *,
     generator: MotifGenerator,
     universes: Sequence[RowSet],
-    cache: Mapping[int, RowInputs],
-    index: Mapping[Pair, int],
+    cache: Mapping[str, NDArray[np.int16]],
     loss: GraphLossWeights,
     fitted_constant: torch.Tensor,
     mean_template: torch.Tensor,
@@ -1000,8 +1005,7 @@ def _final_report(
     Args:
         generator: The trained generator.
         universes: The fit, held-out and ``val_cls`` row sets.
-        cache: The captured inputs.
-        index: Row index of every pair in the capture pass.
+        cache: The per-node trunk states.
         loss: The checkpoint's own ``L_G``.
         fitted_constant: The asymmetric constant fitted on the fit rows.
         mean_template: The fit rows' mean adjacency.
@@ -1015,7 +1019,7 @@ def _final_report(
     """
     out: dict[str, object] = {}
     for rows in universes:
-        predicted = _evaluate(generator, rows, cache, index, device=device, chunk=eval_chunk)
+        predicted = _evaluate(generator, rows, cache, device=device, chunk=eval_chunk)
         constant_rows = fitted_constant.unsqueeze(0).expand_as(predicted)
         mean_rows = mean_template.unsqueeze(0).expand_as(predicted)
         transplants: dict[str, object] = {
@@ -1047,7 +1051,7 @@ def _final_report(
                 "mean_template": loss.mean(mean_rows, rows.target),
             },
             "per_stratum_L_G": _per_stratum(predicted, rows, loss),
-            "dispersion": _dispersion_for(generator, rows, cache, index, device=device),
+            "dispersion": _dispersion_for(generator, rows, cache, device=device),
             "identical_closure_row_fraction": identical_closure_fraction(predicted),
             "gate_logits": gate_logit_summary(predicted),
             "wedge_mass_auroc": wedge_mass_auroc(predicted, rows.target),
@@ -1265,13 +1269,14 @@ __all__ = [
     "build_generator",
     "build_parser",
     "build_row_set",
-    "capture_generator_inputs",
+    "capture_node_states",
     "collate",
     "dispersion_chain",
     "identical_closure_fraction",
     "main",
     "markdown_summary",
     "replay",
+    "row_inputs",
     "run_fit",
     "slot_dispersion",
     "strata_of",

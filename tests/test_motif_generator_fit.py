@@ -17,6 +17,7 @@ from src.experiments.motif_generator_fit import (
     dispersion_chain,
     identical_closure_fraction,
     replay,
+    row_inputs,
     slot_dispersion,
     strata_of,
     stratified_draw,
@@ -111,6 +112,14 @@ def test_collate_pads_to_the_batch_maximum_and_keeps_the_true_lengths() -> None:
     torch.testing.assert_close(
         encoded_u[0], torch.from_numpy(rows[0].u).view(torch.bfloat16).float(), rtol=0, atol=0
     )
+
+
+def test_row_inputs_shares_one_cached_array_per_endpoint() -> None:
+    cache = {"a": _row(4, 8, 1), "b": _row(6, 8, 2)}
+    left = row_inputs(("a", "b"), cache)
+    right = row_inputs(("b", "a"), cache)
+    assert left.u is cache["a"] and left.v is cache["b"]
+    assert right.u is cache["b"] and right.v is cache["a"]
 
 
 def test_collate_rejects_an_empty_batch() -> None:
