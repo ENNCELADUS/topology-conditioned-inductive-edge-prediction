@@ -452,3 +452,27 @@ def test_only_the_wave_three_arm_and_its_prefixes_use_the_residual_read() -> Non
         assert parsed.slot_read == expected
         gain = 0.01 if Path(name).stem in _WAVE_THREE_ATTRIBUTION else 1e-3
         assert parsed.head_output_init_std == gain
+
+
+def test_the_warm_eight_arm_is_the_joint_phase_of_its_own_eight_epoch_prefix() -> None:
+    # Phase A's continuation: epochs 1-8 are the graph-only warm-up the prefix
+    # already trained, epochs 9-15 are the joint phase. Nothing but output_dir
+    # and the halt point differs, so `src.train_b0.resume_config_matches`
+    # accepts the resume whatever the inert-key rule decides.
+    stem = "motif_prompt_stage2_v3_initonly_warm8"
+    prefix, arm = _raw(f"{stem}_prefix.yaml"), _raw(f"{stem}.yaml")
+    assert arm["output_dir"] == f"outputs/split_seed42/{stem}"
+    assert arm["model"] == prefix["model"]
+    for section in ("data", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert arm[section] == prefix[section]
+    assert prefix["optim"]["stop_after_epoch"] == 8
+    assert "stop_after_epoch" not in arm["optim"]
+    assert arm["optim"] == {
+        key: value for key, value in prefix["optim"].items() if key != "stop_after_epoch"
+    }
+    # The prefix halted inside its own warm-up, so the interface opens for the
+    # first time in the continuation.
+    assert arm["model"]["config"]["motif_prompt"]["interface_warmup_epochs"] == 8
+    header = (CONFIG_DIR / f"{stem}.yaml").read_text(encoding="utf-8")
+    assert "--resume-attempt" in header
+    assert f"outputs/split_seed42/{stem}_prefix/attempts/" in header
