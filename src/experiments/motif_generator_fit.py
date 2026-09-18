@@ -925,7 +925,7 @@ def run_fit(
         optimiser.step()
         schedule.step()
         if step % eval_every == 0 or step == steps:
-            entry: dict[str, object] = {"step": step, "train_batch_L_G": float(value)}
+            entry: dict[str, object] = {"step": step, "train_batch_L_G": float(value.detach())}
             for rows in universes:
                 prediction = _evaluate(generator, rows, cache, device=device, chunk=eval_chunk)
                 entry[rows.name] = loss.mean(prediction, rows.target)
