@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
@@ -985,7 +985,15 @@ class TestRunPipelineSuccess:
         assert prior_status["status"] == "abandoned"
         assert prior_status["abandoned_by_attempt_id"] == complete["attempt_id"]
 
-    def _seed_resume_source(self, output_dir: Path, name: str, *, status: str, epoch: int) -> Path:
+    def _seed_resume_source(
+        self,
+        output_dir: Path,
+        name: str,
+        *,
+        status: str,
+        epoch: int,
+        config: Mapping[str, object] | None = None,
+    ) -> Path:
         """Write a resumable prior attempt covering epochs ``1..epoch``."""
         prior = output_dir / "attempts" / name
         checkpoints = prior / "checkpoints"
@@ -1001,7 +1009,7 @@ class TestRunPipelineSuccess:
         torch.save(
             {
                 "resume_supported": True,
-                "config": {},
+                "config": {} if config is None else dict(config),
                 "model_state": {},
                 "optimizer": {},
                 "scheduler": {},
@@ -1049,6 +1057,78 @@ class TestRunPipelineSuccess:
         assert new_status["resumed_from_attempt_id"] == prior.name
         # A successfully halted prefix is continued, not abandoned.
         assert json.loads((prior / "status.json").read_text())["status"] == "complete"
+
+    def _cross_dir_source(self, tmp_path: Path, config_path: Path, **overrides: object) -> Path:
+        """A completed two-epoch prefix under ANOTHER arm's output_dir."""
+        from src.train_b0 import config_to_dict, load_config
+
+        saved = config_to_dict(load_config(config_path))
+        saved["output_dir"] = str(tmp_path / "prefix_out")
+        cast(dict[str, object], saved["optim"])["stop_after_epoch"] = 1
+        saved.update(overrides)
+        return self._seed_resume_source(
+            tmp_path / "prefix_out", "shared-prefix", status="complete", epoch=1, config=saved
+        )
+
+    def test_resume_accepts_a_prefix_from_another_output_dir(self, tmp_path: Path) -> None:
+        """The wave-2 phase-1 arms continue one prefix that lives under its own arm.
+
+        Accepted only because the saved config differs from this run's in the
+        keys the worker excludes -- here ``output_dir`` and
+        ``optim.stop_after_epoch`` -- and the source attempt is never written to.
+        """
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = self._cross_dir_source(tmp_path, args.config)
+        before = json.loads((prior / "status.json").read_text())
+        base_runner = _make_fake_runner()
+
+        def runner(command: Sequence[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+            new_attempt = Path(_arg_value(command, "--output-dir"))
+            assert _arg_value(command, "--resume-attempt") == str(prior)
+            assert (new_attempt / "metrics.jsonl").read_text() == '{"epoch": 1}\n'
+            assert (new_attempt / "checkpoints" / "epoch-0001.pt").is_file()
+            return base_runner(command, log_path)
+
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+        assert run_pipeline(resumed_args, training_command_runner=runner) == 0
+        complete = json.loads((output_dir / "complete.json").read_text())
+        new_status = json.loads(
+            (output_dir / "attempts" / complete["attempt_id"] / "status.json").read_text()
+        )
+        assert new_status["resume_source_attempt"] == str(prior)
+        assert new_status["resumed_from_attempt_id"] == prior.name
+        # The source attempt is read-only: its status is exactly what it was.
+        assert json.loads((prior / "status.json").read_text()) == before
+
+    def test_a_cross_output_dir_resume_is_refused_when_any_other_key_differs(
+        self, tmp_path: Path
+    ) -> None:
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = self._cross_dir_source(tmp_path, args.config, seed=99)
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+
+        assert run_pipeline(resumed_args, training_command_runner=_make_fake_runner()) == 2
+
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert failure["stage"] == "train"
+        assert "another output_dir" in failure["message"]
+        assert not (output_dir / "complete.json").exists()
+
+    def test_a_cross_output_dir_resume_refuses_a_running_source_instead_of_abandoning_it(
+        self, tmp_path: Path
+    ) -> None:
+        # The same-output_dir path adopts an orphaned running attempt; another
+        # arm's attempt is never ours to rewrite.
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = self._cross_dir_source(tmp_path, args.config)
+        (prior / "status.json").write_text(json.dumps({"status": "running"}))
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+
+        assert run_pipeline(resumed_args, training_command_runner=_make_fake_runner()) == 2
+
+        assert json.loads((prior / "status.json").read_text()) == {"status": "running"}
+        failure = json.loads((output_dir / "failure.json").read_text())
+        assert "failed, abandoned, complete, or orphaned running" in failure["message"]
 
     def test_resume_refuses_a_complete_attempt_that_ran_the_whole_schedule(
         self, tmp_path: Path

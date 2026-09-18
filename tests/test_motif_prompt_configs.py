@@ -234,10 +234,89 @@ def test_the_teachability_pilots_name_three_distinct_stage_one_candidates() -> N
 
 
 @pytest.mark.parametrize("name", ARMS)
-def test_only_the_teachability_pilots_stop_early(name: str) -> None:
+def test_only_the_pilots_and_the_wave_two_prefixes_stop_early(name: str) -> None:
     cfg = load_config(CONFIG_DIR / name)
-    expected = 2 if name.startswith("motif_prompt_teach_") else None
-    assert cfg.optim.stop_after_epoch == expected
+    halted = name.startswith("motif_prompt_teach_") or (
+        name.startswith("motif_prompt_stage2_v2") and name.endswith("_prefix.yaml")
+    )
+    assert cfg.optim.stop_after_epoch == (2 if halted else None)
+
+
+#: The wave-2 phase-1 arms and what each one may change against the shared prefix.
+_WAVE_TWO_ARMS: dict[str, dict[str, Any]] = {
+    "motif_prompt_stage2_v2": {},
+    "motif_prompt_stage2_v2_no_topo": {"w_topo": 0.0},
+    "motif_prompt_stage2_v2_strong_graph": {"w_slot_multiplier": 10.0},
+}
+
+#: The wave-2 phase-0 attribution prefixes and what each one drops.
+_WAVE_TWO_PREFIXES: dict[str, dict[str, Any]] = {
+    "motif_prompt_stage2_v2_initonly_prefix": {"beta_c": 0.0},
+    "motif_prompt_stage2_v2_lossonly_prefix": {"closure_bias_init": "density"},
+}
+
+
+def test_the_wave_two_prefix_carries_all_three_fixes_over_stage_two() -> None:
+    base, prefix = _block("motif_prompt_stage2.yaml"), _block("motif_prompt_stage2_v2_prefix.yaml")
+    assert prefix["bundle_checkpoint"] == "outputs/split_seed42/motif_prompt_stage1/best.pt"
+    assert {key for key in base if base[key] != prefix.get(key)} == {"w_slot"}
+    assert set(prefix) - set(base) == {
+        "warmup_losses",
+        "w_slot_multiplier",
+        "balance_probe_rows",
+        "beta_c",
+        "closure_bias_init",
+    }
+    assert prefix["warmup_losses"] == "graph_only"
+    assert prefix["w_slot"] == "balanced" and prefix["w_slot_multiplier"] == 1.0
+    assert prefix["beta_c"] == 1.0 and prefix["closure_bias_init"] == "nonzero_mean"
+    assert prefix["w_topo"] == 0.1
+    header = (CONFIG_DIR / "motif_prompt_stage2_v2_prefix.yaml").read_text(encoding="utf-8")
+    # The teachability note of spec 7.4 is retired: the reader swap was worth
+    # 0.0005 AUPRC, so the bundle stays the five-metric Stage I winner.
+    assert "must be replaced by" not in header
+    assert "hpc/run.sh train configs/split_seed42/motif_prompt_stage2_v2_prefix.yaml" in header
+
+
+@pytest.mark.parametrize(("name", "overrides"), sorted(_WAVE_TWO_ARMS.items()))
+def test_each_wave_two_arm_is_the_prefix_plus_its_own_joint_phase_key(
+    name: str, overrides: dict[str, Any]
+) -> None:
+    prefix, arm = _raw("motif_prompt_stage2_v2_prefix.yaml"), _raw(f"{name}.yaml")
+    assert arm["output_dir"] == f"outputs/split_seed42/{name}"
+    assert arm["model"]["config"]["motif_prompt"] == {
+        **prefix["model"]["config"]["motif_prompt"],
+        **overrides,
+    }
+    # The only keys an arm may move are the three the resume comparison excludes
+    # while the resumed epoch is inside the graph-only warm-up.
+    assert set(overrides) <= {"w_slot", "w_slot_multiplier", "w_topo"}
+    for section in ("data", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert arm[section] == prefix[section]
+    # The prefix is a true two-epoch prefix: nothing but the halt point differs.
+    assert arm["optim"] == {
+        key: value for key, value in prefix["optim"].items() if key != "stop_after_epoch"
+    }
+    assert "stop_after_epoch" not in arm["optim"]
+    assert prefix["optim"]["stop_after_epoch"] == 2
+    header = (CONFIG_DIR / f"{name}.yaml").read_text(encoding="utf-8")
+    assert "--resume-attempt" in header
+    assert "outputs/split_seed42/motif_prompt_stage2_v2_prefix/attempts/" in header
+
+
+@pytest.mark.parametrize(("name", "overrides"), sorted(_WAVE_TWO_PREFIXES.items()))
+def test_each_attribution_prefix_drops_exactly_one_wave_two_fix(
+    name: str, overrides: dict[str, Any]
+) -> None:
+    prefix, other = _raw("motif_prompt_stage2_v2_prefix.yaml"), _raw(f"{name}.yaml")
+    assert other["output_dir"] == f"outputs/split_seed42/{name}"
+    assert other["model"]["config"]["motif_prompt"] == {
+        **prefix["model"]["config"]["motif_prompt"],
+        **overrides,
+    }
+    assert other["model"]["config"]["motif_prompt"]["warmup_losses"] == "graph_only"
+    for section in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert other[section] == prefix[section]
 
 
 def test_the_three_seed_replicates_differ_only_in_seed_and_output_dir() -> None:

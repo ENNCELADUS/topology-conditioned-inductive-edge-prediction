@@ -1,0 +1,38 @@
+{
+  "pairs": "val_topology",
+  "identity_checks": {},
+  "cells": {
+    "s1_pred": {
+      "n_rows": 297209,
+      "auroc": 0.7798592145763021,
+      "auprc": 0.20431679551902904,
+      "mean_logit": -4.1017649097332765,
+      "std_logit": 1.7625953143492628,
+      "topology": {
+        "graph_similarity": 0.3758727341452704,
+        "relative_density": 0.7808005709710062,
+        "mmd_ratio": {
+          "degree": 20.060277074224963,
+          "clustering": 10.694026172171698,
+          "spectral": 16.013239247085995
+        }
+      }
+    },
+    "s2_true": {
+      "n_rows": 297209,
+      "auroc": 0.8689866915546048,
+      "auprc": 0.3774254960596091,
+      "mean_logit": -3.992613300074695,
+      "std_logit": 2.071532960175675,
+      "topology": {
+        "graph_similarity": 0.5271443331457756,
+        "relative_density": 1.3117885399200626,
+        "mmd_ratio": {
+          "degree": 8.615720495303895,
+          "clustering": 3.149534814207088,
+          "spectral": 7.193127906460808
+        }
+      }
+    }
+  }
+}

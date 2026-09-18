@@ -1,9 +1,12 @@
 # Motif graph prompts read by GRIT
 
-**Date:** 2026-09-16. **Version:** v9 (supersedes v8 of the same day; change log in §11).
-**Status:** architecture selected; intended as the paper's deployable topology arm. A bounded pilot
-(§0.2) precedes the wave as a resource-allocation decision, not as a proof of impossibility.
-Not implemented, trained or scored.
+**Date:** 2026-09-16, amended 2026-09-18. **Version:** v10 (supersedes v9; change log in §11).
+**Status:** implemented and run once (wave 1, `686627d`, 2026-09-17/18): Stage I and its two family
+ablations, Stage II and its bridge-only / closure-only controls. Stage I gains (+0.066 test AUPRC, +0.08 GS
+over the frozen trunk); every Stage II row finished at the trunk. The wave-1 verdict
+(`docs/results/motif_prompt_verdict/README.md`) locates the failure in the generator's initialisation and
+supervision, not in the reader or the interface, and v10 amends §4, §7.3, §7.5, §0.2 and §8 accordingly
+(fix plan: `docs/tmp/2026-09-18-motif-stage2-fix-plan.md`). Wave 2 retrains Stage II only.
 It supersedes the coordinate/coarse-block interface **for this proposed arm only**. Existing
 `virtual_prompt_d*` checkpoints, run records and the historical September 15 specification remain valid
 descriptions of their own implementations.
@@ -50,6 +53,26 @@ ranker. Pair labelling is a sound design reason; it is not a retrospective proof
 endpoint-conditioned interface violated an applicable impossibility theorem.
 
 ### 0.2 Bounded pilot before the wave, and the stop rule it does and does not license
+
+**v10 status.** Neither pilot was run before wave 1. Pilot A is superseded: the wave-1 reader x graph
+counterfactual answered its question directly (the Stage II interface on the true template recovers Stage I's
+gain, 0.8867 vs 0.8872 V_val AUPRC; a 25% true-template mix recovers 71% of the gap). Pilot B is **retained and
+becomes wave 2's first two epochs**: under §7.5's graph-only warm-up the generator trains on `L_G` alone, so the
+epoch-2 checkpoint of the `stop_after_epoch: 2` prefix *is* pilot B's conditional head, read by
+`src/experiments/motif_pilot_b.py` at three levels on node-disjoint held-out training rows and V_val:
+
+1. *Fit:* `L_G` below the asymmetric constant template re-fitted by Adam under the same `L_G` on both universes
+   (wave 1: generator 0.135 / 0.143 against the constant's 0.105 / 0.099, i.e. worse); positive-row wedge-mass
+   reconstruction below 0.7 (wave 1: 0.99); predicted mean wedge mass within a factor 3 of the truth's (wave 1:
+   1/85).
+2. *Conditional dependence:* the row-transplant rise of `L_G` under ten seeded permutations, every one at least
+   +25% (wave 1: +1-3% on one permutation).
+3. *Downstream utility:* the predicted graph through the frozen Stage I bundle and through the prefix's own
+   interface, both above `gates_off` on V_val `val_cls` AUPRC (0.8136) with no retraining.
+
+Failing level 1 or 2 stops the wave and records a resource-allocation negative for this generator class; failing
+level 3 alone lets the joint phase run, flagged. The wording below on what a negative does and does not license
+stands unchanged.
 
 Three designs have finished at the trunk's level, and the measured common factor is weak
 attribute-to-structure transfer for unseen proteins. Before committing the wave, buy information cheaply.
@@ -172,7 +195,8 @@ are the project's practical reporting thresholds, not statistical uncertainty bo
 
 ### 0.3 Amendments carried since the first decision
 
-Ten amendments separate this arm from the v1 text. Five further owner reviews corrected the supervision and
+Ten amendments separate this arm from the v1 text; v10 adds the four wave-2 fixes after the first measured
+run (§11). Five further owner reviews corrected the supervision and
 the instruments that judge it — the path-product loss and its raw interior term, pilot B's feasible and
 orientation-aware baselines, its selector, the structural-frequency and batching reclassifications, the
 calibration / output-density split with its algorithm and self-loop convention, and the caching, autocast,
@@ -312,8 +336,18 @@ For each allowed undirected edge predict `w_ij = sigmoid(MLP_type([h_i+h_j, |h_i
 in both orientations, attachment heads shared across sides. **LayerNorm the gate-head inputs** and
 reparameterise the heads through an MLP rather than optimising edge logits directly: the predecessor's gate
 died when its input norm grew (`||u*v||` 23 to 162, pushing the pre-activation to 13 where the sigmoid
-derivative is about 2e-6). Initialise output biases from the training mean weight per edge type, clipped to
-`[0.01,0.99]` in logit space, with small nonzero head weights so gradients reach the generator. No global
+derivative is about 2e-6). Initialise output biases per edge type **from a magnitude, never from a density**, with small nonzero head
+weights so gradients reach the generator. Wave 1 set every bias to `logit(mean training weight of the type)`;
+for closure that mean is `0.0185`, a *density* (58% of training rows have no closure edge at all; the mean
+non-zero closure weight is `0.196`), so the closure heads started at `z = -3.97`, sat at `-4.34` for the whole
+run (sigmoid derivative `0.015`, 100% of rows beyond `|z| > 3`) and moved `+0.004` logits in 5,413 steps. The
+`[0.01, 0.99]` clip does not catch this. v10 rule (`closure_bias_init: nonzero_mean`): the closure bias is
+`logit(w)` with `w` the mean **non-zero** closure weight of the training corpus, subject to a mass check: if the
+initial wedge mass `8 w^2` exceeds twice the mean positive-row wedge mass `m_C^+`, use `w = sqrt(m_C^+ / 8)`
+instead. Attach (`z ~ -1.2`, unsaturated) and interior keep the density rule: the interior non-zero mean is 1,
+which the clip would turn into `z = 4.6`, a new saturation. All statistics come from the training corpus in the
+same pass that computes `Abar`, never from balanced diagnostic samples. The rule, the value used and the
+pre-activation distribution per type at initialisation are recorded in `profile.json`. No global
 pair-density gate, free adjacency, hard top-k, Gumbel sampler or evaluation-time binarisation. Soft edges
 are a deterministic computational graph, not independent Bernoulli probabilities nor a claim to recover
 named neighbours.
@@ -477,10 +511,21 @@ L_slot = beta_p * mean_i Huber( sort_desc(p)_i , sort_desc(p*)_i )
        + beta_i * mean_i Huber( sort_desc(b)_i , sort_desc(b*)_i )
 ```
 
-with `beta_p = beta_q = beta_a = beta_i = 1` and `delta = 1`. Sorting is a permutation, so gradient reaches
-the predicted weight occupying each rank; the product terms route it to both (or all three) edges of each
-motif, and the raw terms keep gradient flowing to an edge whose path product vanishes because a *different*
-edge of that path is zero. All 96 edges are reached on non-degenerate inputs.
+```
+       + beta_c * mean_i Huber( sort_desc(w_C)_i , sort_desc(w_C*)_i )        v10: the 16 raw closure weights
+```
+
+with `beta_p = beta_q = beta_a = beta_i = beta_c = 1` and `delta = 1` (`beta_c = 0` is the wave-1 loss, bit for
+bit). Sorting is a permutation, so gradient reaches the predicted weight occupying each rank; the product terms
+route it to both (or all three) edges of each motif, and the raw terms keep gradient flowing to an edge whose
+path product vanishes because a *different* edge of that path is zero. All 96 edges are *reached* on
+non-degenerate inputs, but reached is not taught: through a product the closure gradient is attenuated by the
+partner weight and by the sigmoid derivative of a saturated head, `dL/dz_c ~ dL/dp * w_partner * sigma'`,
+measured in wave 1 at `2e-6` per edge against `2e-4` for an interior edge, and the slot gradient into the
+closure head at 1/1800 of the interior head's; the closure-only control's whole slot loss was `0.0003` for 15
+epochs. The raw closure term is exactly the repair §7.3 already applied to the interior family, and the wedge
+products stay because the raw multiset alone cannot tell a wedge from two weights on different witnesses.
+Direct wedge-mass supervision is not the fix: `d m_C / d z_c` still carries the partner weight.
 
 **The raw interior term exists because the products alone are badly conditioned.** For a bridge `q = a b c`,
 `dq/db = a c`, so the interior gradient is attenuated quadratically by small attachments, and the attachment
@@ -511,6 +556,11 @@ way. If pilot B shows the interior family is unpredictable while the closure fam
 and `beta_i` to zero and report the arm as closure-supervised rather than implying more.
 
 ### 7.4 Teacher selection
+
+**v10: the teachability pilots are dropped.** Wave 1 measured the reader swap at 0.0005 V_val AUPRC against
+0.086 for the graph swap, so Stage II uses the published five-metric Stage I winner
+(`motif_prompt_stage1/best.pt`) as the single bundle, reported as such. The text below is kept as the record
+of the procedure and of the prefix/resume mechanics that §7.5 now reuses for the warm-up.
 
 Two distinct selections, stated separately because v2 conflated them:
 
@@ -556,18 +606,36 @@ Initialise `R_S`, the count head, the token projections, the role embeddings and
 the **single selected Stage I bundle of §7.4**, the same bundle `R_T` copies; freeze F and the head
 throughout.
 
-| Epochs | Trainable | Frozen |
-|---|---|---|
-| 1–2 | G (attention, private seeds, gate MPNN, heads) | `R_S`, count head, prefix adapter, F/head, `R_T` |
-| 3–15 | G; final block and output projections of `R_S`; count head; prefix adapter/gates | Earlier `R_S` blocks and role/input embeddings; F/head; all `R_T` |
+| Epochs | Trainable | Loss reaching G | Frozen |
+|---|---|---|---|
+| 1–2 | G (attention, private seeds, gate MPNN, heads) | **`L_G` only** (`warmup_losses: graph_only`): the predicted weights are detached before the trunk, the structural pass and `R_T`, so task BCE, the structural stream and `L_topo` are computed and logged but contribute exactly zero gradient to G | `R_S`, count head, prefix adapter, F/head, `R_T` |
+| 3–15 | G; final block and output projections of `R_S`; count head; prefix adapter/gates | the joint objective below | Earlier `R_S` blocks and role/input embeddings; F/head; all `R_T` |
 
 15-epoch one-cycle, no early stopping, five-metric selection. New generator at AdamW LR `1e-4`, weight
 decay `1e-2`, clip 1; reader and prefix parameters use 0.1 times the instantaneous generator LR once
 opened. The freeze-forever arm uses the same initialisation, batches and schedule.
 
+Why the warm-up is graph-only (v10): at wave 1's initialisation the gradient into G was `45.5` from the task
+term, `6.9` from `0.1 L_topo` and `0.053` from `L_slot`; removing the task term alone would still leave the
+topo term ~130x the graph term, and a LayerNormed direction match is satisfied by a constant prompt (wave 1:
+`L_topo` fell 0.70 -> 0.34 while the graph never moved). Two epochs are the pre-registered checkpoint of §0.2,
+not a guarantee of sufficiency; the epoch-2 prefix is continued under the guarded resume path, and the keys
+that are inert before the interface opens (`w_slot`, `w_slot_multiplier`, `w_topo`) are excluded from the
+resume comparison for such a prefix, so one prefix serves every joint-phase arm.
+
 ```
-L_II = L_task_BCE + L_struct + w_slot * L_slot + 0.1 * L_topo        (w_slot = 1)
+L_II = L_task_BCE + L_struct + lambda_G * L_G + lambda_T * L_topo
 ```
+
+`lambda_G` is **not** a carried-over constant (`w_slot = 1` against a task gradient 5-18x larger at the wave-1
+checkpoint and 170-860x larger at initialisation is the cheap no-structure minimum wave 1 found). With
+`w_slot: balanced` it is set once, at the first optimizer step of the first interface-open epoch, on a fixed
+256-row probe batch: `lambda_G = clamp(10^round(log10(||grad_G L_task|| / ||grad_G L_G||)), 0.1, 1000)`
+times `w_slot_multiplier`, broadcast from rank 0, recorded in `profile.json`, `metrics.jsonl` and the
+checkpoint, and never re-balanced on resume. `lambda_T` is `w_topo` (0.1 in the main arm; 0 in the no-topo
+arm). Per-parameter-group gradient norms of G under each term, the gate-head pre-activation statistics and the
+predicted family masses are logged every epoch on the same probe batch, so a drift back towards the constant
+graph is visible during training.
 
 `L_struct` is §7.1's structural stream. `L_topo` is the light representation term: with fixed non-affine
 LayerNorm `N`, `mean over fields and dimensions of (N(R_T(Ahat)) - stopgrad(N(R_T(A*))))^2`, over all four
@@ -596,7 +664,8 @@ strata separately, and per-C-class strata where the benchmark's pair classes are
 dropping the endpoint-only and relation-only readout rows and one motif-family ablation. Pre-register the
 reading — row, metric, margin — before scoring. Single-seed differences inside ±0.01 GS and ±0.5 MMD ratio
 are not read; one previous arm's V_val MMD swung 5.8–14.4 across epochs of a single run. These margins are
-reporting thresholds, not confidence intervals.
+reporting thresholds, not confidence intervals, and they are GS / MMD margins: no margin is claimed for
+AUROC or AUPRC, whose single-seed differences are reported as such.
 
 | Comparison | Trained? | Question answered |
 |---|---|---|
@@ -611,6 +680,28 @@ reporting thresholds, not confidence intervals.
 | Freeze R/adapter for all 15 epochs vs the warm-up | trained | Does adaptation repair the teacher-student input shift? |
 | Closure-only and bridge-only, inactive family zeroed in both stages | trained | Does each family earn its place? |
 | `w_slot = 0`, and `L_topo = 0`, all else matched | trained | Which supervision contributes? |
+
+**Wave-2 arms (v10).** Three joint-phase arms continue from one graph-only prefix: **A** the fixed arm
+(`lambda_G` balanced, `lambda_T = 0.1`), **B** `lambda_T = 0` (does `L_topo`'s constant-token pull hurt once G
+carries structure?), **C** `10 lambda_G` (does the joint phase drift G back to the constant without a stronger
+anchor?). Two further two-epoch prefixes attribute the fix: init-only (`beta_c = 0`, non-zero-mean closure init)
+and loss-only (`beta_c = 1`, density init), read at pilot-B level 1. Held-out test is scored only for an arm that
+leaves the trunk on V_val, one seed; the seed replicas and the controls of the table above follow that.
+
+**Family-scaling diagnostic (v10, decides the presence gate).** On the Stage I bundle and V_val rows, scale one
+family's weights by `s in {1, 0.3, 0.1, 0.03, 0.01, 0}` and record the RRWP, token and logit change against the
+empty family (`src/experiments/motif_family_scaling.py`). A sigmoid gate cannot emit zero, and RRWP's degree
+normalisation cancels a uniform scaling of a witness's two edges, so "near-zero" and "empty" need not look alike
+to the reader. If the logit at `s = 0.01` differs from `s = 0` by more than 10% of the `s = 1` effect, a
+per-family presence gate (targets `t_C = 1[wedge_mass* > 0]`, `t_B = 1[bridge_mass* > 0]`, a bridge being a
+complete `u-l-r-v` path with attachments untouched) enters wave 3; otherwise no gate. No hard-concrete or
+straight-through estimator either way. The label lives largely in family *presence* (94.5% of training
+negatives have an empty closure family against 21.4% of positives; interior 74.8% against 15.8%), which a
+dense sigmoid template cannot emit, so this check is not optional.
+
+**Self rows (wave-3 option).** Stage I gives self rows an empty template; Stage II excludes them from `L_G` and
+`L_topo`, so G never receives the same convention. A candidate control adds an empty-template term on valid
+training self rows aggregated as its own stream, so the extra zero target cannot drive a global collapse.
 
 **The degree-only control, defined.** v8 named this row "degree-matched" and left its algorithm unstated,
 which admits two incompatible readings. It is the **trained** reading, matching its neighbours in the table: an
@@ -682,6 +773,11 @@ no pair channel and take no residue input, so the motif reader and generator can
 - Training, scoring and evaluation entry points: family registration, stage trainability, structural-stream
   support, teacher targets, diagnostics and truth-free score loading, plus the `optim.stop_after_epoch` key
   of §7.4 and its exclusion from the resume-config comparison. No parallel pipeline.
+- v10: `src/experiments/motif_pilot_b.py` (the §0.2 three-level reading of a prefix checkpoint) and
+  `src/experiments/motif_family_scaling.py` (the §8 presence-gate check); configs
+  `configs/split_seed42/motif_prompt_stage2_v2{_prefix,,_no_topo,_strong_graph,_initonly_prefix,_lossonly_prefix}.yaml`.
+  The wave-1 configs keep their meaning: `beta_c`, `closure_bias_init` and `warmup_losses` default to the
+  wave-1 behaviour and the v2 configs opt in.
 
 **Cost, with every figure labelled.** *Measured in this repo:* `b0_v31` 102 s/epoch train at 59.7 GiB/rank;
 `prefix_base` 316.6 s; struct arms 245–270 s at **81.7 GiB/rank** against the 85 GiB cap; the GRIT teacher
@@ -744,6 +840,7 @@ cannot instantiate this interface.
 
 | Version | Date | Changes |
 |---|---|---|
+| v10 | 2026-09-18 | First measured run read (`docs/results/motif_prompt_verdict/README.md`): Stage I +0.066 test AUPRC / +0.08 GS, every Stage II row at the trunk; the interface converts a true template into the full gain (reader swap 0.0005 vs graph swap 0.086 AUPRC), the generator emits a near-constant slot-symmetric graph, and the cause is closure gate heads initialised into saturation by `logit(density)` plus a product-only closure supervision (closure-head slot gradient 1/1800 of the interior's) inside a composite whose task gradient dominates the graph term 5-18x (170-860x at init). Four amendments, owner-reviewed: **§4** closure bias from the training-corpus non-zero mean with a mass check, attach/interior unchanged; **§7.3** raw closure term `beta_c`, products kept, wedge-mass loss rejected as not removing the attenuation; **§7.5** graph-only warm-up with task, structural and topo terms detached from G, then `lambda_G` by gradient-norm balancing at the interface opening, the prefix continued under the guarded resume with the inert keys excluded; **§0.2** pilot B run as those two epochs with a three-level pre-registered reading and its stop rule, pilot A superseded by the wave-1 counterfactual; **§7.4** teachability pilots dropped; **§8** wave-2 arms, the family-scaling diagnostic that decides a presence gate, the self-row option, and no AUPRC margin. Corrections to the verdict itself: "failed to learn structure", not "never trained"; the integrated-gradients attribution withdrawn (completeness does not close); the test transplant's -0.008 AUPRC is a small single-seed signal, not "inside the margin". |
 | v9 | 2026-09-16 | Implementation-planning clarifications, no design change. §8's "degree-matched control" is renamed the **degree-only control** and given an algorithm: a trained arm whose prompt carries only the symmetric degree pair from the predicted adjacency, with the mass entries zeroed and the GRIT fields row-masked — not a degree-marginal re-thresholding, which this specification never uses as a matching target. Recorded because the plan could not write that control's config from the v8 text. Separately, §11 was lost from the file between the v8 edit and the planning pass and has been reconstructed from the edit scripts; the cause was not determined and the file is untracked, so no git history existed to recover from. |
 | v8 | 2026-09-16 | Sixth owner review; no architectural blocker found. Pilot B's **collapse control is withdrawn**: averaging predicted edge weights is not invariant to the anonymous-slot permutation §3 randomises, so two rows predicting the same wedge through different closure slots — each at zero loss, identical sorted profiles, wedge mass `0.25` — average to two half-strength wedges at mass `0.125` and loss `0.00244140625` (reproduced), which would have been misread as row-dependent prediction. Row-dependence is now tested by a **row-transplant control** reusing §8's seeded whole-graph transplant, which keeps each predicted graph intact and scores exactly zero on that fixture, alongside the retained asymmetric fixed-template baseline and profile dispersion (§0.2). |
 | v7 | 2026-09-16 | Fifth owner review. The oracle orientation of v6 is removed as vacuous: `L_slot` is **exactly invariant** under `u<->v, L<->R` — wedge products fixed, bridge-product and interior matrices transposed, attachment vectors exchanged, so every sorted profile is unchanged (verified, max `6.9e-18` in float64 over 100 fixtures). The comparator is simply an **asymmetric** fixed template; removing the symmetry constraint, not adding an orientation, is what the v6 counterexample called for. Beating one fitted template is downgraded from a bound to held-out empirical evidence, with a profile-dispersion statistic and a **collapse control** (evaluate the head's own row-mean 96-weight vector) added to test row-dependence directly (§0.2). *The collapse control was withdrawn in v8; the dispersion statistic stands.* The false-mass guard gains a pre-declared absolute allowance `F_1 - F_0 <= max(0.1*F_0, 0.01*s_bridge)`, since the bare 10% form is zero-tolerance at `F_0 = 0` and would reject a 1.0 → 0.1 reconstruction gain against a `1e-9` false mass; empty-stratum behaviour is defined so no undefined mean can select a setting (§0.2). |
@@ -754,4 +851,4 @@ cannot instantiate this interface.
 | v2 | 2026-09-16 | Nine amendments after an adversarial review returned "do not proceed as specified" and a feasibility audit returned "buildable with named changes". |
 | v1 | 2026-09-16 | First decision: motif template graph read by GRIT, three tokens, counts removed, corpus-wide compilation implied, teacher by true-template rank. |
 
-No implementation, training, scoring, HPO or monitoring was performed by this design task.
+Wave 1 (v9) was implemented, trained and scored on 2026-09-17/18; wave 2 (v10) is implemented from the fix plan and not yet trained.

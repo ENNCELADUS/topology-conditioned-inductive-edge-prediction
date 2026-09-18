@@ -81,6 +81,15 @@ selected method. Every piece of writing must explain how its context helps decid
   degree marginals; the output-density control is `python -m src.experiments.motif_density_control`.
   Edge weights, the count head and the RRWP stack are fp32 by construction; the family runs only
   through `hpc/run.sh train`, never the debug CLI.
+  Wave 1 (2026-09-17/18) put every Stage II row at the trunk; verdict and mechanism in
+  `docs/results/motif_prompt_verdict/README.md`, fixes in spec v10 and
+  `docs/tmp/2026-09-18-motif-stage2-fix-plan.md`. Wave 2: `motif_prompt_stage2_v2_prefix` (graph-only
+  warm-up, `optim.stop_after_epoch: 2`, launch with `--skip-test`) is read by
+  `python -m src.experiments.motif_pilot_b` (three pre-registered levels; level 1 or 2 failing stops the
+  wave) and continued with `hpc/run.sh train configs/split_seed42/motif_prompt_stage2_v2{,_no_topo,_strong_graph}.yaml
+  --resume-attempt <prefix attempt dir>`; `motif_prompt_stage2_v2_{initonly,lossonly}_prefix` attribute the
+  fix; `python -m src.experiments.motif_family_scaling` decides the wave-3 presence gate. The wave-1 configs
+  keep their meaning: `beta_c`, `closure_bias_init` and `warmup_losses` default to wave-1 behaviour.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.

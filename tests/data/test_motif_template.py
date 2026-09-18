@@ -30,8 +30,10 @@ from src.data.motif_template import (
     TYPE_INTERIOR,
     MotifTemplateTable,
     count_statistics,
+    mean_template,
     role_permutation,
     slot_profiles,
+    template_statistics,
 )
 
 
@@ -235,7 +237,24 @@ def test_slot_profiles_are_products_and_raw_weights() -> None:
     assert parts["a"][0, 0].item() == pytest.approx(0.2)
     assert parts["a"][0, 8].item() == pytest.approx(0.5)
     assert parts["b"][0, 0].item() == pytest.approx(0.7)
+    assert parts["c"].shape == (2, 16)
+    assert parts["c"][0, 0].item() == pytest.approx(0.5)
+    assert parts["c"][0, 8].item() == pytest.approx(0.4)
     assert not parts["p"][1].any()
+
+
+def test_the_raw_closure_profile_is_exactly_the_two_closure_index_sets() -> None:
+    # The wave-2 `beta_c` term supervises this multiset, so it has to be the 16
+    # closure weights in CLOSURE_U-then-CLOSURE_V order and nothing else.
+    weights = torch.rand(3, 96)
+    torch.testing.assert_close(
+        slot_profiles(weights)["c"],
+        torch.cat([weights[:, CLOSURE_U], weights[:, CLOSURE_V]], dim=1),
+        rtol=0,
+        atol=0,
+    )
+    closure_edges = [index for index, kind in enumerate(EDGE_TYPES) if kind == TYPE_CLOSURE]
+    assert closure_edges == list(range(16))
 
 
 def test_count_statistics_are_the_sums_of_the_supervised_multisets() -> None:
@@ -259,7 +278,7 @@ def test_profiles_and_counts_are_invariant_under_a_within_role_permutation() -> 
     )
     shuffled = torch.zeros_like(weights)
     shuffled[:, perm] = weights
-    for key in ("p", "q", "a", "b"):
+    for key in ("p", "q", "a", "b", "c"):
         torch.testing.assert_close(
             slot_profiles(shuffled)[key].sort(dim=1, descending=True).values,
             slot_profiles(weights)[key].sort(dim=1, descending=True).values,
@@ -304,3 +323,40 @@ def test_summary_records_the_measured_compile_rate() -> None:
     assert summary["edges"] == 96
     assert isinstance(summary["compile_seconds_per_10k"], float)
     assert summary["compile_seconds_per_10k"] >= 0.0
+
+
+def test_template_statistics_match_a_hand_computed_fixture() -> None:
+    # Three rows: one with a single wedge, one bridge-only, one empty. Every
+    # field is small enough to check by hand, which is the point of the fixture.
+    rows = np.zeros((3, 96), dtype=np.float32)
+    rows[0, 0] = 0.5  # w(u, c0)
+    rows[0, 8] = 0.25  # w(c0, v)
+    rows[1, 16] = 0.5  # w(u, l0)
+    rows[1, 24] = 0.5  # w(r0, v)
+    rows[1, 32] = 1.0  # w(l0, r0)
+
+    stats = template_statistics(rows)
+
+    assert stats.rows == 3
+    assert np.array_equal(stats.mean, mean_template(rows))
+    # Closure: the two positive weights 0.5 and 0.25. Attach: 0.5 and 0.5.
+    # Interior: the single 1.0. None of the three is the per-edge density.
+    assert stats.nonzero_mean_by_type[TYPE_CLOSURE] == pytest.approx(0.375)
+    assert stats.nonzero_mean_by_type[TYPE_ATTACH] == pytest.approx(0.5)
+    assert stats.nonzero_mean_by_type[TYPE_INTERIOR] == pytest.approx(1.0)
+    assert float(stats.mean[0]) == pytest.approx(0.5 / 3.0)
+    # Only row 0 has a wedge (0.5 * 0.25) and only row 1 a bridge (0.5 * 1 * 0.5).
+    assert stats.positive_row_wedge_mass == pytest.approx(0.125)
+    assert stats.positive_row_bridge_mass == pytest.approx(0.25)
+
+
+def test_template_statistics_are_zero_on_an_empty_corpus_and_reject_a_bad_shape() -> None:
+    empty = template_statistics(np.zeros((0, 96), dtype=np.float32))
+    assert empty.rows == 0
+    assert not empty.mean.any() and not empty.nonzero_mean_by_type.any()
+    assert (empty.positive_row_wedge_mass, empty.positive_row_bridge_mass) == (0.0, 0.0)
+    # A corpus with no positive entry of a type reports 0.0 for it, never a NaN.
+    zeros = template_statistics(np.zeros((2, 96), dtype=np.float32))
+    assert not zeros.nonzero_mean_by_type.any()
+    with pytest.raises(ValueError, match="must have shape"):
+        template_statistics(np.zeros((2, 95), dtype=np.float32))

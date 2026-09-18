@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -19,7 +20,7 @@ from src.model.egostitch.classifier.motif_prompt import TEMPLATE_KEY, V3_1MotifP
 from src.model.egostitch.classifier.topo_prompt import V3_1TopoPrompt
 from src.train_b0 import Config, ModelConfig, StructStream, TrainResult
 
-from tests.model.test_motif_prompt_model import _model, _open_gates, _weights
+from tests.model.test_motif_prompt_model import _model, _open_gates, _statistics, _weights
 from tests.test_prefix_model import _pair_batch, _tiny_base_config
 from tests.test_train_b0 import _constant_metrics, _tiny_config, _write_yaml_config
 from tests.test_train_b0_struct import (
@@ -64,7 +65,7 @@ def _motif_model(*, with_teacher: bool = True, stage: str = "two") -> V3_1MotifP
     if stage == "two":
         block["bundle_checkpoint"] = "bundle.pt"
     model = V3_1MotifPrompt(base=_tiny_base_config(), motif_prompt=block)
-    model.install_mean_template(torch.full((96,), 0.1))
+    model.install_mean_template(_statistics(torch.full((96,), 0.1)))
     gen = torch.Generator().manual_seed(1)
     with torch.no_grad():
         model.adapter.gates.copy_(torch.randn(model.adapter.gates.shape, generator=gen))
@@ -915,6 +916,78 @@ def test_a_resume_config_comparison_ignores_stop_after_epoch_only() -> None:
     assert _resume_comparable_config(saved) != _resume_comparable_config(epochs_changed)
 
 
+def _prefix_config(**block: object) -> dict[str, object]:
+    """A serialized config carrying a graph-only two-epoch motif prefix."""
+    motif: dict[str, object] = {
+        "stage": "two",
+        "warmup_losses": "graph_only",
+        "interface_warmup_epochs": 2,
+        "w_slot": "balanced",
+        "w_slot_multiplier": 1.0,
+        "w_topo": 0.1,
+        "beta_c": 1.0,
+    }
+    motif.update(block)
+    return {
+        "output_dir": "outputs/prefix",
+        "seed": 0,
+        "optim": {"epochs": 15, "stop_after_epoch": 2, "lr": 1e-4},
+        "model": {"family": "v3_1_motif_prompt", "config": {"motif_prompt": motif}},
+    }
+
+
+@pytest.mark.parametrize(
+    "override", [{"w_slot": 5.0}, {"w_slot_multiplier": 10.0}, {"w_topo": 0.0}]
+)
+def test_the_graph_only_prefix_excludes_exactly_the_three_inert_joint_keys(
+    override: dict[str, object],
+) -> None:
+    # Those three first apply at the interface-open epoch, so one two-epoch
+    # prefix is a true prefix of every phase-1 arm that differs only in them.
+    from src.train_b0 import _motif_prefix_keys_inert, _resume_comparable_config
+
+    saved = _prefix_config()
+    arm = _prefix_config(**override)
+    arm["output_dir"] = "outputs/arm"
+    cast(dict[str, object], arm["optim"]).pop("stop_after_epoch")
+    inert = _motif_prefix_keys_inert(saved, 2)
+    assert inert
+    assert _resume_comparable_config(saved, drop_motif_joint_keys=True) == (
+        _resume_comparable_config(arm, drop_motif_joint_keys=True)
+    )
+    # Still strict without the exclusion, and the saved mapping is untouched.
+    assert _resume_comparable_config(saved) != _resume_comparable_config(arm)
+    assert saved["model"] == _prefix_config()["model"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"beta_c": 0.0}, {"closure_bias_init": "density"}, {"interface_warmup_epochs": 3}],
+)
+def test_any_other_motif_difference_still_rejects_the_resume(
+    override: dict[str, object],
+) -> None:
+    from src.train_b0 import _resume_comparable_config
+
+    saved = _prefix_config()
+    other = _prefix_config(**override)
+    assert _resume_comparable_config(saved, drop_motif_joint_keys=True) != (
+        _resume_comparable_config(other, drop_motif_joint_keys=True)
+    )
+
+
+def test_the_exclusion_needs_graph_only_and_an_epoch_inside_the_warm_up() -> None:
+    from src.train_b0 import _motif_prefix_keys_inert
+
+    assert _motif_prefix_keys_inert(_prefix_config(), 1)
+    assert _motif_prefix_keys_inert(_prefix_config(), 2)
+    # Epoch 3 already trained under the joint objective, so the keys were live.
+    assert not _motif_prefix_keys_inert(_prefix_config(), 3)
+    assert not _motif_prefix_keys_inert(_prefix_config(warmup_losses="joint"), 2)
+    assert not _motif_prefix_keys_inert(_prefix_config(interface_warmup_epochs=None), 2)
+    assert not _motif_prefix_keys_inert({"seed": 0}, 1)
+
+
 def test_schedule_total_steps_ignores_stop_after_epoch() -> None:
     # The pilot keeps optim.epochs at 15 so the first two epochs are a true
     # prefix of the full one-cycle: same trainability mask, same LRs, same order.
@@ -1060,7 +1133,7 @@ def test_the_model_returns_task_bce_only_and_leaves_the_composite_to_the_trainer
     assert float(out["slot_loss_rows"].detach().sum()) > 0.0
     assert out["slot_loss_rows"].requires_grad and out["topo_loss_rows"].requires_grad
     assert float(out["loss_term_slot"].detach()) == pytest.approx(
-        model.cfg.w_slot * float(out["slot_loss_rows"].detach().mean())
+        model.w_slot_value * float(out["slot_loss_rows"].detach().mean())
     )
     assert float(out["loss_term_topo"].detach()) == pytest.approx(
         model.cfg.w_topo * float(out["topo_loss_rows"].detach().mean())
@@ -1290,3 +1363,144 @@ def test_every_parameter_the_structural_pass_reaches_is_reached_by_the_task_pass
     task_batch[TEMPLATE_MASK_KEY] = torch.tensor([1.0, 1.0, 0.0, 1.0])
     struct_only = reached(model, struct_batch) - reached(model, task_batch)
     assert struct_only == set()
+
+
+def _probe_batch(n: int = 6, seed: int = 4) -> dict[str, torch.Tensor]:
+    """A task batch with labels, templates and a nonself mask, for the probe."""
+    from src.model.egostitch.classifier.motif_prompt import TEMPLATE_MASK_KEY
+
+    batch = _pair_batch(n=n)
+    batch[TEMPLATE_KEY] = _weights(n=n, seed=seed)
+    batch[TEMPLATE_MASK_KEY] = torch.ones(n)
+    batch["label"] = torch.tensor([1.0, 0.0] * (n // 2))
+    return batch
+
+
+def _probe_model(**block: object) -> V3_1MotifPrompt:
+    """A stage-two motif model with open gates, a teacher and a trainable G."""
+    model = _model("two", 0, **block)
+    _open_gates(model)
+    model.initialize_teacher()
+    model.train()
+    return model
+
+
+def test_the_balance_rule_rounds_the_ratio_to_a_power_of_ten_and_clamps_it() -> None:
+    from src.train_b0 import _motif_balanced_w_slot
+
+    def resolve(task: float, slot: float, multiplier: float = 1.0) -> float:
+        return _motif_balanced_w_slot(task_norm=task, slot_norm=slot, multiplier=multiplier)
+
+    assert resolve(30.0, 1.0) == pytest.approx(10.0)
+    assert resolve(3.0, 1.0) == pytest.approx(1.0)
+    assert resolve(1.0, 30.0) == pytest.approx(0.1)
+    # Clamped into [0.1, 1000] before the multiplier, which then scales it.
+    assert resolve(1e9, 1.0) == pytest.approx(1000.0)
+    assert resolve(1.0, 1e9) == pytest.approx(0.1)
+    assert resolve(30.0, 1.0, multiplier=10.0) == pytest.approx(100.0)
+    # A degenerate probe cannot drown the task: no log10 of zero, no NaN weight.
+    assert resolve(0.0, 1.0) == pytest.approx(0.1)
+    assert resolve(1.0, 0.0) == pytest.approx(1000.0)
+
+
+def test_the_generator_probe_is_deterministic_and_reports_every_key() -> None:
+    from src.train_b0 import _motif_generator_probe, _motif_probe_keys
+
+    model = _probe_model(beta_c=1.0)
+    batch = _probe_batch()
+    first = _motif_generator_probe(model, batch, rows=4)
+    second = _motif_generator_probe(model, batch, rows=4)
+
+    assert first.telemetry == second.telemetry
+    assert (first.task_norm, first.slot_norm) == (second.task_norm, second.slot_norm)
+    assert sorted(first.telemetry) == sorted(_motif_probe_keys())
+    assert first.task_norm > 0.0 and first.slot_norm > 0.0
+    assert first.telemetry["grad_g_slot_head_closure"] > 0.0
+    assert first.telemetry["gate_logit_closure_frac_abs_gt_3"] >= 0.0
+    assert first.telemetry["pred_wedge_mass"] >= 0.0
+    # The probe leaves training exactly as it found it: mode restored, no .grad.
+    assert model.training
+    assert all(param.grad is None for param in model.parameters())
+
+
+def test_the_probe_reads_only_the_first_rows_of_the_batch() -> None:
+    from src.train_b0 import _motif_generator_probe, _motif_probe_batch
+
+    model = _probe_model()
+    batch = _probe_batch(n=6)
+    sliced = _motif_probe_batch(batch, rows=4)
+    assert sliced["label"].shape == (4,)
+    assert sliced[TEMPLATE_KEY].shape == (4, 96)
+    assert torch.equal(sliced["label"], batch["label"][:4])
+    head = _motif_generator_probe(model, batch, rows=4)
+    direct = _motif_generator_probe(model, dict(sliced), rows=4)
+    assert head.telemetry == direct.telemetry
+    # More rows than the batch holds is the whole batch, not an error.
+    assert _motif_probe_batch(batch, rows=100)["label"].shape == (6,)
+
+
+def test_the_graph_only_warm_up_probe_reports_a_zero_task_gradient() -> None:
+    from src.train_b0 import _motif_generator_probe
+
+    warm = _probe_model(warmup_losses="graph_only", beta_c=1.0)
+    assert warm.graph_only_warmup
+    batch = _probe_batch()
+    measured = _motif_generator_probe(warm, batch, rows=4)
+    assert measured.task_norm == 0.0
+    assert measured.slot_norm > 0.0
+    assert all(
+        value == 0.0 for key, value in measured.telemetry.items() if key.startswith("grad_g_task_")
+    )
+    assert all(
+        value == 0.0 for key, value in measured.telemetry.items() if key.startswith("grad_g_topo_")
+    )
+    warm.interface_open = True
+    opened = _motif_generator_probe(warm, batch, rows=4)
+    assert opened.task_norm > 0.0
+
+
+def test_the_shared_probe_fixes_the_balanced_w_slot_once_and_records_it() -> None:
+    from src.train_b0 import _share_motif_probe
+
+    accelerator = Accelerator(cpu=True)
+    model = _probe_model(w_slot="balanced", w_slot_multiplier=10.0, beta_c=1.0)
+    batch = _probe_batch()
+    profile: dict[str, object] = {}
+
+    # Epoch 1 is inside the warm-up: the probe records the initialisation row and
+    # leaves the weight unresolved, because the task gradient is not live yet.
+    model.interface_open = False
+    warm_row = _share_motif_probe(model, batch, accelerator, epoch=1, world_size=1, profile=profile)
+    assert "init" in profile and "balance" not in profile
+    assert "w_slot_resolved" not in warm_row
+    assert model.w_slot_value == 1.0
+
+    model.interface_open = True
+    row = _share_motif_probe(model, batch, accelerator, epoch=3, world_size=1, profile=profile)
+    balance = cast(dict[str, object], profile["balance"])
+    assert balance["epoch"] == 3
+    assert balance["w_slot_multiplier"] == 10.0
+    assert row["w_slot_resolved"] == balance["w_slot_resolved"] == model.w_slot_value
+    assert row["balance_ratio"] == pytest.approx(
+        row["balance_grad_g_task"] / row["balance_grad_g_slot"]
+    )
+    resolved = model.w_slot_value
+    power = 10.0 ** float(round(math.log10(row["balance_ratio"])))
+    assert resolved == pytest.approx(min(max(power, 0.1), 1000.0) * 10.0)
+
+    # A later epoch never re-balances, and a restored checkpoint keeps the weight.
+    later = _share_motif_probe(model, batch, accelerator, epoch=4, world_size=1, profile=profile)
+    assert "w_slot_resolved" not in later
+    assert model.w_slot_value == resolved
+    restored = _model("two", w_slot="balanced", w_slot_multiplier=10.0)
+    restored.load_state_dict(model.state_dict(), strict=False)
+    assert restored.w_slot_value == resolved
+
+
+def test_the_composite_uses_the_resolved_weight_not_the_configured_string() -> None:
+    model = _probe_model(w_slot="balanced", beta_c=1.0)
+    batch = _probe_batch()
+    before = model(batch)["loss_term_slot"].detach().clone()
+    model.resolve_w_slot(100.0)
+    after = model(batch)["loss_term_slot"].detach()
+    torch.testing.assert_close(after, before * 100.0, rtol=1e-5, atol=1e-7)

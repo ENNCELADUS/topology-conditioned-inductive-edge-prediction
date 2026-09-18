@@ -1050,14 +1050,21 @@ def _run_pipeline_unlocked(
             resume_attempt = args.resume_attempt.resolve(strict=True)
             resolved_resume_attempt = resume_attempt
             attempts_root = (output_dir / "attempts").resolve()
-            if not resume_attempt.is_dir() or resume_attempt.parent != attempts_root:
-                raise ValueError("--resume-attempt must be a direct child of output_dir/attempts")
+            if not resume_attempt.is_dir() or resume_attempt.parent.name != "attempts":
+                raise ValueError("--resume-attempt must be a direct child of an attempts directory")
+            # A prefix run under ANOTHER output_dir is accepted, because the
+            # wave-2 phase-1 arms continue one shared two-epoch prefix that lives
+            # under the prefix arm's own output_dir. Such a source is read-only
+            # here -- its status is never rewritten, only its metrics prefix is
+            # copied and its checkpoints hard-linked -- and it is accepted only
+            # after the worker's own resume comparison passes on its saved config.
+            own_output_dir = resume_attempt.parent == attempts_root
             if resume_attempt == attempt_dir.resolve():
                 raise ValueError("--resume-attempt must identify a prior attempt")
             source_status = json.loads((resume_attempt / "status.json").read_text(encoding="utf-8"))
             if not isinstance(source_status, dict):
                 raise ValueError("resume attempt must have failed or abandoned terminal status")
-            if source_status.get("status") == "running":
+            if own_output_dir and source_status.get("status") == "running":
                 source_status.update({"status": "abandoned", "abandoned_by_attempt_id": attempt_id})
                 _write_json_atomic(resume_attempt / "status.json", source_status)
             elif source_status.get("status") not in {"failed", "abandoned", "complete"}:
@@ -1115,6 +1122,20 @@ def _run_pipeline_unlocked(
                     "a complete resume attempt must be an intentionally halted prefix, "
                     f"but epoch {completed_epoch} ends the {cfg.optim.epochs}-epoch schedule"
                 )
+            if not own_output_dir:
+                matches = getattr(worker, "resume_config_matches", None)
+                if not callable(matches):
+                    raise ValueError(
+                        "this worker does not support resuming an attempt from another output_dir"
+                    )
+                saved_config = state["config"]
+                if not isinstance(saved_config, dict) or not matches(
+                    saved_config, cfg, completed_epoch=completed_epoch
+                ):
+                    raise ValueError(
+                        "a resume attempt from another output_dir must carry a config that "
+                        "differs only in the keys the worker excludes from the comparison"
+                    )
             if not isinstance(state["global_step"], int) or state["global_step"] <= 0:
                 raise ValueError("training_state.pt global_step is invalid")
             for field in ("rng_by_rank", "runtime_by_rank"):
@@ -1152,6 +1173,7 @@ def _run_pipeline_unlocked(
             for checkpoint in expected_checkpoints:
                 os.link(checkpoint, seeded_checkpoints / checkpoint.name)
             attempt_status["resumed_from_attempt_id"] = resume_attempt.name
+            attempt_status["resume_source_attempt"] = str(resume_attempt)
             _write_json_atomic(attempt_status_path, attempt_status)
             _write_json_atomic(current_attempt_path, attempt_status)
         except Exception as error:

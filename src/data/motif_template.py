@@ -474,14 +474,15 @@ def mean_template(weights: NDArray[np.float32]) -> NDArray[np.float32]:
 
 
 def slot_profiles(weights: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Return the four section 7.3 supervised multisets of a weight table.
+    """Return the five section 7.3 supervised multisets of a weight table.
 
     Args:
         weights: ``(B, 96)`` edge weights against `EDGE_ENDPOINTS`.
 
     Returns:
         ``p`` the 8 wedge products, ``q`` the 64 path products, ``a`` the 16 raw
-        attachment weights and ``b`` the 64 raw interior weights, in float32.
+        attachment weights, ``b`` the 64 raw interior weights and ``c`` the 16
+        raw closure weights, in float32.
 
     Raises:
         ValueError: If ``weights`` is not ``(B, 96)``.
@@ -502,6 +503,7 @@ def slot_profiles(weights: torch.Tensor) -> dict[str, torch.Tensor]:
         "q": products.reshape(-1, 64),
         "a": torch.cat([attach_l, attach_r], dim=1),
         "b": interior.reshape(-1, 64),
+        "c": torch.cat([closure_u, closure_v], dim=1),
     }
 
 
@@ -524,3 +526,89 @@ def count_statistics(weights: torch.Tensor) -> dict[str, torch.Tensor]:
         "deg_u": value[:, CLOSURE_U].sum(dim=1) + value[:, ATTACH_L].sum(dim=1),
         "deg_v": value[:, CLOSURE_V].sum(dim=1) + value[:, ATTACH_R].sum(dim=1),
     }
+
+
+@dataclass(frozen=True)
+class MotifTemplateStatistics:
+    """Training-corpus statistics of the compiled templates (spec section 4).
+
+    Everything a generator's gate heads are initialised from is measured here,
+    on the same randomised compiled training templates the mean adjacency
+    ``Abar`` is averaged over, never on a balanced diagnostic sample.
+
+    The distinction that matters is density versus magnitude: 58% of training
+    rows carry no closure edge at all, so the per-edge mean of the closure block
+    is a *density* (0.0185 on the seed-42 corpus) while the mean weight of an
+    edge that exists is 0.196. Initialising a sigmoid gate head from the first
+    starts it at ``z = -3.97`` and it never leaves (the wave-1 collapse).
+
+    Attributes:
+        mean: The ``(96,)`` mean weight vector, identical to `mean_template`.
+        nonzero_mean_by_type: Mean over the strictly positive entries of each
+            edge type, ordered ``[closure, attach, interior]``; ``0.0`` for a
+            type with no positive entry anywhere in the corpus.
+        positive_row_wedge_mass: Mean ``wedge_mass`` over the rows that have
+            any; ``0.0`` when no row does.
+        positive_row_bridge_mass: The same for ``bridge_mass``.
+        rows: Rows the statistics were measured over.
+    """
+
+    mean: NDArray[np.float32]
+    nonzero_mean_by_type: NDArray[np.float32]
+    positive_row_wedge_mass: float
+    positive_row_bridge_mass: float
+    rows: int
+
+
+def _positive_mean(values: NDArray[np.float32]) -> float:
+    """Return the mean of the strictly positive entries of ``values``, else 0.0.
+
+    Args:
+        values: Any float array.
+
+    Returns:
+        The mean over ``values > 0``, or ``0.0`` when there is no such entry.
+    """
+    positive = values[values > 0.0]
+    return float(positive.mean()) if positive.size else 0.0
+
+
+def template_statistics(weights: NDArray[np.float32]) -> MotifTemplateStatistics:
+    """Measure `MotifTemplateStatistics` over a compiled training corpus.
+
+    One pass: the per-type non-zero means come from the edge blocks directly and
+    the two positive-row masses from `count_statistics`, so a caller that already
+    holds the compiled table never compiles it twice.
+
+    Args:
+        weights: ``(n, 96)`` compiled weights over the training corpus.
+
+    Returns:
+        The statistics; every field is zero on an empty corpus.
+
+    Raises:
+        ValueError: If ``weights`` is not ``(n, 96)``.
+    """
+    value = np.asarray(weights, dtype=np.float32)
+    if value.ndim != 2 or value.shape[1] != N_EDGES:
+        raise ValueError(f"template weights must have shape (n, {N_EDGES}), got {value.shape}")
+    if value.shape[0] == 0:
+        return MotifTemplateStatistics(
+            mean=np.zeros(N_EDGES, dtype=np.float32),
+            nonzero_mean_by_type=np.zeros(N_EDGE_TYPES, dtype=np.float32),
+            positive_row_wedge_mass=0.0,
+            positive_row_bridge_mass=0.0,
+            rows=0,
+        )
+    types = np.asarray(EDGE_TYPES, dtype=np.int64)
+    counts = count_statistics(torch.from_numpy(value))
+    return MotifTemplateStatistics(
+        mean=mean_template(value),
+        nonzero_mean_by_type=np.asarray(
+            [_positive_mean(value[:, types == edge_type]) for edge_type in range(N_EDGE_TYPES)],
+            dtype=np.float32,
+        ),
+        positive_row_wedge_mass=_positive_mean(counts["wedge_mass"].numpy()),
+        positive_row_bridge_mass=_positive_mean(counts["bridge_mass"].numpy()),
+        rows=int(value.shape[0]),
+    )

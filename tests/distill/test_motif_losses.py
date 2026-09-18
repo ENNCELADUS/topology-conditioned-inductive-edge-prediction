@@ -19,8 +19,15 @@ from src.distill.motif_losses import (
     topo_loss_rows,
 )
 
-_BETAS = {"beta_p": 1.0, "beta_q": 1.0, "beta_a": 1.0, "beta_i": 1.0, "huber_delta": 1.0}
-_FAMILIES = ("beta_p", "beta_q", "beta_a", "beta_i")
+_BETAS = {
+    "beta_p": 1.0,
+    "beta_q": 1.0,
+    "beta_a": 1.0,
+    "beta_i": 1.0,
+    "beta_c": 1.0,
+    "huber_delta": 1.0,
+}
+_FAMILIES = ("beta_p", "beta_q", "beta_a", "beta_i", "beta_c")
 
 
 def _only(name: str) -> dict[str, float]:
@@ -174,12 +181,79 @@ def test_each_family_weight_switches_off_exactly_its_own_term() -> None:
     # The closure-supervised fallback of spec section 7.3: beta_q = beta_i = 0.
     torch.testing.assert_close(
         slot_loss_rows(
-            predicted, target, beta_p=1.0, beta_q=0.0, beta_a=1.0, beta_i=0.0, huber_delta=1.0
+            predicted,
+            target,
+            beta_p=1.0,
+            beta_q=0.0,
+            beta_a=1.0,
+            beta_i=0.0,
+            beta_c=0.0,
+            huber_delta=1.0,
         ),
         singles["beta_p"] + singles["beta_a"],
         rtol=1e-6,
         atol=1e-7,
     )
+
+
+def test_beta_c_zero_reproduces_the_wave_one_loss_bit_for_bit() -> None:
+    # `beta_c` is the wave-2 addition; every published wave-1 number has to stay
+    # reachable, so the zero weight must not perturb the loss by one ulp.
+    gen = torch.Generator().manual_seed(11)
+    predicted = torch.rand(4, 96, generator=gen, requires_grad=True)
+    target = torch.rand(4, 96, generator=gen)
+    wave_one = {name: 1.0 for name in _FAMILIES if name != "beta_c"}
+    rows = slot_loss_rows(predicted, target, beta_c=0.0, huber_delta=1.0, **wave_one)
+    reference = (
+        slot_loss_rows(predicted, target, **_only("beta_p"))
+        + slot_loss_rows(predicted, target, **_only("beta_q"))
+        + slot_loss_rows(predicted, target, **_only("beta_a"))
+        + slot_loss_rows(predicted, target, **_only("beta_i"))
+    )
+    assert torch.equal(rows, reference)
+    rows.sum().backward()  # type: ignore[no-untyped-call]
+    assert predicted.grad is not None
+    zero_weighted = predicted.grad.clone()
+    predicted.grad = None
+    slot_loss_rows(predicted, target, beta_c=1.0, huber_delta=1.0, **wave_one).sum().backward()  # type: ignore[no-untyped-call]
+    assert predicted.grad is not None
+    # The raw term moves the closure block and nothing else.
+    assert float((predicted.grad[:, 16:] - zero_weighted[:, 16:]).abs().max()) == 0.0
+    assert float((predicted.grad[:, :16] - zero_weighted[:, :16]).abs().max()) > 0.0
+
+
+def test_the_raw_closure_term_is_the_sorted_huber_of_the_16_closure_weights() -> None:
+    gen = torch.Generator().manual_seed(13)
+    predicted = torch.rand(3, 96, generator=gen)
+    target = torch.rand(3, 96, generator=gen)
+    ours = (
+        torch.cat([predicted[:, :8], predicted[:, 8:16]], dim=1).sort(dim=1, descending=True).values
+    )
+    theirs = torch.cat([target[:, :8], target[:, 8:16]], dim=1).sort(dim=1, descending=True).values
+    expected = torch.nn.functional.huber_loss(ours, theirs, delta=1.0, reduction="none").mean(dim=1)
+    torch.testing.assert_close(
+        slot_loss_rows(predicted, target, **_only("beta_c")), expected, rtol=1e-6, atol=1e-7
+    )
+
+
+def test_the_raw_closure_term_reaches_a_gate_the_wedge_products_barely_move() -> None:
+    # The wave-1 mechanism: at a closure gate initialised from the density the
+    # product gradient carries the partner weight and the sigmoid slope, so the
+    # raw term is what restores an O(1) signal (the measured 1/1800 ratio).
+    logit = torch.full((1, 16), -3.97, requires_grad=True)
+    predicted = torch.zeros(1, 96)
+    predicted = predicted.clone()
+    predicted[0, :16] = torch.sigmoid(logit)[0]
+    target = torch.zeros(1, 96)
+    target[0, :8] = 0.4
+    target[0, 8:16] = 0.4
+    products_only = torch.autograd.grad(
+        slot_loss(predicted, target, **_only("beta_p")), logit, retain_graph=True
+    )[0]
+    raw_only = torch.autograd.grad(slot_loss(predicted, target, **_only("beta_c")), logit)[0]
+    # Measured on this fixture: 4.0e-4 against 6.7e-6, a factor ~60. The run-level
+    # ratio was 1/1800; the direction is what this pins, not that number.
+    assert float(raw_only.abs().max()) > 20.0 * float(products_only.abs().max())
 
 
 def test_rows_are_independent_so_self_rows_can_be_masked_out() -> None:
@@ -249,7 +323,14 @@ def _interior_fixture(beta_i: float) -> float:
     )
     assert float(count_statistics(target)["bridge_mass"]) == pytest.approx(0.64, rel=1e-4)
     loss = slot_loss(
-        predicted, target, beta_p=1.0, beta_q=1.0, beta_a=1.0, beta_i=beta_i, huber_delta=1.0
+        predicted,
+        target,
+        beta_p=1.0,
+        beta_q=1.0,
+        beta_a=1.0,
+        beta_i=beta_i,
+        beta_c=0.0,
+        huber_delta=1.0,
     )
     loss.backward()  # type: ignore[no-untyped-call]
     assert interior_logit.grad is not None

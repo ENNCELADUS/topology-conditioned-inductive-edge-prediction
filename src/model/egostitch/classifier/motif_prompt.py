@@ -9,6 +9,7 @@ from ``(x_u, x_v)`` alone, read through the identical interface.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
@@ -29,6 +30,10 @@ from src.data.motif_template import (
     SLOT_ROLES,
     SLOT_U,
     SLOT_V,
+    TYPE_ATTACH,
+    TYPE_CLOSURE,
+    TYPE_INTERIOR,
+    MotifTemplateStatistics,
     count_statistics,
 )
 from src.distill.motif_losses import slot_loss_rows, topo_loss_rows
@@ -55,6 +60,23 @@ INTERVENTIONS = (
     "rewire_bridge",
 )
 STAGES = ("one", "two")
+CLOSURE_BIAS_INITS = ("density", "nonzero_mean")
+WARMUP_LOSSES = ("joint", "graph_only")
+#: ``w_slot`` may be this string instead of a number: the weight is then fixed
+#: once, by gradient-norm balancing at the first interface-open step.
+BALANCED_W_SLOT = "balanced"
+#: Edge-type names, in `src.data.motif_template`'s type order.
+EDGE_TYPE_NAMES: tuple[str, ...] = ("closure", "attach", "interior")
+#: Generator parameter groups the per-epoch gradient probe attributes terms to.
+GENERATOR_GRAD_GROUPS: tuple[str, ...] = (
+    "slot_queries",
+    "attention",
+    "mpnn",
+    "head_closure",
+    "head_attach",
+    "head_interior",
+    "other",
+)
 TOKEN_SOURCES = ("graph", "direct")
 COUNT_FEATURES = ("all", "degree")
 GATE_MODES = ("learned", "per_type", "mean_graph")
@@ -129,12 +151,17 @@ class MotifPromptConfig:
     gate_mode: str = "learned"
     count_features: str = "all"
     interface_warmup_epochs: int | None = 2
-    w_slot: float = 1.0
+    warmup_losses: str = "joint"
+    w_slot: float | str = 1.0
+    w_slot_multiplier: float = 1.0
+    balance_probe_rows: int = 256
     w_topo: float = 0.1
     beta_p: float = 1.0
     beta_q: float = 1.0
     beta_a: float = 1.0
     beta_i: float = 1.0
+    beta_c: float = 0.0
+    closure_bias_init: str = "density"
     huber_delta: float = 1.0
 
     def __post_init__(self) -> None:
@@ -168,11 +195,33 @@ class MotifPromptConfig:
             raise ValueError(f"motif_prompt.count_features must be one of {list(COUNT_FEATURES)}")
         if self.interface_warmup_epochs is not None and self.interface_warmup_epochs < 0:
             raise ValueError("motif_prompt.interface_warmup_epochs must be non-negative or null")
-        for name in ("w_slot", "w_topo", "beta_p", "beta_q", "beta_a", "beta_i"):
+        if self.warmup_losses not in WARMUP_LOSSES:
+            raise ValueError(f"motif_prompt.warmup_losses must be one of {list(WARMUP_LOSSES)}")
+        if self.closure_bias_init not in CLOSURE_BIAS_INITS:
+            raise ValueError(
+                f"motif_prompt.closure_bias_init must be one of {list(CLOSURE_BIAS_INITS)}"
+            )
+        if isinstance(self.w_slot, str):
+            if self.w_slot != BALANCED_W_SLOT:
+                raise ValueError(
+                    f"motif_prompt.w_slot must be a non-negative number or {BALANCED_W_SLOT!r}"
+                )
+        elif float(self.w_slot) < 0.0:
+            raise ValueError("motif_prompt.w_slot must be non-negative")
+        if self.w_slot_multiplier <= 0.0:
+            raise ValueError("motif_prompt.w_slot_multiplier must be positive")
+        if self.balance_probe_rows < 1:
+            raise ValueError("motif_prompt.balance_probe_rows must be at least one row")
+        for name in ("w_topo", "beta_p", "beta_q", "beta_a", "beta_i", "beta_c"):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"motif_prompt.{name} must be non-negative")
         if self.huber_delta <= 0.0:
             raise ValueError("motif_prompt.huber_delta must be positive")
+
+    @property
+    def w_slot_is_balanced(self) -> bool:
+        """Whether ``w_slot`` is resolved by gradient-norm balancing at run time."""
+        return isinstance(self.w_slot, str)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> MotifPromptConfig:
@@ -581,34 +630,148 @@ class MotifGenerator(nn.Module):
             nn.init.zeros_(output.bias)
         self.register_buffer("fixed_weights", torch.zeros(N_EDGES))
         self.register_buffer("incidence", _candidate_incidence())
+        #: What `init_biases` did, per edge type, for ``profile.json``.
+        self.bias_init_record: dict[str, dict[str, float | str]] = {}
 
-    @torch.no_grad()
-    def init_biases(self, mean_weights: torch.Tensor) -> None:
-        """Publish the training mean and set each head's output bias from it.
+    def _closure_init_weight(
+        self, stats: MotifTemplateStatistics, *, closure_bias_init: str
+    ) -> tuple[str, float]:
+        """Return the rule name and the closure magnitude the bias is set from.
 
-        Each head's bias is the logit of its edge type's mean training weight,
-        clipped to ``[0.01, 0.99]`` so no trainable sigmoid head starts in a
-        saturated region (spec section 4); the clip belongs to the bias alone.
-        The ``mean_graph`` control has no sigmoid to saturate and must return the
-        adjacency that was actually installed -- clipping it would turn zero and
-        rare edges positive, move both motif masses, and make the control
-        disagree with the ``mean`` intervention over the same graph.
+        ``density`` is the wave-1 rule: the per-edge mean of the closure block.
+        58% of training rows carry no closure edge, so that mean is a density and
+        ``logit`` of it starts the gates at ``z = -3.97``, where the sigmoid
+        derivative is 0.015 and they stay for the whole run.
+
+        ``nonzero_mean`` uses the mean weight of a closure edge that *exists*
+        instead, then mass-checks it: eight wedges at magnitude ``w`` carry
+        ``8 w^2``, and if that exceeds twice the mean wedge mass of a row that has
+        one, the magnitude is lowered to ``sqrt(m_C^+ / 8)`` so the graph does not
+        start far denser than the corpus it is fitting. Both land in the
+        unsaturated regime (spec section 4, wave-2 fix F1).
 
         Args:
-            mean_weights: ``(96,)`` training-corpus mean edge weights.
+            stats: The training-corpus statistics.
+            closure_bias_init: ``density`` or ``nonzero_mean``.
+
+        Returns:
+            ``(rule, weight)`` before the ``[0.01, 0.99]`` clip.
+        """
+        if closure_bias_init == "density":
+            return "density", float(self.fixed_weights[_TYPE_MASKS[TYPE_CLOSURE]].mean())
+        weight = float(stats.nonzero_mean_by_type[TYPE_CLOSURE])
+        mass = float(stats.positive_row_wedge_mass)
+        # The mass check needs a positive-row mass to check against: with none the
+        # fallback would be sqrt(0) = 0, clipped to 0.01 -- a deeper saturation than
+        # the density rule this initialisation replaces.
+        if mass > 0.0 and 8.0 * weight**2 > 2.0 * mass:
+            return "nonzero_mean_mass_checked", math.sqrt(mass / 8.0)
+        return "nonzero_mean", weight
+
+    @torch.no_grad()
+    def init_biases(self, stats: MotifTemplateStatistics, *, closure_bias_init: str) -> None:
+        """Publish the training mean and set each head's output bias from it.
+
+        The attachment and interior heads keep the wave-1 rule: the logit of the
+        edge type's mean training weight. The non-zero interior mean is 1, which
+        the clip would turn into ``z = 4.6``, a new saturation on the other side,
+        and attachment already starts unsaturated at ``z ~ -1.2``. The closure
+        head follows ``closure_bias_init`` (`_closure_init_weight`).
+
+        Every magnitude is clipped to ``[0.01, 0.99]`` so no trainable sigmoid
+        head starts in a saturated region (spec section 4); the clip belongs to
+        the bias alone. The ``mean_graph`` control has no sigmoid to saturate and
+        must return the adjacency that was actually installed -- clipping it would
+        turn zero and rare edges positive, move both motif masses, and make the
+        control disagree with the ``mean`` intervention over the same graph.
+
+        Args:
+            stats: The training-corpus statistics of the compiled templates.
+            closure_bias_init: ``density`` or ``nonzero_mean``.
 
         Raises:
-            ValueError: On a shape mismatch.
+            ValueError: On a shape mismatch or an unknown rule.
         """
-        if tuple(mean_weights.shape) != (N_EDGES,):
+        if tuple(stats.mean.shape) != (N_EDGES,):
             raise ValueError(f"mean weights must be a ({N_EDGES},) vector")
+        if closure_bias_init not in CLOSURE_BIAS_INITS:
+            raise ValueError(f"closure_bias_init must be one of {list(CLOSURE_BIAS_INITS)}")
         low, high = _BIAS_CLIP
-        mean = mean_weights.float()
-        self.fixed_weights.copy_(mean)
+        self.fixed_weights.copy_(torch.as_tensor(stats.mean, dtype=torch.float32))
+        record: dict[str, dict[str, float | str]] = {}
         for edge_type, head in enumerate(self.heads):
-            type_mean = mean[_TYPE_MASKS[edge_type]].mean().clamp(low, high)
+            if edge_type == TYPE_CLOSURE:
+                rule, raw = self._closure_init_weight(stats, closure_bias_init=closure_bias_init)
+            else:
+                rule = "density"
+                raw = float(self.fixed_weights[_TYPE_MASKS[edge_type]].mean())
+            weight = min(max(raw, low), high)
+            bias = float(torch.logit(torch.tensor(weight, dtype=torch.float32)))
             output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
-            output.bias.fill_(float(torch.logit(type_mean)))
+            output.bias.fill_(bias)
+            record[EDGE_TYPE_NAMES[edge_type]] = {
+                "rule": rule,
+                "weight": weight,
+                "bias_logit": bias,
+            }
+        self.bias_init_record = record
+
+    def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
+        """This generator's trainable parameters, grouped for the gradient probe.
+
+        Every trainable parameter lands in exactly one group, the remainder in
+        ``other``, so a group's norm is never silently dropped when the module
+        tree changes (spec section 7.5 telemetry, wave-2 fix F3).
+
+        Returns:
+            One list per `GENERATOR_GRAD_GROUPS` entry; a group may be empty.
+        """
+        named: dict[str, list[nn.Parameter]] = {name: [] for name in GENERATOR_GRAD_GROUPS}
+        head_groups = {
+            TYPE_CLOSURE: "head_closure",
+            TYPE_ATTACH: "head_attach",
+            TYPE_INTERIOR: "head_interior",
+        }
+        heads = {f"heads.{index}": head_groups[index] for index in range(N_EDGE_TYPES)}
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            group = "other"
+            if name in ("bridge_queries", "witness_queries"):
+                group = "slot_queries"
+            elif name.startswith(("residue_proj.", "attention.", "endpoint_proj.", "witness_mix.")):
+                group = "attention"
+            elif name.startswith("message_layers."):
+                group = "mpnn"
+            else:
+                for prefix, head_group in heads.items():
+                    if name.startswith(f"{prefix}."):
+                        group = head_group
+                        break
+            named[group].append(param)
+        return named
+
+    @staticmethod
+    def gate_logit_statistics(weights: torch.Tensor) -> dict[str, float]:
+        """Pre-activation statistics per edge type, inverted from the emitted weights.
+
+        The heads emit ``sigmoid(z)``, so ``logit`` recovers ``z`` exactly; the
+        clamp only guards the fp32 endpoints. ``frac_abs_gt_3`` is the saturated
+        fraction that made wave 1's closure family immovable.
+
+        Args:
+            weights: ``(B, 96)`` emitted weights.
+
+        Returns:
+            ``gate_logit_{type}_{mean,frac_abs_gt_3}`` for the three edge types.
+        """
+        logits = torch.logit(weights.detach().float().clamp(1e-6, 1.0 - 1e-6))
+        out: dict[str, float] = {}
+        for edge_type, name in enumerate(EDGE_TYPE_NAMES):
+            block = logits[:, _TYPE_MASKS[edge_type]]
+            out[f"gate_logit_{name}_mean"] = float(block.mean())
+            out[f"gate_logit_{name}_frac_abs_gt_3"] = float((block.abs() > 3.0).float().mean())
+        return out
 
     def _read(
         self, queries: torch.Tensor, states: torch.Tensor, pad: torch.Tensor | None
@@ -996,6 +1159,7 @@ class V3_1MotifPrompt(nn.Module):
     name: str = "v3_1_motif_prompt"
     mean_template: torch.Tensor
     family_mask: torch.Tensor
+    w_slot_resolved: torch.Tensor
 
     def __init__(self, *, base: Mapping[str, object], motif_prompt: Mapping[str, object]) -> None:
         """Build the frozen base and the motif path on top.
@@ -1054,6 +1218,10 @@ class V3_1MotifPrompt(nn.Module):
         self.student_counts = "topo_cnt" in self.cfg.fields
         self._freeze_permanently_frozen()
         self.register_buffer("mean_template", torch.zeros(N_EDGES))
+        # The balanced ``w_slot``, once measured; -1 means "not yet". It is a
+        # buffer so it rides in ``model_state``: a resumed or scored run reads
+        # the weight the run was actually trained under and never re-balances.
+        self.register_buffer("w_slot_resolved", torch.full((), -1.0))
         # Derived from `cfg.families` on every construction, so a checkpoint can
         # never restore a stale family gate over a changed config.
         self.register_buffer("family_mask", _family_mask(self.cfg.families), persistent=False)
@@ -1104,6 +1272,54 @@ class V3_1MotifPrompt(nn.Module):
         the generator's instantaneous LR (spec sections 7.2 and 7.5).
         """
         return 1.0 if self.cfg.stage == "one" else STAGE_TWO_INTERFACE_LR_SCALE
+
+    @property
+    def graph_only_warmup(self) -> bool:
+        """Whether this step's task, structural and topo losses are cut off from G.
+
+        Wave-2 fix F3: with ``warmup_losses='graph_only'`` the warm-up epochs are
+        the spec 0.2 pilot B run as the first two epochs. The predicted weights
+        the trunk and the immutable teacher read are detached there, so every
+        loss is still computed and logged at its unchanged value while ``L_slot``
+        is the only term that reaches the generator. The task gradient into G
+        outweighed the graph gradient 170-860x at wave-1 initialisation, which is
+        what the warm start removes.
+        """
+        return (
+            self.cfg.stage == "two"
+            and self.cfg.warmup_losses == "graph_only"
+            and not self.interface_open
+        )
+
+    @property
+    def w_slot_value(self) -> float:
+        """The ``L_slot`` weight in force, balanced or configured.
+
+        A balanced weight that has not been measured yet -- the warm-up epochs,
+        which run before the first interface-open step -- is 1.0, the numeric
+        default, so the warm start is ``L_G`` at its own scale.
+        """
+        resolved = float(self.w_slot_resolved)
+        if resolved >= 0.0:
+            return resolved
+        return 1.0 if self.cfg.w_slot_is_balanced else float(cast(float, self.cfg.w_slot))
+
+    @torch.no_grad()
+    def resolve_w_slot(self, value: float) -> None:
+        """Fix the balanced ``L_slot`` weight for the rest of the run.
+
+        Args:
+            value: The measured weight.
+
+        Raises:
+            ValueError: On a negative weight, or on a model whose ``w_slot`` is
+                a number and therefore never balanced.
+        """
+        if not self.cfg.w_slot_is_balanced:
+            raise ValueError("motif_prompt.w_slot is a number; it is not balanced at run time")
+        if not value >= 0.0:
+            raise ValueError(f"the balanced w_slot must be non-negative, got {value}")
+        self.w_slot_resolved.fill_(float(value))
 
     def train(self, mode: bool = True) -> V3_1MotifPrompt:
         """Switch the wrapper's mode while the frozen base and teacher stay in eval.
@@ -1219,20 +1435,25 @@ class V3_1MotifPrompt(nn.Module):
         return groups
 
     @torch.no_grad()
-    def install_mean_template(self, mean: torch.Tensor) -> None:
+    def install_mean_template(self, stats: MotifTemplateStatistics) -> None:
         """Publish the training-corpus mean adjacency ``Abar`` (spec section 3).
 
+        The buffer keeps its meaning -- the corpus mean, which the ``mean``
+        intervention and the ``mean_graph`` control read -- and the rest of the
+        statistics reach the generator's bias initialisation alone.
+
         Args:
-            mean: ``(96,)`` mean of the randomised compiled training templates.
+            stats: Statistics of the randomised compiled training templates.
 
         Raises:
             ValueError: On a shape mismatch or a non-finite entry.
         """
+        mean = torch.as_tensor(stats.mean, dtype=torch.float32)
         if tuple(mean.shape) != (N_EDGES,) or not torch.isfinite(mean).all():
             raise ValueError(f"mean template must be a finite ({N_EDGES},) vector")
         self.mean_template.copy_(mean.to(self.mean_template))
         if self.generator is not None:
-            self.generator.init_biases(self.mean_template)
+            self.generator.init_biases(stats, closure_bias_init=self.cfg.closure_bias_init)
 
     def initialize_teacher(self) -> None:
         """Snapshot the loaded Stage I bundle as the immutable teacher ``R_T``.
@@ -1586,16 +1807,22 @@ class V3_1MotifPrompt(nn.Module):
             if not self.training:
                 encoded_a, encoded_b = encoded_a.float(), encoded_b.float()
             weights = self.resolve_weights(merged, encoded_a, encoded_b, lengths_a, lengths_b)
+            # The single point the graph-only warm-up acts at: everything that
+            # reads the graph -- the token/trunk path of both streams and the
+            # immutable teacher -- takes the detached weights, ``L_slot`` takes
+            # the live ones. The values are identical, so every logged loss is
+            # unchanged and only G's gradient path differs.
+            read_weights = weights.detach() if self.graph_only_warmup else weights
             logits = self.logits_from_encoded(
-                encoded_a, encoded_b, lengths_a, lengths_b, weights=weights
+                encoded_a, encoded_b, lengths_a, lengths_b, weights=read_weights
             )
             output: dict[str, torch.Tensor] = {"logits": logits}
             if self.cfg.stage == "two":
                 # `_apply_intervention` may have substituted the graph the trunk read;
                 # report what was actually read, not what the generator emitted.
-                output["predicted_weights"] = self._apply_intervention(weights)[0]
+                output["predicted_weights"] = self._apply_intervention(read_weights)[0]
             slot_row, topo_row = self._supervision_rows(
-                merged, weights, encoded_a, encoded_b, lengths_a, lengths_b
+                merged, weights, read_weights, encoded_a, encoded_b, lengths_a, lengths_b
             )
             if slot_row is not None:
                 output["slot_loss_rows"] = slot_row
@@ -1604,6 +1831,11 @@ class V3_1MotifPrompt(nn.Module):
             if "label" not in merged:
                 return output
             self._add_composite_loss(output, logits, merged["label"], slot_row, topo_row)
+            if self.graph_only_warmup:
+                # Keep G on the synced task backward's autograd graph with an
+                # exact zero, so a global batch without a valid slot row leaves
+                # no generator parameter unreduced under DDP.
+                output["loss"] = output["loss"] + 0.0 * weights.sum()
             return output
 
     def _eval_pair_precision(self, device: torch.device) -> AbstractContextManager[None]:
@@ -1654,12 +1886,17 @@ class V3_1MotifPrompt(nn.Module):
         self,
         merged: Mapping[str, torch.Tensor],
         weights: torch.Tensor,
+        read_weights: torch.Tensor,
         encoded_a: torch.Tensor,
         encoded_b: torch.Tensor,
         lengths_a: torch.Tensor,
         lengths_b: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return the masked per-row ``L_slot`` and ``L_topo`` of this batch.
+
+        ``weights`` is what ``L_slot`` is measured on and ``read_weights`` what
+        ``L_topo``'s student side reads; they are the same tensor except in the
+        graph-only warm-up, where the second is detached (`graph_only_warmup`).
 
         Only Stage II is supervised on the graph: in Stage I the compiled template
         is the model's *input*, so comparing it against itself would add a constant
@@ -1688,6 +1925,7 @@ class V3_1MotifPrompt(nn.Module):
                 beta_q=self.cfg.beta_q,
                 beta_a=self.cfg.beta_a,
                 beta_i=self.cfg.beta_i,
+                beta_c=self.cfg.beta_c,
                 huber_delta=self.cfg.huber_delta,
             )
             * row_mask
@@ -1697,7 +1935,9 @@ class V3_1MotifPrompt(nn.Module):
         bundle = cast(nn.ModuleDict, self.teacher)
         # Both sides run through the immutable teacher: `R_T(Ahat)` keeps autograd
         # so the term reaches the generator, `R_T(A*)` is detached (spec 7.5).
-        student_tokens = self._tokens(bundle, weights, encoded_a, encoded_b, lengths_a, lengths_b)
+        student_tokens = self._tokens(
+            bundle, read_weights, encoded_a, encoded_b, lengths_a, lengths_b
+        )
         with torch.no_grad():
             teacher_tokens = self._tokens(
                 bundle, target, encoded_a, encoded_b, lengths_a, lengths_b
@@ -1742,12 +1982,17 @@ class V3_1MotifPrompt(nn.Module):
         # of the composite the trainer forms. None is detached and every rank
         # emits all three.
         output["loss_term_task"] = output["loss"]
-        output["loss_term_slot"] = stream_share(slot_row, float(self.cfg.w_slot))
+        output["loss_term_slot"] = stream_share(slot_row, self.w_slot_value)
         output["loss_term_topo"] = stream_share(topo_row, float(self.cfg.w_topo))
 
 
 __all__ = [
+    "BALANCED_W_SLOT",
+    "CLOSURE_BIAS_INITS",
     "COUNT_FEATURES",
+    "EDGE_TYPE_NAMES",
+    "GENERATOR_GRAD_GROUPS",
+    "WARMUP_LOSSES",
     "STAGE_TWO_INTERFACE_LR_SCALE",
     "FAMILIES",
     "FIELD_ORDER",

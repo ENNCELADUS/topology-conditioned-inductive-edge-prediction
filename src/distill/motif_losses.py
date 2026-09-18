@@ -1,9 +1,10 @@
 """``L_slot`` and ``L_topo``, the motif-prompt graph-supervision losses.
 
 Design: ``docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md``
-sections 7.3 and 7.5. ``L_slot`` supervises four multisets per row -- the 8 wedge
-products, the 64 bridge path products, the 16 raw attachment weights and the 64
-raw interior weights -- each through a descending sort and a Huber term.
+sections 7.3 and 7.5. ``L_slot`` supervises five multisets per row -- the 8 wedge
+products, the 64 bridge path products, the 16 raw attachment weights, the 64
+raw interior weights and the 16 raw closure weights -- each through a descending
+sort and a Huber term.
 ``L_topo`` is the light representation term comparing the four token fields the
 immutable teacher reads from the predicted and the true graph. Sibling of
 `src.distill.struct_losses`, where the other training losses live.
@@ -23,6 +24,7 @@ _TERMS: tuple[tuple[str, str], ...] = (
     ("q", "beta_q"),
     ("a", "beta_a"),
     ("b", "beta_i"),
+    ("c", "beta_c"),
 )
 
 
@@ -34,21 +36,28 @@ def slot_loss_rows(
     beta_q: float,
     beta_a: float,
     beta_i: float,
+    beta_c: float,
     huber_delta: float,
 ) -> torch.Tensor:
-    """Per-row ``L_slot``: descending-sorted Huber over four per-family multisets.
+    """Per-row ``L_slot``: descending-sorted Huber over five per-family multisets.
 
-    Path products, not raw closure weights, are supervised: the 16 closure edge
-    weights as one multiset are invariant to moving weight between the two sides
-    of a wedge, so the products are what pins the wedge mass. Because
-    ``wedge_mass`` and ``bridge_mass`` are sums over the supervised multisets and
-    a sum is permutation-invariant, matching sorted products pins both count-head
-    quantities exactly. The two product terms route gradient to both (or all
-    three) edges of each motif; the two raw terms keep gradient flowing to an
-    edge whose path product vanishes because a *different* edge of that path is
-    zero. The raw interior term is not decoration: for ``q = a b c`` the interior
-    gradient is attenuated quadratically by small attachments, and the attachment
-    term contributes nothing to it (spec section 7.3).
+    Both the wedge products and the raw closure weights are supervised. The
+    products are what pins the wedge mass: the 16 closure edge weights as one
+    multiset are invariant to moving weight between the two sides of a wedge, so
+    the raw term alone cannot tell a wedge from two weights sitting on different
+    witnesses. Because ``wedge_mass`` and ``bridge_mass`` are sums over the
+    supervised multisets and a sum is permutation-invariant, matching sorted
+    products pins both count-head quantities exactly.
+
+    The product terms alone, however, do not *reach* the closure gates. For
+    ``p = w(u,c) w(c,v)`` the gradient into one side carries the partner weight
+    and the sigmoid derivative, and at a gate initialised from the closure
+    *density* both are small: the measured slot gradient into the closure head
+    was 1/1800 of the interior head's through the whole of wave 1, and the head
+    never left its initialisation (`docs/results/motif_prompt_verdict/README.md`).
+    ``beta_c`` restores an O(1) signal on the 16 raw closure weights, exactly as
+    ``beta_i`` does for the interior family, whose path gradient is attenuated
+    quadratically by small attachments. ``beta_c = 0`` reproduces the wave-1 loss.
 
     Sorting is a permutation, so the loss is invariant to within-role slot
     permutation and to the endpoint swap, consistent with the slot randomisation
@@ -61,6 +70,7 @@ def slot_loss_rows(
         beta_q: Weight of the bridge-path-product term.
         beta_a: Weight of the raw attachment term.
         beta_i: Weight of the raw interior term.
+        beta_c: Weight of the raw closure term.
         huber_delta: Huber transition point.
 
     Returns:
@@ -75,7 +85,13 @@ def slot_loss_rows(
         )
     parts = slot_profiles(predicted)
     truth = slot_profiles(target.detach())
-    betas = {"beta_p": beta_p, "beta_q": beta_q, "beta_a": beta_a, "beta_i": beta_i}
+    betas = {
+        "beta_p": beta_p,
+        "beta_q": beta_q,
+        "beta_a": beta_a,
+        "beta_i": beta_i,
+        "beta_c": beta_c,
+    }
     total = predicted.new_zeros(predicted.size(0), dtype=torch.float32)
     for key, name in _TERMS:
         scale = betas[name]
@@ -96,6 +112,7 @@ def slot_loss(
     beta_q: float,
     beta_a: float,
     beta_i: float,
+    beta_c: float,
     huber_delta: float,
 ) -> torch.Tensor:
     """Batch-mean ``L_slot``.
@@ -107,6 +124,7 @@ def slot_loss(
         beta_q: Weight of the bridge-path-product term.
         beta_a: Weight of the raw attachment term.
         beta_i: Weight of the raw interior term.
+        beta_c: Weight of the raw closure term.
         huber_delta: Huber transition point.
 
     Returns:
@@ -119,6 +137,7 @@ def slot_loss(
         beta_q=beta_q,
         beta_a=beta_a,
         beta_i=beta_i,
+        beta_c=beta_c,
         huber_delta=huber_delta,
     ).mean()
 

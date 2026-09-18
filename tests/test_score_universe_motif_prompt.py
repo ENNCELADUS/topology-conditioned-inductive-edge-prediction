@@ -13,6 +13,7 @@ from src.data import motif_template
 from src.data.features import FeatureStore
 from src.model.egostitch.classifier.motif_prompt import TEMPLATE_KEY, V3_1MotifPrompt
 
+from tests.model.test_motif_prompt_model import _statistics
 from tests.test_prefix_model import _tiny_base_config
 from tests.test_score_universe import _build_prefix_packed_fixture
 
@@ -45,7 +46,7 @@ def _motif_model(stage: str = "two", seed: int = 0) -> V3_1MotifPrompt:
     """
     torch.manual_seed(seed)
     model = V3_1MotifPrompt(**_model_config(stage))  # type: ignore[arg-type]
-    model.install_mean_template(torch.full((96,), 0.1))
+    model.install_mean_template(_statistics(torch.full((96,), 0.1)))
     gen = torch.Generator().manual_seed(seed + 1)
     with torch.no_grad():
         model.adapter.gates.copy_(torch.randn(model.adapter.gates.shape, generator=gen))
@@ -148,6 +149,29 @@ def test_a_stage_one_checkpoint_has_no_teacher_to_rebuild(tmp_path: Path) -> Non
     rebuilt, _, _ = score_universe._load_checkpoint(path)
 
     assert cast(V3_1MotifPrompt, rebuilt).teacher is None
+
+
+def test_a_wave_one_checkpoint_without_the_balance_buffer_still_loads(tmp_path: Path) -> None:
+    """Wave-1 motif checkpoints predate ``w_slot_resolved``; the loader backfills it."""
+    for stage in ("one", "two"):
+        model = _motif_model(stage)
+        if stage == "two":
+            model.initialize_teacher()
+        state = model.state_dict()
+        state.pop("w_slot_resolved")
+        path = tmp_path / f"wave1_{stage}.pt"
+        torch.save(
+            {
+                "model_state": state,
+                "model_family": "v3_1_motif_prompt",
+                "model_config": _model_config(stage),
+            },
+            path,
+        )
+
+        rebuilt, _, _ = score_universe._load_checkpoint(path)
+
+        assert float(cast(V3_1MotifPrompt, rebuilt).w_slot_resolved) == -1.0
 
 
 # ------------------------------------------------------------------ truth-free scoring

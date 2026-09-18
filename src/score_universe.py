@@ -1621,6 +1621,11 @@ def _load_checkpoint(
         # by reopening the Stage I bundle the checkpoint was initialised from -- or
         # the strict load below rejects the checkpoint outright.
         cast("V3_1MotifPrompt", model).initialize_teacher()
+    if model_family == MOTIF_PROMPT_FAMILY and "w_slot_resolved" not in model_state:
+        # Wave-1 motif checkpoints predate the balanced-`w_slot` buffer (spec v10
+        # section 7.5). They never balanced, so the unresolved sentinel is their
+        # exact state; without it the strict load below rejects every wave-1 row.
+        model_state["w_slot_resolved"] = torch.full((), -1.0)
     model.load_state_dict(model_state)
     model.eval()
     return model, model_family, _checkpoint_id(model_state)

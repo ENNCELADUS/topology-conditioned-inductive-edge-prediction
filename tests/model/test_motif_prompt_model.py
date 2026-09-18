@@ -6,10 +6,17 @@ from typing import cast
 
 import pytest
 import torch
-from src.data.motif_template import SWAP_PERM, count_statistics, role_permutation
+from src.data.motif_template import (
+    SWAP_PERM,
+    MotifTemplateStatistics,
+    count_statistics,
+    role_permutation,
+    template_statistics,
+)
 from src.model.egostitch.classifier.motif_prompt import (
     FIELD_ORDER,
     GATE_MODES,
+    GENERATOR_GRAD_GROUPS,
     TEMPLATE_KEY,
     MotifCountHead,
     MotifGenerator,
@@ -26,6 +33,11 @@ from src.model.egostitch.classifier.prefix import prefix_branch
 from src.model.egostitch.encoder.grit_gmt import dense_rrwp
 
 from tests.test_prefix_model import _pair_batch, _tiny_base_config
+
+
+def _statistics(mean: torch.Tensor) -> MotifTemplateStatistics:
+    """Corpus statistics of a one-row corpus whose mean is exactly ``mean``."""
+    return template_statistics(mean.reshape(1, -1).numpy())
 
 
 def test_config_round_trip_and_defaults() -> None:
@@ -268,13 +280,104 @@ def test_output_biases_start_at_the_clipped_training_mean_in_logit_space() -> No
     generator = _generator()
     mean = torch.full((96,), 0.001)
     mean[16:32] = 0.4
-    generator.init_biases(mean)
+    generator.init_biases(_statistics(mean), closure_bias_init="density")
     h_u, len_u = _states(seed=1)
     h_v, len_v = _states(seed=2)
     weights = generator(h_u, h_v, len_u, len_v).detach()
     # Clipped to [0.01, 0.99] before the logit, so nothing saturates.
     assert float(weights[:, :16].mean()) < 0.2
     assert 0.2 < float(weights[:, 16:32].mean()) < 0.8
+
+
+def _closure_corpus(rows: int, positive: int, weight: float) -> torch.Tensor:
+    """A corpus where ``positive`` of ``rows`` carry one wedge of magnitude ``weight``."""
+    corpus = torch.zeros(rows, 96)
+    corpus[:positive, 0] = weight
+    corpus[:positive, 8] = weight
+    return corpus
+
+
+def test_the_closure_bias_uses_the_non_zero_mean_not_the_density() -> None:
+    # Wave 1: 58% of rows have no closure edge, so logit(per-edge density) put the
+    # gates at z = -3.97 and they never moved. The magnitude is the fix (F1).
+    corpus = _closure_corpus(rows=100, positive=42, weight=0.196)
+    stats = template_statistics(corpus.numpy())
+    density = float(stats.mean[:16].mean())
+    assert density < 0.02 < stats.nonzero_mean_by_type[0]
+
+    generator = _generator()
+    generator.init_biases(stats, closure_bias_init="density")
+    wave_one = dict(generator.bias_init_record["closure"])
+    generator.init_biases(stats, closure_bias_init="nonzero_mean")
+    wave_two = dict(generator.bias_init_record["closure"])
+
+    assert wave_one["rule"] == "density"
+    assert wave_one["weight"] == pytest.approx(density, rel=1e-5)
+    assert cast(float, wave_one["bias_logit"]) < -3.5
+    # One wedge per positive row: 8 w^2 = 0.307 against 2 * m_C^+ = 0.077, so the
+    # mass check lowers the magnitude to sqrt(m_C^+ / 8).
+    assert wave_two["rule"] == "nonzero_mean_mass_checked"
+    assert wave_two["weight"] == pytest.approx(
+        (stats.positive_row_wedge_mass / 8.0) ** 0.5, rel=1e-5
+    )
+    # Unsaturated on both sides of the sigmoid, which is the whole point of F1.
+    assert -3.0 < cast(float, wave_two["bias_logit"]) < -1.0
+
+
+def test_the_mass_check_leaves_a_magnitude_the_corpus_can_carry() -> None:
+    # Every positive row carries all eight wedges, so 8 w^2 == m_C^+ and the
+    # unchecked non-zero mean is already consistent with the corpus.
+    corpus = torch.zeros(20, 96)
+    corpus[:10, :16] = 0.2
+    stats = template_statistics(corpus.numpy())
+    generator = _generator()
+    generator.init_biases(stats, closure_bias_init="nonzero_mean")
+    record = generator.bias_init_record["closure"]
+    assert record["rule"] == "nonzero_mean"
+    assert record["weight"] == pytest.approx(0.2, rel=1e-5)
+
+
+def test_only_the_closure_head_follows_the_new_rule_and_the_clip_still_guards() -> None:
+    corpus = torch.zeros(4, 96)
+    corpus[:, :16] = 0.5  # closure density == magnitude here
+    corpus[:2, 16:32] = 0.4  # attach density 0.2, non-zero mean 0.4
+    corpus[:, 32:] = 1.0  # interior non-zero mean 1.0 would clip to 0.99
+    stats = template_statistics(corpus.numpy())
+    generator = _generator()
+    generator.init_biases(stats, closure_bias_init="nonzero_mean")
+    record = generator.bias_init_record
+    assert record["attach"]["rule"] == record["interior"]["rule"] == "density"
+    assert record["attach"]["weight"] == pytest.approx(0.2, rel=1e-5)
+    # Interior's density is 1.0, which the [0.01, 0.99] clip holds off saturation.
+    assert record["interior"]["weight"] == pytest.approx(0.99)
+    assert set(record) == {"closure", "attach", "interior"}
+    for entry in record.values():
+        assert set(entry) == {"rule", "weight", "bias_logit"}
+    with pytest.raises(ValueError, match="closure_bias_init"):
+        generator.init_biases(stats, closure_bias_init="not_a_rule")
+
+
+def test_the_gate_logit_statistics_invert_the_emitted_weights() -> None:
+    weights = torch.full((2, 96), 0.5)
+    weights[:, :16] = torch.sigmoid(torch.tensor(-4.0))
+    stats = MotifGenerator.gate_logit_statistics(weights)
+    assert stats["gate_logit_closure_mean"] == pytest.approx(-4.0, abs=1e-4)
+    assert stats["gate_logit_closure_frac_abs_gt_3"] == pytest.approx(1.0)
+    assert stats["gate_logit_attach_mean"] == pytest.approx(0.0, abs=1e-6)
+    assert stats["gate_logit_interior_frac_abs_gt_3"] == pytest.approx(0.0)
+
+
+def test_the_generator_parameter_groups_cover_every_trainable_parameter_once() -> None:
+    generator = _generator()
+    groups = generator.parameter_groups()
+    assert set(groups) == set(GENERATOR_GRAD_GROUPS)
+    flat = [param for params in groups.values() for param in params]
+    assert len({id(param) for param in flat}) == len(flat)
+    expected = {id(p) for p in generator.parameters() if p.requires_grad}
+    assert {id(param) for param in flat} == expected
+    assert not groups["other"]
+    for name in ("slot_queries", "attention", "mpnn", "head_closure"):
+        assert groups[name]
 
 
 def test_generator_weights_are_fp32_under_autocast_and_match_the_fp32_heads() -> None:
@@ -299,7 +402,7 @@ def test_per_type_and_mean_graph_gate_modes_realise_their_controls() -> None:
     for block in (slice(0, 16), slice(16, 32), slice(32, 96)):
         assert float(weights[:, block].std(dim=1).abs().max()) == pytest.approx(0.0, abs=1e-6)
     mean_graph = _generator(gate_mode="mean_graph")
-    mean_graph.init_biases(torch.full((96,), 0.3))
+    mean_graph.init_biases(_statistics(torch.full((96,), 0.3)), closure_bias_init="density")
     fixed = mean_graph(h_u, h_v, len_u, len_v).detach()
     assert float(fixed.std(dim=0).abs().max()) == pytest.approx(0.0, abs=1e-6)
     assert float(fixed.mean()) == pytest.approx(0.3, abs=1e-6)
@@ -403,7 +506,7 @@ def _model(stage: str = "one", seed: int = 0, **extra: object) -> V3_1MotifPromp
         block["bundle_checkpoint"] = "bundle.pt"
     block.update(extra)
     model = V3_1MotifPrompt(base=_tiny_base_config(), motif_prompt=block)
-    model.install_mean_template(torch.full((96,), 0.1))
+    model.install_mean_template(_statistics(torch.full((96,), 0.1)))
     return model
 
 
@@ -475,7 +578,7 @@ def test_the_mean_graph_control_installs_the_unclipped_training_mean() -> None:
     mean = torch.full((96,), 0.5)
     mean[:8] = 0.0
     mean[8:16] = 1.0
-    model.install_mean_template(mean)
+    model.install_mean_template(_statistics(mean))
     batch = _pair_batch(n=3)
     encoded_a = model.base.encoder(batch["emb_a"], batch["len_a"])
     encoded_b = model.base.encoder(batch["emb_b"], batch["len_b"])
@@ -532,7 +635,7 @@ def test_stage_one_corruption_leaves_self_rows_empty() -> None:
     # nonself-only. Corrupting one gives it nonzero training-mean topology in
     # training while evaluation keeps it empty.
     model = _model("one", corruption={"prob": 1.0, "lambda_min": 1.0, "lambda_max": 1.0})
-    model.install_mean_template(torch.full((96,), 0.7))
+    model.install_mean_template(_statistics(torch.full((96,), 0.7)))
     model.train()
     batch = _pair_batch(n=4)
     batch[TEMPLATE_KEY] = torch.zeros(4, 96)
@@ -867,3 +970,132 @@ def test_an_inactive_family_is_zeroed_in_both_stages(stage: str) -> None:
     read = model.resolve_weights(batch, encoded_a, encoded_b, batch["len_a"], batch["len_b"])
     assert float(read[:, 16:].abs().sum()) == 0.0
     assert float(read[:, :16].abs().sum()) > 0.0
+
+
+def _supervised_batch(n: int = 4, seed: int = 7) -> dict[str, torch.Tensor]:
+    """A task batch with labels, a compiled template and a nonself mask."""
+    batch = _pair_batch(n=n)
+    batch[TEMPLATE_KEY] = _weights(n=n, seed=seed)
+    batch["motif_mask"] = torch.ones(n)
+    batch["label"] = torch.tensor([1.0, 0.0] * (n // 2))
+    return batch
+
+
+def _generator_grads(
+    model: V3_1MotifPrompt, batch: dict[str, torch.Tensor], key: str
+) -> torch.Tensor:
+    """The flat gradient of one forward output term over the generator.
+
+    A term the warm-up detached from every trainable parameter -- ``L_topo``,
+    whose teacher bundle is frozen -- has no graph at all and reports zeros.
+    """
+    generator = model.generator
+    assert generator is not None
+    output = model(batch)
+    term = output[key].sum() if output[key].dim() else output[key]
+    params = [p for p in generator.parameters() if p.requires_grad]
+    if not term.requires_grad:
+        return torch.zeros(sum(param.numel() for param in params))
+    grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
+    return torch.cat(
+        [
+            (torch.zeros_like(param) if grad is None else grad).reshape(-1)
+            for param, grad in zip(params, grads, strict=True)
+        ]
+    )
+
+
+def test_the_graph_only_warm_up_cuts_the_generator_off_from_every_other_term() -> None:
+    # F3: the task, structural and topo losses are still computed and logged at
+    # their joint-mode values; only their gradient path to G is removed.
+    joint = _model("two", warmup_losses="joint", beta_c=1.0)
+    _open_gates(joint)
+    warm = _model("two", warmup_losses="graph_only", beta_c=1.0)
+    warm.load_state_dict(joint.state_dict())
+    for model in (joint, warm):
+        model.initialize_teacher()
+        model.train()
+    assert not joint.graph_only_warmup and warm.graph_only_warmup
+
+    batch = _supervised_batch()
+    joint_out = joint(batch)
+    warm_out = warm(batch)
+    for key in ("logits", "loss", "slot_loss_rows", "topo_loss_rows", "predicted_weights"):
+        torch.testing.assert_close(warm_out[key], joint_out[key], rtol=0, atol=0)
+
+    for key in ("loss", "topo_loss_rows"):
+        assert float(_generator_grads(warm, batch, key).abs().max()) == 0.0
+        assert float(_generator_grads(joint, batch, key).abs().max()) > 0.0
+    # L_slot still reaches G in both modes: it is the warm start's whole objective.
+    assert float(_generator_grads(warm, batch, "slot_loss_rows").abs().max()) > 0.0
+
+    # Once the interface opens, the graph-only mode is over and the task term
+    # reaches G again through exactly the joint-mode path.
+    warm.interface_open = True
+    assert not warm.graph_only_warmup
+    torch.testing.assert_close(
+        _generator_grads(warm, batch, "loss"), _generator_grads(joint, batch, "loss")
+    )
+
+
+def test_a_structural_style_forward_is_detached_in_the_warm_up_too() -> None:
+    # The structural stream drives the same forward without a label, so the one
+    # detach point covers both streams.
+    warm = _model("two", warmup_losses="graph_only")
+    warm.initialize_teacher()
+    _open_gates(warm)
+    warm.train()
+    batch = _supervised_batch()
+    del batch["label"]
+    assert float(_generator_grads(warm, batch, "logits").abs().max()) == 0.0
+    assert float(_generator_grads(warm, batch, "slot_loss_rows").abs().max()) > 0.0
+
+
+def test_the_balanced_w_slot_defaults_to_one_and_survives_a_checkpoint() -> None:
+    model = _model("two", w_slot="balanced", w_slot_multiplier=10.0)
+    assert model.cfg.w_slot_is_balanced
+    assert model.w_slot_value == 1.0
+    model.resolve_w_slot(30.0)
+    assert model.w_slot_value == 30.0
+    restored = _model("two", w_slot="balanced", w_slot_multiplier=10.0)
+    restored.load_state_dict(model.state_dict())
+    assert restored.w_slot_value == 30.0
+    # A numeric w_slot is never balanced at run time.
+    numeric = _model("two", w_slot=0.25)
+    assert numeric.w_slot_value == 0.25
+    with pytest.raises(ValueError, match="not balanced"):
+        numeric.resolve_w_slot(1.0)
+
+
+def test_the_wave_two_config_keys_default_to_the_wave_one_behaviour() -> None:
+    cfg = MotifPromptConfig.from_mapping({"stage": "one", "base_checkpoint": "base.pt"})
+    assert cfg.beta_c == 0.0
+    assert cfg.closure_bias_init == "density"
+    assert cfg.warmup_losses == "joint"
+    assert cfg.w_slot == 1.0 and not cfg.w_slot_is_balanced
+    assert cfg.w_slot_multiplier == 1.0
+    assert cfg.balance_probe_rows == 256
+    block = {
+        "stage": "two",
+        "base_checkpoint": "base.pt",
+        "bundle_checkpoint": "bundle.pt",
+        "beta_c": 1.0,
+        "closure_bias_init": "nonzero_mean",
+        "warmup_losses": "graph_only",
+        "w_slot": "balanced",
+        "w_slot_multiplier": 10.0,
+        "balance_probe_rows": 64,
+    }
+    parsed = MotifPromptConfig.from_mapping(block)
+    assert MotifPromptConfig.from_mapping(parsed.to_dict()) == parsed
+    assert parsed.to_dict()["w_slot"] == "balanced"
+    for key, value, message in (
+        ("warmup_losses", "later", "warmup_losses"),
+        ("closure_bias_init", "mass", "closure_bias_init"),
+        ("w_slot", "auto", "w_slot"),
+        ("w_slot_multiplier", 0.0, "w_slot_multiplier"),
+        ("balance_probe_rows", 0, "balance_probe_rows"),
+        ("beta_c", -1.0, "beta_c"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            MotifPromptConfig.from_mapping({**block, key: value})

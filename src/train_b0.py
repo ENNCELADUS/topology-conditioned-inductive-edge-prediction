@@ -67,7 +67,12 @@ from src.data.distributed_pairs import (
     identity_compact_batch,
 )
 from src.data.features import FeatureStore, build_f0_matrix
-from src.data.motif_template import MotifTemplateTable, mean_template
+from src.data.motif_template import (
+    MotifTemplateStatistics,
+    MotifTemplateTable,
+    count_statistics,
+    template_statistics,
+)
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import (
     BUCKET_BOUNDARIES,
@@ -137,12 +142,18 @@ from src.model.egostitch.classifier.coord_gen import (
     V3_1CoordGen,
     distance_class_targets,
 )
-from src.model.egostitch.classifier.motif_prompt import FAMILIES as MOTIF_FAMILIES
 from src.model.egostitch.classifier.motif_prompt import (
+    BALANCED_W_SLOT,
+    EDGE_TYPE_NAMES,
     FIELD_ORDER,
+    GENERATOR_GRAD_GROUPS,
     TEMPLATE_KEY,
     TEMPLATE_MASK_KEY,
     V3_1MotifPrompt,
+)
+from src.model.egostitch.classifier.motif_prompt import FAMILIES as MOTIF_FAMILIES
+from src.model.egostitch.classifier.motif_prompt import (
+    LOSS_TERM_NAMES as MOTIF_LOSS_TERM_NAMES,
 )
 from src.model.egostitch.classifier.prefix import PrefixConfig, V3_1Prefix
 from src.model.egostitch.classifier.topo_gen import TopoGenBase
@@ -637,15 +648,67 @@ def _build_scheduler(
     )
 
 
-def _resume_comparable_config(config: Mapping[str, object]) -> dict[str, object]:
+#: Motif-prompt weights that are inert over a ``graph_only`` warm-up prefix.
+_MOTIF_PREFIX_INERT_KEYS = ("w_slot", "w_slot_multiplier", "w_topo")
+
+
+def _motif_prompt_block(config: Mapping[str, object]) -> Mapping[str, object] | None:
+    """Return ``model.config.motif_prompt`` of a serialized config, or ``None``."""
+    model_block = config.get("model")
+    if not isinstance(model_block, Mapping):
+        return None
+    model_config = model_block.get("config")
+    if not isinstance(model_config, Mapping):
+        return None
+    block = model_config.get("motif_prompt")
+    return block if isinstance(block, Mapping) else None
+
+
+def _motif_prefix_keys_inert(config: Mapping[str, object], completed_epoch: int) -> bool:
+    """Whether the joint-phase motif weights did nothing over the resumed prefix.
+
+    Under ``warmup_losses: graph_only`` the warm-up epochs cut the task, the
+    structural stream and ``L_topo`` off from the generator and train it on
+    ``L_slot`` at its own scale, so ``w_slot``, ``w_slot_multiplier`` and
+    ``w_topo`` first apply at the epoch that opens the interface. A prefix that
+    stopped inside the warm-up is therefore a true prefix of every arm that
+    differs only in those three, which is what lets one phase-0 prefix continue
+    into the wave-2 phase-1 arms.
+
+    Args:
+        config: The serialized config saved with the resumed prefix.
+        completed_epoch: The last epoch the prefix finished.
+
+    Returns:
+        ``True`` when the three keys may be excluded from the resume comparison.
+    """
+    block = _motif_prompt_block(config)
+    if block is None or block.get("warmup_losses") != "graph_only":
+        return False
+    if block.get("w_slot", 1.0) != BALANCED_W_SLOT:
+        # A numeric ``w_slot`` scales ``L_slot`` during the warm-up itself (the
+        # clipped step is not scale-invariant), so only the balanced form is inert.
+        return False
+    warmup = block.get("interface_warmup_epochs", 2)
+    if isinstance(warmup, bool) or not isinstance(warmup, int):
+        return False
+    return completed_epoch <= warmup
+
+
+def _resume_comparable_config(
+    config: Mapping[str, object], *, drop_motif_joint_keys: bool = False
+) -> dict[str, object]:
     """Return the config a resume compares, with the excluded keys dropped.
 
     ``output_dir`` is an attempt path and ``optim.stop_after_epoch`` is a halt
     point; neither changes the training function, so neither may block a resume
-    (spec section 7.4). The argument is never mutated.
+    (spec section 7.4). ``drop_motif_joint_keys`` additionally drops the three
+    motif weights `_motif_prefix_keys_inert` declares inert over the resumed
+    prefix. Everything else stays strict. The argument is never mutated.
 
     Args:
         config: A serialized training config.
+        drop_motif_joint_keys: Also drop `_MOTIF_PREFIX_INERT_KEYS`.
 
     Returns:
         A deep copy without the excluded keys.
@@ -655,7 +718,35 @@ def _resume_comparable_config(config: Mapping[str, object]) -> dict[str, object]
     optim_block = comparable.get("optim")
     if isinstance(optim_block, dict):
         optim_block.pop("stop_after_epoch", None)
+    if drop_motif_joint_keys:
+        block = _motif_prompt_block(comparable)
+        if isinstance(block, dict):
+            for key in _MOTIF_PREFIX_INERT_KEYS:
+                block.pop(key, None)
     return comparable
+
+
+def resume_config_matches(
+    saved_config: Mapping[str, object], cfg: Config, *, completed_epoch: int
+) -> bool:
+    """Whether a saved prefix's config may be continued by ``cfg``.
+
+    The one comparison rule, shared by the worker's own guarded resume and by
+    `src.e2_pipeline`'s cross-output-dir acceptance, so the pipeline can never
+    seed an attempt the worker would then refuse.
+
+    Args:
+        saved_config: The serialized config stored with the prefix.
+        cfg: The config the continuation runs under.
+        completed_epoch: The last epoch the prefix finished.
+
+    Returns:
+        ``True`` when the two differ only in the excluded keys.
+    """
+    inert = _motif_prefix_keys_inert(saved_config, completed_epoch)
+    return _resume_comparable_config(saved_config, drop_motif_joint_keys=inert) == (
+        _resume_comparable_config(config_to_dict(cfg), drop_motif_joint_keys=inert)
+    )
 
 
 def _unwrapped_model(model: nn.Module) -> nn.Module:
@@ -974,6 +1065,284 @@ def _reduce_motif_counts(
         reduction="sum",
     )
     return [float(value) for value in reduced.tolist()]
+
+
+#: The balanced ``w_slot`` is clamped into this range before the multiplier.
+_MOTIF_BALANCE_CLAMP = (0.1, 1000.0)
+
+
+def _motif_probe_keys() -> list[str]:
+    """Every generator-probe telemetry key, in a fixed order the ranks agree on."""
+    return (
+        [
+            f"grad_g_{term}_{group}"
+            for term in MOTIF_LOSS_TERM_NAMES
+            for group in GENERATOR_GRAD_GROUPS
+        ]
+        + [
+            f"gate_logit_{name}_{stat}"
+            for name in EDGE_TYPE_NAMES
+            for stat in ("mean", "frac_abs_gt_3")
+        ]
+        + ["pred_wedge_mass", "pred_bridge_mass"]
+    )
+
+
+def _motif_probe_batch(batch: Mapping[str, torch.Tensor], *, rows: int) -> dict[str, torch.Tensor]:
+    """Return the first ``rows`` rows of ``batch``, unchanged when it is smaller.
+
+    Args:
+        batch: A training batch with its templates and mask attached.
+        rows: Rows to keep.
+
+    Returns:
+        A batch whose row-indexed tensors are sliced; the rest are passed through.
+
+    Raises:
+        KeyError: If the batch carries no ``len_a`` to read its row count from.
+    """
+    size = int(batch["len_a"].shape[0])
+    keep = min(size, max(rows, 1))
+    return {
+        key: value[:keep] if value.dim() > 0 and value.shape[0] == size else value
+        for key, value in batch.items()
+    }
+
+
+@dataclass(frozen=True)
+class MotifGeneratorProbe:
+    """One epoch's generator gradient probe (spec section 7.5 telemetry).
+
+    Attributes:
+        telemetry: The `_motif_probe_keys` row.
+        task_norm: ``||grad_G L_task||`` over every trainable generator parameter.
+        slot_norm: ``||grad_G L_G||`` over the same parameters, ``L_G`` unweighted.
+    """
+
+    telemetry: dict[str, float]
+    task_norm: float
+    slot_norm: float
+
+
+def _grad_norms_by_group(
+    term: torch.Tensor, groups: Mapping[str, list[nn.Parameter]]
+) -> dict[str, float]:
+    """Gradient L2 norm of ``term`` per parameter group, and 0.0 where it has none.
+
+    As in `_term_grad_norms`, `torch.autograd.grad` never runs the
+    ``AccumulateGrad`` nodes DDP's reducer hooks sit on, and ``retain_graph``
+    leaves the training step's own backward untouched.
+
+    Args:
+        term: A scalar loss term.
+        groups: Parameter lists, keyed by group name.
+
+    Returns:
+        One norm per group.
+    """
+    flat: list[nn.Parameter] = []
+    positions: dict[str, list[int]] = {}
+    for name, params in groups.items():
+        positions[name] = list(range(len(flat), len(flat) + len(params)))
+        flat.extend(params)
+    result = dict.fromkeys(groups, 0.0)
+    if not flat or not term.requires_grad:
+        return result
+    grads = torch.autograd.grad(term, flat, retain_graph=True, allow_unused=True)
+    for name, slots in positions.items():
+        squares = [grads[i].float().pow(2).sum() for i in slots if grads[i] is not None]
+        if squares:
+            result[name] = float(torch.stack(squares).sum().sqrt().item())
+    return result
+
+
+def _grad_norm_over(term: torch.Tensor, params: Sequence[nn.Parameter]) -> float:
+    """L2 norm of ``term``'s gradient over ``params`` (0.0 when it has no graph).
+
+    Args:
+        term: A scalar loss term.
+        params: The parameters to differentiate against.
+
+    Returns:
+        The norm.
+    """
+    if not term.requires_grad or not params:
+        return 0.0
+    grads = torch.autograd.grad(term, list(params), retain_graph=True, allow_unused=True)
+    squares = [g.float().pow(2).sum() for g in grads if g is not None]
+    if not squares:
+        return 0.0
+    return float(torch.stack(squares).sum().sqrt().item())
+
+
+def _motif_generator_probe(
+    model: V3_1MotifPrompt, batch: Mapping[str, torch.Tensor], *, rows: int
+) -> MotifGeneratorProbe:
+    """Measure which loss term moves which generator group, on a fixed probe batch.
+
+    The wave-1 diagnosis had to reconstruct this table from checkpoints after the
+    run; it is the drift detector the wave-2 plan reads every epoch, and the same
+    two norms fix a balanced ``w_slot``. The probe runs the model in eval mode so
+    a repeat on the same batch returns the same numbers, and reads gradients only
+    through `torch.autograd.grad`, so no ``.grad`` and no optimiser state moves.
+
+    ``L_G`` is the unweighted masked mean of ``L_slot``'s rows and the topo term
+    carries ``w_topo``, matching the composite the trainer forms.
+
+    Args:
+        model: The unwrapped motif-prompt model, with a trainable generator.
+        batch: The epoch's first task batch, templates and mask attached.
+        rows: Probe rows taken from the front of the batch.
+
+    Returns:
+        The probe.
+
+    Raises:
+        RuntimeError: If the model has no generator to probe.
+    """
+    if model.generator is None:
+        raise RuntimeError("the motif generator probe needs a stage 'two' model")
+    groups = model.generator.parameter_groups()
+    probe = _motif_probe_batch(batch, rows=rows)
+    if TEMPLATE_MASK_KEY not in probe or not model.supervises(probe)[0]:
+        raise RuntimeError("the motif generator probe needs a batch with compiled templates")
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.enable_grad():
+            output = cast(dict[str, torch.Tensor], model(dict(probe)))
+            mask = probe[TEMPLATE_MASK_KEY].reshape(-1).to(output["loss"])
+            denominator = mask.sum().clamp_min(1.0)
+            terms = {
+                "task": output["loss"],
+                "slot": output["slot_loss_rows"].sum() / denominator,
+                "topo": float(model.cfg.w_topo)
+                * (output.get("topo_loss_rows", output["loss"] * 0.0).sum() / denominator),
+            }
+            telemetry: dict[str, float] = {}
+            for name, term in terms.items():
+                for group, value in _grad_norms_by_group(term, groups).items():
+                    telemetry[f"grad_g_{name}_{group}"] = value
+            weights = output["predicted_weights"].detach()
+            telemetry.update(model.generator.gate_logit_statistics(weights))
+            counts = count_statistics(weights.float())
+            telemetry["pred_wedge_mass"] = float(counts["wedge_mass"].mean())
+            telemetry["pred_bridge_mass"] = float(counts["bridge_mass"].mean())
+            flat = [param for params in groups.values() for param in params]
+            norms = {name: _grad_norm_over(terms[name], flat) for name in ("task", "slot")}
+    finally:
+        model.train(was_training)
+    return MotifGeneratorProbe(
+        telemetry=telemetry, task_norm=norms["task"], slot_norm=norms["slot"]
+    )
+
+
+def _motif_balanced_w_slot(*, task_norm: float, slot_norm: float, multiplier: float) -> float:
+    """The balanced ``L_slot`` weight: the task/graph gradient ratio, to a power of ten.
+
+    Wave 1 ran ``w_slot = 1`` against a task gradient into G that was 170-860x the
+    slot gradient at initialisation, and G settled at the no-structure minimum.
+    The ratio is rounded to a power of ten because nothing here justifies more
+    precision, and clamped so a degenerate probe cannot erase or drown the task.
+
+    Args:
+        task_norm: ``||grad_G L_task||``.
+        slot_norm: ``||grad_G L_G||``.
+        multiplier: ``motif_prompt.w_slot_multiplier``.
+
+    Returns:
+        The weight to train the rest of the run with.
+    """
+    low, high = _MOTIF_BALANCE_CLAMP
+    ratio = task_norm / max(slot_norm, 1e-12)
+    power = low if ratio <= 0.0 or not math.isfinite(ratio) else 10.0 ** round(math.log10(ratio))
+    return min(max(power, low), high) * multiplier
+
+
+def _share_motif_probe(
+    model: V3_1MotifPrompt,
+    batch: Mapping[str, torch.Tensor],
+    accelerator: Accelerator,
+    *,
+    epoch: int,
+    world_size: int,
+    profile: dict[str, object],
+) -> dict[str, float]:
+    """Run the epoch's generator probe on rank 0 and hand every rank the result.
+
+    The probe is rank-0 work, but its two norms fix a balanced ``w_slot``, which
+    every rank must then train under, so the values travel through one sum over a
+    fixed key order -- the non-main ranks contribute zeros. Nothing here writes a
+    ``.grad`` or an optimiser state: `torch.autograd.grad` does not run the
+    ``AccumulateGrad`` nodes, so there is no gradient to clear afterwards.
+
+    Args:
+        model: The unwrapped motif-prompt model with a trainable generator.
+        batch: The epoch's first task batch, templates and mask attached.
+        accelerator: The run's accelerator.
+        epoch: The 1-based epoch.
+        world_size: Ranks in the run.
+        profile: The run's motif generator profile, extended in place with the
+            initialisation row and the balancing record.
+
+    Returns:
+        This epoch's ``metrics.jsonl`` probe row.
+    """
+    keys = _motif_probe_keys()
+    values = [0.0] * (len(keys) + 2)
+    if accelerator.is_main_process:
+        try:
+            measured = _motif_generator_probe(model, batch, rows=model.cfg.balance_probe_rows)
+        except RuntimeError as exc:
+            # Telemetry never blocks a run: a probe batch without compiled
+            # templates reports zeros and the balancing waits for the next epoch.
+            logger.warning("motif generator probe skipped at epoch %d: %s", epoch, exc)
+        else:
+            values = [measured.telemetry[key] for key in keys] + [
+                measured.task_norm,
+                measured.slot_norm,
+            ]
+    if world_size > 1:
+        reduced = accelerator.reduce(
+            torch.tensor(values, device=accelerator.device, dtype=torch.float64),
+            reduction="sum",
+        )
+        values = [float(value) for value in reduced.tolist()]
+    telemetry = dict(zip(keys, values[: len(keys)], strict=True))
+    task_norm, slot_norm = values[-2], values[-1]
+    if epoch == 1:
+        profile["init"] = {"epoch": 1, **telemetry}
+    if (
+        model.cfg.w_slot_is_balanced
+        and model.interface_open
+        and float(model.w_slot_resolved) < 0.0
+        and values[-1] > 0.0
+    ):
+        resolved = _motif_balanced_w_slot(
+            task_norm=task_norm,
+            slot_norm=slot_norm,
+            multiplier=float(model.cfg.w_slot_multiplier),
+        )
+        model.resolve_w_slot(resolved)
+        ratio = task_norm / max(slot_norm, 1e-12)
+        balance: dict[str, object] = {
+            "epoch": epoch,
+            "grad_g_task": task_norm,
+            "grad_g_slot": slot_norm,
+            "ratio": ratio,
+            "w_slot_multiplier": float(model.cfg.w_slot_multiplier),
+            "w_slot_resolved": resolved,
+        }
+        profile["balance"] = balance
+        telemetry.update(
+            {
+                "balance_grad_g_task": task_norm,
+                "balance_grad_g_slot": slot_norm,
+                "balance_ratio": ratio,
+                "w_slot_resolved": resolved,
+            }
+        )
+    return telemetry
 
 
 def _motif_epoch_telemetry(*, slot_sum: float, topo_sum: float, steps: int) -> dict[str, float]:
@@ -2441,6 +2810,8 @@ def _run_metadata(
         }
     if "virtual_graph" in result.runtime_profile:
         run_metadata["virtual_graph"] = result.runtime_profile["virtual_graph"]
+    if "resume_source_attempt" in result.runtime_profile:
+        run_metadata["resume_source_attempt"] = result.runtime_profile["resume_source_attempt"]
     if cfg.run_kind is not None:
         # Same vocabulary as the EgoStitch worker so the test protocol and readers
         # classify the run identically; a diagnostic run consumed held-out truth.
@@ -4463,9 +4834,13 @@ class MotifTemplateRows:
             self.train_table.weights(train_pairs, seed=seed, epoch=1, randomise=True)
         )
         self.train_mask = _motif_self_row_mask(train_pairs)
-        self.mean = torch.from_numpy(
-            mean_template(self.train.numpy()[np.asarray(stats_rows, dtype=np.int64)])
+        # One pass over epoch 1's rows: the mean adjacency the trunk's `mean`
+        # intervention reads and the non-zero magnitudes the generator's gate
+        # biases are initialised from come from exactly the same templates.
+        self.stats: MotifTemplateStatistics = template_statistics(
+            self.train.numpy()[np.asarray(stats_rows, dtype=np.int64)]
         )
+        self.mean = torch.from_numpy(self.stats.mean)
         self.stats_rows = int(np.asarray(stats_rows).size)
         self.val_table: MotifTemplateTable | None = None
         self.val_cls: torch.Tensor | None = None
@@ -4495,7 +4870,7 @@ class MotifTemplateRows:
         raw_model = _unwrapped_model(model)
         if not isinstance(raw_model, V3_1MotifPrompt):
             raise TypeError("MotifTemplateRows.install needs a V3_1MotifPrompt")
-        raw_model.install_mean_template(self.mean)
+        raw_model.install_mean_template(self.stats)
 
     def _attach(self, batch: Batch, table: torch.Tensor, mask: torch.Tensor) -> None:
         rows = batch["_row_id"].detach().to("cpu", torch.int64)
@@ -5751,14 +6126,7 @@ def _term_grad_norms(
 
 def _grad_norm(term: torch.Tensor, model: nn.Module) -> float:
     """L2 norm of ``term``'s gradient over trainable parameters (0.0 when it has no graph)."""
-    if not term.requires_grad:
-        return 0.0
-    params = [p for p in model.parameters() if p.requires_grad]
-    grads = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True)
-    squares = [g.float().pow(2).sum() for g in grads if g is not None]
-    if not squares:
-        return 0.0
-    return float(torch.stack(squares).sum().sqrt().item())
+    return _grad_norm_over(term, [p for p in model.parameters() if p.requires_grad])
 
 
 #: Generator parameter groups the per-epoch virtual probe attributes terms to.
@@ -6028,9 +6396,7 @@ def train_ddp_loop(
             saved_config = snapshot.get("config")
             if not isinstance(saved_config, dict):
                 raise RuntimeError("resume snapshot is missing its training configuration")
-            saved_resume_config = _resume_comparable_config(saved_config)
-            current_resume_config = _resume_comparable_config(config_to_dict(cfg))
-            if saved_resume_config != current_resume_config:
+            if not resume_config_matches(saved_config, cfg, completed_epoch=completed_epoch):
                 raise ValueError("resume configuration does not match the current training run")
             if snapshot.get("world_size") != world_size:
                 raise ValueError("resume world size does not match the current training run")
@@ -6174,6 +6540,18 @@ def train_ddp_loop(
             start_epoch = cfg.optim.epochs + 1
 
     last_heartbeat = time.monotonic()
+    # The generator's initialisation record, the init probe row and the balancing
+    # decision, all written into `profile.json` (spec section 7.5 telemetry).
+    motif_generator_profile: dict[str, object] = {}
+    _unwrapped_start_model = _unwrapped_model(model)
+    if (
+        isinstance(_unwrapped_start_model, V3_1MotifPrompt)
+        and _unwrapped_start_model.generator is not None
+        and resume_attempt is None
+    ):
+        # A resumed run restores the prefix's biases after this initialisation,
+        # so the record would describe weights the arm never started from.
+        motif_generator_profile["bias_init"] = _unwrapped_start_model.generator.bias_init_record
     for epoch in range(start_epoch, cfg.optim.epochs + 1):
         _set_topo_gen_training_stage(
             model,
@@ -6192,6 +6570,7 @@ def train_ddp_loop(
         epoch_struct_sums: dict[str, float] = {}
         epoch_motif_slot_sum = 0.0
         epoch_motif_topo_sum = 0.0
+        epoch_motif_probe: dict[str, float] = {}
         epoch_online_sums: dict[str, float] = {}
         epoch_online_weight = 0.0
         epoch_struct_seconds = 0.0
@@ -6240,6 +6619,24 @@ def train_ddp_loop(
             raw_training_model = _unwrapped_model(model)
             if isinstance(raw_training_model, (V3_1TopoPrompt, V3_1MotifPrompt)):
                 raw_training_model.set_corruption_step(global_step, seed=cfg.seed)
+            if (
+                isinstance(raw_training_model, V3_1MotifPrompt)
+                and raw_training_model.generator_trainable
+                and epoch_steps == 0
+            ):
+                # Once per epoch, before the first update: which term moves which
+                # generator group, the gate pre-activations and the predicted
+                # motif masses. Measured on rank 0 alone and shared by one
+                # rank-symmetric sum over a fixed key order, because it also
+                # carries the two norms that fix a balanced `w_slot`.
+                epoch_motif_probe = _share_motif_probe(
+                    raw_training_model,
+                    batch,
+                    accelerator,
+                    epoch=epoch,
+                    world_size=world_size,
+                    profile=motif_generator_profile,
+                )
             start_event, end_event = _maybe_cuda_events(use_cuda)
             optimizer.zero_grad()
             # The structural pass forwards and backpropagates before the task
@@ -6301,7 +6698,7 @@ def train_ddp_loop(
                         cfg_motif = raw_training_model.cfg
                         struct_loss = (
                             struct_loss
-                            + cfg_motif.w_slot * slot_share
+                            + raw_training_model.w_slot_value * slot_share
                             + cfg_motif.w_topo * topo_share
                         )
                         epoch_motif_slot_sum += float(slot_share.detach().float().item())
@@ -6415,7 +6812,11 @@ def train_ddp_loop(
                     world_size=world_size,
                 )
                 cfg_motif = raw_training_model.cfg
-                loss = loss + cfg_motif.w_slot * slot_term + cfg_motif.w_topo * topo_term
+                loss = (
+                    loss
+                    + raw_training_model.w_slot_value * slot_term
+                    + cfg_motif.w_topo * topo_term
+                )
                 epoch_motif_slot_sum += float(slot_term.detach().float().item())
                 epoch_motif_topo_sum += float(topo_term.detach().float().item())
 
@@ -6677,6 +7078,7 @@ def train_ddp_loop(
             entry["train_kd_loss"] = train_kd_loss
         entry.update(epoch_kd_telemetry)
         entry.update(epoch_motif_telemetry)
+        entry.update(epoch_motif_probe)
         if epoch_struct_telemetry:
             epoch_wall = max(time.monotonic() - epoch_wall_start, 1e-9)
             epoch_struct_telemetry["struct_wall_fraction"] = (
@@ -6988,6 +7390,12 @@ def train_ddp_loop(
         "stopped_early": stopped_early,
         "per_epoch": per_epoch_profiles,
     }
+    if motif_generator_profile:
+        runtime_profile["motif_generator"] = motif_generator_profile
+    if resume_attempt is not None:
+        # The attempt whose epoch boundary this run continued; it may live under
+        # another arm's output_dir (`src.e2_pipeline`'s cross-dir resume).
+        runtime_profile["resume_source_attempt"] = str(resume_attempt)
 
     # Selection over the whole run: mean rank on AUPRC, GS and three MMD
     # metrics over the epochs whose due V_val pass ran (production; the
