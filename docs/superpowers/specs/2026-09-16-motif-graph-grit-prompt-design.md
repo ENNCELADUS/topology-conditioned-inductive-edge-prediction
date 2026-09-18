@@ -352,6 +352,30 @@ pair-density gate, free adjacency, hard top-k, Gumbel sampler or evaluation-time
 are a deterministic computational graph, not independent Bernoulli probabilities nor a claim to recover
 named neighbours.
 
+v12 (wave-3 phase C), two optional keys, defaults unchanged. The wave-2 prefixes emitted the eight closure
+slots of a row **identical** in 100% of rows (83% in the init-only prefix), witness attention uniform (entropy
+0.996 of `log L`, cosine 0.997 between the eight witness reads) and the witness queries never left their
+`0.02*randn` initialisation. Three causes, all in the read rather than in the message passing (mean
+aggregation over a complete template sends every slot of a role the same message and provably cannot create
+slot differences): (i) the read returned the bare attention output `r_k = MHA(q_k, H, H)`, so slot identity
+rode on the attention weights alone and a near-uniform attention returned eight copies of the same mean of
+`V`; (ii) the heads' last `Linear(96,1)` was initialised at `std = 1e-3`, so the bias -- whose gradient does not
+pass through the slot states -- absorbed the target mean immediately while every upstream gradient was
+attenuated by that weight; (iii) the head features were formed as `cat([h_i+h_j, |h_i-h_j|]).float()`, casting
+*after* the arithmetic, so under autocast a slot difference below the bf16 ulp of the sum was rounded away
+before the fp32 head saw it. `motif_prompt.slot_read: residual_block` replaces the bare read with a
+query-preserving pre-norm block, `Z = Q + MHA(LN_q(Q), LN_h(S), LN_h(S))` then `Z + FFN(LN_z(Z))` with
+`FFN = Linear(96,192)-GELU-Linear(192,96)`, one instance shared by both endpoints of the bridge read and one
+by the witness read (so the `u<->v, L<->R` equivariance is untouched), and initialises the slot queries at
+`std = 1.0` because the residual must be comparable in norm to the attention output.
+`motif_prompt.head_output_init_std` scales the heads' output layer (`1e-3` is the wave-1 value). The promotion order is
+fixed unconditionally: it changes an older checkpoint's bf16 numerics only by that rounding.
+`slot_read: bare` with `head_output_init_std: 1e-3` reproduces wave-2 behaviour exactly, and every existing
+config keeps those defaults. The four-way comparison (`bare`/`residual_block` x `1e-3`/`1e-2`) is run by
+`python -m src.experiments.motif_generator_fit --group {baseline,residual,head_gain,combined}`, which fits a
+freshly initialised generator alone, on cached frozen-trunk inputs of a fixed witness-count-stratified row
+set, against `L_G`, the re-fitted asymmetric constant and the transplant null.
+
 G is equivariant to `u<->v, L<->R`. Its private seeds can distinguish attachments while the reader stays
 order-invariant; this permits more than one activity value but does not guarantee the model uses it.
 
@@ -850,6 +874,7 @@ cannot instantiate this interface.
 
 | Version | Date | Changes |
 |---|---|---|
+| v12 | 2026-09-18 | Wave-3 phase C, two optional generator keys, no default change: **§4** `motif_prompt.slot_read` (`bare` / `residual_block`) puts the slot query back on the read's residual path and raises the query init to `std = 1.0` in that mode, `motif_prompt.head_output_init_std` scales the gate heads' output layer, and the head features promote to fp32 *before* the sum and the difference are formed (unconditional; bf16 rounding only). Measured cause: identical closure slots in 100% of wave-2 rows, uniform witness attention, untrained queries. Read by `src.experiments.motif_generator_fit`, a fixed-set generator-only fit over a witness-count-stratified row set with cached frozen-trunk inputs. |
 | v11 | 2026-09-18 | Wave-3 phase B, one optional key pair, no default change: **§7.5** `motif_prompt.graph_row_weighting` (`uniform` / `closure_balanced`) with `graph_row_positive_share` re-weights the rows of `L_G` alone, so the closure-non-empty rows carry a fixed share of the graph loss instead of the ~18% they hold in the task stream's 1:5 rows; the weights sum to the valid-row count and use the rank-reduced counts, leaving every other loss, the sampler and both streams untouched. Read as `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` against the wave-2 prefixes they copy; `graph_rows_closure_nonempty_frac` is logged per epoch whatever the setting. |
 | v10 | 2026-09-18 | First measured run read (`docs/results/motif_prompt_verdict/README.md`): Stage I +0.066 test AUPRC / +0.08 GS, every Stage II row at the trunk; the interface converts a true template into the full gain (reader swap 0.0005 vs graph swap 0.086 AUPRC), the generator emits a near-constant slot-symmetric graph, and the cause is closure gate heads initialised into saturation by `logit(density)` plus a product-only closure supervision (closure-head slot gradient 1/1800 of the interior's) inside a composite whose task gradient dominates the graph term 5-18x (170-860x at init). Four amendments, owner-reviewed: **§4** closure bias from the training-corpus non-zero mean with a mass check, attach/interior unchanged; **§7.3** raw closure term `beta_c`, products kept, wedge-mass loss rejected as not removing the attenuation; **§7.5** graph-only warm-up with task, structural and topo terms detached from G, then `lambda_G` by gradient-norm balancing at the interface opening, the prefix continued under the guarded resume with the inert keys excluded; **§0.2** pilot B run as those two epochs with a three-level pre-registered reading and its stop rule, pilot A superseded by the wave-1 counterfactual; **§7.4** teachability pilots dropped; **§8** wave-2 arms, the family-scaling diagnostic that decides a presence gate, the self-row option, and no AUPRC margin. Corrections to the verdict itself: "failed to learn structure", not "never trained"; the integrated-gradients attribution withdrawn (completeness does not close); the test transplant's -0.008 AUPRC is a small single-seed signal, not "inside the margin". |
 | v9 | 2026-09-16 | Implementation-planning clarifications, no design change. §8's "degree-matched control" is renamed the **degree-only control** and given an algorithm: a trained arm whose prompt carries only the symmetric degree pair from the predicted adjacency, with the mass entries zeroed and the GRIT fields row-masked — not a degree-marginal re-thresholding, which this specification never uses as a matching target. Recorded because the plan could not write that control's config from the v8 text. Separately, §11 was lost from the file between the v8 edit and the planning pass and has been reconstructed from the edit scripts; the cause was not determined and the file is untracked, so no git history existed to recover from. |

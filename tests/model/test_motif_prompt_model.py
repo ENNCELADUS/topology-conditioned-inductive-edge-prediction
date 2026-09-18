@@ -53,8 +53,20 @@ def test_config_round_trip_and_defaults() -> None:
     assert (cfg.w_slot, cfg.w_topo) == (1.0, 0.1)
     assert (cfg.beta_p, cfg.beta_q, cfg.beta_a, cfg.beta_i) == (1.0, 1.0, 1.0, 1.0)
     assert cfg.huber_delta == 1.0
+    assert cfg.slot_read == "bare"
+    assert cfg.head_output_init_std == 1e-3
     assert cfg.reader == ReaderConfig(layers=3, dim=96, heads=4, rrwp_k=4)
     assert MotifPromptConfig.from_mapping(cfg.to_dict()) == cfg
+    tuned = MotifPromptConfig.from_mapping(
+        {
+            "stage": "one",
+            "base_checkpoint": "base.pt",
+            "slot_read": "residual_block",
+            "head_output_init_std": 1e-2,
+        }
+    )
+    assert (tuned.slot_read, tuned.head_output_init_std) == ("residual_block", 1e-2)
+    assert MotifPromptConfig.from_mapping(tuned.to_dict()) == tuned
 
 
 def test_config_validation_rejects_illegal_blocks() -> None:
@@ -80,6 +92,10 @@ def test_config_validation_rejects_illegal_blocks() -> None:
         MotifPromptConfig(stage="one", base_checkpoint="b.pt", reader=ReaderConfig(dim=97, heads=4))
     with pytest.raises(ValueError, match="reader.rrwp_k"):
         MotifPromptConfig(stage="one", base_checkpoint="b.pt", reader=ReaderConfig(rrwp_k=0))
+    with pytest.raises(ValueError, match="motif_prompt.slot_read"):
+        MotifPromptConfig(stage="one", base_checkpoint="b.pt", slot_read="residual")
+    with pytest.raises(ValueError, match="motif_prompt.head_output_init_std"):
+        MotifPromptConfig(stage="one", base_checkpoint="b.pt", head_output_init_std=0.0)
 
 
 def test_gate_modes_are_the_three_spec_controls() -> None:
@@ -267,13 +283,83 @@ def test_generator_emits_96_weights_in_the_unit_interval() -> None:
     assert float(weights.min()) >= 0.0 and float(weights.max()) <= 1.0
 
 
-def test_generator_is_equivariant_under_swapping_the_endpoints() -> None:
-    generator = _generator()
+@pytest.mark.parametrize("slot_read", ["bare", "residual_block"])
+def test_generator_is_equivariant_under_swapping_the_endpoints(slot_read: str) -> None:
+    generator = _generator(slot_read=slot_read)
     h_u, len_u = _states(seed=1)
     h_v, len_v = _states(seed=2)
     forward = generator(h_u, h_v, len_u, len_v)
     reverse = generator(h_v, h_u, len_v, len_u)
     torch.testing.assert_close(reverse, forward[:, list(SWAP_PERM)], rtol=1e-5, atol=1e-5)
+
+
+def test_the_residual_read_block_keeps_the_queries_on_the_path() -> None:
+    # The bare read returns MHA(q, H, H): with the queries zeroed every slot is
+    # the same mean of V. The residual block adds the query back, so the slots
+    # stay distinct whatever the attention does.
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    for slot_read, distinct in (("bare", False), ("residual_block", True)):
+        generator = _generator(slot_read=slot_read)
+        with torch.no_grad():
+            # Kill the query projection: every slot then attends uniformly and
+            # the attention hands back the same mean of V eight times over.
+            generator.attention.in_proj_weight[:96].zero_()
+            generator.attention.in_proj_bias[:96].zero_()
+            generator.witness_queries.copy_(
+                torch.arange(8, dtype=torch.float32).unsqueeze(1).expand(8, 96).contiguous()
+            )
+            states = generator._slot_states(h_u, h_v, len_u, len_v)
+            witness = generator._read(
+                generator.witness_queries,
+                generator.residue_proj(h_u),
+                None,
+                generator.witness_read,
+            )
+        spread = float((witness - witness.mean(dim=1, keepdim=True)).abs().max())
+        assert states.shape == (4, 26, 96)
+        assert (spread > 1e-3) is distinct
+
+
+def test_the_residual_block_queries_start_at_unit_scale() -> None:
+    bare = _generator(slot_read="bare")
+    residual = _generator(slot_read="residual_block")
+    assert float(bare.witness_queries.detach().std()) < 0.05
+    assert 0.5 < float(residual.witness_queries.detach().std()) < 2.0
+    assert bare.bridge_read is None and bare.witness_read is None
+    assert residual.bridge_read is not None and residual.witness_read is not None
+
+
+def test_the_head_output_init_std_scales_the_last_gate_layer() -> None:
+    small = _generator(head_output_init_std=1e-3)
+    large = _generator(head_output_init_std=1e-2)
+
+    def _output_std(head: torch.nn.Module) -> float:
+        linear = cast(torch.nn.Linear, cast(torch.nn.Sequential, head)[-1])
+        return float(linear.weight.detach().std())
+
+    for head in small.heads:
+        assert _output_std(head) < 3e-3
+    for head in large.heads:
+        assert 3e-3 < _output_std(head) < 3e-2
+
+
+def test_the_head_features_promote_to_fp32_before_the_sum_and_the_difference() -> None:
+    # Under autocast the slot states arrive in bf16. The wave-1/2 order formed
+    # h_i + h_j and |h_i - h_j| in bf16 and cast afterwards, which rounded a
+    # slot difference below the bf16 ulp of the sum to exactly zero.
+    big = torch.tensor(300.0, dtype=torch.bfloat16)
+    tiny = torch.tensor(0.5, dtype=torch.bfloat16)
+    late = ((big + tiny).float(), (big - tiny).abs().float())
+    early = (big.float() + tiny.float(), (big.float() - tiny.float()).abs())
+    assert float(late[0]) == float(late[1])
+    assert float(early[0]) != float(early[1])
+    generator = _generator()
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        weights = generator(h_u, h_v, len_u, len_v)
+    assert weights.dtype == torch.float32 and torch.isfinite(weights).all()
 
 
 def test_output_biases_start_at_the_clipped_training_mean_in_logit_space() -> None:
@@ -365,6 +451,18 @@ def test_the_gate_logit_statistics_invert_the_emitted_weights() -> None:
     assert stats["gate_logit_closure_frac_abs_gt_3"] == pytest.approx(1.0)
     assert stats["gate_logit_attach_mean"] == pytest.approx(0.0, abs=1e-6)
     assert stats["gate_logit_interior_frac_abs_gt_3"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("slot_read", ["bare", "residual_block"])
+def test_the_generator_parameter_groups_cover_every_trainable_parameter_once_per_read(
+    slot_read: str,
+) -> None:
+    generator = _generator(slot_read=slot_read)
+    groups = generator.parameter_groups()
+    seen = [id(param) for params in groups.values() for param in params]
+    assert sorted(seen) == sorted(id(param) for param in generator.parameters())
+    assert len(seen) == len(set(seen))
+    assert groups["other"] == []
 
 
 def test_the_generator_parameter_groups_cover_every_trainable_parameter_once() -> None:

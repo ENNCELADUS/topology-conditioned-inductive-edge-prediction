@@ -66,6 +66,11 @@ WARMUP_LOSSES = ("joint", "graph_only")
 #: distribution of the stream itself; ``closure_balanced`` gives the rows whose
 #: closure family is non-empty a fixed share of L_G's mass (spec section 7.5).
 GRAPH_ROW_WEIGHTINGS = ("uniform", "closure_balanced")
+#: How a slot query reads one endpoint's residue states. ``bare`` is the wave-1
+#: and wave-2 read -- the raw `nn.MultiheadAttention` output, whose slot identity
+#: rides on the attention weights alone. ``residual_block`` keeps the query on
+#: the path (spec section 4, wave-3 fix G1).
+SLOT_READS = ("bare", "residual_block")
 #: ``w_slot`` may be this string instead of a number: the weight is then fixed
 #: once, by gradient-norm balancing at the first interface-open step.
 BALANCED_W_SLOT = "balanced"
@@ -169,6 +174,8 @@ class MotifPromptConfig:
     graph_row_weighting: str = "uniform"
     graph_row_positive_share: float = 0.5
     huber_delta: float = 1.0
+    slot_read: str = "bare"
+    head_output_init_std: float = 1e-3
 
     def __post_init__(self) -> None:
         """Validate the block.
@@ -229,6 +236,10 @@ class MotifPromptConfig:
                 raise ValueError(f"motif_prompt.{name} must be non-negative")
         if self.huber_delta <= 0.0:
             raise ValueError("motif_prompt.huber_delta must be positive")
+        if self.slot_read not in SLOT_READS:
+            raise ValueError(f"motif_prompt.slot_read must be one of {list(SLOT_READS)}")
+        if self.head_output_init_std <= 0.0:
+            raise ValueError("motif_prompt.head_output_init_std must be positive")
 
     @property
     def w_slot_is_balanced(self) -> bool:
@@ -585,6 +596,67 @@ class _MessageLayer(nn.Module):
         return h + update
 
 
+class _ResidualReadBlock(nn.Module):
+    """A pre-norm, query-preserving read of one endpoint's residue states.
+
+    The wave-1/wave-2 read was the bare attention output ``r_k = MHA(q_k, H, H)``:
+    the query never reaches the result, so a slot's identity rides entirely on
+    its attention weights and a near-uniform attention returns eight copies of
+    the same mean of ``V``. That is exactly what the wave-2 prefixes emitted
+    (100% of rows with identical closure slots, witness entropy 0.996 of
+    ``log L``). This block puts the query back on the path,
+    ``Z = Q + MHA(LN_q(Q), LN_h(S), LN_h(S))`` followed by ``Z + FFN(LN_z(Z))``,
+    so distinct queries give distinct slots whatever the attention does, and the
+    queries carry a gradient that does not have to pass through the attention
+    weights first.
+
+    One instance is shared by both endpoints of a read, which is what keeps the
+    ``u<->v, L<->R`` equivariance of spec section 4 intact.
+    """
+
+    def __init__(self, dim: int) -> None:
+        """Build the three norms and the position-wise FFN.
+
+        Args:
+            dim: Slot-state width.
+        """
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_h = nn.LayerNorm(dim)
+        self.norm_z = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        states: torch.Tensor,
+        pad: torch.Tensor | None,
+        attention: nn.MultiheadAttention,
+    ) -> torch.Tensor:
+        """Read ``states`` with ``queries`` kept on the residual path.
+
+        The attention module is passed in rather than owned so the generator's
+        one `nn.MultiheadAttention` stays a single registered parameter set
+        whatever mix of blocks reads through it.
+
+        Args:
+            queries: ``(B, K, dim)`` expanded slot queries.
+            states: ``(B, L, dim)`` projected residue states.
+            pad: ``(B, L)`` key padding mask, or ``None``.
+            attention: The shared multi-head attention.
+
+        Returns:
+            ``(B, K, dim)`` slot states.
+        """
+        normed = self.norm_h(states)
+        read, _ = attention(
+            self.norm_q(queries), normed, normed, key_padding_mask=pad, need_weights=False
+        )
+        mixed = queries + read
+        out: torch.Tensor = mixed + self.ffn(self.norm_z(mixed))
+        return out
+
+
 class MotifGenerator(nn.Module):
     """Residue-conditioned edge gates over the fixed template (spec section 4).
 
@@ -604,6 +676,19 @@ class MotifGenerator(nn.Module):
     endpoints entirely and returns the installed training-mean adjacency -- in
     that mode no generator parameter is on the autograd path, which a trainer
     must account for before wrapping the model in DDP.
+
+    ``slot_read`` selects the read. ``bare`` is the wave-1/wave-2 behaviour.
+    ``residual_block`` reads through `_ResidualReadBlock` and, because the query
+    is then a term of the result rather than only a selector, initialises the
+    slot queries at ``std = 1.0`` instead of ``0.02``: the residual has to be
+    comparable in norm to the attention output it is added to, or the block
+    reduces to the bare read again.
+
+    ``head_output_init_std`` scales the last linear of each gate head. At the
+    wave-1 value of ``1e-3`` the head's bias -- whose gradient does not pass
+    through the slot states -- absorbs the target mean in the first steps while
+    every upstream gradient is attenuated by the tiny output weight, so the
+    queries and the attention barely train.
     """
 
     incidence: torch.Tensor
@@ -620,8 +705,12 @@ class MotifGenerator(nn.Module):
         self.cfg = cfg
         self.residue_proj = nn.Linear(d_model, _GATE_DIM)
         self.attention = nn.MultiheadAttention(_GATE_DIM, 4, batch_first=True)
-        self.bridge_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * 0.02)
-        self.witness_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * 0.02)
+        residual = cfg.slot_read == "residual_block"
+        query_std = 1.0 if residual else 0.02
+        self.bridge_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * query_std)
+        self.witness_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * query_std)
+        self.bridge_read = _ResidualReadBlock(_GATE_DIM) if residual else None
+        self.witness_read = _ResidualReadBlock(_GATE_DIM) if residual else None
         self.endpoint_proj = nn.Linear(_GATE_DIM, _GATE_DIM)
         self.witness_mix = nn.Sequential(
             nn.Linear(2 * _GATE_DIM, _GATE_DIM), nn.GELU(), nn.Linear(_GATE_DIM, _GATE_DIM)
@@ -638,7 +727,7 @@ class MotifGenerator(nn.Module):
         )
         for head in self.heads:
             output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
-            nn.init.normal_(output.weight, std=1e-3)
+            nn.init.normal_(output.weight, std=float(cfg.head_output_init_std))
             nn.init.zeros_(output.bias)
         self.register_buffer("fixed_weights", torch.zeros(N_EDGES))
         self.register_buffer("incidence", _candidate_incidence())
@@ -751,7 +840,16 @@ class MotifGenerator(nn.Module):
             group = "other"
             if name in ("bridge_queries", "witness_queries"):
                 group = "slot_queries"
-            elif name.startswith(("residue_proj.", "attention.", "endpoint_proj.", "witness_mix.")):
+            elif name.startswith(
+                (
+                    "residue_proj.",
+                    "attention.",
+                    "endpoint_proj.",
+                    "witness_mix.",
+                    "bridge_read.",
+                    "witness_read.",
+                )
+            ):
                 group = "attention"
             elif name.startswith("message_layers."):
                 group = "mpnn"
@@ -786,10 +884,26 @@ class MotifGenerator(nn.Module):
         return out
 
     def _read(
-        self, queries: torch.Tensor, states: torch.Tensor, pad: torch.Tensor | None
+        self,
+        queries: torch.Tensor,
+        states: torch.Tensor,
+        pad: torch.Tensor | None,
+        block: _ResidualReadBlock | None,
     ) -> torch.Tensor:
-        """Let one shared query block attend over one endpoint's residue states."""
+        """Let one shared query block attend over one endpoint's residue states.
+
+        Args:
+            queries: ``(K, 96)`` shared slot queries.
+            states: ``(B, L, 96)`` projected residue states of one endpoint.
+            pad: ``(B, L)`` key padding mask.
+            block: The residual read block, or ``None`` for the bare read.
+
+        Returns:
+            ``(B, K, 96)`` slot states.
+        """
         expanded = queries.unsqueeze(0).expand(states.size(0), -1, -1)
+        if block is not None:
+            return cast(torch.Tensor, block(expanded, states, pad, self.attention))
         out, _ = self.attention(expanded, states, states, key_padding_mask=pad, need_weights=False)
         return cast(torch.Tensor, out)
 
@@ -805,10 +919,10 @@ class MotifGenerator(nn.Module):
         pad_v = _build_padding_mask(lengths_v, encoded_v.size(1))
         state_u = self.residue_proj(encoded_u)
         state_v = self.residue_proj(encoded_v)
-        left = self._read(self.bridge_queries, state_u, pad_u)
-        right = self._read(self.bridge_queries, state_v, pad_v)
-        witness_u = self._read(self.witness_queries, state_u, pad_u)
-        witness_v = self._read(self.witness_queries, state_v, pad_v)
+        left = self._read(self.bridge_queries, state_u, pad_u, self.bridge_read)
+        right = self._read(self.bridge_queries, state_v, pad_v, self.bridge_read)
+        witness_u = self._read(self.witness_queries, state_u, pad_u, self.witness_read)
+        witness_v = self._read(self.witness_queries, state_v, pad_v, self.witness_read)
         closure = self.witness_mix(
             torch.cat([witness_u + witness_v, (witness_u - witness_v).abs()], dim=-1)
         )
@@ -852,14 +966,19 @@ class MotifGenerator(nn.Module):
 
         rows = _EDGE_ROWS.to(h.device).reshape(-1)
         cols = _EDGE_COLS.to(h.device).reshape(-1)
-        h_i, h_j = h[:, rows], h[:, cols]
         # The gate heads run in fp32 with autocast disabled: the weights they
         # emit are the inputs of the fp32 count and RRWP arithmetic, and a
         # bf16 sigmoid would quantise them before that arithmetic ever sees
         # them (the `assemble.py` trap, spec section 5). Under autocast the
-        # slot states arrive in bf16 and are promoted here.
+        # slot states arrive in bf16 and are promoted *before* the sum and the
+        # difference are formed: the wave-1/wave-2 order promoted afterwards,
+        # so a slot difference below the bf16 ulp of the sum was rounded away
+        # and the fp32 head saw eight identical rows. It changes the numerics
+        # of an older checkpoint only by that rounding.
         with torch.autocast(device_type=h.device.type, enabled=False):
-            features = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1).float()
+            h_i = h[:, rows].float()
+            h_j = h[:, cols].float()
+            features = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1)
             logits = features.new_zeros(batch, N_EDGES)
             for edge_type, head in enumerate(self.heads):
                 mask = _TYPE_MASKS[edge_type].to(h.device)

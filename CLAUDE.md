@@ -88,7 +88,11 @@ selected method. Every piece of writing must explain how its context helps decid
   `python -m src.experiments.motif_pilot_b` (three pre-registered levels; level 1 or 2 failing stops the
   wave) and continued with `hpc/run.sh train configs/split_seed42/motif_prompt_stage2_v2{,_no_topo,_strong_graph}.yaml
   --resume-attempt <prefix attempt dir>`; `motif_prompt_stage2_v2_{initonly,lossonly}_prefix` attribute the
-  fix; `python -m src.experiments.motif_family_scaling` decides the wave-3 presence gate. Wave-3 phase B asks
+  fix; `python -m src.experiments.motif_family_scaling` decides the wave-3 presence gate.
+  Wave 3 phase C (spec v12): `motif_prompt.slot_read` (`bare` / `residual_block`) and
+  `motif_prompt.head_output_init_std` are read by `python -m src.experiments.motif_generator_fit
+  --group {baseline,residual,head_gain,combined}`, a minutes-long generator-only fit on cached
+  frozen-trunk inputs over a witness-count-stratified fixed row set. Wave-3 phase B asks
   whether G hedges because the graph loss reads the task stream's 1:5 rows (~82% with an empty closure
   family): `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` add only
   `motif_prompt.graph_row_weighting: closure_balanced` (share `graph_row_positive_share`, counts reduced
