@@ -12,7 +12,7 @@ Thumbs.db
 .codex/
 .superpowers/
 .worktrees/
-docs/tmp/
+tmp/
 autoresearch/
 
 # Python caches and test artifacts
