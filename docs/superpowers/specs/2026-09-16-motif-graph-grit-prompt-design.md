@@ -1,6 +1,6 @@
 # Motif graph prompts read by GRIT
 
-**Date:** 2026-09-16, amended 2026-09-18. **Version:** v11 (supersedes v10; change log in §11).
+**Date:** 2026-09-16, amended 2026-09-18. **Version:** v13 (supersedes v12; change log in §11).
 **Status:** implemented and run once (wave 1, `686627d`, 2026-09-17/18): Stage I and its two family
 ablations, Stage II and its bridge-only / closure-only controls. Stage I gains (+0.066 test AUPRC, +0.08 GS
 over the frozen trunk); every Stage II row finished at the trunk. The wave-1 verdict
@@ -370,11 +370,20 @@ by the witness read (so the `u<->v, L<->R` equivariance is untouched), and initi
 `std = 1.0` because the residual must be comparable in norm to the attention output.
 `motif_prompt.head_output_init_std` scales the heads' output layer (`1e-3` is the wave-1 value). The promotion order is
 fixed unconditionally: it changes an older checkpoint's bf16 numerics only by that rounding.
-`slot_read: bare` with `head_output_init_std: 1e-3` reproduces wave-2 behaviour exactly, and every existing
-config keeps those defaults. The four-way comparison (`bare`/`residual_block` x `1e-3`/`1e-2`) is run by
+`slot_read: bare` with `head_output_init_std: 1e-3` reproduces wave-2 behaviour exactly. The four-way
+comparison (`bare`/`residual_block` x `1e-3`/`1e-2`) is run by
 `python -m src.experiments.motif_generator_fit --group {baseline,residual,head_gain,combined}`, which fits a
 freshly initialised generator alone, on cached frozen-trunk inputs of a fixed witness-count-stratified row
 set, against `L_G`, the re-fitted asymmetric constant and the transplant null.
+
+v13: that fit answered it. `residual_block` took the fraction of rows with identical closure slots from
+`0.6` to `0.0` and the witness-read spread from `0.004` to `0.98` at no cost in held-out `L_G`, while
+`head_output_init_std: 1e-2` alone moved nothing measurable. **The residual read is therefore the design of
+this section**: the Stage II model is `motif_prompt_stage2_v3` (the wave-2 init-only setting plus
+`slot_read: residual_block`), continued from `motif_prompt_stage2_v3_prefix`, and
+`motif_prompt_stage2_v3_headgain_prefix` carries the output-scale attribution on the full corpus. The keys
+stay optional with their wave-1 defaults, and `bare` is kept for one purpose only -- reproducing the
+published wave-1 and wave-2 rows -- so every pre-v13 config keeps it unchanged.
 
 G is equivariant to `u<->v, L<->R`. Its private seeds can distinguish attachments while the reader stays
 order-invariant; this permits more than one activity value but does not guarantee the model uses it.
@@ -874,6 +883,7 @@ cannot instantiate this interface.
 
 | Version | Date | Changes |
 |---|---|---|
+| v13 | 2026-09-18 | Wave-3 phase C read, and the adoption it licenses: on the fixed-set generator-only fit `slot_read: residual_block` dropped the identical-closure-row fraction from 0.6 to 0.0 and raised the witness-read spread from 0.004 to 0.98 at no cost in held-out `L_G`, while `head_output_init_std: 1e-2` alone changed nothing measurable. **§4** the residual read is now the design and `bare` is retained only to reproduce the wave-1/wave-2 rows; no default moves, so every pre-v13 config is unaffected. The main Stage II arm becomes `motif_prompt_stage2_v3` (wave-2 init-only setting + `slot_read: residual_block`, full 15-epoch schedule) continued from `motif_prompt_stage2_v3_prefix` under the guarded resume, with `motif_prompt_stage2_v3_headgain_prefix` attributing the read against the gate-head output scale on the full corpus; both prefixes are read by `src.experiments.motif_pilot_b` and `src.experiments.motif_generator_probe` against the wave-2 init-only rows. |
 | v12 | 2026-09-18 | Wave-3 phase C, two optional generator keys, no default change: **§4** `motif_prompt.slot_read` (`bare` / `residual_block`) puts the slot query back on the read's residual path and raises the query init to `std = 1.0` in that mode, `motif_prompt.head_output_init_std` scales the gate heads' output layer, and the head features promote to fp32 *before* the sum and the difference are formed (unconditional; bf16 rounding only). Measured cause: identical closure slots in 100% of wave-2 rows, uniform witness attention, untrained queries. Read by `src.experiments.motif_generator_fit`, a fixed-set generator-only fit over a witness-count-stratified row set with cached frozen-trunk inputs. |
 | v11 | 2026-09-18 | Wave-3 phase B, one optional key pair, no default change: **§7.5** `motif_prompt.graph_row_weighting` (`uniform` / `closure_balanced`) with `graph_row_positive_share` re-weights the rows of `L_G` alone, so the closure-non-empty rows carry a fixed share of the graph loss instead of the ~18% they hold in the task stream's 1:5 rows; the weights sum to the valid-row count and use the rank-reduced counts, leaving every other loss, the sampler and both streams untouched. Read as `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` against the wave-2 prefixes they copy; `graph_rows_closure_nonempty_frac` is logged per epoch whatever the setting. |
 | v10 | 2026-09-18 | First measured run read (`docs/results/motif_prompt_verdict/README.md`): Stage I +0.066 test AUPRC / +0.08 GS, every Stage II row at the trunk; the interface converts a true template into the full gain (reader swap 0.0005 vs graph swap 0.086 AUPRC), the generator emits a near-constant slot-symmetric graph, and the cause is closure gate heads initialised into saturation by `logit(density)` plus a product-only closure supervision (closure-head slot gradient 1/1800 of the interior's) inside a composite whose task gradient dominates the graph term 5-18x (170-860x at init). Four amendments, owner-reviewed: **§4** closure bias from the training-corpus non-zero mean with a mass check, attach/interior unchanged; **§7.3** raw closure term `beta_c`, products kept, wedge-mass loss rejected as not removing the attenuation; **§7.5** graph-only warm-up with task, structural and topo terms detached from G, then `lambda_G` by gradient-norm balancing at the interface opening, the prefix continued under the guarded resume with the inert keys excluded; **§0.2** pilot B run as those two epochs with a three-level pre-registered reading and its stop rule, pilot A superseded by the wave-1 counterfactual; **§7.4** teachability pilots dropped; **§8** wave-2 arms, the family-scaling diagnostic that decides a presence gate, the self-row option, and no AUPRC margin. Corrections to the verdict itself: "failed to learn structure", not "never trained"; the integrated-gradients attribution withdrawn (completeness does not close); the test transplant's -0.008 AUPRC is a small single-seed signal, not "inside the margin". |

@@ -92,7 +92,14 @@ selected method. Every piece of writing must explain how its context helps decid
   Wave 3 phase C (spec v12): `motif_prompt.slot_read` (`bare` / `residual_block`) and
   `motif_prompt.head_output_init_std` are read by `python -m src.experiments.motif_generator_fit
   --group {baseline,residual,head_gain,combined}`, a minutes-long generator-only fit on cached
-  frozen-trunk inputs over a witness-count-stratified fixed row set. Wave-3 phase B asks
+  frozen-trunk inputs over a witness-count-stratified fixed row set. The residual read won that fit,
+  so the current Stage II model is `motif_prompt_stage2_v3` -- the wave-2 init-only setting plus
+  `slot_read: residual_block` -- continued from its two-epoch graph-only prefix
+  `motif_prompt_stage2_v3_prefix` with `--resume-attempt`, with
+  `motif_prompt_stage2_v3_headgain_prefix` (`head_output_init_std: 0.01`) attributing the read against
+  the gate-head output scale; the wave-3 reads live in `outputs/analysis/motif_pilot_b_v3_prefix`,
+  `outputs/analysis/motif_pilot_b_v3_headgain` and
+  `outputs/analysis/motif_generator_probe/motif_prompt_stage2_v3{,_headgain}_prefix`. Wave-3 phase B asks
   whether G hedges because the graph loss reads the task stream's 1:5 rows (~82% with an empty closure
   family): `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` add only
   `motif_prompt.graph_row_weighting: closure_balanced` (share `graph_row_positive_share`, counts reduced

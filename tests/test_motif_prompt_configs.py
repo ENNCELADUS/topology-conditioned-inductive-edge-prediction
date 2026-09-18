@@ -372,3 +372,83 @@ def test_every_other_motif_arm_keeps_the_streams_own_row_distribution() -> None:
         expected = "closure_balanced" if Path(name).stem in _WAVE_THREE_BALANCED else "uniform"
         assert block.get("graph_row_weighting", "uniform") == expected
         assert MotifPromptConfig.from_mapping(block).graph_row_weighting == expected
+
+
+#: The wave-3 main Stage II arm and the two-epoch prefix it is continued from.
+_WAVE_THREE_MAIN = "motif_prompt_stage2_v3"
+
+#: The wave-3 attribution prefix and what it adds to the main prefix.
+_WAVE_THREE_ATTRIBUTION: dict[str, dict[str, Any]] = {
+    "motif_prompt_stage2_v3_headgain_prefix": {"head_output_init_std": 0.01},
+}
+
+
+def test_the_wave_three_arm_is_the_init_only_setting_plus_the_residual_read() -> None:
+    # The owner's rule: a validated revision is adopted into the main model, so
+    # wave 3's Stage II arm is wave 2's winning "init-only" prefix (F1 + F3, the
+    # wave-1 loss) plus F4, the query-preserving read.
+    init_only = _block("motif_prompt_stage2_v2_initonly_prefix.yaml")
+    arm = _block(f"{_WAVE_THREE_MAIN}.yaml")
+    assert arm == {**init_only, "slot_read": "residual_block"}
+    assert arm["beta_c"] == 0.0
+    assert arm["closure_bias_init"] == "nonzero_mean"
+    assert arm["warmup_losses"] == "graph_only"
+    assert arm["w_slot"] == "balanced"
+    parsed = MotifPromptConfig.from_mapping(arm)
+    assert parsed.slot_read == "residual_block"
+    assert parsed.head_output_init_std == 1e-3
+
+
+def test_the_wave_three_prefix_is_a_true_two_epoch_prefix_of_the_arm() -> None:
+    prefix = _raw(f"{_WAVE_THREE_MAIN}_prefix.yaml")
+    arm = _raw(f"{_WAVE_THREE_MAIN}.yaml")
+    assert prefix["output_dir"] == f"outputs/split_seed42/{_WAVE_THREE_MAIN}_prefix"
+    assert arm["output_dir"] == f"outputs/split_seed42/{_WAVE_THREE_MAIN}"
+    # Nothing but the halt point differs, so the resume comparison of
+    # `src.train_b0.resume_config_matches` accepts the continuation whatever the
+    # inert-key rule decides -- no key of the pair relies on it.
+    assert arm["model"] == prefix["model"]
+    for section in ("data", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert arm[section] == prefix[section]
+    assert prefix["optim"]["stop_after_epoch"] == 2
+    assert "stop_after_epoch" not in arm["optim"]
+    assert arm["optim"] == {
+        key: value for key, value in prefix["optim"].items() if key != "stop_after_epoch"
+    }
+    header = (CONFIG_DIR / f"{_WAVE_THREE_MAIN}.yaml").read_text(encoding="utf-8")
+    assert "--resume-attempt" in header
+    assert f"outputs/split_seed42/{_WAVE_THREE_MAIN}_prefix/attempts/" in header
+    prefix_header = (CONFIG_DIR / f"{_WAVE_THREE_MAIN}_prefix.yaml").read_text(encoding="utf-8")
+    assert (
+        f"hpc/run.sh train configs/split_seed42/{_WAVE_THREE_MAIN}_prefix.yaml --skip-test"
+        in prefix_header
+    )
+
+
+@pytest.mark.parametrize(("name", "overrides"), sorted(_WAVE_THREE_ATTRIBUTION.items()))
+def test_each_wave_three_attribution_prefix_adds_only_its_own_key(
+    name: str, overrides: dict[str, Any]
+) -> None:
+    base, other = _raw(f"{_WAVE_THREE_MAIN}_prefix.yaml"), _raw(f"{name}.yaml")
+    assert other["output_dir"] == f"outputs/split_seed42/{name}"
+    assert other["model"]["config"]["motif_prompt"] == {
+        **base["model"]["config"]["motif_prompt"],
+        **overrides,
+    }
+    for section in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert other[section] == base[section]
+
+
+def test_only_the_wave_three_arm_and_its_prefixes_use_the_residual_read() -> None:
+    # F4 is opt-in: wave 1 and wave 2 keep the bare read so their published rows
+    # stay reproducible, and the gate-head output scale keeps its wave-1 value
+    # everywhere but the one attribution prefix.
+    residual = {_WAVE_THREE_MAIN, f"{_WAVE_THREE_MAIN}_prefix", *_WAVE_THREE_ATTRIBUTION}
+    for name in ARMS:
+        block = _block(name)
+        expected = "residual_block" if Path(name).stem in residual else "bare"
+        assert block.get("slot_read", "bare") == expected
+        parsed = MotifPromptConfig.from_mapping(block)
+        assert parsed.slot_read == expected
+        gain = 0.01 if Path(name).stem in _WAVE_THREE_ATTRIBUTION else 1e-3
+        assert parsed.head_output_init_std == gain
