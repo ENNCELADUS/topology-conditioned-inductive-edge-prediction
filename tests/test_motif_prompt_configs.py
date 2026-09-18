@@ -337,11 +337,12 @@ def test_the_three_seed_replicates_differ_only_in_seed_and_output_dir() -> None:
         assert other == stripped
 
 
-#: The wave-3 phase-B prefixes and the wave-2 prefix each one re-weights the
-#: graph-loss rows of; nothing else may differ (the imbalance is the question).
+#: The wave-3 phase-B prefixes and the prefix each one re-weights the graph-loss
+#: rows of; nothing else may differ (the imbalance is the question).
 _WAVE_THREE_BALANCED: dict[str, str] = {
     "motif_prompt_stage2_v3_balanced_initonly_prefix": "motif_prompt_stage2_v2_initonly_prefix",
     "motif_prompt_stage2_v3_balanced_full_prefix": "motif_prompt_stage2_v2_prefix",
+    "motif_prompt_stage2_v3_novln_balanced_prefix": "motif_prompt_stage2_v3_novln_prefix",
 }
 
 
@@ -425,6 +426,33 @@ def test_the_wave_three_prefix_is_a_true_two_epoch_prefix_of_the_arm() -> None:
     )
 
 
+#: The wave-3 phase-C prefix and what it changes against the main wave-3 prefix:
+#: the residual read's value path, which the fixed-set harness round 2 selected.
+_WAVE_THREE_VALUE_NORM: dict[str, dict[str, Any]] = {
+    "motif_prompt_stage2_v3_novln_prefix": {"slot_read_value_norm": False},
+}
+
+
+@pytest.mark.parametrize(("name", "overrides"), sorted(_WAVE_THREE_VALUE_NORM.items()))
+def test_each_value_norm_prefix_changes_only_the_residual_reads_value_path(
+    name: str, overrides: dict[str, Any]
+) -> None:
+    base, other = _raw(f"{_WAVE_THREE_MAIN}_prefix.yaml"), _raw(f"{name}.yaml")
+    assert other["output_dir"] == f"outputs/split_seed42/{name}"
+    assert other["model"]["config"]["motif_prompt"] == {
+        **base["model"]["config"]["motif_prompt"],
+        **overrides,
+    }
+    for section in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert other[section] == base[section]
+    parsed = MotifPromptConfig.from_mapping(_block(f"{name}.yaml"))
+    assert parsed.slot_read == "residual_block"
+    # The query scale keeps the residual block's own unit-scale rule.
+    assert parsed.slot_query_init_std is None
+    header = (CONFIG_DIR / f"{name}.yaml").read_text(encoding="utf-8")
+    assert f"hpc/run.sh train configs/split_seed42/{name}.yaml --skip-test" in header
+
+
 @pytest.mark.parametrize(("name", "overrides"), sorted(_WAVE_THREE_ATTRIBUTION.items()))
 def test_each_wave_three_attribution_prefix_adds_only_its_own_key(
     name: str, overrides: dict[str, Any]
@@ -443,13 +471,22 @@ def test_only_the_wave_three_arm_and_its_prefixes_use_the_residual_read() -> Non
     # F4 is opt-in: wave 1 and wave 2 keep the bare read so their published rows
     # stay reproducible, and the gate-head output scale keeps its wave-1 value
     # everywhere but the one attribution prefix.
-    residual = {_WAVE_THREE_MAIN, f"{_WAVE_THREE_MAIN}_prefix", *_WAVE_THREE_ATTRIBUTION}
+    residual = {
+        _WAVE_THREE_MAIN,
+        f"{_WAVE_THREE_MAIN}_prefix",
+        *_WAVE_THREE_ATTRIBUTION,
+        *_WAVE_THREE_VALUE_NORM,
+        "motif_prompt_stage2_v3_novln_balanced_prefix",
+    }
+    # The value path is normalised everywhere but the two phase-C prefixes.
+    plain_values = {*_WAVE_THREE_VALUE_NORM, "motif_prompt_stage2_v3_novln_balanced_prefix"}
     for name in ARMS:
         block = _block(name)
         expected = "residual_block" if Path(name).stem in residual else "bare"
         assert block.get("slot_read", "bare") == expected
         parsed = MotifPromptConfig.from_mapping(block)
         assert parsed.slot_read == expected
+        assert parsed.slot_read_value_norm == (Path(name).stem not in plain_values)
         gain = 0.01 if Path(name).stem in _WAVE_THREE_ATTRIBUTION else 1e-3
         assert parsed.head_output_init_std == gain
 
