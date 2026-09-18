@@ -237,9 +237,15 @@ def test_the_teachability_pilots_name_three_distinct_stage_one_candidates() -> N
 def test_only_the_pilots_and_the_wave_two_prefixes_stop_early(name: str) -> None:
     cfg = load_config(CONFIG_DIR / name)
     halted = name.startswith("motif_prompt_teach_") or (
-        name.startswith("motif_prompt_stage2_v2") and name.endswith("_prefix.yaml")
+        name.startswith("motif_prompt_stage2_v") and name.endswith("_prefix.yaml")
     )
-    assert cfg.optim.stop_after_epoch == (2 if halted else None)
+    # The wave-3 A1 prefix stretches the graph-only warm-up to eight epochs and
+    # halts there; every other prefix is a two-epoch warm-up.
+    expected = 8 if name == "motif_prompt_stage2_v3_initonly_warm8_prefix.yaml" else 2
+    assert cfg.optim.stop_after_epoch == (expected if halted else None)
+    if halted:
+        warmup = cfg.model.config["motif_prompt"]["interface_warmup_epochs"]
+        assert cfg.optim.stop_after_epoch <= warmup
 
 
 #: The wave-2 phase-1 arms and what each one may change against the shared prefix.
