@@ -175,6 +175,8 @@ class MotifPromptConfig:
     graph_row_positive_share: float = 0.5
     huber_delta: float = 1.0
     slot_read: str = "bare"
+    slot_read_value_norm: bool = True
+    slot_query_init_std: float | None = None
     head_output_init_std: float = 1e-3
 
     def __post_init__(self) -> None:
@@ -238,6 +240,8 @@ class MotifPromptConfig:
             raise ValueError("motif_prompt.huber_delta must be positive")
         if self.slot_read not in SLOT_READS:
             raise ValueError(f"motif_prompt.slot_read must be one of {list(SLOT_READS)}")
+        if self.slot_query_init_std is not None and float(self.slot_query_init_std) <= 0.0:
+            raise ValueError("motif_prompt.slot_query_init_std must be positive or null")
         if self.head_output_init_std <= 0.0:
             raise ValueError("motif_prompt.head_output_init_std must be positive")
 
@@ -612,15 +616,26 @@ class _ResidualReadBlock(nn.Module):
 
     One instance is shared by both endpoints of a read, which is what keeps the
     ``u<->v, L<->R`` equivariance of spec section 4 intact.
+
+    ``value_norm`` controls whether the value path is normalised too. With it on
+    -- the first form of this block -- ``LN_h`` rescales every residue state to
+    unit RMS before the values are formed, which discards exactly the per-residue
+    magnitude the bare read carried through as its pair signal, and the wave-3
+    prefix duly lost its pair dependence (transplant rise +71% -> +15%, ``V``
+    over projection variance 4.87 -> 0.54). With it off the keys are still
+    normalised, so the attention logits keep their scale, but the values are the
+    raw projected states ``S``.
     """
 
-    def __init__(self, dim: int) -> None:
+    def __init__(self, dim: int, *, value_norm: bool = True) -> None:
         """Build the three norms and the position-wise FFN.
 
         Args:
             dim: Slot-state width.
+            value_norm: Read ``LN_h(S)`` as the values; ``False`` reads ``S``.
         """
         super().__init__()
+        self.value_norm = value_norm
         self.norm_q = nn.LayerNorm(dim)
         self.norm_h = nn.LayerNorm(dim)
         self.norm_z = nn.LayerNorm(dim)
@@ -649,8 +664,9 @@ class _ResidualReadBlock(nn.Module):
             ``(B, K, dim)`` slot states.
         """
         normed = self.norm_h(states)
+        values = normed if self.value_norm else states
         read, _ = attention(
-            self.norm_q(queries), normed, normed, key_padding_mask=pad, need_weights=False
+            self.norm_q(queries), normed, values, key_padding_mask=pad, need_weights=False
         )
         mixed = queries + read
         out: torch.Tensor = mixed + self.ffn(self.norm_z(mixed))
@@ -682,7 +698,11 @@ class MotifGenerator(nn.Module):
     is then a term of the result rather than only a selector, initialises the
     slot queries at ``std = 1.0`` instead of ``0.02``: the residual has to be
     comparable in norm to the attention output it is added to, or the block
-    reduces to the bare read again.
+    reduces to the bare read again. At ``std = 1.0`` the residual (norm ~10)
+    instead dominates an attention output of order one, so the slot state is
+    mostly a learned constant; ``slot_query_init_std`` overrides the rule with an
+    explicit scale, and ``slot_read_value_norm`` decides whether the residual
+    block's values keep their per-residue magnitude.
 
     ``head_output_init_std`` scales the last linear of each gate head. At the
     wave-1 value of ``1e-3`` the head's bias -- whose gradient does not pass
@@ -706,11 +726,19 @@ class MotifGenerator(nn.Module):
         self.residue_proj = nn.Linear(d_model, _GATE_DIM)
         self.attention = nn.MultiheadAttention(_GATE_DIM, 4, batch_first=True)
         residual = cfg.slot_read == "residual_block"
-        query_std = 1.0 if residual else 0.02
+        default_std = 1.0 if residual else 0.02
+        query_std = (
+            default_std if cfg.slot_query_init_std is None else float(cfg.slot_query_init_std)
+        )
         self.bridge_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * query_std)
         self.witness_queries = nn.Parameter(torch.randn(8, _GATE_DIM) * query_std)
-        self.bridge_read = _ResidualReadBlock(_GATE_DIM) if residual else None
-        self.witness_read = _ResidualReadBlock(_GATE_DIM) if residual else None
+        value_norm = cfg.slot_read_value_norm
+        self.bridge_read = (
+            _ResidualReadBlock(_GATE_DIM, value_norm=value_norm) if residual else None
+        )
+        self.witness_read = (
+            _ResidualReadBlock(_GATE_DIM, value_norm=value_norm) if residual else None
+        )
         self.endpoint_proj = nn.Linear(_GATE_DIM, _GATE_DIM)
         self.witness_mix = nn.Sequential(
             nn.Linear(2 * _GATE_DIM, _GATE_DIM), nn.GELU(), nn.Linear(_GATE_DIM, _GATE_DIM)

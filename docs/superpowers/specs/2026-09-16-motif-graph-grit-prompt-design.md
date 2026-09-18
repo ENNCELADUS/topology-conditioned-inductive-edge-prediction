@@ -1,6 +1,6 @@
 # Motif graph prompts read by GRIT
 
-**Date:** 2026-09-16, amended 2026-09-18. **Version:** v13 (supersedes v12; change log in §11).
+**Date:** 2026-09-16, amended 2026-09-18. **Version:** v14 (supersedes v13; change log in §11).
 **Status:** implemented and run once (wave 1, `686627d`, 2026-09-17/18): Stage I and its two family
 ablations, Stage II and its bridge-only / closure-only controls. Stage I gains (+0.066 test AUPRC, +0.08 GS
 over the frozen trunk); every Stage II row finished at the trunk. The wave-1 verdict
@@ -384,6 +384,26 @@ this section**: the Stage II model is `motif_prompt_stage2_v3` (the wave-2 init-
 `motif_prompt_stage2_v3_headgain_prefix` carries the output-scale attribution on the full corpus. The keys
 stay optional with their wave-1 defaults, and `bare` is kept for one purpose only -- reproducing the
 published wave-1 and wave-2 rows -- so every pre-v13 config keeps it unchanged.
+
+v14, two further optional keys of the same block, defaults unchanged. The full-corpus wave-3 prefix
+showed the residual read trading one failure for another: the within-row slot collapse was gone
+(identical-closure-row fraction `0.61 -> 0.00`, witness-read spread `0.012 -> 0.94`) but the emitted
+graph became *less* pair-dependent than the bare read's (transplant rise `+71%/+25% -> +15%/+3%` on
+held-out/`val_cls`, attention entropy `0.998` of `log L` for both query families, `V` over projection
+variance `4.87 -> 0.54`, bridge-read cosine `0.77 -> 0.996`). Two candidate causes, both in the block
+as first written: the `LN_h` on the **value** path rescales every residue state to unit RMS and so
+discards the per-residue magnitude the bare read used as its pair signal; and the unit-scale query
+residual (norm ~10) dominates an attention output of order one, so the slot state is mostly a learned
+constant and `L_G` is satisfied by a constant slot pattern rather than by reading the residues.
+`motif_prompt.slot_read_value_norm: false` reads the raw projected states `S` as the values while the
+keys stay normalised (the attention logits are unchanged); `motif_prompt.slot_query_init_std` replaces
+the per-read init rule (`1.0` residual, `0.02` bare) with an explicit positive scale. Both default to
+the v12/v13 behaviour, so `slot_read: residual_block` as published stays reproducible. They are read on
+the same fixed-set fit by `--group {residual_novln,residual_q01,residual_q01_novln,residual_q03_novln}`
+against re-run `residual` and `baseline`, at `--steps 600 --eval-every 100` because the held-out optimum
+of the first runs sat near step 400 and the curve rose afterwards; that report now also carries the
+attention entropy and the `K/proj`, `V/proj` centred-variance ratios of
+`src.experiments.motif_generator_probe` and the held-out `L_G` at its best eval step.
 
 G is equivariant to `u<->v, L<->R`. Its private seeds can distinguish attachments while the reader stays
 order-invariant; this permits more than one activity value but does not guarantee the model uses it.
@@ -883,6 +903,7 @@ cannot instantiate this interface.
 
 | Version | Date | Changes |
 |---|---|---|
+| v14 | 2026-09-18 | Wave-3 phase C revision, two optional generator keys, no default change: **§4** `motif_prompt.slot_read_value_norm` (`true` default) drops the `LN_h` from the residual block's value path, and `motif_prompt.slot_query_init_std` (`null` default) overrides the per-read query init rule. Measured cause: on the full corpus the residual read removed the within-row slot collapse but halved the transplant rise and the `V/proj` variance ratio, i.e. it bought slot distinction with pair dependence. Read by `src.experiments.motif_generator_fit --group {residual_novln,residual_q01,residual_q01_novln,residual_q03_novln}` at 600 steps against re-run `residual` and `baseline`; that harness's report gains the probe's attention entropy and `K/proj`, `V/proj` ratios and the held-out `L_G` at its best eval step. |
 | v13 | 2026-09-18 | Wave-3 phase C read, and the adoption it licenses: on the fixed-set generator-only fit `slot_read: residual_block` dropped the identical-closure-row fraction from 0.6 to 0.0 and raised the witness-read spread from 0.004 to 0.98 at no cost in held-out `L_G`, while `head_output_init_std: 1e-2` alone changed nothing measurable. **§4** the residual read is now the design and `bare` is retained only to reproduce the wave-1/wave-2 rows; no default moves, so every pre-v13 config is unaffected. The main Stage II arm becomes `motif_prompt_stage2_v3` (wave-2 init-only setting + `slot_read: residual_block`, full 15-epoch schedule) continued from `motif_prompt_stage2_v3_prefix` under the guarded resume, with `motif_prompt_stage2_v3_headgain_prefix` attributing the read against the gate-head output scale on the full corpus; both prefixes are read by `src.experiments.motif_pilot_b` and `src.experiments.motif_generator_probe` against the wave-2 init-only rows. |
 | v12 | 2026-09-18 | Wave-3 phase C, two optional generator keys, no default change: **§4** `motif_prompt.slot_read` (`bare` / `residual_block`) puts the slot query back on the read's residual path and raises the query init to `std = 1.0` in that mode, `motif_prompt.head_output_init_std` scales the gate heads' output layer, and the head features promote to fp32 *before* the sum and the difference are formed (unconditional; bf16 rounding only). Measured cause: identical closure slots in 100% of wave-2 rows, uniform witness attention, untrained queries. Read by `src.experiments.motif_generator_fit`, a fixed-set generator-only fit over a witness-count-stratified row set with cached frozen-trunk inputs. |
 | v11 | 2026-09-18 | Wave-3 phase B, one optional key pair, no default change: **§7.5** `motif_prompt.graph_row_weighting` (`uniform` / `closure_balanced`) with `graph_row_positive_share` re-weights the rows of `L_G` alone, so the closure-non-empty rows carry a fixed share of the graph loss instead of the ~18% they hold in the task stream's 1:5 rows; the weights sum to the valid-row count and use the rank-reduced counts, leaving every other loss, the sampler and both streams untouched. Read as `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` against the wave-2 prefixes they copy; `graph_rows_closure_nonempty_frac` is logged per epoch whatever the setting. |

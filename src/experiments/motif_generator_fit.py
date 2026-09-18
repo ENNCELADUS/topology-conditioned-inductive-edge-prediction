@@ -12,14 +12,26 @@ nothing but a fresh generator on ``L_G`` over those cached inputs, in fp32, for 
 few hundred steps. Four groups share the same rows, the same seeds and the same
 schedule and differ only in the two wave-3 generator keys:
 
-===========  ========================  ==========================
-group        ``slot_read``             ``head_output_init_std``
-===========  ========================  ==========================
-baseline     ``bare``                  ``1e-3`` (wave-1/2 behaviour)
-residual     ``residual_block``        ``1e-3``
-head_gain    ``bare``                  ``1e-2``
-combined     ``residual_block``        ``1e-2``
-===========  ========================  ==========================
+====================  ==================  ========  =========  ========
+group                 ``slot_read``       head std  query std  value LN
+====================  ==================  ========  =========  ========
+baseline              ``bare``            ``1e-3``  rule       n/a
+residual              ``residual_block``  ``1e-3``  rule (1.0) on
+head_gain             ``bare``            ``1e-2``  rule       n/a
+combined              ``residual_block``  ``1e-2``  rule (1.0) on
+residual_novln        ``residual_block``  ``1e-3``  rule (1.0) off
+residual_q01          ``residual_block``  ``1e-3``  ``0.1``    on
+residual_q01_novln    ``residual_block``  ``1e-3``  ``0.1``    off
+residual_q03_novln    ``residual_block``  ``1e-3``  ``0.3``    off
+====================  ==================  ========  =========  ========
+
+The last four are the wave-3 revision groups. The residual block as first written
+normalises both the keys and the values, and starts the queries at unit scale; on
+the full corpus that read lost the pair dependence the bare read had (transplant
+rise +71% -> +15%, ``V`` over projection variance 4.87 -> 0.54) while fixing the
+within-row slot collapse. ``slot_read_value_norm=False`` restores the values'
+per-residue magnitude, and ``slot_query_init_std`` shrinks the residual so the
+attention output is not drowned by a learned constant.
 
 Rows are stratified by the true witness count, because the corpus is dominated
 by rows with no closure edge at all and an unstratified reading cannot tell a
@@ -66,6 +78,7 @@ from src.data.motif_template import (
 )
 from src.data.packed_features import PackedFeatureTable
 from src.data.pairs import BUCKET_BOUNDARIES
+from src.experiments.motif_generator_probe import attention_side, variance_ratios
 from src.experiments.motif_pilot_b import (
     GraphLossWeights,
     fit_constant_template,
@@ -92,13 +105,44 @@ logger = logging.getLogger("motif_generator_fit")
 
 Pair = tuple[str, str]
 
-#: ``(slot_read, head_output_init_std)`` per comparison group.
-GROUPS: dict[str, tuple[str, float]] = {
-    "baseline": ("bare", 1e-3),
-    "residual": ("residual_block", 1e-3),
-    "head_gain": ("bare", 1e-2),
-    "combined": ("residual_block", 1e-2),
+#: `MotifPromptConfig` overrides per comparison group.
+GROUPS: dict[str, dict[str, object]] = {
+    "baseline": {"slot_read": "bare", "head_output_init_std": 1e-3},
+    "residual": {"slot_read": "residual_block", "head_output_init_std": 1e-3},
+    "head_gain": {"slot_read": "bare", "head_output_init_std": 1e-2},
+    "combined": {"slot_read": "residual_block", "head_output_init_std": 1e-2},
+    "residual_novln": {
+        "slot_read": "residual_block",
+        "head_output_init_std": 1e-3,
+        "slot_read_value_norm": False,
+    },
+    "residual_q01": {
+        "slot_read": "residual_block",
+        "head_output_init_std": 1e-3,
+        "slot_query_init_std": 0.1,
+    },
+    "residual_q01_novln": {
+        "slot_read": "residual_block",
+        "head_output_init_std": 1e-3,
+        "slot_query_init_std": 0.1,
+        "slot_read_value_norm": False,
+    },
+    "residual_q03_novln": {
+        "slot_read": "residual_block",
+        "head_output_init_std": 1e-3,
+        "slot_query_init_std": 0.3,
+        "slot_read_value_norm": False,
+    },
 }
+#: The generator keys every group's header line reports.
+GROUP_KEYS: tuple[str, ...] = (
+    "slot_read",
+    "head_output_init_std",
+    "slot_read_value_norm",
+    "slot_query_init_std",
+)
+#: Query families the attention block is measured for.
+QUERY_FAMILIES: tuple[str, ...] = ("witness", "bridge")
 #: Witness-count strata, by the number of non-zero ``CLOSURE_U`` slots.
 STRATUM_NAMES: tuple[str, ...] = ("0", "1-2", "3-7", "8")
 #: Target share of each stratum: 40% empty, the rest spread over the three
@@ -663,6 +707,24 @@ def _pool_size(total: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def group_config(cfg: MotifPromptConfig, group: str) -> MotifPromptConfig:
+    """Return the checkpoint's motif-prompt block with one group's overrides on.
+
+    Args:
+        cfg: The checkpoint's own motif-prompt block.
+        group: A `GROUPS` key.
+
+    Returns:
+        The group's config.
+
+    Raises:
+        ValueError: On an unknown group.
+    """
+    if group not in GROUPS:
+        raise ValueError(f"group must be one of {sorted(GROUPS)}")
+    return replace(cfg, **GROUPS[group])  # type: ignore[arg-type]
+
+
 def build_generator(
     cfg: MotifPromptConfig, *, d_model: int, group: str, fit_target: torch.Tensor, seed: int
 ) -> MotifGenerator:
@@ -682,10 +744,7 @@ def build_generator(
     Raises:
         ValueError: On an unknown group.
     """
-    if group not in GROUPS:
-        raise ValueError(f"group must be one of {sorted(GROUPS)}")
-    slot_read, head_std = GROUPS[group]
-    group_cfg = replace(cfg, slot_read=slot_read, head_output_init_std=head_std)
+    group_cfg = group_config(cfg, group)
     torch.manual_seed(seed)
     generator = MotifGenerator(d_model, group_cfg)
     generator.init_biases(
@@ -758,6 +817,87 @@ def _dispersion_for(
         stages = replay(generator, encoded_u, encoded_v, lengths_u, lengths_v)
     generator.train(was_training)
     return dispersion_chain(stages)
+
+
+def _attention_for(
+    generator: MotifGenerator,
+    rows: RowSet,
+    cache: Mapping[str, NDArray[np.int16]],
+    *,
+    device: torch.device,
+    chunk: int,
+) -> dict[str, dict[str, float]]:
+    """Measure the read's attention on the universe's first `DISPERSION_ROWS` rows.
+
+    The per-row arrays are `src.experiments.motif_generator_probe`'s own -- the
+    attention entropy over ``log`` the valid length, the pre-softmax logit
+    spread, the off-diagonal read cosine and the centred variances of ``H``, its
+    projection and the attention's ``K`` and ``V`` -- averaged over both
+    endpoints and turned into the ``proj/H``, ``K/proj`` and ``V/proj`` ratios by
+    that module's `variance_ratios`.
+
+    Args:
+        generator: The generator to read.
+        rows: The universe.
+        cache: The per-node trunk states.
+        device: Compute device.
+        chunk: Rows per forward.
+
+    Returns:
+        ``family -> measurement -> value``.
+    """
+    families = {
+        "witness": generator.witness_queries,
+        "bridge": generator.bridge_queries,
+    }
+    collected: dict[str, dict[str, list[float]]] = {name: {} for name in families}
+    pairs = rows.pairs[:DISPERSION_ROWS]
+    was_training = generator.training
+    generator.eval()
+    with torch.no_grad():
+        for start in range(0, len(pairs), chunk):
+            batch = [row_inputs(pair, cache) for pair in pairs[start : start + chunk]]
+            encoded_u, encoded_v, lengths_u, lengths_v = collate(batch, device)
+            sides = (
+                (encoded_u, _build_padding_mask(lengths_u, encoded_u.size(1))),
+                (encoded_v, _build_padding_mask(lengths_v, encoded_v.size(1))),
+            )
+            for name, queries in families.items():
+                for raw, pad in sides:
+                    measured = attention_side(
+                        generator, raw, generator.residue_proj(raw), pad, queries
+                    )
+                    for key, series in measured.items():
+                        collected[name].setdefault(key, []).extend(series.tolist())
+    generator.train(was_training)
+    summary = {
+        name: {
+            key: float(np.mean(np.asarray(values, dtype=np.float64)))
+            for key, values in cell.items()
+        }
+        for name, cell in collected.items()
+    }
+    return variance_ratios(summary)
+
+
+def _best_eval(curve: Sequence[Mapping[str, object]], name: str) -> dict[str, float]:
+    """Return the best eval step of one universe and its ``L_G``.
+
+    The held-out optimum of the first six-hundred-step runs sat near step 400 and
+    the curve rose afterwards, so the final value alone understates every group.
+
+    Args:
+        curve: The learning curve entries.
+        name: A universe name.
+
+    Returns:
+        ``{"step": ..., "L_G": ...}``, empty when the curve is.
+    """
+    entries = [entry for entry in curve if name in entry]
+    if not entries:
+        return {}
+    best = min(entries, key=lambda entry: float(cast(float, entry[name])))
+    return {"step": float(cast(float, best["step"])), "L_G": float(cast(float, best[name]))}
 
 
 def _lr_lambda(step: int) -> float:
@@ -945,7 +1085,7 @@ def run_fit(
         seed=seed,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    group_cfg = replace(cfg, slot_read=GROUPS[group][0], head_output_init_std=GROUPS[group][1])
+    group_cfg = group_config(cfg, group)
     torch.save(
         {"group": group, "cfg": group_cfg.to_dict(), "state": generator.state_dict()},
         output_dir / "generator_state.pt",
@@ -954,8 +1094,9 @@ def run_fit(
         "harness": "motif_generator_fit",
         "written_at": datetime.now(UTC).isoformat(),
         "group": group,
-        "slot_read": GROUPS[group][0],
-        "head_output_init_std": GROUPS[group][1],
+        "group_config": {key: getattr(group_cfg, key) for key in GROUP_KEYS},
+        "slot_read": group_cfg.slot_read,
+        "head_output_init_std": group_cfg.head_output_init_std,
         "checkpoint": str(checkpoint),
         "checkpoint_id": checkpoint_id,
         "strategy": strategy,
@@ -983,6 +1124,7 @@ def run_fit(
         },
         "node_disjoint": {"fit_nodes": len(fit_nodes), "heldout_nodes": len(heldout_nodes)},
         "learning_curve": curve,
+        "best_eval": {rows.name: _best_eval(curve, rows.name) for rows in universes},
         "final": report,
     }
 
@@ -1052,6 +1194,9 @@ def _final_report(
             },
             "per_stratum_L_G": _per_stratum(predicted, rows, loss),
             "dispersion": _dispersion_for(generator, rows, cache, device=device),
+            "attention": _attention_for(
+                generator, rows, cache, device=device, chunk=min(eval_chunk, 64)
+            ),
             "identical_closure_row_fraction": identical_closure_fraction(predicted),
             "gate_logits": gate_logit_summary(predicted),
             "wedge_mass_auroc": wedge_mass_auroc(predicted, rows.target),
@@ -1092,12 +1237,12 @@ def markdown_summary(report: Mapping[str, object]) -> str:
         The markdown body.
     """
     final = cast(Mapping[str, Mapping[str, object]], report["final"])
+    keys = cast(Mapping[str, object], report.get("group_config", {}))
+    header = ", ".join(f"`{name}={keys[name]}`" for name in GROUP_KEYS if name in keys)
     lines = [
         f"# motif generator fit -- group `{report['group']}`",
         "",
-        f"`slot_read={report['slot_read']}`, "
-        f"`head_output_init_std={report['head_output_init_std']}`, "
-        f"checkpoint `{report['checkpoint_id']}`.",
+        f"{header}, checkpoint `{report['checkpoint_id']}`.",
         "",
         "## Learning curve (mean L_G)",
         "",
@@ -1115,15 +1260,19 @@ def markdown_summary(report: Mapping[str, object]) -> str:
         "",
         "## Final fit against the comparators",
         "",
-        "| universe | rows | generator | fitted constant | mean template | identical closure rows"
-        " | wedge-mass AUROC |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| universe | rows | generator | best (step) | fitted constant | mean template "
+        "| identical closure rows | wedge-mass AUROC |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
+    best_eval = cast(Mapping[str, Mapping[str, float]], report.get("best_eval", {}))
     for name, payload in final.items():
         losses = cast(Mapping[str, float], payload["L_G"])
         auroc = payload["wedge_mass_auroc"]
+        best = best_eval.get(name, {})
+        has_best = "L_G" in best and "step" in best
+        best_cell = f"{best['L_G']:.5f} ({int(best['step'])})" if has_best else "n/a"
         lines.append(
-            f"| {name} | {payload['rows']} | {losses['generator']:.5f} "
+            f"| {name} | {payload['rows']} | {losses['generator']:.5f} | {best_cell} "
             f"| {losses['fitted_constant_template']:.5f} | {losses['mean_template']:.5f} "
             f"| {float(cast(float, payload['identical_closure_row_fraction'])):.3f} "
             f"| {'n/a' if auroc is None else f'{float(cast(float, auroc)):.3f}'} |"
@@ -1153,6 +1302,23 @@ def markdown_summary(report: Mapping[str, object]) -> str:
         lines.append(
             f"| {stage} | {'n/a' if first is None else f'{first:.5f}'} "
             f"| {'n/a' if second is None else f'{second:.5f}'} |"
+        )
+    lines += [
+        "",
+        "## Attention of the slot read (held-out rows)",
+        "",
+        "| family | entropy / log L | logit std | read cosine | K/proj | V/proj | proj/H |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    attention = cast(Mapping[str, Mapping[str, float]], final["heldout"].get("attention", {}))
+    for family in QUERY_FAMILIES:
+        if family not in attention:
+            continue
+        values = attention[family]
+        lines.append(
+            f"| {family} | {values['entropy_ratio']:.4f} | {values['logit_std']:.4f} "
+            f"| {values['read_cosine']:.4f} | {values['K_over_proj']:.4f} "
+            f"| {values['V_over_proj']:.4f} | {values['proj_over_H']:.4f} |"
         )
     lines += [
         "",
@@ -1260,6 +1426,8 @@ __all__ = [
     "CANDIDATE_MULTIPLIER",
     "DISPERSION_ROWS",
     "GROUPS",
+    "GROUP_KEYS",
+    "QUERY_FAMILIES",
     "STRATUM_NAMES",
     "STRATUM_SHARES",
     "RowInputs",
@@ -1272,6 +1440,7 @@ __all__ = [
     "capture_node_states",
     "collate",
     "dispersion_chain",
+    "group_config",
     "identical_closure_fraction",
     "main",
     "markdown_summary",

@@ -54,6 +54,8 @@ def test_config_round_trip_and_defaults() -> None:
     assert (cfg.beta_p, cfg.beta_q, cfg.beta_a, cfg.beta_i) == (1.0, 1.0, 1.0, 1.0)
     assert cfg.huber_delta == 1.0
     assert cfg.slot_read == "bare"
+    assert cfg.slot_read_value_norm is True
+    assert cfg.slot_query_init_std is None
     assert cfg.head_output_init_std == 1e-3
     assert cfg.reader == ReaderConfig(layers=3, dim=96, heads=4, rrwp_k=4)
     assert MotifPromptConfig.from_mapping(cfg.to_dict()) == cfg
@@ -63,9 +65,12 @@ def test_config_round_trip_and_defaults() -> None:
             "base_checkpoint": "base.pt",
             "slot_read": "residual_block",
             "head_output_init_std": 1e-2,
+            "slot_read_value_norm": False,
+            "slot_query_init_std": 0.1,
         }
     )
     assert (tuned.slot_read, tuned.head_output_init_std) == ("residual_block", 1e-2)
+    assert (tuned.slot_read_value_norm, tuned.slot_query_init_std) == (False, 0.1)
     assert MotifPromptConfig.from_mapping(tuned.to_dict()) == tuned
 
 
@@ -96,6 +101,10 @@ def test_config_validation_rejects_illegal_blocks() -> None:
         MotifPromptConfig(stage="one", base_checkpoint="b.pt", slot_read="residual")
     with pytest.raises(ValueError, match="motif_prompt.head_output_init_std"):
         MotifPromptConfig(stage="one", base_checkpoint="b.pt", head_output_init_std=0.0)
+    with pytest.raises(ValueError, match="motif_prompt.slot_query_init_std"):
+        MotifPromptConfig(stage="one", base_checkpoint="b.pt", slot_query_init_std=0.0)
+    with pytest.raises(ValueError, match="motif_prompt.slot_query_init_std"):
+        MotifPromptConfig(stage="one", base_checkpoint="b.pt", slot_query_init_std=-1.0)
 
 
 def test_gate_modes_are_the_three_spec_controls() -> None:
@@ -328,6 +337,44 @@ def test_the_residual_block_queries_start_at_unit_scale() -> None:
     assert 0.5 < float(residual.witness_queries.detach().std()) < 2.0
     assert bare.bridge_read is None and bare.witness_read is None
     assert residual.bridge_read is not None and residual.witness_read is not None
+
+
+def test_the_value_norm_switch_changes_what_the_residual_block_reads() -> None:
+    # LN_h on the value path rescales every residue state to unit RMS, throwing
+    # away the per-residue magnitude the read otherwise carries. With it off the
+    # keys stay normalised -- the attention logits are unchanged -- but the
+    # values are the raw projected states, so the read differs.
+    h_u, len_u = _states(seed=1)
+    h_v, len_v = _states(seed=2)
+    normed = _generator(seed=3, slot_read="residual_block")
+    raw = _generator(seed=3, slot_read="residual_block", slot_read_value_norm=False)
+    assert normed.witness_read is not None and raw.witness_read is not None
+    assert normed.witness_read.value_norm and not raw.witness_read.value_norm
+    assert raw.bridge_read is not None and not raw.bridge_read.value_norm
+    torch.testing.assert_close(normed.witness_queries, raw.witness_queries)
+    with torch.no_grad():
+        states = normed.residue_proj(h_u)
+        read_normed = normed._read(normed.witness_queries, states, None, normed.witness_read)
+        read_raw = raw._read(raw.witness_queries, raw.residue_proj(h_u), None, raw.witness_read)
+        weights_normed = normed(h_u, h_v, len_u, len_v)
+        weights_raw = raw(h_u, h_v, len_u, len_v)
+    assert float((read_normed - read_raw).abs().max()) > 1e-4
+    assert float((weights_normed - weights_raw).abs().max()) > 1e-6
+    # The bare read has no block, so the switch cannot reach it.
+    assert _generator(slot_read="bare", slot_read_value_norm=False).witness_read is None
+
+
+def test_the_slot_query_init_std_overrides_the_per_read_rule() -> None:
+    for slot_read in ("bare", "residual_block"):
+        tuned = _generator(seed=4, slot_read=slot_read, slot_query_init_std=0.1)
+        for queries in (tuned.witness_queries, tuned.bridge_queries):
+            assert 0.05 < float(queries.detach().std()) < 0.2
+    coarse = _generator(seed=4, slot_read="residual_block", slot_query_init_std=0.3)
+    assert 0.2 < float(coarse.witness_queries.detach().std()) < 0.45
+    # None keeps the rule: 1.0 for the residual block, 0.02 for the bare read.
+    unit = _generator(seed=4, slot_read="residual_block").witness_queries.detach()
+    assert float(unit.std()) > 0.5
+    assert float(_generator(seed=4, slot_read="bare").witness_queries.detach().std()) < 0.05
 
 
 def test_the_head_output_init_std_scales_the_last_gate_layer() -> None:

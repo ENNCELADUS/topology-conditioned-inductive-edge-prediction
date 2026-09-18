@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pytest
 import torch
@@ -9,12 +11,14 @@ from src.experiments.motif_generator_fit import (
     GROUPS,
     STRATUM_NAMES,
     RowInputs,
+    _best_eval,
     allocate_strata,
     assert_replay_matches,
     build_generator,
     build_parser,
     collate,
     dispersion_chain,
+    group_config,
     identical_closure_fraction,
     replay,
     row_inputs,
@@ -227,14 +231,45 @@ def test_the_dispersion_chain_covers_every_stage_and_role() -> None:
 
 def test_build_generator_applies_the_group_keys_and_the_bias_initialisation() -> None:
     target = _corpus([0, 0, 4, 8])
-    for group, (slot_read, head_std) in GROUPS.items():
+    for group, overrides in GROUPS.items():
         generator = build_generator(_cfg(), d_model=32, group=group, fit_target=target, seed=0)
-        assert generator.cfg.slot_read == slot_read
-        assert generator.cfg.head_output_init_std == head_std
-        assert (generator.bridge_read is not None) is (slot_read == "residual_block")
+        for key, value in overrides.items():
+            assert getattr(generator.cfg, key) == value
+        residual = overrides["slot_read"] == "residual_block"
+        assert (generator.bridge_read is not None) is residual
+        if residual:
+            assert generator.bridge_read is not None
+            assert generator.bridge_read.value_norm is overrides.get("slot_read_value_norm", True)
+        expected = overrides.get("slot_query_init_std", 1.0 if residual else 0.02)
+        assert float(generator.witness_queries.detach().std()) == pytest.approx(
+            float(cast(float, expected)), rel=0.6
+        )
         assert set(generator.bias_init_record) == {"closure", "attach", "interior"}
     with pytest.raises(ValueError, match="group must be one of"):
         build_generator(_cfg(), d_model=32, group="nope", fit_target=target, seed=0)
+
+
+def test_group_config_overrides_only_the_group_keys() -> None:
+    cfg = _cfg(w_topo=0.25)
+    assert group_config(cfg, "baseline").slot_read == "bare"
+    tuned = group_config(cfg, "residual_q03_novln")
+    assert tuned.slot_read == "residual_block"
+    assert tuned.slot_query_init_std == 0.3
+    assert tuned.slot_read_value_norm is False
+    assert tuned.w_topo == 0.25
+    with pytest.raises(ValueError, match="group must be one of"):
+        group_config(cfg, "nope")
+
+
+def test_the_best_eval_picks_the_lowest_step_not_the_last() -> None:
+    curve = [
+        {"step": 100, "heldout": 0.11, "val_cls": 0.13},
+        {"step": 400, "heldout": 0.08, "val_cls": 0.12},
+        {"step": 600, "heldout": 0.09, "val_cls": 0.11},
+    ]
+    assert _best_eval(curve, "heldout") == {"step": 400.0, "L_G": 0.08}
+    assert _best_eval(curve, "val_cls") == {"step": 600.0, "L_G": 0.11}
+    assert _best_eval([], "heldout") == {}
 
 
 def test_the_parser_defaults_match_the_pre_registered_protocol() -> None:
@@ -246,5 +281,14 @@ def test_the_parser_defaults_match_the_pre_registered_protocol() -> None:
     assert (args.steps, args.batch_rows, args.lr) == (1500, 256, 1e-4)
     assert (args.weight_decay, args.grad_clip, args.eval_every) == (1e-2, 1.0, 100)
     assert args.seed == 0
-    assert sorted(GROUPS) == ["baseline", "combined", "head_gain", "residual"]
+    assert sorted(GROUPS) == [
+        "baseline",
+        "combined",
+        "head_gain",
+        "residual",
+        "residual_novln",
+        "residual_q01",
+        "residual_q01_novln",
+        "residual_q03_novln",
+    ]
     assert STRATUM_NAMES == ("0", "1-2", "3-7", "8")

@@ -510,6 +510,32 @@ def _attention_side(
     }
 
 
+def attention_side(
+    generator: MotifGenerator,
+    raw: torch.Tensor,
+    state: torch.Tensor,
+    pad: torch.Tensor | None,
+    queries: torch.Tensor,
+) -> dict[str, NDArray[np.float64]]:
+    """Measure one query family reading one endpoint (public wrapper).
+
+    `src.experiments.motif_generator_fit` reports the same attention entropy and
+    K/V variance ratios as this probe, and must measure them with this module's
+    code rather than a second copy of it.
+
+    Args:
+        generator: The Stage II generator.
+        raw: ``(B, L, d_model)`` trunk residue states.
+        state: ``(B, L, 96)`` their projection, the attention's own input.
+        pad: ``(B, L)`` padding mask, or ``None``.
+        queries: ``(8, 96)`` the query family.
+
+    Returns:
+        The per-row arrays of `_attention_side`.
+    """
+    return _attention_side(generator, raw, state, pad, queries)
+
+
 def _read_cosine(reads: torch.Tensor) -> torch.Tensor:
     """Mean cosine between two different slots' reads, per row.
 
@@ -1868,6 +1894,7 @@ __all__ = [
     "CachedInputs",
     "GeneratorStages",
     "Universe",
+    "attention_side",
     "build_parser",
     "cache_inputs",
     "capture_generator_inputs",
@@ -1891,4 +1918,5 @@ __all__ = [
     "stratum_fit",
     "stratum_of",
     "summarise_replay",
+    "variance_ratios",
 ]
