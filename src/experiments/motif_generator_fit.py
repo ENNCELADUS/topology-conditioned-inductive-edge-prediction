@@ -33,6 +33,13 @@ within-row slot collapse. ``slot_read_value_norm=False`` restores the values'
 per-residue magnitude, and ``slot_query_init_std`` shrinks the residual so the
 attention output is not drowned by a learned constant.
 
+``--generator-input raw`` replaces the trunk states with the pack's own raw
+per-residue features, leaving everything else identical. The generator reads its
+input through a single ``nn.Linear`` (`residue_proj`), so the swap is exactly a
+change of the width that linear is built at, and the comparison isolates one
+question: does the frozen trunk's 512-d residue state carry less of the
+neighbourhood signal than the features it was itself built from?
+
 Rows are stratified by the true witness count, because the corpus is dominated
 by rows with no closure edge at all and an unstratified reading cannot tell a
 generator that fits the closure family from one that has learnt to emit zero.
@@ -76,7 +83,7 @@ from src.data.motif_template import (
     count_statistics,
     template_statistics,
 )
-from src.data.packed_features import PackedFeatureTable
+from src.data.packed_features import PackedFeatureTable, load_packed_manifest
 from src.data.pairs import BUCKET_BOUNDARIES
 from src.experiments.motif_generator_probe import attention_side, variance_ratios
 from src.experiments.motif_pilot_b import (
@@ -134,6 +141,8 @@ GROUPS: dict[str, dict[str, object]] = {
         "slot_read_value_norm": False,
     },
 }
+#: Sources the generator's per-residue input may be captured from.
+GENERATOR_INPUTS: tuple[str, ...] = ("trunk", "raw")
 #: The generator keys every group's header line reports.
 GROUP_KEYS: tuple[str, ...] = (
     "slot_read",
@@ -324,33 +333,46 @@ def capture_node_states(
     device: torch.device,
     amp: str,
     token_budget: int,
+    generator_input: str = "trunk",
 ) -> dict[str, NDArray[np.int16]]:
-    """Encode every node once with the frozen trunk and keep the states on the host.
+    """Capture every node's generator input once and keep it on the host.
 
-    This is exactly the per-node encoding cache `src.score_universe` builds and
-    then slices per pair: the encoder sees one node at a time, padded to its own
-    length bucket, so a node's states are a function of the node alone and the
-    row a batch happens to put it in is irrelevant. It is not run through
-    `su._score_v3_1_packed` because that function allocates its cache for
-    *every* node of the pack in fp32 -- 19.9 GiB on top of the 12.7 GiB packed
-    token table -- which does not fit beside a training job on the same GPU. The
-    same buckets, the same batching rule and the same autocast context are used
-    here, and the states land on the host as bf16 bits.
+    Under ``generator_input="trunk"`` this is exactly the per-node encoding cache
+    `src.score_universe` builds and then slices per pair: the encoder sees one
+    node at a time, padded to its own length bucket, so a node's states are a
+    function of the node alone and the row a batch happens to put it in is
+    irrelevant. It is not run through `su._score_v3_1_packed` because that
+    function allocates its cache for *every* node of the pack in fp32 -- 19.9 GiB
+    on top of the 12.7 GiB packed token table -- which does not fit beside a
+    training job on the same GPU. The same buckets, the same batching rule and
+    the same autocast context are used here, and the states land on the host as
+    bf16 bits.
+
+    Under ``generator_input="raw"`` the encoder is not run at all and the pack's
+    own bf16 per-residue features are kept instead, trimmed to the same true
+    lengths. They are already bf16, so the same bit round trip is lossless.
 
     Args:
-        model: The Stage II checkpoint carrying the frozen trunk.
+        model: The Stage II checkpoint carrying the frozen trunk; unused when
+            ``generator_input`` is ``"raw"``.
         nodes: The node ids to encode.
         pack_dir: The packed feature directory.
         device: Compute device.
         amp: Encoder autocast mode.
         token_budget: Tokens per encode batch.
+        generator_input: ``"trunk"`` for the frozen trunk's residue states,
+            ``"raw"`` for the pack's raw per-residue features.
 
     Returns:
-        One ``(length, d_model)`` bf16-bit array per node id.
+        One ``(length, width)`` bf16-bit array per node id, where ``width`` is
+        the trunk's ``d_model`` or the pack's ``input_dim``.
 
     Raises:
-        ValueError: If a node is missing from the pack.
+        ValueError: If a node is missing from the pack, or on an unknown
+            ``generator_input``.
     """
+    if generator_input not in GENERATOR_INPUTS:
+        raise ValueError(f"generator_input must be one of {sorted(GENERATOR_INPUTS)}")
     table = PackedFeatureTable.from_pack(pack_dir, device)
     node_index = table.manifest.node_index()
     missing = sorted({node for node in nodes if node not in node_index})
@@ -368,15 +390,18 @@ def capture_node_states(
         for start in range(0, len(bucket), per_batch):
             indices = torch.tensor(bucket[start : start + per_batch], dtype=torch.int64)
             raw_tokens, node_lengths = table.gather_nodes(indices, boundary)
-            with torch.inference_mode(), su._autocast_context(device, amp):
-                encoded = model.encoder(raw_tokens, node_lengths)
+            if generator_input == "raw":
+                captured = raw_tokens
+            else:
+                with torch.inference_mode(), su._autocast_context(device, amp):
+                    captured = model.encoder(raw_tokens, node_lengths)
             for position, index in enumerate(indices.tolist()):
                 record = table.manifest.nodes[int(index)]
-                states[record.node_id] = _to_bits(encoded[position, : record.length])
+                states[record.node_id] = _to_bits(captured[position, : record.length])
     del table
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    logger.info("encoded %d nodes with the frozen trunk", len(states))
+    logger.info("captured %d nodes (%s input)", len(states), generator_input)
     return states
 
 
@@ -918,6 +943,7 @@ def run_fit(
     strategy: str,
     output_dir: Path,
     group: str,
+    generator_input: str,
     fit_rows: int,
     heldout_rows: int,
     val_rows: int,
@@ -945,6 +971,8 @@ def run_fit(
         strategy: Split strategy.
         output_dir: Destination for ``fit.json``, ``fit.md`` and the state dict.
         group: A `GROUPS` key.
+        generator_input: ``"trunk"`` for the frozen trunk's residue states,
+            ``"raw"`` for the pack's raw per-residue features.
         fit_rows: Training rows.
         heldout_rows: Node-disjoint held-out training rows.
         val_rows: ``val_cls`` rows.
@@ -966,9 +994,11 @@ def run_fit(
         The full ``fit.json`` payload.
 
     Raises:
-        ValueError: If the checkpoint is not a full-family, learned-gate Stage II
-            motif-prompt checkpoint.
+        ValueError: If ``generator_input`` is unknown, or if the checkpoint is not
+            a full-family, learned-gate Stage II motif-prompt checkpoint.
     """
+    if generator_input not in GENERATOR_INPUTS:
+        raise ValueError(f"generator_input must be one of {sorted(GENERATOR_INPUTS)}")
     torch.manual_seed(seed)
     loaded, family, checkpoint_id = su._load_checkpoint(checkpoint)
     if family != su.MOTIF_PROMPT_FAMILY:
@@ -1023,9 +1053,19 @@ def run_fit(
         sum(len(rows.pairs) for rows in universes),
     )
     cache = capture_node_states(
-        model, endpoints, pack_dir, device=device, amp=amp, token_budget=token_budget
+        model,
+        endpoints,
+        pack_dir,
+        device=device,
+        amp=amp,
+        token_budget=token_budget,
+        generator_input=generator_input,
     )
-    d_model = int(model.d_model)
+    d_model = (
+        int(load_packed_manifest(pack_dir).input_dim)
+        if generator_input == "raw"
+        else int(model.d_model)
+    )
     closure_bias_init = model.cfg.closure_bias_init
     cfg = model.cfg
     del model, loaded
@@ -1094,6 +1134,8 @@ def run_fit(
         "harness": "motif_generator_fit",
         "written_at": datetime.now(UTC).isoformat(),
         "group": group,
+        "generator_input": generator_input,
+        "generator_input_width": d_model,
         "group_config": {key: getattr(group_cfg, key) for key in GROUP_KEYS},
         "slot_read": group_cfg.slot_read,
         "head_output_init_std": group_cfg.head_output_init_std,
@@ -1244,6 +1286,9 @@ def markdown_summary(report: Mapping[str, object]) -> str:
         "",
         f"{header}, checkpoint `{report['checkpoint_id']}`.",
         "",
+        f"Generator input: `{report.get('generator_input', 'trunk')}`, "
+        f"width {report.get('generator_input_width', 'n/a')}.",
+        "",
         "## Learning curve (mean L_G)",
         "",
         "| step | train batch | fit | heldout | val_cls |",
@@ -1359,6 +1404,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", default="breadth_first")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--group", default="baseline", choices=sorted(GROUPS))
+    parser.add_argument("--generator-input", default="trunk", choices=sorted(GENERATOR_INPUTS))
     parser.add_argument("--fit-rows", type=int, default=4000)
     parser.add_argument("--heldout-rows", type=int, default=1500)
     parser.add_argument("--val-rows", type=int, default=1500)
@@ -1393,6 +1439,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         strategy=args.strategy,
         output_dir=args.output_dir,
         group=args.group,
+        generator_input=args.generator_input,
         fit_rows=args.fit_rows,
         heldout_rows=args.heldout_rows,
         val_rows=args.val_rows,
@@ -1425,6 +1472,7 @@ if __name__ == "__main__":
 __all__ = [
     "CANDIDATE_MULTIPLIER",
     "DISPERSION_ROWS",
+    "GENERATOR_INPUTS",
     "GROUPS",
     "GROUP_KEYS",
     "QUERY_FAMILIES",

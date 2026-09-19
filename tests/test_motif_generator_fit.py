@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import cast
 
 import numpy as np
 import pytest
 import torch
+from src.data.packed_features import (
+    PACK_FORMAT,
+    PackedFeatureManifest,
+    PackedNodeRecord,
+    PackedShardRecord,
+    sha256_file,
+    write_packed_manifest,
+)
 from src.experiments.motif_generator_fit import (
+    GENERATOR_INPUTS,
     GROUPS,
     STRATUM_NAMES,
     RowInputs,
@@ -16,6 +26,7 @@ from src.experiments.motif_generator_fit import (
     assert_replay_matches,
     build_generator,
     build_parser,
+    capture_node_states,
     collate,
     dispersion_chain,
     group_config,
@@ -28,7 +39,7 @@ from src.experiments.motif_generator_fit import (
     wedge_mass_auroc,
     witness_counts,
 )
-from src.model.egostitch.classifier.motif_prompt import MotifPromptConfig
+from src.model.egostitch.classifier.motif_prompt import MotifPromptConfig, V3_1MotifPrompt
 
 
 def _cfg(**extra: object) -> MotifPromptConfig:
@@ -292,3 +303,115 @@ def test_the_parser_defaults_match_the_pre_registered_protocol() -> None:
         "residual_q03_novln",
     ]
     assert STRATUM_NAMES == ("0", "1-2", "3-7", "8")
+
+
+# ---------------------------------------------------------------------------
+# Raw packed features as the generator's input
+# ---------------------------------------------------------------------------
+
+_RAW_WIDTH = 6
+
+
+class _NoEncoder:
+    """Stand-in trunk whose encoder must never be touched on the raw path."""
+
+    @property
+    def encoder(self) -> object:
+        raise AssertionError("the raw capture path must not run the frozen encoder")
+
+
+def _write_fake_pack(pack_dir: Path, lengths: dict[str, int]) -> dict[str, torch.Tensor]:
+    """Write a minimal bf16 pack and return the exact per-node feature blocks."""
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(7)
+    shard = pack_dir / "shard-000.bin"
+    records: list[PackedNodeRecord] = []
+    written: dict[str, torch.Tensor] = {}
+    offset = 0
+    with shard.open("wb") as handle:
+        for node, length in lengths.items():
+            block = torch.from_numpy(rng.normal(size=(length, _RAW_WIDTH)).astype(np.float32)).to(
+                torch.bfloat16
+            )
+            handle.write(block.contiguous().view(torch.uint16).numpy().tobytes())
+            written[node] = block
+            records.append(PackedNodeRecord(node, 0, offset, offset, length))
+            offset += length
+    write_packed_manifest(
+        pack_dir,
+        PackedFeatureManifest(
+            format=PACK_FORMAT,
+            input_dim=_RAW_WIDTH,
+            dtype="bfloat16",
+            source_metadata_sha256="0" * 64,
+            source_index_sha256="0" * 64,
+            nodes=tuple(records),
+            shards=(
+                PackedShardRecord(
+                    filename=shard.name,
+                    num_tokens=offset,
+                    byte_size=shard.stat().st_size,
+                    sha256=sha256_file(shard),
+                ),
+            ),
+            pack_workers=1,
+            build_seconds=0.0,
+        ),
+    )
+    return written
+
+
+def test_the_raw_capture_round_trips_the_packed_features_at_the_pack_width(
+    tmp_path: Path,
+) -> None:
+    lengths = {"n0": 5, "n1": 3, "n2": 130}
+    written = _write_fake_pack(tmp_path / "pack", lengths)
+    cache = capture_node_states(
+        cast(V3_1MotifPrompt, _NoEncoder()),
+        sorted(lengths),
+        tmp_path / "pack",
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=256,
+        generator_input="raw",
+    )
+    assert sorted(cache) == sorted(lengths)
+    for node, length in lengths.items():
+        states = torch.from_numpy(cache[node]).view(torch.bfloat16)
+        assert states.shape == (length, _RAW_WIDTH)
+        assert torch.equal(states, written[node])
+
+
+def test_the_raw_capture_refuses_an_unknown_input_source(tmp_path: Path) -> None:
+    _write_fake_pack(tmp_path / "pack", {"n0": 4})
+    with pytest.raises(ValueError, match="generator_input"):
+        capture_node_states(
+            cast(V3_1MotifPrompt, _NoEncoder()),
+            ["n0"],
+            tmp_path / "pack",
+            device=torch.device("cpu"),
+            amp="off",
+            token_budget=256,
+            generator_input="encoder",
+        )
+
+
+def test_the_generator_builds_at_the_raw_pack_width(tmp_path: Path) -> None:
+    _write_fake_pack(tmp_path / "pack", {"n0": 4})
+    target = _corpus([0, 3])
+    generator = build_generator(
+        _cfg(), d_model=_RAW_WIDTH, group="residual_novln", fit_target=target, seed=0
+    )
+    assert generator.residue_proj.in_features == _RAW_WIDTH
+    states_u = torch.randn(2, 5, _RAW_WIDTH)
+    states_v = torch.randn(2, 4, _RAW_WIDTH)
+    predicted = generator(states_u, states_v, torch.tensor([5, 4]), torch.tensor([4, 3]))
+    assert predicted.shape == (2, 96)
+
+
+def test_the_parser_carries_the_generator_input_choice() -> None:
+    base = ["--checkpoint", "c.pt", "--pack-dir", "p", "--output-dir", "o"]
+    assert build_parser().parse_args(base).generator_input == "trunk"
+    raw = build_parser().parse_args([*base, "--generator-input", "raw"])
+    assert raw.generator_input == "raw"
+    assert sorted(GENERATOR_INPUTS) == ["raw", "trunk"]
