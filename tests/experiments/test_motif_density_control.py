@@ -115,10 +115,60 @@ def _write_run(
         },
     )
     if threshold is not None:
-        report = {
-            "graph": {"fixed_threshold": {"validation_selection": {"logit_threshold": threshold}}}
+        (run_dir / "test_report.json").write_text(
+            json.dumps(_v8_report(threshold)), encoding="utf-8"
+        )
+
+
+def _v8_report(threshold: float) -> dict[str, object]:
+    """A minimal ``test_report.json`` in the `test_protocol_v8` graph shape.
+
+    ``validation_selection`` is `select_fixed_threshold`'s report, which carries
+    the chosen threshold inside ``selected``; the flat ``logit_threshold`` key
+    exists only on the sibling ``test`` replay block, at a deliberately
+    different value here so a reader of the wrong path cannot pass.
+    """
+    return {
+        "graph": {
+            "fixed_threshold": {
+                "validation_selection": {
+                    "rule": "geometric_rd_five_rank_v1",
+                    "selected": {
+                        "logit_threshold": threshold,
+                        "probability_threshold": 0.5,
+                    },
+                },
+                "test": {
+                    "matching": "fixed_threshold_selected_on_validation",
+                    "logit_threshold": threshold + 100.0,
+                },
+            }
         }
-        (run_dir / "test_report.json").write_text(json.dumps(report), encoding="utf-8")
+    }
+
+
+def test_the_frozen_threshold_is_read_from_the_v8_validation_selection_block(
+    tmp_path: Path,
+) -> None:
+    from src.experiments.motif_density_control import selected_logit_threshold
+
+    report_path = tmp_path / "test_report.json"
+    report_path.write_text(json.dumps(_v8_report(1.5)), encoding="utf-8")
+    assert selected_logit_threshold(report_path) == 1.5
+
+
+def test_a_report_without_the_selected_block_is_refused(tmp_path: Path) -> None:
+    from src.experiments.motif_density_control import selected_logit_threshold
+
+    report_path = tmp_path / "test_report.json"
+    report_path.write_text(
+        json.dumps(
+            {"graph": {"fixed_threshold": {"validation_selection": {"logit_threshold": 1.5}}}}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="predates test_protocol_v8"):
+        selected_logit_threshold(report_path)
 
 
 def test_the_cli_reads_the_arms_own_threshold_and_matches_every_reference_to_it(

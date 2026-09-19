@@ -164,11 +164,19 @@ def _load_topology_artifact(run_dir: Path) -> ScoresArtifact:
 def selected_logit_threshold(report_path: Path) -> float:
     """Read the arm's ONE V_val-selected topology threshold from its test report.
 
+    ``test_protocol_v8`` writes `select_fixed_threshold`'s report under
+    ``graph.fixed_threshold.validation_selection``, where the chosen threshold
+    lives in the nested ``selected`` block beside its selection audit -- the
+    flat sibling key belongs to the ``test`` replay block, not to the selection.
+
     Args:
         report_path: The run's ``test_report.json`` written by `test_protocol`.
 
     Returns:
         The frozen logit threshold the protocol replayed on every test subgraph.
+
+    Raises:
+        ValueError: If the report has no selected validation threshold.
     """
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     selection = cast(
@@ -177,7 +185,13 @@ def selected_logit_threshold(report_path: Path) -> float:
             "validation_selection"
         ],
     )
-    return float(cast(float, selection["logit_threshold"]))
+    selected = selection.get("selected")
+    if not isinstance(selected, Mapping) or "logit_threshold" not in selected:
+        raise ValueError(
+            f"{report_path}: graph.fixed_threshold.validation_selection.selected."
+            "logit_threshold is missing; the report predates test_protocol_v8"
+        )
+    return float(cast(float, selected["logit_threshold"]))
 
 
 def density_control_from_runs(
