@@ -54,7 +54,7 @@ graph similarity — while *losing* edge AUROC (0.701 → 0.677). Source of trut
 
 ## *Latest News* 🔥
 
-- **[2026/09]** **Motif-graph GRIT prompt** selected as the intended deployable topology arm — a fixed 26-slot, 96-edge motif template read by a small GRIT reader and a closed-form count head into gated KV prefixes ([spec](docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md), [plan](docs/superpowers/plans/2026-09-16-motif-graph-grit-prompt.md)). Stage I lanes are in flight on H20; no bundle published yet.
+- **[2026/09]** **Motif prompt architecture experiments:** three repair waves produced a pair-dependent generator, but no held-out edge or matched-density shape gain ([wave-3 evidence](docs/results/motif_prompt_wave3/README.md)). The next comparison separates a shared motif dictionary oracle, endpoint-only routing, and head-only adaptation ([design](docs/superpowers/specs/2026-09-19-motif-dictionary-routing-design.md), [implementation plan](docs/superpowers/plans/2026-09-19-motif-dictionary-routing.md)).
 - **[2026/09]** **Topology prompt Stage II (`coord_gen_full`)** becomes the best deployable topology row, and an independent audit decomposes the gain: it is carried by the *predicted* coordinates — mostly the relation field — not by the retrained trunk ([verdict](docs/results/topo_prompt_stage2_verdict/), [notes](docs/results/topo_prompt_stage2.md)).
 - **[2026/09]** **Geometric-RD reselection** — every arm re-selected under `geometric_rd_five_rank_v1` and re-scored under `test_protocol_v8` ([reports](docs/results/split_seed42_geometric_20260910/)).
 - **[2026/09]** **Headline split fixed to seed 42** (random BFS root, no test information). The earlier test-informed density-matched split is retired to a labeled secondary upper bound ([selection record](docs/results/validation_density_selection/README.md)).
@@ -178,14 +178,15 @@ tokens of dimension 1,536), a pair module, and a pair-context-gated readout with
 symmetric `abba_max` order aggregation. Training is AdamW (1e-4, wd 0.05,
 one-cycle, 25 epochs, BF16 DDP) on a dynamic 1:5 positive/negative stream.
 
-Four families sit on top of it:
+The following families sit on top of it:
 
 | Family | Idea | Configs |
 |---|---|---|
 | **Topology prompt** (headline) | Stage I teaches a reader on 34 fixed-semantics structural coordinates through a zero-init gated KV prefix; Stage II trains a generator to *predict* those coordinates from the endpoints, and the frozen reader scores the prediction. Deployable: `(x_u,x_v)` only. | `configs/split_seed42/{topo_prompt_*,coord_gen_*}.yaml` |
 | **Knowledge distillation** | A Full-Ego oracle teacher reads the true training ego graph through GRIT + PMA; four losses transfer it into the endpoint-only student — soft logits (GLNN), strict-LLP rank, cosine-Gram (SPKD), per-row representation. | `configs/split_seed42/kd_*.yaml` |
 | **Structural objectives** | A second stream scores every legal pair of one sampled 40-node training subgraph per optimizer step, so a loss can see the *output adjacency*: BCE, ported soft-GS + RD, or neighbour rank + degree + motif. | `configs/split_seed42/struct_*.yaml` |
-| **Motif-graph GRIT prompt** (in flight) | A fixed 26-slot, 96-edge motif template (shared-neighbour wedges + degree-normalised bridges) read by a small GRIT reader and a closed-form count head into four gated prefix fields on the frozen trunk. Intended deployable topology arm. | `configs/split_seed42/motif_prompt_*.yaml` |
+| **Motif-graph GRIT prompt** (three-wave baseline) | A fixed 26-slot, 96-edge motif template read by GRIT and a count head into four gated prefix fields. True-template Stage I is a ceiling; repaired endpoint-only Stage II has not demonstrated held-out improvement. | `configs/split_seed42/motif_prompt_*.yaml` |
+| **Motif dictionary / head adaptation** (experimental) | A fixed training-only bank supplies four-field prompts through true-template oracle weights or an endpoint-only router. A separate control adapts only the final wave3 PPI head, paired with content-only head training. | `configs/split_seed42/motif_dict_*.yaml`, `motif_wave3_head*.yaml` |
 
 **Guardrail that must not drift:** inferred topology is *intermediate context*
 for deciding the queried edge — never graph generation, never the output.

@@ -59,6 +59,7 @@ INTERVENTIONS = (
     "permute_closure",
     "rewire_bridge",
 )
+TRAINING_POLICIES = ("default", "head_only")
 STAGES = ("one", "two")
 CLOSURE_BIAS_INITS = ("density", "nonzero_mean")
 #: Which losses reach the generator while the interface is held. ``joint`` is the
@@ -183,6 +184,9 @@ class MotifPromptConfig:
     slot_read_value_norm: bool = True
     slot_query_init_std: float | None = None
     head_output_init_std: float = 1e-3
+    training_policy: str = "default"
+    head_prompt_enabled: bool = True
+    init_checkpoint: str = ""
 
     def __post_init__(self) -> None:
         """Validate the block.
@@ -249,6 +253,12 @@ class MotifPromptConfig:
             raise ValueError("motif_prompt.slot_query_init_std must be positive or null")
         if self.head_output_init_std <= 0.0:
             raise ValueError("motif_prompt.head_output_init_std must be positive")
+        if self.training_policy not in TRAINING_POLICIES:
+            raise ValueError(
+                f"motif_prompt.training_policy must be one of {list(TRAINING_POLICIES)}"
+            )
+        if self.training_policy == "head_only" and not self.init_checkpoint:
+            raise ValueError("head-only motif_prompt requires motif_prompt.init_checkpoint")
 
     @property
     def w_slot_is_balanced(self) -> bool:
@@ -1381,6 +1391,9 @@ class V3_1MotifPrompt(nn.Module):
         )
         self.student_counts = "topo_cnt" in self.cfg.fields
         self._freeze_permanently_frozen()
+        if self.cfg.training_policy == "head_only":
+            self.requires_grad_(False)
+            self.base.output_head.requires_grad_(True)
         self.register_buffer("mean_template", torch.zeros(N_EDGES))
         # The balanced ``w_slot``, once measured; -1 means "not yet". It is a
         # buffer so it rides in ``model_state``: a resumed or scored run reads
@@ -1507,6 +1520,19 @@ class V3_1MotifPrompt(nn.Module):
         self.base.eval()
         if self.teacher is not None:
             self.teacher.eval()
+        if self.cfg.training_policy == "head_only":
+            # Calling ``train()`` on the wrapper must not reactivate dropout in
+            # any frozen feature producer.  The output head is the sole module
+            # whose mode and parameters follow the optimisation phase.
+            self.reader.eval()
+            self.count_head.eval()
+            self.adapter.eval()
+            self.prompt_layers.eval()
+            if self.direct_head is not None:
+                self.direct_head.eval()
+            if self.generator is not None:
+                self.generator.eval()
+            self.base.output_head.train(mode)
         return self
 
     def trainable_parameters(self) -> list[nn.Parameter]:
@@ -1904,6 +1930,35 @@ class V3_1MotifPrompt(nn.Module):
             raise ValueError("motif_prompt interventions are scoring-time only; call eval() first")
         weights, gate_scale = self._apply_intervention(weights)
         tokens = self.tokens_from_weights(weights, encoded_a, encoded_b, lengths_a, lengths_b)
+        return self.logits_from_tokens(
+            encoded_a,
+            encoded_b,
+            lengths_a,
+            lengths_b,
+            tokens=tokens,
+            gate_scale=gate_scale,
+            return_pair_repr=return_pair_repr,
+        )
+
+    def logits_from_tokens(
+        self,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+        *,
+        tokens: Mapping[str, torch.Tensor],
+        gate_scale: float = 1.0,
+        return_pair_repr: bool = False,
+    ) -> torch.Tensor:
+        """Compute pair logits from the existing four prompt-token fields.
+
+        This is the graph-independent prompt interface shared by the legacy
+        motif model and dictionary mixtures.  Factoring it here leaves the
+        graph-to-token path and its checkpoint keys unchanged.
+        """
+        if self.cfg.training_policy == "head_only" and not self.cfg.head_prompt_enabled:
+            gate_scale = 0.0
         view_a, view_b = self.adapter.views(tokens)
         prefixes_a = [self.adapter.prefix(i, view_a) for i in range(len(self.prompt_layers))]
         prefixes_b = [self.adapter.prefix(i, view_b) for i in range(len(self.prompt_layers))]
@@ -2069,6 +2124,8 @@ class V3_1MotifPrompt(nn.Module):
         Returns:
             ``(slot, topo)`` flags.
         """
+        if self.cfg.training_policy == "head_only":
+            return False, False
         slot = self.cfg.stage == "two" and TEMPLATE_KEY in batch
         topo = slot and self.teacher is not None and self.cfg.w_topo != 0.0
         return slot, topo
@@ -2195,6 +2252,7 @@ __all__ = [
     "TEMPLATE_KEY",
     "TEMPLATE_MASK_KEY",
     "TOKEN_SOURCES",
+    "TRAINING_POLICIES",
     "CorruptionConfig",
     "MotifCountHead",
     "MotifDirectTokens",

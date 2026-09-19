@@ -1,7 +1,8 @@
 # Shared motif dictionary, sequence routing and task-head adaptation
 
 **Date:** 2026-09-19. **Version:** v1.
-**Status:** written for owner review after conversational design approval; not implemented or launched.
+**Status:** approved and implemented on 2026-09-19; local review/checks complete, three-container launch in progress.
+Implementation: [plan](../plans/2026-09-19-motif-dictionary-routing.md).
 **Source checkout:** `63061a9`, branch `codex/motif-graph-grit-prompt`.
 
 This is the next architecture experiment after the three motif-prompt repair waves. It defines three
@@ -324,9 +325,10 @@ After implementation and local checks, build the shared dictionary once, then al
 |---|---|
 | `30838`, 4 H20 | R training and its selected-checkpoint route interventions |
 | `30846`, 4 H20 | H prompted training, then its matched content-only training |
-| `30030`, 2 H20 | D oracle scoring and cached-score comparisons |
+| `30030`, 4 H20 | D oracle scoring and cached-score comparisons |
 
-Confirm actual occupancy before launch; these are allocations, not observations of current idle
+The execution-time inspection on 2026-09-19 found four H20s on each container; the earlier
+two-GPU description of `30030` was stale. Confirm actual occupancy again before launch; these are allocations, not observations of current idle
 resources. All containers share the checkout/data/output filesystem. Use Git to synchronize working
 code, cap concurrent Torch CPU threads per the HPC runbook, and use the production `hpc/run.sh`
 training/scoring paths with automatic visible-GPU sizing. Preserve batching across the paired H
@@ -361,10 +363,11 @@ documentation only when an implemented behavior or accepted working architecture
 
 ## 9. Review boundary and change log
 
-This spec is the architectural brainstorming deliverable. The owner reviews this written artifact
-before the `superpowers:writing-plans` handoff. It authorizes no claim that implementation, remote
-launch or the proposed architecture has succeeded. The later implementation plan must preserve the
-three-lane comparison and the adopted-versus-confirmed distinction.
+This spec is the approved architectural brainstorming deliverable. The owner explicitly requested
+GPT-5.6-sol medium subagents for implementation, primary-agent review, and parallel launch after
+integration. Authorization is not evidence that implementation, remote launch or the proposed
+architecture has succeeded. The implementation plan preserves the three-lane comparison and the
+adopted-versus-confirmed distinction.
 
 | Version | Date | Change |
 |---|---|---|

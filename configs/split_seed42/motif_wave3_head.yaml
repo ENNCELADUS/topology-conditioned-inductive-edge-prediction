@@ -1,0 +1,81 @@
+# Lane H: adapt only the final task head over the selected wave-3 epoch-2 model.
+model:
+  family: v3_1_motif_prompt
+  config:
+    motif_prompt: &head
+      stage: two
+      base_checkpoint: outputs/split_seed42/prefix_base/best.pt
+      bundle_checkpoint: outputs/split_seed42/motif_prompt_stage1/best.pt
+      init_checkpoint: outputs/split_seed42/motif_prompt_stage2_v3_prefix/best.pt
+      training_policy: head_only
+      head_prompt_enabled: true
+      width: 128
+      slots_per_field: 2
+      reader: {layers: 3, dim: 96, heads: 4, rrwp_k: 4}
+      corruption: {prob: 0.5, lambda_min: 0.0, lambda_max: 1.0}
+      fields: [topo_self, topo_partner, topo_rel, topo_cnt]
+      families: [closure, bridge]
+      token_source: graph
+      gate_mode: learned
+      interface_warmup_epochs: 8
+      warmup_losses: graph_only
+      w_slot: balanced
+      w_slot_multiplier: 1.0
+      balance_probe_rows: 256
+      w_topo: 0.1
+      beta_p: 1.0
+      beta_q: 1.0
+      beta_a: 1.0
+      beta_i: 1.0
+      beta_c: 0.0
+      closure_bias_init: nonzero_mean
+      graph_row_weighting: closure_balanced
+      graph_row_positive_share: 0.5
+      huber_delta: 1.0
+      slot_read: residual_block
+      slot_read_value_norm: false
+data: &data
+  root: data
+  strategy: breadth_first
+  negative_ratio: 5
+  token_budget: 131072
+  batch_pairs: 1024
+  num_workers: 0
+  f0_cache: outputs/f0_cache/f0_matrix.pt
+  expected_missing_features: [node_004764, node_007050]
+optim:
+  lr: 1.0e-5
+  weight_decay: 1.0e-2
+  epochs: 15
+  warmup_steps: 500
+  grad_clip: 1.0
+  scheduler: {type: onecycle, max_lr: 1.0e-5, pct_start: 0.1, div_factor: 25, final_div_factor: 10000, anneal_strategy: cos}
+eval: {patience: null, eval_every: 1}
+runtime: &runtime
+  world_size: auto
+  pack_dir: outputs/feature_packs/b0_v31_bf16
+  pack_workers: 16
+  loader_workers_per_rank: 4
+  prefetch_factor: 4
+  token_budget: 196608
+  max_pairs_per_rank: 1536
+  memory_limit_gib: 85.0
+  probe_warmup_steps: 10
+  probe_timed_steps: 30
+seed: 0
+output_dir: outputs/split_seed42/motif_wave3_head
+mixed_precision: "bf16"
+struct: &struct
+  nodes: 40
+  background_nodes: 8
+  mix: {bfs: 0.5, motif: 0.25, bridge: 0.25}
+  subgraphs_per_epoch: null
+  weights: {bce: 1.0, gs: 0.0, rd: 0.0, deg_mmd: 0.0, rank: 1.0, degree: 0.1, motif: 0.1}
+  rank_margin: 0.1
+  rank_temperature: 1.0
+  huber_delta: 1.0
+  mmd_sigma: 1.25
+  mmd_bins: 48
+  val_subgraphs: 32
+  token_budget: 98304
+  resident_tokens: 393216

@@ -42,7 +42,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from itertools import cycle, islice
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, TypeVar, cast
+from typing import Any, Literal, NamedTuple, TypeGuard, TypeVar, cast
 
 import networkx as nx
 import numpy as np
@@ -50,6 +50,7 @@ import scipy.sparse as sp
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import broadcast_object_list, gather_object, set_seed
@@ -67,6 +68,7 @@ from src.data.distributed_pairs import (
     identity_compact_batch,
 )
 from src.data.features import FeatureStore, build_f0_matrix
+from src.data.motif_dictionary import closure_nonempty_from_weights, load_dictionary
 from src.data.motif_template import (
     MotifTemplateStatistics,
     MotifTemplateTable,
@@ -142,6 +144,11 @@ from src.model.egostitch.classifier.coord_gen import (
     V3_1CoordGen,
     distance_class_targets,
 )
+from src.model.egostitch.classifier.motif_dictionary import (
+    ROUTE_NONEMPTY_KEY,
+    ROUTE_TARGET_KEY,
+    V3_1MotifDictionary,
+)
 from src.model.egostitch.classifier.motif_prompt import (
     BALANCED_W_SLOT,
     EDGE_TYPE_NAMES,
@@ -176,14 +183,23 @@ MODEL_FAMILIES = (
     "v3_1_topo_prompt",
     "v3_1_coord_gen",
     "v3_1_motif_prompt",
+    "v3_1_motif_dictionary",
     "f0_mlp",
 )
 V3_1_FAMILIES = frozenset(
-    {"v3_1", "v3_1_prefix", "v3_1_topo_prompt", "v3_1_coord_gen", "v3_1_motif_prompt"}
+    {
+        "v3_1",
+        "v3_1_prefix",
+        "v3_1_topo_prompt",
+        "v3_1_coord_gen",
+        "v3_1_motif_prompt",
+        "v3_1_motif_dictionary",
+    }
 )
 TOPO_PROMPT_FAMILY = "v3_1_topo_prompt"
 COORD_GEN_FAMILY = "v3_1_coord_gen"
 MOTIF_PROMPT_FAMILY = "v3_1_motif_prompt"
+MOTIF_DICTIONARY_FAMILY = "v3_1_motif_dictionary"
 RUN_KINDS = ("formal", "diagnostic")
 
 
@@ -664,6 +680,26 @@ def _motif_prompt_block(config: Mapping[str, object]) -> Mapping[str, object] | 
     return block if isinstance(block, Mapping) else None
 
 
+def _is_head_only_motif(model: nn.Module) -> bool:
+    """Whether ``model`` is the wave-3 output-head adaptation lane."""
+    raw = _unwrapped_model(model)
+    return (
+        isinstance(raw, V3_1MotifPrompt)
+        and not isinstance(raw, V3_1MotifDictionary)
+        and raw.cfg.training_policy == "head_only"
+    )
+
+
+def _uses_legacy_motif_objective(model: nn.Module) -> TypeGuard[V3_1MotifPrompt]:
+    """Whether old graph/topology supervision belongs in this training step."""
+    raw = _unwrapped_model(model)
+    return (
+        isinstance(raw, V3_1MotifPrompt)
+        and not isinstance(raw, V3_1MotifDictionary)
+        and raw.cfg.training_policy == "default"
+    )
+
+
 def _motif_prefix_keys_inert(config: Mapping[str, object], completed_epoch: int) -> bool:
     """Whether the joint-phase motif weights did nothing over the resumed prefix.
 
@@ -934,7 +970,7 @@ def _set_motif_prompt_training_stage(
         epoch: The 1-based epoch about to run.
     """
     raw_model = _unwrapped_model(model)
-    if not isinstance(raw_model, V3_1MotifPrompt):
+    if not _uses_legacy_motif_objective(raw_model):
         return
     was_open = raw_model.interface_open
     raw_model.interface_open = raw_model.interface_open_at(epoch)
@@ -963,7 +999,7 @@ def _drop_closed_interface_gradients(model: nn.Module, optimizer: torch.optim.Op
         optimizer: The prepared optimizer holding the named groups.
     """
     raw_model = _unwrapped_model(model)
-    if not isinstance(raw_model, V3_1MotifPrompt) or raw_model.interface_open:
+    if not _uses_legacy_motif_objective(raw_model) or raw_model.interface_open:
         return
     for group in optimizer.param_groups:
         if group.get("name") != "interface":
@@ -1268,6 +1304,83 @@ def _reduce_motif_counts(
         reduction="sum",
     )
     return [float(value) for value in reduced.tolist()]
+
+
+def route_kl_global_counts(
+    nonempty: torch.Tensor, nonself: torch.Tensor
+) -> tuple[float, float]:
+    """Return this rank/microbatch's valid and closure-nonempty row counts."""
+    valid = (nonself.reshape(-1) > 0).to(torch.float64)
+    positive = (nonempty.reshape(-1) > 0).to(torch.float64) * valid
+    return float(valid.sum().item()), float(positive.sum().item())
+
+
+def closure_balanced_route_kl(
+    rows: torch.Tensor,
+    nonempty: torch.Tensor,
+    nonself: torch.Tensor,
+    *,
+    global_valid: float,
+    global_nonempty: float,
+    world_size: int,
+    positive_share: float = 0.5,
+) -> torch.Tensor:
+    """Globally reduce lane-R KL while compensating DDP's gradient average.
+
+    ``global_*`` may be accumulated over several local microbatches before this
+    function is called.  Consequently the result is invariant to rank and
+    microbatch partitioning.  An all-self step returns a zero connected to the
+    router graph, so every DDP rank traverses the same trainable parameters.
+    """
+    rows = rows.reshape(-1)
+    nonempty = nonempty.reshape(-1)
+    nonself = nonself.reshape(-1)
+    if rows.shape != nonempty.shape or rows.shape != nonself.shape:
+        raise ValueError("route KL rows, nonempty flags and nonself mask must align")
+    if global_valid <= 0.0:
+        return rows.sum() * 0.0
+    weights = balanced_row_weights(
+        nonempty,
+        nonself,
+        positive_share=positive_share,
+        global_nonempty=global_nonempty,
+        global_empty=global_valid - global_nonempty,
+    ).to(rows)
+    return rows.mul(weights).sum() * (float(world_size) / float(global_valid))
+
+
+def _route_step_loss(
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+    accelerator: Accelerator,
+    *,
+    world_size: int,
+) -> tuple[torch.Tensor, tuple[float, float]]:
+    """Build one lane-R optimizer scalar from globally counted categories."""
+    rows = output.get("route_loss_rows")
+    nonempty = batch.get(ROUTE_NONEMPTY_KEY)
+    nonself = batch.get(TEMPLATE_MASK_KEY)
+    if rows is None or nonempty is None or nonself is None:
+        raise RuntimeError(
+            "sequence dictionary training requires route_loss_rows, "
+            "motif_route_nonempty and motif_mask"
+        )
+    local = route_kl_global_counts(nonempty, nonself)
+    counts = accelerator.reduce(
+        torch.tensor(local, device=rows.device, dtype=torch.float64), reduction="sum"
+    )
+    global_valid, global_nonempty = (float(value) for value in counts.tolist())
+    return (
+        closure_balanced_route_kl(
+            rows,
+            nonempty,
+            nonself,
+            global_valid=global_valid,
+            global_nonempty=global_nonempty,
+            world_size=world_size,
+        ),
+        (global_valid, global_nonempty),
+    )
 
 
 #: The balanced ``w_slot`` is clamped into this range before the multiplier.
@@ -2087,6 +2200,8 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
         return _resolve_coord_gen_kwargs(model_cfg)
     if model_cfg.family == MOTIF_PROMPT_FAMILY:
         return _resolve_motif_prompt_kwargs(model_cfg)
+    if model_cfg.family == MOTIF_DICTIONARY_FAMILY:
+        return _resolve_motif_dictionary_kwargs(model_cfg)
     if model_cfg.family == "v3_1":
         return dict(model_cfg.config) if model_cfg.config else dict(BEST_V3_1_CONFIG)
     if model_cfg.family == "f0_mlp":
@@ -2094,7 +2209,7 @@ def resolve_model_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     raise ValueError(
         f"unknown model family '{model_cfg.family}' "
         "(expected v3_1, v3_1_prefix, v3_1_topo_prompt, v3_1_coord_gen, "
-        "v3_1_motif_prompt, or f0_mlp)"
+        "v3_1_motif_prompt, v3_1_motif_dictionary, or f0_mlp)"
     )
 
 
@@ -2322,6 +2437,64 @@ def _resolve_motif_prompt_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     return {"motif_prompt": resolved, "base": dict(cast(Mapping[str, object], base))}
 
 
+def _resolve_motif_dictionary_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
+    """Resolve training sources while keeping dictionary construction file-free.
+
+    Source checkpoints and the dictionary artifact are consumed here and by
+    :func:`build_model` only.  The constructed model embeds every inference
+    constant in its state dict, so its constructor never opens these paths.
+    """
+    raw = dict(model_cfg.config)
+    dictionary = raw.pop("motif_dictionary", None)
+    motif = raw.pop("motif_prompt", None)
+    base = raw.pop("base", None)
+    if not isinstance(dictionary, Mapping):
+        raise ValueError(
+            "model.config.motif_dictionary is required for v3_1_motif_dictionary"
+        )
+    if not isinstance(motif, Mapping):
+        raise ValueError("model.config.motif_prompt is required for v3_1_motif_dictionary")
+    if raw:
+        raise ValueError(
+            "v3_1_motif_dictionary accepts only "
+            f"model.config.{{motif_dictionary,motif_prompt,base}}, got {sorted(raw)}"
+        )
+    resolved_motif = dict(motif)
+    base_checkpoint = str(resolved_motif.get("base_checkpoint", "") or "")
+    if base is None:
+        if not base_checkpoint:
+            raise ValueError(
+                "v3_1_motif_dictionary needs model.config.base or "
+                "motif_prompt.base_checkpoint"
+            )
+        payload, digest = _load_base_checkpoint(Path(base_checkpoint))
+        base = cast(Mapping[str, object], payload["model_config"])
+        resolved_motif["base_checkpoint_sha256"] = digest
+    bundle = str(resolved_motif.get("bundle_checkpoint", "") or "")
+    if bundle:
+        _, digest = _load_motif_bundle(Path(bundle))
+        resolved_motif["bundle_checkpoint_sha256"] = digest
+    resolved_dictionary = dict(dictionary)
+    artifact_path = str(resolved_dictionary.get("artifact_path", "") or "")
+    if not artifact_path:
+        raise ValueError("motif_dictionary.artifact_path is required for training")
+    artifact = load_dictionary(Path(artifact_path))
+    configured_size = int(cast(int, resolved_dictionary.get("dictionary_size", 0)))
+    actual_size = int(artifact.tokens.shape[0])
+    if configured_size != actual_size:
+        logger.info(
+            "motif dictionary effective size is %d (configured pre-dedup maximum %d)",
+            actual_size,
+            configured_size,
+        )
+    resolved_dictionary["dictionary_size"] = actual_size
+    return {
+        "base": dict(cast(Mapping[str, object], base)),
+        "motif_prompt": resolved_motif,
+        "motif_dictionary": resolved_dictionary,
+    }
+
+
 def _resolve_prefix_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     """Embed the frozen base's ``model_config`` and record the base file's SHA-256.
 
@@ -2440,8 +2613,82 @@ def build_model(cfg: Config) -> nn.Module:
                 )
             motif_model.load_state_dict(bundle_state, strict=False)
             motif_model.initialize_teacher()
+        if motif_model.cfg.training_policy == "head_only":
+            init_path = Path(motif_model.cfg.init_checkpoint)
+            source, _ = _load_motif_bundle(init_path)
+            missing, unexpected = motif_model.load_state_dict(
+                cast(Mapping[str, Any], source["model_state"]), strict=False
+            )
+            if missing or unexpected:
+                raise ValueError(
+                    f"{init_path}: head-only source state mismatch: "
+                    f"missing={missing[:5]}, unexpected={unexpected[:5]}"
+                )
         _validate_topo_gen_distill_contract(motif_model, cfg.distill)
         return motif_model
+    if cfg.model.family == MOTIF_DICTIONARY_FAMILY:
+        dictionary_model = V3_1MotifDictionary(**kwargs)  # type: ignore[arg-type]
+        block = cast(Mapping[str, object], kwargs["motif_prompt"])
+        dictionary_block = cast(Mapping[str, object], kwargs["motif_dictionary"])
+        bundle_path = str(block.get("bundle_checkpoint", "") or "")
+        if not bundle_path:
+            raise ValueError("motif dictionary requires motif_prompt.bundle_checkpoint")
+        stage_one, _ = _load_motif_bundle(Path(bundle_path))
+        stage_state = cast(Mapping[str, Any], stage_one["model_state"])
+        own_keys = set(dictionary_model.state_dict())
+        stage_interface_prefixes = (
+            "base.",
+            "reader.",
+            "count_head.",
+            "adapter.",
+            "prompt_layers.",
+        )
+        stage_keys = {
+            key
+            for key in own_keys
+            if key.startswith(stage_interface_prefixes) or key == "mean_template"
+        }
+        missing_stage = sorted(stage_keys - set(stage_state))
+        if missing_stage:
+            raise ValueError(
+                f"{bundle_path}: Stage I dictionary interface is missing "
+                f"{missing_stage[:5]}"
+            )
+        dictionary_model.load_state_dict(
+            {key: stage_state[key] for key in stage_keys}, strict=False
+        )
+        source_path = str(dictionary_block.get("slot_checkpoint", "") or "")
+        if source_path:
+            wave3, _ = _load_motif_bundle(Path(source_path))
+            wave3_state = cast(Mapping[str, Any], wave3["model_state"])
+            slot_prefixes = (
+                "generator.residue_proj.",
+                "generator.attention.",
+                "generator.bridge_queries",
+                "generator.witness_queries",
+                "generator.bridge_read.",
+                "generator.witness_read.",
+                "generator.endpoint_proj.",
+                "generator.witness_mix.",
+            )
+            slot_keys = {
+                key
+                for key in own_keys
+                if key.startswith(slot_prefixes)
+            }
+            missing_slots = sorted(slot_keys - set(wave3_state))
+            if missing_slots:
+                raise ValueError(
+                    f"{source_path}: wave-3 slot source is missing {missing_slots[:5]}"
+                )
+            dictionary_model.load_state_dict(
+                {key: wave3_state[key] for key in slot_keys}, strict=False
+            )
+        dictionary_model.install_dictionary(
+            load_dictionary(Path(str(dictionary_block["artifact_path"])))
+        )
+        _validate_topo_gen_distill_contract(dictionary_model, cfg.distill)
+        return dictionary_model
     if cfg.model.family == "v3_1":
         v3_1_model = V3_1(**kwargs)
         _validate_topo_gen_distill_contract(v3_1_model, cfg.distill)
@@ -3064,6 +3311,18 @@ def _run_metadata(
             # The compiled-template provenance and the measured compile rate
             # behind the once-per-run compilation (spec section 3).
             "templates": result.runtime_profile.get("motif_templates"),
+        }
+    if cfg.model.family == MOTIF_DICTIONARY_FAMILY:
+        dictionary_kwargs = cast(Mapping[str, object], model_kwargs["motif_dictionary"])
+        motif_kwargs = cast(Mapping[str, object], model_kwargs["motif_prompt"])
+        run_metadata["motif_dictionary"] = {
+            "mode": dictionary_kwargs.get("mode"),
+            "dictionary_size": dictionary_kwargs.get("dictionary_size"),
+            "artifact_path": dictionary_kwargs.get("artifact_path") or None,
+            "slot_checkpoint": dictionary_kwargs.get("slot_checkpoint") or None,
+            "stage1_checkpoint": motif_kwargs.get("bundle_checkpoint") or None,
+            "route_targets": result.runtime_profile.get("motif_dictionary_routes"),
+            "validation_targets_role": "diagnostic_only",
         }
     if "virtual_graph" in result.runtime_profile:
         run_metadata["virtual_graph"] = result.runtime_profile["virtual_graph"]
@@ -5165,6 +5424,346 @@ class MotifTemplateRows:
         }
 
 
+class DictionaryRouteRows:
+    """Training route targets and separately labelled V_val diagnostics.
+
+    Both tables preserve the pair-list orientation.  Training targets are built
+    from the V_val-quarantined legal graph; the V_val table is used only by the
+    explicit diagnostic pass and is never attached to ordinary validation or
+    scoring forwards.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: V3_1MotifDictionary,
+        train_graph: nx.Graph,
+        train_pairs: Sequence[Pair],
+        val_graph: nx.Graph,
+        val_pairs: Sequence[Pair],
+        device: torch.device,
+        accelerator: Accelerator,
+        cache_path: Path,
+        encode_batch_size: int = 4096,
+    ) -> None:
+        started = time.monotonic()
+        cache_status: list[dict[str, object] | None] = [None]
+        if accelerator.is_main_process:
+            try:
+                cached = self._load_cache(
+                    cache_path,
+                    model=model,
+                    train_pairs=train_pairs,
+                    val_pairs=val_pairs,
+                )
+                cache_status[0] = {"hit": cached is not None, "error": None}
+            except Exception as exc:
+                cache_status[0] = {
+                    "hit": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        broadcast_object_list(cache_status, from_process=0)
+        status = cache_status[0]
+        if status is None or status.get("error") is not None:
+            raise RuntimeError(
+                "route-target cache inspection failed: "
+                f"{None if status is None else status.get('error')}"
+            )
+        if not bool(status["hit"]):
+            train_payload = self._build_distributed_table(
+                model,
+                graph=train_graph,
+                pairs=train_pairs,
+                device=device,
+                accelerator=accelerator,
+                batch_size=encode_batch_size,
+                label="training",
+            )
+            val_payload = self._build_distributed_table(
+                model,
+                graph=val_graph,
+                pairs=val_pairs,
+                device=device,
+                accelerator=accelerator,
+                batch_size=encode_batch_size,
+                label="V_val diagnostic",
+            )
+            write_error: list[str | None] = [None]
+            if accelerator.is_main_process:
+                try:
+                    payload = {
+                        "format_version": 1,
+                        "train_pairs": list(train_pairs),
+                        "val_pairs": list(val_pairs),
+                        "dictionary_tokens": model.dictionary_tokens.detach().cpu(),
+                        "dictionary_scales": model.dictionary_scales.detach().cpu(),
+                        "dictionary_temperature": model.dictionary_temperature.detach().cpu(),
+                        "train_targets": train_payload[0],
+                        "train_nonempty": train_payload[1],
+                        "train_mask": train_payload[2],
+                        # Validation truth is a separately named diagnostic table;
+                        # attach_train never reads these fields.
+                        "val_targets": val_payload[0],
+                        "val_nonempty": val_payload[1],
+                        "val_mask": val_payload[2],
+                    }
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    _torch_save_atomic(payload, cache_path)
+                    logger.info("cached motif dictionary route targets at %s", cache_path)
+                except Exception as exc:
+                    write_error[0] = f"{type(exc).__name__}: {exc}"
+            broadcast_object_list(write_error, from_process=0)
+            if write_error[0] is not None:
+                raise RuntimeError(f"route-target cache write failed: {write_error[0]}")
+            accelerator.wait_for_everyone()
+        payload = cast(
+            dict[str, object], torch.load(cache_path, map_location="cpu", weights_only=False)
+        )
+        self.train_targets = cast(torch.Tensor, payload["train_targets"])
+        self.val_targets = cast(torch.Tensor, payload["val_targets"])
+        self.train_nonempty = cast(torch.Tensor, payload["train_nonempty"])
+        self.val_nonempty = cast(torch.Tensor, payload["val_nonempty"])
+        self.train_mask = cast(torch.Tensor, payload["train_mask"])
+        self.val_mask = cast(torch.Tensor, payload["val_mask"])
+        self._device = device
+        self.build_seconds = time.monotonic() - started
+        self.cache_path = cache_path
+
+    @classmethod
+    def _build_distributed_table(
+        cls,
+        model: V3_1MotifDictionary,
+        *,
+        graph: nx.Graph,
+        pairs: Sequence[Pair],
+        device: torch.device,
+        accelerator: Accelerator,
+        batch_size: int,
+        label: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compile/encode one contiguous shard per rank and gather row order."""
+        total = len(pairs)
+        start = total * accelerator.process_index // accelerator.num_processes
+        stop = total * (accelerator.process_index + 1) // accelerator.num_processes
+        local_pairs = list(pairs[start:stop])
+        weights = torch.from_numpy(MotifTemplateTable(graph).weights(local_pairs))
+        targets = cls._routes(
+            model,
+            weights,
+            device=device,
+            batch_size=batch_size,
+            label=f"{label} rank {accelerator.process_index}",
+        ).to(device)
+        nonempty = closure_nonempty_from_weights(weights).to(device, torch.float32)
+        mask = _motif_self_row_mask(local_pairs).to(device)
+        row_ids = torch.arange(start, stop, device=device, dtype=torch.int64)
+        padded_ids = accelerator.pad_across_processes(row_ids, dim=0, pad_index=-1)
+        padded_targets = accelerator.pad_across_processes(targets, dim=0, pad_index=0)
+        padded_nonempty = accelerator.pad_across_processes(nonempty, dim=0, pad_index=0)
+        padded_mask = accelerator.pad_across_processes(mask, dim=0, pad_index=0)
+        gathered_ids = accelerator.gather(padded_ids)
+        gathered_targets = accelerator.gather(padded_targets)
+        gathered_nonempty = accelerator.gather(padded_nonempty)
+        gathered_mask = accelerator.gather(padded_mask)
+        keep = gathered_ids >= 0
+        ids = gathered_ids[keep]
+        order = torch.argsort(ids)
+        ordered_ids = ids.index_select(0, order).cpu()
+        if not torch.equal(ordered_ids, torch.arange(total, dtype=torch.int64)):
+            raise RuntimeError(f"{label} route-target gather lost or duplicated rows")
+        return (
+            gathered_targets[keep].index_select(0, order).cpu(),
+            gathered_nonempty[keep].index_select(0, order).cpu(),
+            gathered_mask[keep].index_select(0, order).cpu(),
+        )
+
+    @staticmethod
+    def _load_cache(
+        path: Path,
+        *,
+        model: V3_1MotifDictionary,
+        train_pairs: Sequence[Pair],
+        val_pairs: Sequence[Pair],
+    ) -> dict[str, object] | None:
+        if not path.is_file():
+            return None
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict) or payload.get("format_version") != 1:
+            return None
+        cached_tokens = payload.get("dictionary_tokens")
+        cached_scales = payload.get("dictionary_scales")
+        cached_temperature = payload.get("dictionary_temperature")
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (cached_tokens, cached_scales, cached_temperature)
+        ):
+            return None
+        compatible = (
+            payload.get("train_pairs") == list(train_pairs)
+            and payload.get("val_pairs") == list(val_pairs)
+            and torch.equal(
+                cast(torch.Tensor, cached_tokens),
+                model.dictionary_tokens.detach().cpu(),
+            )
+            and torch.equal(
+                cast(torch.Tensor, cached_scales),
+                model.dictionary_scales.detach().cpu(),
+            )
+            and torch.equal(
+                cast(torch.Tensor, cached_temperature),
+                model.dictionary_temperature.detach().cpu(),
+            )
+        )
+        return cast(dict[str, object], payload) if compatible else None
+
+    @staticmethod
+    def _routes(
+        model: V3_1MotifDictionary,
+        weights: torch.Tensor,
+        *,
+        device: torch.device,
+        batch_size: int,
+        label: str,
+    ) -> torch.Tensor:
+        was_training = model.training
+        model.eval()
+        parts: list[torch.Tensor] = []
+        try:
+            with torch.no_grad():
+                for start in range(0, weights.shape[0], batch_size):
+                    part = weights[start : start + batch_size].to(device, non_blocking=True)
+                    parts.append(model.routes_from_weights(part).cpu())
+                    if start == 0 or start + batch_size >= weights.shape[0]:
+                        logger.info(
+                            "encoded %s route targets: %d/%d",
+                            label,
+                            min(start + batch_size, weights.shape[0]),
+                            weights.shape[0],
+                        )
+        finally:
+            model.train(was_training)
+        return torch.cat(parts) if parts else torch.empty(0, model.dictionary_size)
+
+    def _attach(
+        self,
+        batch: Batch,
+        targets: torch.Tensor,
+        nonempty: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        rows = batch["_row_id"].detach().to("cpu", torch.int64)
+        batch[ROUTE_TARGET_KEY] = targets.index_select(0, rows).to(
+            self._device, non_blocking=True
+        )
+        batch[ROUTE_NONEMPTY_KEY] = nonempty.index_select(0, rows).to(
+            self._device, non_blocking=True
+        )
+        batch[TEMPLATE_MASK_KEY] = mask.index_select(0, rows).to(
+            self._device, non_blocking=True
+        )
+
+    def attach_train(self, batch: Batch) -> None:
+        """Attach legal training targets by the corpus row id."""
+        self._attach(
+            batch, self.train_targets, self.train_nonempty, self.train_mask
+        )
+
+    def attach_val_diagnostic(self, batch: Batch) -> None:
+        """Attach V_val truth only for the labelled diagnostic pass."""
+        self._attach(batch, self.val_targets, self.val_nonempty, self.val_mask)
+
+    def summary(self) -> dict[str, object]:
+        """Return cache/provenance facts for run metadata."""
+        return {
+            "train_rows": int(self.train_targets.shape[0]),
+            "val_diagnostic_rows": int(self.val_targets.shape[0]),
+            "dictionary_size": int(self.train_targets.shape[1]),
+            "build_seconds": self.build_seconds,
+            "cache_path": str(self.cache_path),
+            "val_role": "diagnostic_only",
+        }
+
+
+@torch.no_grad()
+def _dictionary_route_diagnostics(
+    model: nn.Module,
+    loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    rows: DictionaryRouteRows,
+) -> dict[str, float]:
+    """Measure V_val routing fit without feeding truth to the deployable pass."""
+    raw = cast(V3_1MotifDictionary, _unwrapped_model(model))
+    sums = torch.zeros(8, device=accelerator.device, dtype=torch.float64)
+    route_sum = torch.zeros(raw.dictionary_size, device=accelerator.device, dtype=torch.float64)
+    route_sq_sum = torch.zeros_like(route_sum)
+    was_training = model.training
+    model.eval()
+    try:
+        for batch in loader:
+            batch = _to_device(batch, accelerator.device)
+            rows.attach_val_diagnostic(batch)
+            output = cast(dict[str, torch.Tensor], model(batch))
+            truth = batch[ROUTE_TARGET_KEY].float()
+            predicted = output["predicted_routes"].float()
+            mask = batch[TEMPLATE_MASK_KEY].reshape(-1).float()
+            count = mask.sum()
+            log_truth = truth.clamp_min(torch.finfo(torch.float32).tiny).log()
+            log_mean = raw.dictionary_mean_weights.float().clamp_min(
+                torch.finfo(torch.float32).tiny
+            ).log()
+            mean_kl = (truth * (log_truth - log_mean.unsqueeze(0))).sum(-1)
+            pred_tokens = torch.einsum("bk,kfd->bfd", predicted, raw.dictionary_tokens.float())
+            true_tokens = torch.einsum("bk,kfd->bfd", truth, raw.dictionary_tokens.float())
+            token_mse = (pred_tokens - true_tokens).square().mean(dim=(-1, -2))
+            entropy = -(predicted * predicted.clamp_min(torch.finfo(torch.float32).tiny).log()).sum(
+                -1
+            )
+            pred_norm = pred_tokens.square().mean(dim=(-1, -2)).sqrt()
+            target_norm = true_tokens.square().mean(dim=(-1, -2)).sqrt()
+            route_sum += (predicted * mask[:, None]).sum(0).to(torch.float64)
+            route_sq_sum += (predicted.square() * mask[:, None]).sum(0).to(torch.float64)
+            sums += torch.stack(
+                [
+                    (output["route_loss_rows"].float() * mask).sum(),
+                    (mean_kl * mask).sum(),
+                    (token_mse * mask).sum(),
+                    (entropy * mask).sum(),
+                    (predicted.max(-1).values * mask).sum(),
+                    (pred_norm * mask).sum(),
+                    (target_norm * mask).sum(),
+                    count,
+                ]
+            ).to(torch.float64)
+    finally:
+        model.train(was_training)
+    global_sums = accelerator.reduce(sums, reduction="sum")
+    global_route_sum = accelerator.reduce(route_sum, reduction="sum")
+    global_route_sq_sum = accelerator.reduce(route_sq_sum, reduction="sum")
+    denominator = global_sums[-1].clamp_min(1.0)
+    names = (
+        "val_route_kl",
+        "val_route_mean_predictor_kl",
+        "val_route_token_mse",
+        "val_route_entropy",
+        "val_route_max_weight_mean",
+        "val_route_pred_token_norm",
+        "val_route_target_token_norm",
+    )
+    result = {
+        name: float((global_sums[index] / denominator).item())
+        for index, name in enumerate(names)
+    }
+    route_mean = global_route_sum / denominator
+    result["val_route_dispersion"] = float(
+        (global_route_sq_sum / denominator - route_mean.square()).sum().clamp_min(0).item()
+    )
+    result.update(
+        {f"val_route_mean_{index}": float(value) for index, value in enumerate(route_mean.tolist())}
+    )
+    return result
+
+
 def _motif_self_row_mask(pairs: Sequence[Pair]) -> torch.Tensor:
     """Return the nonself row mask of ``pairs``.
 
@@ -5651,7 +6250,7 @@ class StructStream:
                 coord_table.coords_for_pairs(np.asarray(a), np.asarray(b))
             ).to(device)
         pair_templates: torch.Tensor | None = None
-        if isinstance(raw_model, V3_1MotifPrompt):
+        if _uses_legacy_motif_objective(raw_model):
             motif_table = self._motif_table_for(raw_model, sampler)
             if motif_table is not None:
                 left = [motif_table.index[subgraph.nodes[i]] for i, _ in pairs]
@@ -6526,6 +7125,7 @@ def train_ddp_loop(
     val_topology_reference: ValTopologyReference | None = None,
     topo_rows: TopoPromptRows | None = None,
     motif_rows: MotifTemplateRows | None = None,
+    route_rows: DictionaryRouteRows | None = None,
 ) -> TrainResult:
     """Run fixed-epoch E2 DDP training and return rank-consistent metrics.
 
@@ -6576,6 +7176,8 @@ def train_ddp_loop(
         motif_rows: Optional compiled motif templates of every training row
             (`MotifTemplateRows`), attached to each batch before the forward for
             the ``v3_1_motif_prompt`` family.
+        route_rows: Legal training routing targets and separately labelled
+            V_val diagnostics for ``v3_1_motif_dictionary``.
 
     Returns:
         The `TrainResult`, identical across ranks except for the main-rank-only
@@ -6807,7 +7409,7 @@ def train_ddp_loop(
     motif_generator_profile: dict[str, object] = {}
     _unwrapped_start_model = _unwrapped_model(model)
     if (
-        isinstance(_unwrapped_start_model, V3_1MotifPrompt)
+        _uses_legacy_motif_objective(_unwrapped_start_model)
         and _unwrapped_start_model.generator is not None
         and resume_attempt is None
     ):
@@ -6837,6 +7439,15 @@ def train_ddp_loop(
         epoch_motif_probe: dict[str, float] = {}
         epoch_online_sums: dict[str, float] = {}
         epoch_online_weight = 0.0
+        epoch_route_loss_sum = 0.0
+        epoch_route_sums = torch.zeros(9, device=accelerator.device, dtype=torch.float64)
+        route_width = (
+            raw_training_model.dictionary_size
+            if isinstance((raw_training_model := _unwrapped_model(model)), V3_1MotifDictionary)
+            else 0
+        )
+        epoch_route_sum = torch.zeros(route_width, device=accelerator.device, dtype=torch.float64)
+        epoch_route_sq_sum = torch.zeros_like(epoch_route_sum)
         epoch_struct_seconds = 0.0
         grad_norm_struct: dict[str, float] = {}
         grad_norm_terms: dict[str, float] = {}
@@ -6879,12 +7490,16 @@ def train_ddp_loop(
                 topo_rows.attach_train(batch)
             if motif_rows is not None:
                 motif_rows.attach_train(batch)
+            if route_rows is not None:
+                route_rows.attach_train(batch)
 
             raw_training_model = _unwrapped_model(model)
-            if isinstance(raw_training_model, (V3_1TopoPrompt, V3_1MotifPrompt)):
+            if isinstance(raw_training_model, V3_1TopoPrompt) or _uses_legacy_motif_objective(
+                raw_training_model
+            ):
                 raw_training_model.set_corruption_step(global_step, seed=cfg.seed)
             if (
-                isinstance(raw_training_model, V3_1MotifPrompt)
+                _uses_legacy_motif_objective(raw_training_model)
                 and raw_training_model.generator_trainable
                 and epoch_steps == 0
             ):
@@ -6930,7 +7545,7 @@ def train_ddp_loop(
                         for key, term in struct_stream.last_terms.items()
                     }
                 epoch_struct_loss_sum += float(struct_loss.detach().float().item())
-                if isinstance(raw_training_model, V3_1MotifPrompt):
+                if _uses_legacy_motif_objective(raw_training_model):
                     if struct_stream.last_motif_rows:
                         motif_struct_term = (
                             struct_stream.last_motif_rows,
@@ -6976,20 +7591,80 @@ def train_ddp_loop(
                     accelerator.backward(struct_loss)
                 epoch_struct_seconds += time.monotonic() - struct_start
             output = model(batch)
-            local_mean_loss = output["loss"]
-            effective_weight = output.get("loss_weight_sum")
-            if effective_weight is None:
-                batch_loss_weight = float(local_count)
-                loss = scale_ddp_mean_loss(
-                    local_mean_loss,
-                    local_count=local_count,
-                    global_count=global_count,
-                    world_size=world_size,
+            if isinstance(raw_training_model, V3_1MotifDictionary):
+                loss, _route_counts = _route_step_loss(
+                    output, batch, accelerator, world_size=world_size
                 )
+                local_mean_loss = loss
+                batch_loss_weight = 1.0
+                epoch_route_loss_sum += float(loss.detach().item())
+                logits = output["logits"].reshape(-1).float()
+                labels = batch["label"].reshape(-1).float()
+                smoothing = float(raw_training_model.base.label_smoothing)
+                task_targets = (
+                    labels * (1.0 - smoothing) + 0.5 * smoothing
+                    if smoothing > 0.0
+                    else labels
+                )
+                task_rows = F.binary_cross_entropy_with_logits(
+                    logits, task_targets, reduction="none"
+                )
+                task_weights = 1.0 + (
+                    float(raw_training_model.base.positive_weight) - 1.0
+                ) * labels
+                predicted = output["predicted_routes"].float()
+                truth = batch[ROUTE_TARGET_KEY].float()
+                mask = batch[TEMPLATE_MASK_KEY].reshape(-1).float()
+                log_truth = truth.clamp_min(torch.finfo(torch.float32).tiny).log()
+                log_mean = raw_training_model.dictionary_mean_weights.float().clamp_min(
+                    torch.finfo(torch.float32).tiny
+                ).log()
+                mean_kl = (truth * (log_truth - log_mean.unsqueeze(0))).sum(-1)
+                pred_tokens = torch.einsum(
+                    "bk,kfd->bfd", predicted, raw_training_model.dictionary_tokens.float()
+                )
+                true_tokens = torch.einsum(
+                    "bk,kfd->bfd", truth, raw_training_model.dictionary_tokens.float()
+                )
+                token_mse = (pred_tokens - true_tokens).square().mean(dim=(-1, -2))
+                pred_norm = pred_tokens.square().mean(dim=(-1, -2)).sqrt()
+                target_norm = true_tokens.square().mean(dim=(-1, -2)).sqrt()
+                entropy = -(
+                    predicted
+                    * predicted.clamp_min(torch.finfo(torch.float32).tiny).log()
+                ).sum(-1)
+                epoch_route_sum += (predicted * mask[:, None]).sum(0).detach().to(torch.float64)
+                epoch_route_sq_sum += (
+                    predicted.square() * mask[:, None]
+                ).sum(0).detach().to(torch.float64)
+                epoch_route_sums += torch.stack(
+                    [
+                        (task_rows * task_weights).sum().detach(),
+                        task_weights.sum().detach(),
+                        (mean_kl * mask).sum().detach(),
+                        (token_mse * mask).sum().detach(),
+                        (entropy * mask).sum().detach(),
+                        (predicted.max(-1).values * mask).sum().detach(),
+                        (pred_norm * mask).sum().detach(),
+                        (target_norm * mask).sum().detach(),
+                        mask.sum().detach(),
+                    ]
+                ).to(torch.float64)
             else:
-                global_weight = accelerator.reduce(effective_weight.detach(), reduction="sum")
-                batch_loss_weight = float(effective_weight.item())
-                loss = local_mean_loss * (world_size * effective_weight / global_weight)
+                local_mean_loss = output["loss"]
+                effective_weight = output.get("loss_weight_sum")
+                if effective_weight is None:
+                    batch_loss_weight = float(local_count)
+                    loss = scale_ddp_mean_loss(
+                        local_mean_loss,
+                        local_count=local_count,
+                        global_count=global_count,
+                        world_size=world_size,
+                    )
+                else:
+                    global_weight = accelerator.reduce(effective_weight.detach(), reduction="sum")
+                    batch_loss_weight = float(effective_weight.item())
+                    loss = local_mean_loss * (world_size * effective_weight / global_weight)
             if isinstance(_unwrapped_model(model), V3_1CoordGen):
                 # These diagnostics are unweighted row means (see V3_1CoordGen.forward),
                 # so they aggregate by row count; `task_loss` alone is weight-normalised.
@@ -7051,7 +7726,7 @@ def train_ddp_loop(
                     grad_norm_task, grad_norm_kd = _term_grad_norms(loss, kd_loss, model)
                 loss = loss + kd_loss
                 epoch_kd_loss_sum += float(kd_loss.detach().float().item())
-            if isinstance(raw_training_model, V3_1MotifPrompt):
+            if _uses_legacy_motif_objective(raw_training_model):
                 # The task stream's share of the composite: both streams are
                 # averaged inside a stream first and then across streams, and
                 # the structural share already went out with the structural
@@ -7267,7 +7942,7 @@ def train_ddp_loop(
                         (struct_norms[index, 0] / struct_norms[index, 1]).item()
                     )
         epoch_motif_telemetry: dict[str, float] = {}
-        if isinstance(_unwrapped_model(model), V3_1MotifPrompt) and epoch_steps > 0:
+        if _uses_legacy_motif_objective(model) and epoch_steps > 0:
             motif_sums = accelerator.reduce(
                 torch.tensor(
                     [
@@ -7358,6 +8033,59 @@ def train_ddp_loop(
         entry.update(epoch_kd_telemetry)
         entry.update(epoch_motif_telemetry)
         entry.update(epoch_motif_probe)
+        if isinstance(_unwrapped_model(model), V3_1MotifDictionary) and epoch_steps > 0:
+            route_values = accelerator.reduce(
+                torch.cat(
+                    [
+                        torch.tensor(
+                            [epoch_route_loss_sum],
+                            device=accelerator.device,
+                            dtype=torch.float64,
+                        ),
+                        epoch_route_sums,
+                    ]
+                ),
+                reduction="sum",
+            )
+            route_count = route_values[-1].clamp_min(1.0)
+            global_route_sum = accelerator.reduce(epoch_route_sum, reduction="sum")
+            global_route_sq_sum = accelerator.reduce(epoch_route_sq_sum, reduction="sum")
+            route_mean = global_route_sum / route_count
+            entry.update(
+                {
+                    "train_route_kl": float(
+                        route_values[0].item() / float(epoch_steps * world_size)
+                    ),
+                    "train_task_loss_reporting": float(
+                        route_values[1].item() / max(route_values[2].item(), 1.0)
+                    ),
+                    "train_route_mean_predictor_kl": float(
+                        (route_values[3] / route_count).item()
+                    ),
+                    "train_route_token_mse": float((route_values[4] / route_count).item()),
+                    "train_route_entropy": float((route_values[5] / route_count).item()),
+                    "train_route_max_weight_mean": float(
+                        (route_values[6] / route_count).item()
+                    ),
+                    "train_route_pred_token_norm": float(
+                        (route_values[7] / route_count).item()
+                    ),
+                    "train_route_target_token_norm": float(
+                        (route_values[8] / route_count).item()
+                    ),
+                    "train_route_dispersion": float(
+                        (
+                            global_route_sq_sum / route_count - route_mean.square()
+                        ).sum().clamp_min(0).item()
+                    ),
+                }
+            )
+            entry.update(
+                {
+                    f"train_route_mean_{index}": float(value)
+                    for index, value in enumerate(route_mean.tolist())
+                }
+            )
         if epoch_struct_telemetry:
             epoch_wall = max(time.monotonic() - epoch_wall_start, 1e-9)
             epoch_struct_telemetry["struct_wall_fraction"] = (
@@ -7950,6 +8678,7 @@ def _run_probe_mode(
     profile_output: Path,
     topo_rows: TopoPromptRows | None = None,
     motif_rows: MotifTemplateRows | None = None,
+    route_rows: DictionaryRouteRows | None = None,
 ) -> None:
     """Run warm-up + timed steps and write one rank-zero ``ProbeResult`` JSON."""
     runtime = cfg.runtime
@@ -7992,15 +8721,23 @@ def _run_probe_mode(
             topo_rows.attach_train(batch)
         if motif_rows is not None:
             motif_rows.attach_train(batch)
+        if route_rows is not None:
+            route_rows.attach_train(batch)
         loss: torch.Tensor | None = None
         local_failure: tuple[str, str] | None = None
         try:
-            loss = scale_ddp_mean_loss(
-                model(batch)["loss"],
-                local_count=local_count,
-                global_count=global_count,
-                world_size=world_size,
-            )
+            output = model(batch)
+            if isinstance(_unwrapped_model(model), V3_1MotifDictionary):
+                loss, _ = _route_step_loss(
+                    output, batch, accelerator, world_size=world_size
+                )
+            else:
+                loss = scale_ddp_mean_loss(
+                    output["loss"],
+                    local_count=local_count,
+                    global_count=global_count,
+                    world_size=world_size,
+                )
             if not bool(torch.isfinite(loss).all()):
                 local_failure = ("nonfinite", "non-finite probe loss")
         except RuntimeError as error:
@@ -8209,7 +8946,34 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         if accelerator.is_main_process:
             logger.info("coord_gen coordinate targets ready: %s", topo_rows.summary())
     motif_rows: MotifTemplateRows | None = None
-    if isinstance(model, V3_1MotifPrompt):
+    route_rows: DictionaryRouteRows | None = None
+    if isinstance(model, V3_1MotifDictionary):
+        if model.mode != "sequence":
+            raise RuntimeError(
+                "dictionary oracle has no optimizer; run the labelled oracle diagnostic driver"
+            )
+        if cfg.run_kind == "diagnostic":
+            raise RuntimeError("sequence motif dictionary is deployable and requires a formal run")
+        if cfg.distill is not None and cfg.distill.active:
+            raise RuntimeError("sequence motif dictionary does not support external distillation")
+        if cfg.struct is not None:
+            raise RuntimeError("sequence motif dictionary trains on route KL only; remove struct")
+        if cfg.eval.classification_only:
+            raise RuntimeError("sequence motif dictionary requires the V_val topology pass")
+        corpus = _dynamic_training_corpus(cfg, assembled)
+        route_rows = DictionaryRouteRows(
+            model=model,
+            train_graph=val_split.build_training_graph(),
+            train_pairs=corpus.pairs,
+            val_graph=val_split.build_g_val_simple(),
+            val_pairs=val_cls_pairs,
+            device=accelerator.device,
+            accelerator=accelerator,
+            cache_path=Path(model.dictionary_cfg.artifact_path).with_suffix(".routes.pt"),
+        )
+        if accelerator.is_main_process:
+            logger.info("motif dictionary route targets ready: %s", route_rows.summary())
+    elif isinstance(model, V3_1MotifPrompt):
         # Stage I reads a compiled true template as its *input*, on the training
         # graph (legal) and, for validation, on the V_val gold graph (held-out
         # truth) -- a ceiling diagnostic. Stage II predicts the graph from the
@@ -8224,8 +8988,14 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             )
         if cfg.eval.classification_only:
             raise RuntimeError("v3_1_motif_prompt requires the V_val topology pass")
-        corpus = _dynamic_training_corpus(cfg, assembled)
-        if stage == "one":
+        if _is_head_only_motif(model):
+            # The complete wave-3 checkpoint already fixes the generator and
+            # interface.  H trains only the output head on the real task and
+            # structural streams; compiling targets here could overwrite the
+            # loaded generator statistics and reopen the retired losses.
+            motif_rows = None
+        elif stage == "one":
+            corpus = _dynamic_training_corpus(cfg, assembled)
             reference = build_val_topology_reference(val_split)
             universe = val_ball_union_universe(val_split)
             universe_pairs = [
@@ -8243,6 +9013,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 universe_pairs=universe_pairs,
             )
         else:
+            corpus = _dynamic_training_corpus(cfg, assembled)
             motif_rows = MotifTemplateRows(
                 train_graph=val_split.build_training_graph(),
                 train_pairs=corpus.pairs,
@@ -8250,8 +9021,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 device=accelerator.device,
                 seed=cfg.seed,
             )
-        motif_rows.install(model)
-        if accelerator.is_main_process:
+        if motif_rows is not None:
+            motif_rows.install(model)
+        if motif_rows is not None and accelerator.is_main_process:
             logger.info("motif templates ready (stage %s): %s", stage, motif_rows.summary())
     # The prompt family reads true coordinates on the V_val universe; the
     # generator family predicts them there and only reports its fit on val_cls.
@@ -8261,6 +9033,11 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
     coord_fit_fn: DiagnosticsFn | None = (
         functools.partial(_coordinate_fit_metrics, attach=topo_rows.attach_val)
         if topo_rows is not None and isinstance(model, V3_1CoordGen)
+        else None
+    )
+    route_fit_fn: DiagnosticsFn | None = (
+        functools.partial(_dictionary_route_diagnostics, rows=route_rows)
+        if route_rows is not None
         else None
     )
     # Stage I alone carries V_val templates; the Stage II carrier compiled none,
@@ -8280,6 +9057,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             profile_output=args.profile_output,
             topo_rows=topo_rows,
             motif_rows=motif_rows,
+            route_rows=route_rows,
         )
         return
 
@@ -8396,7 +9174,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             label_smoothing=val_label_smoothing,
             validation_bank=validation_bank,
             attach=attach_val_fn,
-            diagnostics_fn=coord_fit_fn,
+            diagnostics_fn=route_fit_fn or coord_fit_fn,
         ),
     )
     evaluate_cls_fn: EvaluateFn | None = None
@@ -8450,7 +9228,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     label_smoothing=val_label_smoothing,
                     validation_bank=validation_bank,
                     attach=attach_val_fn,
-                    diagnostics_fn=coord_fit_fn,
+                    diagnostics_fn=route_fit_fn or coord_fit_fn,
                 ),
             )
 
@@ -8492,6 +9270,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     require_topology=not cfg.eval.classification_only,
                     topo_rows=topo_rows,
                     motif_rows=motif_rows,
+                    route_rows=route_rows,
                 ),
             )
         except BaseException:
@@ -8537,6 +9316,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         val_topology_reference=reference,
         topo_rows=topo_rows,
         motif_rows=motif_rows,
+        route_rows=route_rows,
     )
     if cfg.model.family == "v3_1_prefix":
         _finalize_prefix_mean(
@@ -8553,6 +9333,8 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 result.runtime_profile["virtual_graph"] = virtual_metadata
             if motif_rows is not None:
                 result.runtime_profile["motif_templates"] = motif_rows.summary()
+            if route_rows is not None:
+                result.runtime_profile["motif_dictionary_routes"] = route_rows.summary()
             write_outputs(result, cfg, model_kwargs, assembled.dropped_pair_counts)
             result.runtime_profile["status"] = "complete"
             _write_json_atomic(args.profile_output, result.runtime_profile)
@@ -8623,6 +9405,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "v3_1_motif_prompt runs only through the DDP pipeline path "
             "(hpc/run.sh train <config>); the direct debug CLI attaches no compiled "
             "templates, no structural stream and no L_slot / L_topo terms"
+        )
+    if cfg.model.family == MOTIF_DICTIONARY_FAMILY:
+        raise ValueError(
+            "v3_1_motif_dictionary runs only through the DDP pipeline path "
+            "(hpc/run.sh train <config>); the direct debug CLI has no legal "
+            "row-aligned routing targets"
         )
 
     set_seed(cfg.seed)

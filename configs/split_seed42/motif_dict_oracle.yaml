@@ -1,0 +1,46 @@
+# Lane D: labelled dictionary-mixture oracle. Consumed by the diagnostic driver;
+# it has no optimiser-owned training schedule.
+model:
+  family: v3_1_motif_dictionary
+  config:
+    motif_prompt:
+      stage: one
+      base_checkpoint: outputs/split_seed42/prefix_base/best.pt
+      bundle_checkpoint: outputs/split_seed42/motif_prompt_stage1/best.pt
+      width: 128
+      slots_per_field: 2
+      reader: {layers: 3, dim: 96, heads: 4, rrwp_k: 4}
+      fields: [topo_self, topo_partner, topo_rel, topo_cnt]
+      families: [closure, bridge]
+      token_source: graph
+      gate_mode: learned
+    motif_dictionary:
+      mode: oracle
+      artifact_path: outputs/split_seed42/motif_dictionary/shared_seed0.pt
+      dictionary_size: 32
+      slot_checkpoint: ""
+data:
+  root: data
+  strategy: breadth_first
+  negative_ratio: 5
+  token_budget: 131072
+  batch_pairs: 1024
+  num_workers: 0
+  f0_cache: outputs/f0_cache/f0_matrix.pt
+  expected_missing_features: [node_004764, node_007050]
+optim: {lr: 1.0e-4, weight_decay: 1.0e-2, epochs: 15, warmup_steps: 500, grad_clip: 1.0}
+eval: {patience: null, eval_every: 1}
+runtime:
+  world_size: auto
+  pack_dir: outputs/feature_packs/b0_v31_bf16
+  pack_workers: 16
+  loader_workers_per_rank: 4
+  prefetch_factor: 4
+  token_budget: 196608
+  max_pairs_per_rank: 1536
+  memory_limit_gib: 85.0
+  probe_warmup_steps: 10
+  probe_timed_steps: 30
+seed: 0
+output_dir: outputs/split_seed42/motif_dict_oracle
+mixed_precision: "bf16"

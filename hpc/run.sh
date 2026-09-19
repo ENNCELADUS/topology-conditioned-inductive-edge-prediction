@@ -20,6 +20,8 @@ Usage:
   hpc/run.sh g1 <g1 args...>
   hpc/run.sh g2 <g2 args...>
   hpc/run.sh kd-targets <kd-targets args...>
+  hpc/run.sh dictionary-build <dictionary builder args...>
+  hpc/run.sh dictionary-diagnostic <dictionary oracle args...>
 
 The train command drives the full packed-feature DDP training pipeline
 (`python -m src.e2_pipeline`) across all visible NVIDIA H20 GPUs via an
@@ -67,6 +69,10 @@ be mixed.
   CUDA_VISIBLE_DEVICES=2 hpc/run.sh kd-targets --contexts --device cuda --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --row-shard 2/4
   CUDA_VISIBLE_DEVICES=3 hpc/run.sh kd-targets --contexts --device cuda --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --row-shard 3/4
   hpc/run.sh kd-targets --contexts --config CONFIG --checkpoint CHECKPOINT --output UNIQUE_OUTPUT --merge --row-shard 0/4
+
+dictionary-build prepares the shared training-only motif dictionary; its encoder
+uses the visible GPUs automatically. dictionary-diagnostic orchestrates the V_val
+oracle comparison through score fan-out and never invokes held-out testing.
 
 merge/g1/g2/kd-targets remain single-process while train uses all visible
 NVIDIA H20 GPUs. Use nohup in the calling shell when a run must survive
@@ -242,6 +248,12 @@ print(cfg.output_dir, cfg.strategy, cfg.seed)
     ;;
   kd-targets)
     exec "${PYTHON_BIN}" -m src.distill.teacher_targets "$@"
+    ;;
+  dictionary-build)
+    exec "${PYTHON_BIN}" -m src.experiments.motif_dictionary_build "$@"
+    ;;
+  dictionary-diagnostic)
+    exec "${PYTHON_BIN}" -m src.experiments.motif_dictionary_diagnostic "$@"
     ;;
   *)
     usage >&2

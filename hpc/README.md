@@ -59,7 +59,7 @@ to the exact count in their retained artifacts.
 
 | Item | Fixed value |
 |---|---|
-| SSH | `ssh -p 30838 root@10.15.171.204` (4 × H20, GitHub access); also `-p 30846` (4 × H20) and `-p 30030` (2 × H20); all share `/2023533015` |
+| SSH | `ssh -p 30838 root@10.15.171.204` (4 × H20, GitHub access); also `-p 30846` (4 × H20) and `-p 30030` (4 × H20, verified 2026-09-19); all share `/2023533015` |
 | Repository | `/2023533015/topology-conditioned-inductive-edge-prediction` |
 | GPU | 1 or more NVIDIA H20/H20-3e |
 | NVIDIA driver | 550.144.03 |
@@ -120,6 +120,42 @@ There is no default reason and none is auto-generated — an operator must state
 example when a checkpoint is rescored after a scoring-code fix rather than a new training
 run. `B0` and `CAZI-MBN` are not ledgered, since neither publishes an `egostitch_e2e`
 checkpoint.
+
+## Motif dictionary and head-adaptation experiments
+
+The [approved design](../docs/superpowers/specs/2026-09-19-motif-dictionary-routing-design.md)
+separates dictionary compression (oracle), endpoint-only routing, and output-head adaptation.
+Build the shared training-only dictionary once before starting its oracle and router lanes:
+
+```bash
+hpc/run.sh dictionary-build \
+  --config configs/split_seed42/motif_prompt_stage2_v3_prefix.yaml \
+  --stage1-checkpoint outputs/split_seed42/motif_prompt_stage1/best.pt \
+  --output outputs/split_seed42/motif_dictionary/shared_seed0.pt \
+  --device cuda --batch-size 1024
+
+# 30838: sequence router; no task or structural gradient trains this lane.
+hpc/run.sh train configs/split_seed42/motif_dict_router.yaml --skip-test
+
+# 30846: run the two matched head experiments sequentially on the same allocation.
+hpc/run.sh train configs/split_seed42/motif_wave3_head.yaml --skip-test
+hpc/run.sh train configs/split_seed42/motif_wave3_head_content.yaml --skip-test
+
+# 30030: V_val-only true-template / dictionary / mean / gates-off diagnostic.
+hpc/run.sh dictionary-diagnostic \
+  --artifact outputs/split_seed42/motif_dictionary/shared_seed0.pt \
+  --stage1-checkpoint outputs/split_seed42/motif_prompt_stage1/best.pt \
+  --output-dir outputs/split_seed42/motif_dict_oracle \
+  --pack-dir outputs/feature_packs/b0_v31_bf16 \
+  --data-root data --strategy breadth_first
+```
+
+The builder uses all visible GPUs for graph-token encoding. The oracle driver invokes the existing
+score fan-out and analyzes its cached V_val artifacts; it does not train or access held-out test.
+The `motif_dict_oracle.yaml` config describes the oracle model, but is not an optimizer-bearing
+training job. Use the diagnostic command above. Keep source checkpoints and the shared dictionary
+fixed throughout the comparison; head-only `gates_off` uses the adapted head and is not the historical
+`prefix_base` result.
 
 ## EgoStitch E2E
 
