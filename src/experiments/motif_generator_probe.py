@@ -96,6 +96,7 @@ from src.model.egostitch.classifier.motif_prompt import (
     EDGE_TYPE_NAMES,
     MotifGenerator,
     V3_1MotifPrompt,
+    _ResidualReadBlock,
 )
 
 logger = logging.getLogger("motif_generator_probe")
@@ -328,9 +329,12 @@ def decompose(
     final = slots[-1]
     rows = _EDGE_ROW_INDEX.to(final.device)
     cols = _EDGE_COL_INDEX.to(final.device)
-    h_i, h_j = final[:, rows], final[:, cols]
     with torch.autocast(device_type=final.device.type, enabled=False):
-        features = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1).float()
+        # `MotifGenerator.forward` promotes both operands before forming the sum
+        # and the difference, so a replay that adds in bf16 and promotes after
+        # measures a rounding grid the generator no longer uses.
+        h_i, h_j = final[:, rows].float(), final[:, cols].float()
+        features = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1)
         logits = features.new_zeros(final.size(0), N_EDGES)
         for edge_type, gate in enumerate(generator.heads):
             mask = _TYPE_MASK[edge_type].to(final.device)
@@ -448,6 +452,7 @@ def _attention_side(
     state: torch.Tensor,
     pad: torch.Tensor | None,
     queries: torch.Tensor,
+    block: _ResidualReadBlock | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Measure one query family reading one endpoint.
 
@@ -457,6 +462,7 @@ def _attention_side(
         state: ``(B, L, 96)`` their projection, the attention's own input.
         pad: ``(B, L)`` padding mask, or ``None``.
         queries: ``(8, 96)`` the query family.
+        block: The family's residual read block, or ``None`` for the bare read.
 
     Returns:
         Per-row arrays: the four centred variances, the pre-softmax logit spread
@@ -471,9 +477,20 @@ def _attention_side(
     key_weight, key_bias = weight[GATE_DIM : 2 * GATE_DIM], bias[GATE_DIM : 2 * GATE_DIM]
     value_weight, value_bias = weight[2 * GATE_DIM :], bias[2 * GATE_DIM :]
     projected = state.detach().float()
-    keys = projected @ key_weight.T + key_bias
-    values = projected @ value_weight.T + value_bias
-    projected_queries = queries.detach().float() @ query_weight.T + query_bias
+    # Under ``slot_read='residual_block'`` the attention is handed ``LN_q(Q)`` and
+    # ``LN_h(S)``, and its values are ``LN_h(S)`` or ``S`` by ``value_norm``.
+    # Measuring the bare projection instead would report the entropy and the K/V
+    # variance of a computation the generator does not run -- and ``V/proj`` is
+    # exactly the number the value-norm comparison turns on.
+    key_source = projected if block is None else block.norm_h(projected)
+    value_source = key_source if block is None or block.value_norm else projected
+    # `nn.LayerNorm` is per position over the last dimension, so normalising the
+    # ``(K, 96)`` queries is the same as normalising their batch expansion.
+    bare_queries = queries.detach().float()
+    query_source = bare_queries if block is None else block.norm_q(bare_queries)
+    keys = key_source @ key_weight.T + key_bias
+    values = value_source @ value_weight.T + value_bias
+    projected_queries = query_source @ query_weight.T + query_bias
 
     heads = generator.attention.num_heads
     head_dim = GATE_DIM // heads
@@ -487,9 +504,14 @@ def _attention_side(
     spread = (((scores - mean.unsqueeze(-1)) * valid) ** 2).sum(dim=-1) / counts.view(batch, 1, 1)
     logit_std = spread.sqrt().mean(dim=(1, 2))
 
-    expanded = queries.unsqueeze(0).expand(state.size(0), -1, -1)
+    expanded = query_source.unsqueeze(0).expand(state.size(0), -1, -1)
     attention, weights = generator.attention(
-        expanded, state, state, key_padding_mask=pad, need_weights=True, average_attn_weights=True
+        expanded,
+        key_source,
+        value_source,
+        key_padding_mask=pad,
+        need_weights=True,
+        average_attn_weights=True,
     )
     probability = weights.detach().float().clamp_min(0.0)
     entropy = -(probability * torch.log(probability.clamp_min(1e-30))).sum(dim=-1)
@@ -516,6 +538,7 @@ def attention_side(
     state: torch.Tensor,
     pad: torch.Tensor | None,
     queries: torch.Tensor,
+    block: _ResidualReadBlock | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Measure one query family reading one endpoint (public wrapper).
 
@@ -529,11 +552,12 @@ def attention_side(
         state: ``(B, L, 96)`` their projection, the attention's own input.
         pad: ``(B, L)`` padding mask, or ``None``.
         queries: ``(8, 96)`` the query family.
+        block: The family's residual read block, or ``None`` for the bare read.
 
     Returns:
         The per-row arrays of `_attention_side`.
     """
-    return _attention_side(generator, raw, state, pad, queries)
+    return _attention_side(generator, raw, state, pad, queries, block)
 
 
 def _read_cosine(reads: torch.Tensor) -> torch.Tensor:
@@ -947,15 +971,15 @@ def replay(
                     role_cell["D"].extend(slot_spread(states).cpu().tolist())
                     role_cell["scale"].extend(slot_scale(states).cpu().tolist())
                     role_cell["maxd"].extend(max_pairwise_distance(states).cpu().tolist())
-            for family, queries in (
-                ("bridge", generator.bridge_queries),
-                ("witness", generator.witness_queries),
+            for family, queries, block in (
+                ("bridge", generator.bridge_queries, generator.bridge_read),
+                ("witness", generator.witness_queries, generator.witness_read),
             ):
                 for side, raw, state, pad in (
                     ("u", encoded_u, stages.state_u, stages.pad_u),
                     ("v", encoded_v, stages.state_v, stages.pad_v),
                 ):
-                    measured = _attention_side(generator, raw, state, pad, queries)
+                    measured = _attention_side(generator, raw, state, pad, queries, block)
                     family_cell = attention.setdefault(f"{family}_{side}", {})
                     for key, series in measured.items():
                         family_cell.setdefault(key, []).extend(series.tolist())

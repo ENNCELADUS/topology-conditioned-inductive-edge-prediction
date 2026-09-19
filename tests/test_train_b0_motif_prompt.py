@@ -1244,7 +1244,7 @@ def test_uniform_graph_rows_are_the_composite_the_arm_already_had() -> None:
         torch.testing.assert_close(new, old, rtol=0, atol=0)
 
 
-def test_closure_balanced_rows_reweight_only_the_two_graph_terms() -> None:
+def test_closure_balanced_rows_reweight_l_g_alone() -> None:
     from src.train_b0 import _motif_row_share, _motif_stream_counts, _motif_stream_terms
 
     model = _model("two", graph_row_weighting="closure_balanced")
@@ -1262,12 +1262,15 @@ def test_closure_balanced_rows_reweight_only_the_two_graph_terms() -> None:
         positive_share=_motif_row_share(model),
     )
     nonempty = rows["nonempty"] > 0
-    for term, name in ((slot, "slot"), (topo, "topo")):
-        raw = rows[name].detach()
-        expected = 0.5 * float(raw[nonempty].mean()) + 0.5 * float(raw[~nonempty].mean())
-        assert float(term.detach()) == pytest.approx(expected, rel=1e-5)
-        # The 4:2 row split really did move the term off its plain mean.
-        assert float(term.detach()) != pytest.approx(float(raw.mean()), rel=1e-5)
+    raw_slot = rows["slot"].detach()
+    expected = 0.5 * float(raw_slot[nonempty].mean()) + 0.5 * float(raw_slot[~nonempty].mean())
+    assert float(slot.detach()) == pytest.approx(expected, rel=1e-5)
+    # The 4:2 row split really did move L_G off its plain mean.
+    assert float(slot.detach()) != pytest.approx(float(raw_slot.mean()), rel=1e-5)
+    # L_topo is the composite's separate lambda_T term and keeps the stream's own
+    # rows, so it stays exactly the plain masked mean.
+    raw_topo = rows["topo"].detach()
+    assert float(topo.detach()) == pytest.approx(float(raw_topo.mean()), rel=1e-5)
     assert slot.requires_grad and topo.requires_grad
     # The task BCE is untouched: only the rows of the graph loss are re-weighted.
     torch.testing.assert_close(model(batch)["loss"].detach(), like.detach())
@@ -1589,6 +1592,53 @@ def test_the_balance_rule_rounds_the_ratio_to_a_power_of_ten_and_clamps_it() -> 
     # A degenerate probe cannot drown the task: no log10 of zero, no NaN weight.
     assert resolve(0.0, 1.0) == pytest.approx(0.1)
     assert resolve(1.0, 0.0) == pytest.approx(1000.0)
+
+
+def _balanced_probe_batch(n: int = 6) -> dict[str, torch.Tensor]:
+    """A probe batch whose first two rows are the only ones with a closure target."""
+    batch = _probe_batch(n=n)
+    template = batch[TEMPLATE_KEY].clone()
+    template[2:, :16] = 0.0
+    batch[TEMPLATE_KEY] = template
+    return batch
+
+
+def test_the_balance_probe_measures_the_graph_loss_the_arm_trains() -> None:
+    from src.train_b0 import _motif_generator_probe
+
+    batch = _balanced_probe_batch()
+    uniform = _motif_generator_probe(_probe_model(), batch, rows=6)
+    balanced = _motif_generator_probe(
+        _probe_model(graph_row_weighting="closure_balanced"), batch, rows=6
+    )
+    # Same weights, same batch: only the row distribution of L_G differs, and a
+    # balanced w_slot is the ratio against that gradient, so it has to move.
+    assert uniform.task_norm == pytest.approx(balanced.task_norm, rel=1e-6)
+    assert balanced.slot_norm != pytest.approx(uniform.slot_norm, rel=1e-4)
+
+
+def test_the_balance_probe_is_unweighted_under_uniform_rows() -> None:
+    from src.train_b0 import _motif_probe_slot_rows
+
+    model = _probe_model()
+    batch = _balanced_probe_batch()
+    rows = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    mask = torch.ones(6)
+    torch.testing.assert_close(_motif_probe_slot_rows(model, batch, rows, mask), rows)
+
+
+def test_the_balance_probe_gives_the_closure_rows_their_configured_share() -> None:
+    from src.train_b0 import _motif_probe_slot_rows
+
+    model = _probe_model(graph_row_weighting="closure_balanced")
+    batch = _balanced_probe_batch()
+    rows = torch.ones(6)
+    mask = torch.ones(6)
+    weighted = _motif_probe_slot_rows(model, batch, rows, mask)
+    # Two non-empty rows carry half the mass of six: 0.5 * 6 / 2 = 1.5 each, and
+    # the four empty ones 0.5 * 6 / 4 = 0.75 each.
+    torch.testing.assert_close(weighted, torch.tensor([1.5, 1.5, 0.75, 0.75, 0.75, 0.75]))
+    assert float(weighted.sum()) == pytest.approx(float(mask.sum()))
 
 
 def test_the_generator_probe_is_deterministic_and_reports_every_key() -> None:

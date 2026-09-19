@@ -1058,9 +1058,11 @@ def _motif_stream_terms(
 
     ``positive_share`` turns on the ``closure_balanced`` row weighting: inside
     each stream the rows whose closure target is non-empty carry that share of
-    the graph loss and the empty ones the rest. The weights sum to the stream's
-    valid-row count, so this is a change of the row distribution G's loss sees
-    and not of its scale, and nothing outside the two graph terms moves.
+    ``L_G`` and the empty ones the rest. The weights sum to the stream's
+    valid-row count, so this is a change of the row distribution ``L_G`` sees and
+    not of its scale. It reaches ``L_slot`` alone: ``L_topo`` is the composite's
+    separate ``lambda_T`` term (spec section 7.5), so it keeps the stream's own
+    rows, as does everything outside ``L_G``.
 
     Args:
         task: The task stream's per-row terms and its valid-nonself mask.
@@ -1102,11 +1104,10 @@ def _motif_stream_terms(
             valid_counts=slot_counts,
             nonempty_counts=nonempty_counts,
         )
+        # Only ``L_G``'s rows move. ``L_topo`` is the separate ``lambda_T`` term of
+        # the spec's section 7.5 composite, and re-weighting it too would make the
+        # arm change two objectives where it is meant to isolate one.
         slot_rows = [row * weight for row, weight in zip(slot_rows, weights, strict=True)]
-        topo_rows = [
-            row if row.numel() == 0 else row * weight
-            for row, weight in zip(topo_rows, weights, strict=True)
-        ]
     return (
         stream_mean(slot_rows, masks, like=like, global_counts=slot_counts, world_size=world_size),
         stream_mean(topo_rows, masks, like=like, global_counts=topo_counts, world_size=world_size),
@@ -1377,6 +1378,33 @@ def _grad_norm_over(term: torch.Tensor, params: Sequence[nn.Parameter]) -> float
     return float(torch.stack(squares).sum().sqrt().item())
 
 
+def _motif_probe_slot_rows(
+    model: V3_1MotifPrompt,
+    probe: Mapping[str, torch.Tensor],
+    slot_rows: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """The probe batch's ``L_G`` rows under the arm's own graph-row weighting.
+
+    Args:
+        model: The unwrapped motif-prompt model.
+        probe: The probe batch, with its compiled templates attached.
+        slot_rows: ``(B,)`` per-row ``L_slot``.
+        mask: ``(B,)`` valid-row mask, already cast to the loss dtype.
+
+    Returns:
+        ``slot_rows`` unchanged under ``uniform``, re-weighted under
+        ``closure_balanced``.
+    """
+    share = _motif_row_share(model)
+    template = probe.get(TEMPLATE_KEY)
+    if share is None or template is None:
+        return slot_rows
+    nonempty = model.closure_nonempty_rows(template.to(device=slot_rows.device))
+    weights = balanced_row_weights(nonempty, mask, positive_share=share)
+    return slot_rows * weights.to(slot_rows)
+
+
 def _motif_generator_probe(
     model: V3_1MotifPrompt, batch: Mapping[str, torch.Tensor], *, rows: int
 ) -> MotifGeneratorProbe:
@@ -1388,8 +1416,12 @@ def _motif_generator_probe(
     a repeat on the same batch returns the same numbers, and reads gradients only
     through `torch.autograd.grad`, so no ``.grad`` and no optimiser state moves.
 
-    ``L_G`` is the unweighted masked mean of ``L_slot``'s rows and the topo term
-    carries ``w_topo``, matching the composite the trainer forms.
+    ``L_G`` is the masked mean of ``L_slot``'s rows under the arm's own
+    ``graph_row_weighting`` -- a balanced ``w_slot`` is the ratio of the task
+    gradient to the gradient of the graph loss that is actually trained, so the
+    probe has to weight the rows exactly as `_motif_stream_terms` does -- and the
+    topo term carries ``w_topo``, matching the composite the trainer forms. The
+    probe is one fixed batch, so its counts are that batch's own.
 
     Args:
         model: The unwrapped motif-prompt model, with a trainable generator.
@@ -1415,9 +1447,10 @@ def _motif_generator_probe(
             output = cast(dict[str, torch.Tensor], model(dict(probe)))
             mask = probe[TEMPLATE_MASK_KEY].reshape(-1).to(output["loss"])
             denominator = mask.sum().clamp_min(1.0)
+            slot_rows = _motif_probe_slot_rows(model, probe, output["slot_loss_rows"], mask)
             terms = {
                 "task": output["loss"],
-                "slot": output["slot_loss_rows"].sum() / denominator,
+                "slot": slot_rows.sum() / denominator,
                 "topo": float(model.cfg.w_topo)
                 * (output.get("topo_loss_rows", output["loss"] * 0.0).sum() / denominator),
             }

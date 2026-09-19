@@ -59,7 +59,7 @@ import argparse
 import json
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -150,6 +150,13 @@ GROUP_KEYS: tuple[str, ...] = (
     "slot_read_value_norm",
     "slot_query_init_std",
 )
+#: `MotifPromptConfig`'s own default per `GROUP_KEYS` entry, which every group
+#: is reset to before its overrides go on: the groups are a comparison and may
+#: not inherit one of the keys they compare from whichever checkpoint supplied
+#: the trunk.
+GROUP_DEFAULTS: dict[str, object] = {
+    field.name: field.default for field in fields(MotifPromptConfig) if field.name in GROUP_KEYS
+}
 #: Query families the attention block is measured for.
 QUERY_FAMILIES: tuple[str, ...] = ("witness", "bridge")
 #: Witness-count strata, by the number of non-zero ``CLOSURE_U`` slots.
@@ -733,7 +740,15 @@ def _pool_size(total: int) -> int:
 
 
 def group_config(cfg: MotifPromptConfig, group: str) -> MotifPromptConfig:
-    """Return the checkpoint's motif-prompt block with one group's overrides on.
+    """Return the checkpoint's motif-prompt block carrying exactly one group.
+
+    Every `GROUP_KEYS` entry is first reset to its `MotifPromptConfig` default and
+    only then overridden by the group, because the groups are a comparison: a
+    checkpoint that already carries an adopted value -- and the wave-3 Stage II
+    checkpoints carry ``slot_read_value_norm: false`` -- would otherwise make
+    ``residual`` and ``residual_novln`` the same run under a name that says they
+    differ, and would replace the advertised query initialisation of every group
+    that does not set it.
 
     Args:
         cfg: The checkpoint's own motif-prompt block.
@@ -747,7 +762,7 @@ def group_config(cfg: MotifPromptConfig, group: str) -> MotifPromptConfig:
     """
     if group not in GROUPS:
         raise ValueError(f"group must be one of {sorted(GROUPS)}")
-    return replace(cfg, **GROUPS[group])  # type: ignore[arg-type]
+    return replace(cfg, **{**GROUP_DEFAULTS, **GROUPS[group]})  # type: ignore[arg-type]
 
 
 def build_generator(
@@ -872,8 +887,8 @@ def _attention_for(
         ``family -> measurement -> value``.
     """
     families = {
-        "witness": generator.witness_queries,
-        "bridge": generator.bridge_queries,
+        "witness": (generator.witness_queries, generator.witness_read),
+        "bridge": (generator.bridge_queries, generator.bridge_read),
     }
     collected: dict[str, dict[str, list[float]]] = {name: {} for name in families}
     pairs = rows.pairs[:DISPERSION_ROWS]
@@ -887,10 +902,10 @@ def _attention_for(
                 (encoded_u, _build_padding_mask(lengths_u, encoded_u.size(1))),
                 (encoded_v, _build_padding_mask(lengths_v, encoded_v.size(1))),
             )
-            for name, queries in families.items():
+            for name, (queries, block) in families.items():
                 for raw, pad in sides:
                     measured = attention_side(
-                        generator, raw, generator.residue_proj(raw), pad, queries
+                        generator, raw, generator.residue_proj(raw), pad, queries, block
                     )
                     for key, series in measured.items():
                         collected[name].setdefault(key, []).extend(series.tolist())

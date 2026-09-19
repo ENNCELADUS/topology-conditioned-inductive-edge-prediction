@@ -272,6 +272,28 @@ def test_group_config_overrides_only_the_group_keys() -> None:
         group_config(cfg, "nope")
 
 
+def test_a_group_never_inherits_a_compared_key_from_the_checkpoint() -> None:
+    # The adopted wave-3 Stage II checkpoints carry these three keys, and a group
+    # that does not set one must still run at the advertised default.
+    adopted = _cfg(
+        slot_read="residual_block",
+        slot_read_value_norm=False,
+        slot_query_init_std=0.3,
+        head_output_init_std=1e-2,
+    )
+    bare = group_config(adopted, "baseline")
+    assert bare.slot_read == "bare"
+    assert bare.slot_read_value_norm is True
+    assert bare.slot_query_init_std is None
+    assert bare.head_output_init_std == 1e-3
+    # `residual` and `residual_novln` stay the contrast their names claim.
+    assert group_config(adopted, "residual").slot_read_value_norm is True
+    assert group_config(adopted, "residual_novln").slot_read_value_norm is False
+    assert group_config(adopted, "residual").slot_query_init_std is None
+    # Keys outside the comparison still come from the checkpoint.
+    assert group_config(adopted, "baseline").bundle_checkpoint == "s.pt"
+
+
 def test_the_best_eval_picks_the_lowest_step_not_the_last() -> None:
     curve = [
         {"step": 100, "heldout": 0.11, "val_cls": 0.13},
