@@ -289,9 +289,9 @@ a shape verdict. The test-universe interventions were run for completeness beyon
 `gates_off` and `mean` had completed when this was written and are quoted above; `permute_closure`,
 `rewire_bridge` and `shuffle_graph` on `test` / `test_topology` were still scoring, and land under
 `outputs/analysis/motif_wave3_attribution/interventions/stage2_v3/`. Finally, the shipped entry point
-`python -m src.experiments.motif_density_control` **cannot run against a current report**: it reads
+`python -m src.experiments.motif_density_control` could not run against a current report: it read
 `graph.fixed_threshold.validation_selection.logit_threshold`, a flat key the `test_protocol_v8`
 `geometric_rd_five_rank_v1` schema does not write (the threshold is at `…validation_selection.selected.logit_threshold`),
-and raises `KeyError`. The control here was therefore run through that module's own
+and raised `KeyError`; the control here was therefore run through that module's own
 `target_edge_count` / `density_matched_report` functions unchanged, with the threshold read from the key the
-schema does write; the module was not edited.
+schema does write, and the reader was fixed to that nested path in 54e9d8d.
