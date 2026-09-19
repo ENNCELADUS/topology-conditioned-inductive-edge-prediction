@@ -1,6 +1,6 @@
 # Motif graph prompts read by GRIT
 
-**Date:** 2026-09-16, amended 2026-09-18. **Version:** v14 (supersedes v13; change log in §11).
+**Date:** 2026-09-16, amended 2026-09-19. **Version:** v16 (supersedes v15; change log in §11).
 **Status:** implemented and run once (wave 1, `686627d`, 2026-09-17/18): Stage I and its two family
 ablations, Stage II and its bridge-only / closure-only controls. Stage I gains (+0.066 test AUPRC, +0.08 GS
 over the frozen trunk); every Stage II row finished at the trunk. The wave-1 verdict
@@ -405,6 +405,21 @@ of the first runs sat near step 400 and the curve rose afterwards; that report n
 attention entropy and the `K/proj`, `V/proj` centred-variance ratios of
 `src.experiments.motif_generator_probe` and the held-out `L_G` at its best eval step.
 
+v16 adopts one of those settings. On the full corpus the three wave-3 generator keys pass only
+together: `slot_read: residual_block` (the query-preserving read), `slot_read_value_norm: false` (the
+un-normalised value path, which restores the per-residue magnitude the `LN_h` discards) and, from
+§7.5, `graph_row_weighting: closure_balanced` at `graph_row_positive_share: 0.5` (the closure-non-empty
+rows carry half of `L_G`'s mass instead of the ~18% the 1:5 task stream gives them). Each key alone
+left G on the empty-closure constant -- the bare read collapsed the slots, the normalised value path
+bought slot distinction with pair dependence, and the unweighted rows drifted to the empty-closure
+majority -- while the prefix carrying all three,
+`motif_prompt_stage2_v3_novln_balanced_prefix`, is the first to pass all three pilot-B rules
+(held-out `L_G` `0.0510` against the re-fitted constant's `0.0595` and `val_cls` `0.0934` against
+`0.1081`; reconstruction `0.562`/`0.648`; transplant `+93%` on held-out train; downstream `s2_pred`
+AUPRC `0.8175` against `gates_off` `0.8136`). That setting is now the Stage II arm
+`motif_prompt_stage2_v3`; the wave-1 and wave-2 configs keep the bare read and uniform rows only so
+their published rows stay reproducible.
+
 G is equivariant to `u<->v, L<->R`. Its private seeds can distinguish attachments while the reader stays
 order-invariant; this permits more than one activity value but does not guarantee the model uses it.
 
@@ -676,6 +691,17 @@ not a guarantee of sufficiency; the epoch-2 prefix is continued under the guarde
 that are inert before the interface opens (`w_slot`, `w_slot_multiplier`, `w_topo`) are excluded from the
 resume comparison for such a prefix, so one prefix serves every joint-phase arm.
 
+**The adopted wave-3 warm-up (v16).** The main Stage II arm `motif_prompt_stage2_v3` and its prefix
+`motif_prompt_stage2_v3_prefix` carry the passing generator setting of §4 at `interface_warmup_epochs:
+8`, not 2: the eight-epoch graph-only warm-up of the *previous* generator put the V_val fit's peak at
+epoch 6 (`outputs/analysis/motif_pilot_b_v3_warm8/epoch-000N/pilot_b.md`), so a two-epoch prefix stops
+before the fit this generator reaches. The prefix halts at `optim.stop_after_epoch: 8`, inside its own
+warm-up, so the interface opens for the first time in the continuation, and every epoch checkpoint
+under `attempts/<id>/checkpoints/epoch-000N.pt` is read by `src.experiments.motif_pilot_b`, which is
+what makes the warm-up length itself a measured quantity rather than an assumption. What the open
+interface then does to G -- joint or detached -- is the separate question above; the arm keeps
+`warmup_losses: graph_only` until that read lands.
+
 ```
 L_II = L_task_BCE + L_struct + lambda_G * L_G + lambda_T * L_topo
 ```
@@ -903,6 +929,7 @@ cannot instantiate this interface.
 
 | Version | Date | Changes |
 |---|---|---|
+| v16 | 2026-09-19 | Wave-3 adoption, no new key and no default change: the first generator setting to pass all three pre-registered pilot-B rules is adopted into the main Stage II arm. **§4** the three wave-3 keys pass only together -- `slot_read: residual_block`, `slot_read_value_norm: false` and `graph_row_weighting: closure_balanced` at `graph_row_positive_share: 0.5` -- each one alone leaving G on the empty-closure constant; the passing prefix is `motif_prompt_stage2_v3_novln_balanced_prefix` (held-out `L_G` 0.0510 vs the constant's 0.0595, `val_cls` 0.0934 vs 0.1081, reconstruction 0.562/0.648, transplant +93% on held-out train, downstream `s2_pred` 0.8175 vs `gates_off` 0.8136). **§7.5** `motif_prompt_stage2_v3` and `motif_prompt_stage2_v3_prefix` carry that setting at `interface_warmup_epochs: 8` with the prefix halted at `optim.stop_after_epoch: 8`, because the previous generator's eight-epoch warm-up peaked at epoch 6; every epoch checkpoint of the prefix is read by `src.experiments.motif_pilot_b`. The interface-open regime is left at `warmup_losses: graph_only` pending the v15 detached read. `motif_prompt_stage2_v3_{headgain,novln,novln_balanced}_prefix` stay as the attribution rows. |
 | v14 | 2026-09-18 | Wave-3 phase C revision, two optional generator keys, no default change: **§4** `motif_prompt.slot_read_value_norm` (`true` default) drops the `LN_h` from the residual block's value path, and `motif_prompt.slot_query_init_std` (`null` default) overrides the per-read query init rule. Measured cause: on the full corpus the residual read removed the within-row slot collapse but halved the transplant rise and the `V/proj` variance ratio, i.e. it bought slot distinction with pair dependence. Read by `src.experiments.motif_generator_fit --group {residual_novln,residual_q01,residual_q01_novln,residual_q03_novln}` at 600 steps against re-run `residual` and `baseline`; that harness's report gains the probe's attention entropy and `K/proj`, `V/proj` ratios and the held-out `L_G` at its best eval step. |
 | v13 | 2026-09-18 | Wave-3 phase C read, and the adoption it licenses: on the fixed-set generator-only fit `slot_read: residual_block` dropped the identical-closure-row fraction from 0.6 to 0.0 and raised the witness-read spread from 0.004 to 0.98 at no cost in held-out `L_G`, while `head_output_init_std: 1e-2` alone changed nothing measurable. **§4** the residual read is now the design and `bare` is retained only to reproduce the wave-1/wave-2 rows; no default moves, so every pre-v13 config is unaffected. The main Stage II arm becomes `motif_prompt_stage2_v3` (wave-2 init-only setting + `slot_read: residual_block`, full 15-epoch schedule) continued from `motif_prompt_stage2_v3_prefix` under the guarded resume, with `motif_prompt_stage2_v3_headgain_prefix` attributing the read against the gate-head output scale on the full corpus; both prefixes are read by `src.experiments.motif_pilot_b` and `src.experiments.motif_generator_probe` against the wave-2 init-only rows. |
 | v12 | 2026-09-18 | Wave-3 phase C, two optional generator keys, no default change: **§4** `motif_prompt.slot_read` (`bare` / `residual_block`) puts the slot query back on the read's residual path and raises the query init to `std = 1.0` in that mode, `motif_prompt.head_output_init_std` scales the gate heads' output layer, and the head features promote to fp32 *before* the sum and the difference are formed (unconditional; bf16 rounding only). Measured cause: identical closure slots in 100% of wave-2 rows, uniform witness attention, untrained queries. Read by `src.experiments.motif_generator_fit`, a fixed-set generator-only fit over a witness-count-stratified row set with cached frozen-trunk inputs. |

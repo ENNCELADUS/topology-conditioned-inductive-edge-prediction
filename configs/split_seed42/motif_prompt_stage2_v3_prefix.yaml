@@ -1,5 +1,5 @@
 # Wave 3 of the motif-graph GRIT prompt's Stage II, the DEPLOYABLE arm: the
-# two-epoch graph-only PREFIX of configs/split_seed42/motif_prompt_stage2_v3.yaml.
+# eight-epoch graph-only PREFIX of configs/split_seed42/motif_prompt_stage2_v3.yaml.
 # A residue-conditioned generator G predicts the 96 motif edge weights from
 # (x_u, x_v) alone; the Stage I bundle -- GRIT reader, count head, token
 # projections, role embeddings and the prefix adapter with its gates --
@@ -9,25 +9,33 @@
 # features: no node ids, no neighbour lookup, no truth graph, no bank, no
 # universe statistic. Launched as a formal run, without --run-kind.
 #
-# The setting is wave 2's winning "init-only" prefix -- F1 closure_bias_init:
-# nonzero_mean, F3 warmup_losses: graph_only + w_slot: balanced, and the wave-1
-# loss (beta_c 0.0) -- plus the one wave-3 fix, F4 slot_read: residual_block.
-# Wave 2 showed G hedging to a near-constant graph with every closure slot
-# identical, which the bare read makes unavoidable: the read returns MHA(q, H, H)
-# and nothing else, so under a near-uniform attention all eight slots collapse
-# onto the same mean of V. F4 puts the query back on the residual path.
-# Question: does the query-preserving read move G off the constant on the full
-# corpus, as it did on the fixed-set generator-only fit?
+# ADOPTED 2026-09-19: the generator setting is the one that passed all three
+# pre-registered pilot-B rules on a two-epoch prefix,
+# configs/split_seed42/motif_prompt_stage2_v3_novln_balanced_prefix.yaml --
+# F1 + F3 + the wave-1 loss, plus F4 slot_read: residual_block, the
+# un-normalised value path and the closure-balanced graph-loss rows, three keys
+# that pass only together. A1 stretches the graph-only warm-up from two epochs
+# to eight, because the OLD generator's eight-epoch warm-up put the V_val fit's
+# peak at epoch 6. Question: does the pilot-B pass hold, or regress, when the
+# same generator is trained on L_G four times as long?
 #
-# This is a two-epoch PREFIX (optim.stop_after_epoch: 2, epochs stays 15 so the
-# one-cycle shape, the trainability mask and the data order are the full run's).
+# This is an eight-epoch PREFIX (optim.stop_after_epoch: 8, epochs stays 15 so
+# the one-cycle shape, the trainability mask and the data order are the full
+# run's), halted inside its own warm-up, so the interface opens for the first
+# time in the continuation. Per-epoch checkpoints land in
+# attempts/<attempt id>/checkpoints/epoch-000N.pt and each one is read by
+# src.experiments.motif_pilot_b into
+# outputs/analysis/motif_pilot_b_v3_main_warm8/epoch-000N.
 # Launch:
 #   hpc/run.sh train configs/split_seed42/motif_prompt_stage2_v3_prefix.yaml --skip-test
 # and continue it into the wave-3 main arm with
 #   hpc/run.sh train configs/split_seed42/motif_prompt_stage2_v3.yaml --resume-attempt \
 #     outputs/split_seed42/motif_prompt_stage2_v3_prefix/attempts/<attempt id>
-# Read by src.experiments.motif_pilot_b and src.experiments.motif_generator_probe
-# against outputs/analysis/motif_pilot_b_v2_initonly.
+# output_dir is unchanged from the superseded two-epoch prefix: the pipeline
+# opens a NEW attempt id, and the earlier attempt keeps its own complete
+# artifacts (best.pt, last.pt, metrics.jsonl, profile.json, status.json and its
+# two epoch checkpoints) under attempts/c4c069cc6c034974b38fd293f3aa046a, which
+# publishing this run only re-points the output_dir root away from.
 # Split: seed 42, root node_007630. No key selects another.
 # Spec: docs/superpowers/specs/2026-09-16-motif-graph-grit-prompt-design.md
 # Plan: docs/tmp/2026-09-18-motif-stage2-fix-plan.md
@@ -46,17 +54,26 @@ model:
       families: [closure, bridge]
       token_source: graph
       gate_mode: learned
-      interface_warmup_epochs: 2 # G alone for epochs 1-2 (spec section 7.5)
-      warmup_losses: graph_only # F3: epochs 1-2 detach task/struct/topo from G
-      w_slot: balanced # F3: fixed once by the gradient-norm probe at epoch 3
+      # A1 (wave 3): the graph-only warm-up runs for eight epochs, not two. The
+      # eight-epoch warm-up of the OLD generator put the V_val fit's peak at
+      # epoch 6 (outputs/analysis/motif_pilot_b_v3_warm8/epoch-000N/pilot_b.md),
+      # so two epochs never reached the fit this generator is capable of.
+      interface_warmup_epochs: 8 # G alone for epochs 1-8 (spec section 7.5)
+      # The interface-open regime of epochs 9-15 -- joint vs detached, i.e. this
+      # key's value once the interface opens -- is still being decided by the
+      # `warmup_losses: graph_only_always` experiment; graph_only keeps the
+      # wave-3 meaning (epochs 1-8 detach task/struct/topo from G, epoch 9 opens
+      # both the interface and the task gradient into G) until that lands.
+      warmup_losses: graph_only # F3: epochs 1-8 detach task/struct/topo from G
+      w_slot: balanced # F3: fixed once by the gradient-norm probe at epoch 9
       w_slot_multiplier: 1.0
-      balance_probe_rows: 256 # first rows of the first epoch-3 task batch, rank 0
+      balance_probe_rows: 256 # first rows of the first epoch-9 task batch, rank 0
       w_topo: 0.1 # representation term towards the immutable teacher R_T
       beta_p: 1.0
       beta_q: 1.0
       beta_a: 1.0
       beta_i: 1.0
-      beta_c: 0.0 # F2: raw closure multiset; wave 1 had no such term
+      beta_c: 0.0 # the wave-1 loss; wave 2 attributed the movement to F1, not F2
       closure_bias_init: nonzero_mean # F1: closure magnitude, not closure density
       # F4 (wave 3): the query-preserving read. The bare read returned the
       # attention output alone, so a near-uniform attention gave every slot the
@@ -66,6 +83,23 @@ model:
       # identical-closure-row fraction from 0.6 to 0.0 and the witness-read
       # spread from 0.004 to 0.98 at no cost in held-out L_G.
       slot_read: residual_block
+      # Phase C: the residual read over the RAW states. The fixed-set harness
+      # round 2 measured LN_h(S) as the values against the un-normalised value
+      # path, and the raw path kept the slot distinction the bare read lost
+      # while restoring the magnitude information LN_h throws away
+      # (outputs/analysis/motif_generator_fit_r2/*/fit.md). The slot queries keep
+      # the residual block's own unit-scale rule (slot_query_init_std unset).
+      slot_read_value_norm: false
+      # Phase B: the closure-non-empty rows carry half of L_G's mass, the empty
+      # rows the other half, per stream and over the rank-reduced counts. L_G is
+      # measured on the rows of the dynamic 1:5 task stream, so about 82% of its
+      # rows have an EMPTY closure family and the unweighted fit drifted to that
+      # majority. The weights sum to the valid-row count, so L_G keeps its scale
+      # and only the row distribution G is trained on changes; the epoch's
+      # realised imbalance is logged as graph_rows_closure_nonempty_frac in
+      # metrics.jsonl whether or not the weighting is on.
+      graph_row_weighting: closure_balanced
+      graph_row_positive_share: 0.5
       huber_delta: 1.0
 data:
   root: data
@@ -80,7 +114,7 @@ optim:
   lr: 1.0e-4
   weight_decay: 1.0e-2
   epochs: 15
-  stop_after_epoch: 2 # a halted prefix; the schedule stays the full 15
+  stop_after_epoch: 8 # an eight-epoch halted prefix; the schedule stays the full 15
   warmup_steps: 500 # unused while a onecycle scheduler is configured
   grad_clip: 1.0
   scheduler:

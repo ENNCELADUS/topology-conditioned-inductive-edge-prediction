@@ -239,9 +239,14 @@ def test_only_the_pilots_and_the_wave_two_prefixes_stop_early(name: str) -> None
     halted = name.startswith("motif_prompt_teach_") or (
         name.startswith("motif_prompt_stage2_v") and name.endswith("_prefix.yaml")
     )
-    # The wave-3 A1 prefix stretches the graph-only warm-up to eight epochs and
-    # halts there; every other prefix is a two-epoch warm-up.
-    expected = 8 if name == "motif_prompt_stage2_v3_initonly_warm8_prefix.yaml" else 2
+    # The wave-3 A1 prefix and the adopted wave-3 main prefix both stretch the
+    # graph-only warm-up to eight epochs and halt there; every other prefix is a
+    # two-epoch warm-up.
+    eight = {
+        "motif_prompt_stage2_v3_initonly_warm8_prefix.yaml",
+        f"{_WAVE_THREE_MAIN}_prefix.yaml",
+    }
+    expected = 8 if name in eight else 2
     assert cfg.optim.stop_after_epoch == (expected if halted else None)
     if halted:
         warmup = cfg.model.config["motif_prompt"]["interface_warmup_epochs"]
@@ -366,31 +371,59 @@ def test_each_balanced_prefix_adds_only_the_graph_row_weighting(name: str, sourc
 
 
 def test_every_other_motif_arm_keeps_the_streams_own_row_distribution() -> None:
-    # The weighting is opt-in: wave 1 and wave 2 keep uniform rows, so the two
-    # phase-B prefixes are the only rows that read differently.
+    # The weighting is opt-in: wave 1 and wave 2 keep uniform rows, so the
+    # phase-B prefixes and the wave-3 arm that adopted them are the only rows
+    # that read differently.
+    balanced = {*_WAVE_THREE_BALANCED, _WAVE_THREE_MAIN, f"{_WAVE_THREE_MAIN}_prefix"}
     for name in ARMS:
         block = _block(name)
-        expected = "closure_balanced" if Path(name).stem in _WAVE_THREE_BALANCED else "uniform"
+        expected = "closure_balanced" if Path(name).stem in balanced else "uniform"
         assert block.get("graph_row_weighting", "uniform") == expected
         assert MotifPromptConfig.from_mapping(block).graph_row_weighting == expected
 
 
-#: The wave-3 main Stage II arm and the two-epoch prefix it is continued from.
+#: The wave-3 main Stage II arm and the eight-epoch prefix it is continued from.
 _WAVE_THREE_MAIN = "motif_prompt_stage2_v3"
 
-#: The wave-3 attribution prefix and what it adds to the main prefix.
+#: The three wave-3 generator keys the main arm adopted on 2026-09-19, over the
+#: wave-2 "init-only" setting. Each one alone left G on the empty-closure
+#: constant; together they are the first prefix to pass all three pilot-B rules.
+_WAVE_THREE_ADOPTED: dict[str, Any] = {
+    "slot_read": "residual_block",
+    "slot_read_value_norm": False,
+    "graph_row_weighting": "closure_balanced",
+    "graph_row_positive_share": 0.5,
+}
+
+#: The superseded wave-3 baseline the attribution prefixes were forked from:
+#: the wave-2 "init-only" prefix plus F4 alone, at the two-epoch warm-up. The
+#: main prefix has since moved on, so the comparison is pinned here rather than
+#: read off a config.
+_WAVE_THREE_BASE_SOURCE = "motif_prompt_stage2_v2_initonly_prefix"
+
+#: The wave-3 attribution prefix and what it adds to that baseline.
 _WAVE_THREE_ATTRIBUTION: dict[str, dict[str, Any]] = {
     "motif_prompt_stage2_v3_headgain_prefix": {"head_output_init_std": 0.01},
 }
 
 
-def test_the_wave_three_arm_is_the_init_only_setting_plus_the_residual_read() -> None:
+def _wave_three_base_block() -> dict[str, Any]:
+    """Return the superseded wave-3 baseline block the attribution prefixes fork."""
+    return {**_block(f"{_WAVE_THREE_BASE_SOURCE}.yaml"), "slot_read": "residual_block"}
+
+
+def test_the_wave_three_arm_is_the_init_only_setting_plus_the_adopted_keys() -> None:
     # The owner's rule: a validated revision is adopted into the main model, so
     # wave 3's Stage II arm is wave 2's winning "init-only" prefix (F1 + F3, the
-    # wave-1 loss) plus F4, the query-preserving read.
+    # wave-1 loss) plus the three keys the passing prefix
+    # motif_prompt_stage2_v3_novln_balanced_prefix carried, and A1's eight-epoch
+    # graph-only warm-up.
     init_only = _block("motif_prompt_stage2_v2_initonly_prefix.yaml")
     arm = _block(f"{_WAVE_THREE_MAIN}.yaml")
-    assert arm == {**init_only, "slot_read": "residual_block"}
+    assert arm == {**init_only, **_WAVE_THREE_ADOPTED, "interface_warmup_epochs": 8}
+    # The adopted setting is exactly the passing prefix's, at a longer warm-up.
+    passing = _block("motif_prompt_stage2_v3_novln_balanced_prefix.yaml")
+    assert arm == {**passing, "interface_warmup_epochs": 8}
     assert arm["beta_c"] == 0.0
     assert arm["closure_bias_init"] == "nonzero_mean"
     assert arm["warmup_losses"] == "graph_only"
@@ -400,7 +433,7 @@ def test_the_wave_three_arm_is_the_init_only_setting_plus_the_residual_read() ->
     assert parsed.head_output_init_std == 1e-3
 
 
-def test_the_wave_three_prefix_is_a_true_two_epoch_prefix_of_the_arm() -> None:
+def test_the_wave_three_prefix_is_a_true_eight_epoch_prefix_of_the_arm() -> None:
     prefix = _raw(f"{_WAVE_THREE_MAIN}_prefix.yaml")
     arm = _raw(f"{_WAVE_THREE_MAIN}.yaml")
     assert prefix["output_dir"] == f"outputs/split_seed42/{_WAVE_THREE_MAIN}_prefix"
@@ -411,11 +444,14 @@ def test_the_wave_three_prefix_is_a_true_two_epoch_prefix_of_the_arm() -> None:
     assert arm["model"] == prefix["model"]
     for section in ("data", "eval", "runtime", "struct", "seed", "mixed_precision"):
         assert arm[section] == prefix[section]
-    assert prefix["optim"]["stop_after_epoch"] == 2
+    assert prefix["optim"]["stop_after_epoch"] == 8
     assert "stop_after_epoch" not in arm["optim"]
     assert arm["optim"] == {
         key: value for key, value in prefix["optim"].items() if key != "stop_after_epoch"
     }
+    # The prefix halts inside its own warm-up, so the interface opens for the
+    # first time in the continuation.
+    assert arm["model"]["config"]["motif_prompt"]["interface_warmup_epochs"] == 8
     header = (CONFIG_DIR / f"{_WAVE_THREE_MAIN}.yaml").read_text(encoding="utf-8")
     assert "--resume-attempt" in header
     assert f"outputs/split_seed42/{_WAVE_THREE_MAIN}_prefix/attempts/" in header
@@ -437,10 +473,10 @@ _WAVE_THREE_VALUE_NORM: dict[str, dict[str, Any]] = {
 def test_each_value_norm_prefix_changes_only_the_residual_reads_value_path(
     name: str, overrides: dict[str, Any]
 ) -> None:
-    base, other = _raw(f"{_WAVE_THREE_MAIN}_prefix.yaml"), _raw(f"{name}.yaml")
+    base, other = _raw(f"{_WAVE_THREE_BASE_SOURCE}.yaml"), _raw(f"{name}.yaml")
     assert other["output_dir"] == f"outputs/split_seed42/{name}"
     assert other["model"]["config"]["motif_prompt"] == {
-        **base["model"]["config"]["motif_prompt"],
+        **_wave_three_base_block(),
         **overrides,
     }
     for section in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
@@ -457,10 +493,10 @@ def test_each_value_norm_prefix_changes_only_the_residual_reads_value_path(
 def test_each_wave_three_attribution_prefix_adds_only_its_own_key(
     name: str, overrides: dict[str, Any]
 ) -> None:
-    base, other = _raw(f"{_WAVE_THREE_MAIN}_prefix.yaml"), _raw(f"{name}.yaml")
+    base, other = _raw(f"{_WAVE_THREE_BASE_SOURCE}.yaml"), _raw(f"{name}.yaml")
     assert other["output_dir"] == f"outputs/split_seed42/{name}"
     assert other["model"]["config"]["motif_prompt"] == {
-        **base["model"]["config"]["motif_prompt"],
+        **_wave_three_base_block(),
         **overrides,
     }
     for section in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
@@ -478,8 +514,14 @@ def test_only_the_wave_three_arm_and_its_prefixes_use_the_residual_read() -> Non
         *_WAVE_THREE_VALUE_NORM,
         "motif_prompt_stage2_v3_novln_balanced_prefix",
     }
-    # The value path is normalised everywhere but the two phase-C prefixes.
-    plain_values = {*_WAVE_THREE_VALUE_NORM, "motif_prompt_stage2_v3_novln_balanced_prefix"}
+    # The value path is normalised everywhere but the two phase-C prefixes and
+    # the wave-3 arm and prefix that adopted their read.
+    plain_values = {
+        *_WAVE_THREE_VALUE_NORM,
+        "motif_prompt_stage2_v3_novln_balanced_prefix",
+        _WAVE_THREE_MAIN,
+        f"{_WAVE_THREE_MAIN}_prefix",
+    }
     for name in ARMS:
         block = _block(name)
         expected = "residual_block" if Path(name).stem in residual else "bare"

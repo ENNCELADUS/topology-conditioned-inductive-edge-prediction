@@ -93,8 +93,10 @@ selected method. Every piece of writing must explain how its context helps decid
   `motif_prompt.head_output_init_std` are read by `python -m src.experiments.motif_generator_fit
   --group {baseline,residual,head_gain,combined}`, a minutes-long generator-only fit on cached
   frozen-trunk inputs over a witness-count-stratified fixed row set. The residual read won that fit,
-  so the current Stage II model is `motif_prompt_stage2_v3` -- the wave-2 init-only setting plus
-  `slot_read: residual_block` -- continued from its two-epoch graph-only prefix
+  so the current Stage II model is `motif_prompt_stage2_v3` -- the wave-2 init-only setting plus the
+  three keys adopted on 2026-09-19 (`slot_read: residual_block`, `slot_read_value_norm: false` and
+  `graph_row_weighting: closure_balanced` at `graph_row_positive_share: 0.5`) at
+  `interface_warmup_epochs: 8` -- continued from its eight-epoch graph-only prefix
   `motif_prompt_stage2_v3_prefix` with `--resume-attempt`, with
   `motif_prompt_stage2_v3_headgain_prefix` (`head_output_init_std: 0.01`) attributing the read against
   the gate-head output scale; the wave-3 reads live in `outputs/analysis/motif_pilot_b_v3_prefix`,
@@ -103,7 +105,13 @@ selected method. Every piece of writing must explain how its context helps decid
   whether G hedges because the graph loss reads the task stream's 1:5 rows (~82% with an empty closure
   family): `motif_prompt_stage2_v3_balanced_{initonly,full}_prefix` add only
   `motif_prompt.graph_row_weighting: closure_balanced` (share `graph_row_positive_share`, counts reduced
-  across ranks, `graph_rows_closure_nonempty_frac` in `metrics.jsonl`) to the two wave-2 prefixes. The
+  across ranks, `graph_rows_closure_nonempty_frac` in `metrics.jsonl`) to the two wave-2 prefixes.
+  Adopted 2026-09-19 (spec v16): those three keys pass only together, and the prefix carrying all three,
+  `motif_prompt_stage2_v3_novln_balanced_prefix`, is the first to clear all three pilot-B levels
+  (held-out `L_G` 0.0510 vs the constant's 0.0595, `val_cls` 0.0934 vs 0.1081, transplant +93%,
+  downstream `s2_pred` 0.8175 vs `gates_off` 0.8136), so `motif_prompt_stage2_v3{,_prefix}` carry that
+  setting at an eight-epoch warm-up whose every epoch checkpoint is read by `motif_pilot_b`; the
+  `headgain`, `novln` and `novln_balanced` prefixes stay as the historical attribution rows. The
   wave-1 configs keep their meaning: `beta_c`, `closure_bias_init`, `warmup_losses` and
   `graph_row_weighting` default to wave-1 behaviour.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
