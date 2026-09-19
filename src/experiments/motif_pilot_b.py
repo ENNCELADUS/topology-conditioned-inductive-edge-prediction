@@ -44,6 +44,7 @@ from scipy import stats as scipy_stats
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 import src.score_universe as su
+from src.data.motif_crossfit import seeded_hash_node_folds
 from src.data.motif_template import (
     EDGE_TYPES,
     N_EDGE_TYPES,
@@ -903,7 +904,18 @@ def run_pilot_b(
 
     weights = GraphLossWeights.from_config(model.cfg)
     split = su._load_val_region_split(data_root, strategy)
-    fit_nodes, heldout_nodes = split_training_nodes(sorted(split.train_nodes), seed=seed)
+    if model.cfg.crossfit_fold is None:
+        fit_nodes, heldout_nodes = split_training_nodes(sorted(split.train_nodes), seed=seed)
+        split_kind = "seeded_random_half"
+    else:
+        folds = seeded_hash_node_folds(split.train_nodes, seed=model.cfg.crossfit_seed)
+        fit_nodes = frozenset(
+            node for node, fold in folds.items() if fold == model.cfg.crossfit_fold
+        )
+        heldout_nodes = frozenset(
+            node for node, fold in folds.items() if fold != model.cfg.crossfit_fold
+        )
+        split_kind = "crossfit_opposite_fold"
     fit_pairs, _ = rows_inside(
         sorted(split.training_positives),
         list(split.training_negatives),
@@ -1042,6 +1054,9 @@ def run_pilot_b(
             "node_disjoint": True,
             "fit_nodes": len(fit_nodes),
             "heldout_nodes": len(heldout_nodes),
+            "split_kind": split_kind,
+            "crossfit_fold": model.cfg.crossfit_fold,
+            "crossfit_seed": model.cfg.crossfit_seed,
         },
         "diagnostic_sample_statistics": {
             "note": "statistics of the node-disjoint fit rows, not the F1 initialisation corpus; "

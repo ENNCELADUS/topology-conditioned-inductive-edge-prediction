@@ -1,12 +1,17 @@
 # Motif graph prompts read by GRIT
 
-**Date:** 2026-09-16, amended 2026-09-19. **Version:** v16 (supersedes v15; change log in §11).
+**Date:** 2026-09-16, amended 2026-09-19. **Version:** v17 (supersedes v16; change log in §11).
 **Status:** implemented and run once (wave 1, `686627d`, 2026-09-17/18): Stage I and its two family
 ablations, Stage II and its bridge-only / closure-only controls. Stage I gains (+0.066 test AUPRC, +0.08 GS
 over the frozen trunk); every Stage II row finished at the trunk. The wave-1 verdict
 (`docs/results/motif_prompt_verdict/README.md`) locates the failure in the generator's initialisation and
 supervision, not in the reader or the interface, and v10 amends §4, §7.3, §7.5, §0.2 and §8 accordingly
 (fix plan: `docs/tmp/2026-09-18-motif-stage2-fix-plan.md`). Wave 2 retrains Stage II only.
+Wave 3 (v11–v16) repaired the generator: `motif_prompt_stage2_v3_prefix` is the first Stage II G to pass
+every pre-registered pilot-B rule, and its held-out row sits in the `prefix_base` band
+(`docs/results/motif_prompt_wave3/README.md`). **v17 (§7.6) is implemented; experiment outcomes are pending:**
+it moves the reader onto the distribution the generator can actually emit, instead of moving the generator
+onto the distribution the reader was fitted to.
 It supersedes the coordinate/coarse-block interface **for this proposed arm only**. Existing
 `virtual_prompt_d*` checkpoints, run records and the historical September 15 specification remain valid
 descriptions of their own implementations.
@@ -316,7 +321,9 @@ identical-feature pairs; no self flag exists at inference. Report self and nonse
 **Stationary corruption:** on nonself Stage I rows use the clean adjacency half the time, otherwise
 `(1-lambda) A* + lambda Abar` with `lambda ~ Uniform(0,1)`. `Abar` is the mean training adjacency after
 random within-role permutations, computed from the training corpus only. The range is widened from v1
-because previous generators' realised quality corresponds to the upper part of it.
+because previous generators' realised quality corresponds to the upper part of it. v17 (§7.6.2)
+adds `corruption.source: predicted`, which replaces the blend on within-fold rows by a cached cross-fitted
+generator prediction: the blend covers the sharpness of a predicted graph, not its content errors.
 
 ## 4. Generator G: residue-conditioned edge gates
 
@@ -423,6 +430,10 @@ their published rows stay reproducible.
 G is equivariant to `u<->v, L<->R`. Its private seeds can distinguish attachments while the reader stays
 order-invariant; this permits more than one activity value but does not guarantee the model uses it.
 
+v17 (§7.6.4): `motif_prompt.generator_head: presence_profile` factors each edge weight as a
+per-type presence probability times the typed gate, with a presence BCE per type; `flat` stays the default
+and the wave-1–3 behaviour. The presence probabilities are also the source of the `topo_conf` field of §6.
+
 ## 5. Reading the graph: counts and GRIT
 
 ### 5.1 The count head (retained)
@@ -502,6 +513,11 @@ attribution of training-time gain.
 
 Freezing `F` is supported by this project's own measurement: the frozen-trunk Stage I lane reached V_val
 AUPRC 0.940 / GS 0.648 against the fully trained lane's 0.961 / 0.691, with better test topology.
+
+v17 (§7.6.3): an optional fifth field `topo_conf` (the generator's per-type presence
+probabilities; exact 0/1 on a true template) and an optional row-wise gate `g_row` on the prefix update,
+initialised near one, so a reader trained on predicted inputs can withdraw the channel per row. Both are
+absent by default; with them absent the interface is the v16 one above.
 
 ## 7. Training schedule and losses
 
@@ -759,6 +775,219 @@ anchor KD by default. Task loss plus a representation constraint does not identi
 claim is that a constrained learned structural computation helps the queried edge, never that the witnesses
 recover true neighbours.
 
+### 7.6 v17: one intrinsic subspace for the reader and the generator
+
+**The principle, and where this design breaks it.** L3-PPI (Gao et al., arXiv 2605.09964v2; our reading in
+`docs/tmp/L3PPI.md`) freezes a reader trained on *true* training L3 patterns and then tunes only a prompt,
+and states the condition under which that is sound: the pre-training task and the prompt-tuning task must
+reside in the same intrinsic task subspace. Their design satisfies it trivially, because the prompt is a
+small graph over the same embedded proteins the reader was trained on and the prompt's job is a handful of
+shared embeddings plus per-path gates. Our two stages do not share a subspace, for two reasons that the
+wave-3 measurements now put numbers on.
+
+1. *The domain shift `A_true -> Ahat(x_u,x_v)`.* Stage I fits `R`, the count head and the interface to
+   compiled true templates: exact zeros for an absent family (58% of nonself rows have no closure edge, 82%
+   of the 1:5 stream), weights on the discrete levels `{1/sqrt(d), 1}`, presence known with certainty. Stage
+   II feeds the same frozen reader a sigmoid graph that can never be exactly zero, that hedges (wedge mass
+   2.1x the truth on held-out training rows and 0.75x on V_val, positive-row reconstruction 0.56 / 0.65), and whose quality falls by
+   3.4x from training nodes to unseen ones (held-out-train `L_G` 0.029 against V_val 0.098, the constant at
+   0.108; held-out wedge-presence AUROC 0.77 on the fit harness). The reader therefore reads, at deployment,
+   an object with a different support, a different sharpness and a different error rate from anything it was
+   fitted to. §3's corruption `(1-lambda) A* + lambda Abar` is a one-parameter line between the right
+   template and the corpus mean; the realised `Ahat` is not on that line -- it is a *different* template
+   with presence errors, so the corruption covers the sharpness shift only, and not the content shift.
+2. *Stage II is asked to recover a nearly complete edge-level state.* The prompt task is 96 anonymous
+   weights per row, but what transfers across nodes is coarse: family presence and level (within-mass-stratum
+   transplant rise 7–30% against 89% globally; the closure template carries the label at ~0.90 while witness
+   identity does not transfer). A reader fitted at presence accuracy 1.0 and profile error 0 is handed
+   presence at ~0.77 AUROC and profile error ~0.6, with no signal telling it which rows to trust.
+
+Read this way, the wave-3 rows are consistent rather than puzzling: the +0.004 V_val gain is attributable
+to the row's own graph (§8 interventions) and the channel is net-harmful on test (`gates_off` 0.7446 against
+the arm's 0.7418) -- a high-gain reader (+0.066 test AUPRC on true templates) applied to an input whose
+error rate rises with node distance. The frozen-reader design has no notion of an off-distribution prompt.
+The alternative explanation, that `G`'s only input is the trunk's residue states and so its output cannot
+carry evidence the trunk lacks, remains open; §7.6.1 is designed to separate the two before any lane is
+paid for.
+
+**The decision.** Invert the L3-PPI order. L3-PPI freezes the reader and tunes the prompt, which presumes
+the prompt can reach the reader's subspace. Ours cannot: on unseen nodes `G` hedges by the nature of the
+`(x_u,x_v) -> structure` problem, and every attempt to pull `G` towards the reader (the task gradient in the
+joint phase, `L_topo`) destroyed or nulled it (§7.5, v15). So **`G` is trained once, graph-only, and
+frozen; the reader and the interface are trained last, on the distribution `G` actually emits for nodes it
+never saw.** The subspace condition then holds by construction, because the reader is fitted to the prompt
+distribution instead of the prompt being fitted to the reader. Stage II as a training phase disappears; the
+deployable checkpoint is published by the shift-matched Stage I run of §7.6.3, which carries the frozen `G`.
+
+Three revisions, ordered by cost, each with an isolated read. All keys are optional with defaults equal to
+v16 behaviour, so every published row stays reproducible.
+
+#### 7.6.1 Step 0, the shift diagnostic (scoring only, about two GPU-hours, before any training)
+
+On V_val, with the published Stage I bundle (`motif_prompt_stage1/best.pt`) and the wave-3 deployable `G`
+(`motif_prompt_stage2_v3_prefix/best.pt`, epoch 2), decompose the gap between the reader on the true
+template (`s2_true`, `val_cls` AUPRC 0.8867) and on the predicted one (`s2_pred`, 0.8176; `gates_off`
+0.8136) with four counterfactual inputs. Every row reads true V_val templates and is a labelled oracle
+diagnostic, run under `--allow-oracle-diagnostic` and never a deployable number.
+
+| Input | What it holds fixed | What it measures |
+|---|---|---|
+| `blur_true` | true content; sharpness matched to `Ahat` | `(1-lambda_f) A* + lambda_f Abar` with one `lambda_f` per edge type chosen so the mean within-type normalised entropy of the weight distribution equals `Ahat`'s on V_val. If this alone loses a large share of the gap, the reader is intolerant of the *support and sharpness* of a predicted graph even when its content is right. |
+| `presence_true` | `Ahat`'s profiles; true presence per edge type | For each edge type, zero `Ahat`'s edges of that type where the true type is empty, and substitute the true type where the true type is non-empty and `Ahat`'s type mass is below the corpus non-zero floor. Recovers the part of the gap owed to *presence errors*. |
+| `level_true` | `Ahat`'s presence and profile shape; true per-type mass | Rescale each non-empty predicted type so its mass equals the true type's mass. Recovers the part owed to *level* hedging. |
+| `content_true` | `Ahat`'s sharpness; true presence, level and profile | `blur_true` is this row's complement; reported for the arithmetic. |
+
+Pre-registered reading, in the project's practical margins (no statistical claim): with the gap
+`Delta = s2_true - s2_pred` (0.069 on V_val),
+
+- `blur_true` losing at least a third of `Delta` justifies §7.6.2 (the reader must be trained on the
+  predicted support);
+- `presence_true` recovering at least a third of `Delta` justifies §7.6.4 (the generator should predict
+  presence first and say how sure it is);
+- both small -- `blur_true` near `s2_true` and `presence_true` near `s2_pred` -- means the gap sits in the
+  profiles' content, which is the information-path explanation; the plan then stops at Step 0 and writes
+  that negative, and the dictionary lanes of the 2026-09-19 design become the remaining route.
+
+The four inputs are new `--prefix-intervention` modes that require a true-template source, like `mean`
+requires the corpus mean; they are refused on a formal (non-diagnostic) score.
+
+*Operational definitions (implementation, 2026-09-19).* Entropy is normalised by the
+logarithm of the number of edges of that type; an empty row has entropy zero.
+Calibration uses the complete `val_cls` universe including self rows, once before
+fan-out. The non-zero floor is the smallest positive type mass in the exact
+training epoch-1 corpus. `content_true` restricts the same blend to the true
+support and projects to its true mass with positive lower bounds on that support
+and edge upper bound one. This preserves presence, support and mass, but can alter
+profile shape; its realised entropy residual is reported, not claimed to be zero.
+`level_true` implements the literal proportional rescaling and may exceed one on
+an individual edge; this is explicitly an oracle count-weight diagnostic. All
+counterfactuals and `s2_true` use the same published wave-3 reader/checkpoint as
+`s2_pred` and `gates_off`, so the measured gap does not include a reader swap.
+
+
+#### 7.6.2 Revision 1: shift-matched Stage I on cross-fitted predictions
+
+Stage I's corruption source gains `motif_prompt.corruption.source: mean_blend | predicted`
+(default `mean_blend`, the v16 behaviour). Under `predicted`, a nonself training row is read from a cached
+**cross-fitted** prediction `Ahat_{-f}(u,v)` instead of the mean blend: a prediction made by a generator that
+trained on no pair touching either endpoint. This is the one property the detached joint phase of v15
+lacked. That phase adapted the reader's last block to `Ahat` on *training* rows, where `G` is transductively
+sharp (`L_G` 0.029 against 0.098 on unseen nodes), and V_val slid 0.816 → 0.808: the reader learned to
+trust a sharpness it never sees at deployment. Cross-fitting gives it the deployment error rate.
+
+*Folds.* Partition the training nodes into two folds `A`, `B` by a seeded hash (seed 42, recorded). Train
+`G_A` on rows with **both** endpoints in `A` and `G_B` on rows with both in `B` -- positives and the 1:5
+negative stream alike, so a fold generator never sees a node of the other fold even as a negative
+endpoint -- each under the adopted §4/§7.5 generator setting and the eight-epoch graph-only warm-up, with
+the structural stream disabled (it contributes exactly zero gradient to `G` during the warm-up, so this is
+a cost saving with no objective change), selected by pilot B as usual. Cache `Ahat_A(u,v)` for every
+within-`B` row from `G_A` and vice versa: 96 fp32 weights per row keyed by canonical pair, about 0.5 GB
+per fold, under `outputs/split_seed42/motif_crossfit/seed42_k2/`. Cross rows (one endpoint in each fold)
+have no both-unseen predictor and keep the true template under the existing `mean_blend` rule. Two folds
+put about half of the nonself rows on the predicted source and half on the true one, which is also the
+mixture wanted: the true mode keeps the channel sharp and keeps the ceiling read meaningful, the predicted
+mode is the deployment support. `motif_prompt.corruption.predicted_share` (default `1.0` of the eligible
+within-fold rows) lets an ablation thin it. Fold generators see roughly a quarter of the corpus each, so
+the cached `Ahat` is somewhat *noisier* than the deployed `G`'s; the reader is therefore trained under
+slightly more noise than it will see, which is the conservative direction, and the fold-vs-deployed `L_G`
+gap on V_val is recorded beside the cache.
+
+*The run.* `motif_prompt_stage1_shift`: the Stage I recipe of §7.2 unchanged (trainable `R`, count head,
+projections, role embeddings, adapter/gates; frozen F; both streams; 15 epochs, no early stopping) with the
+predicted source and one addition: the run loads the deployed `G` frozen
+(`motif_prompt.deployed_generator_checkpoint`, the wave-3 epoch-2 checkpoint) and evaluates V_val every
+epoch **on that `G`'s predictions** -- the deployable read, which is what five-metric selection uses -- and
+separately on true templates, logged under `diagnostic_*` keys as the ceiling. The published `best.pt`
+carries `G`, `R`, the count head and the adapter, scores with `hpc/run.sh test` from endpoint features
+alone, and is the arm's deployable row; no Stage II run follows it. Selection never sees a true V_val
+template.
+
+*What it can show.* Against its own `gates_off` (which still reproduces `prefix_base`), the wave-3 row
+(0.8176 V_val, 0.7418 test) and the Stage I ceiling. The null outcome is informative: a reader that closes
+its gates on predicted rows and reproduces `prefix_base` says the predicted graph carries nothing the trunk
+lacks, at the deployment error rate, under a reader fitted to exactly that input -- the cleanest form of
+the information-path negative available. The harmful outcome of wave 3 (a test row *below* `gates_off`)
+should not recur, because the reader has been trained on inputs of that quality; if it does recur, the
+fold `Ahat` did not match the deployed `Ahat` and the cache statistics say how.
+
+#### 7.6.3 Revision 2: tell the reader how sure the generator is
+
+Under §7.6.2 the reader sees the predicted support but still cannot tell a confident row from a hedged one
+except through the weights themselves. Two additions, both to the interface and therefore trained in the
+same shift-matched Stage I run:
+
+- **A confidence field `topo_conf`**, a fifth prompt field (two rows, like the others, swap-invariant) fed
+  by `W_conf [pi_C, pi_A, pi_I]`, the generator's per-edge-type presence probabilities of §7.6.4. On a true
+  template these are exact 0/1; on a predicted row they are `G`'s. The reader learns from the mixture what a
+  hedged presence means for the queried edge, at the cross-fitted calibration.
+- **A row-wise gate**: `update = content_update + tanh(alpha_site,head) * g_row * prefix_update`, with
+  `g_row = sigmoid(b_0 + MLP_g(topo_conf))`, `MLP_g`'s output layer zero-initialised and `b_0 = 4`
+  (`g_row ≈ 0.98`), so the run starts as the v16 interface and can learn to withdraw the channel for rows
+  it should not trust. The per-head gates of §6 stay. `g_row` is logged per epoch on V_val and on training
+  rows; a gate that closes on unseen nodes and not on training nodes is the abstention behaviour this
+  revision exists to produce, and a channel that is non-harmful but null is a legitimate outcome of it.
+
+Keys: `motif_prompt.fields` accepts `topo_conf`; `motif_prompt.row_gate: false | true` (default `false`).
+Neither exists without §7.6.4's presence head, so the lanes of §7.6.5 pair them.
+
+#### 7.6.4 Revision 3: presence first, then profile
+
+Replace the flat per-edge sigmoid of §4 by a presence-first parameterisation
+(`motif_prompt.generator_head: flat | presence_profile`, default `flat`): for each edge type
+`t ∈ {closure, attach, interior}` a presence logit from the pooled slot states of that type,
+`pi_t = sigmoid(MLP_t^pres(...))`, and the rendered weight `w_e = pi_{t(e)} * sigmoid(z_e)` with `z_e` the
+existing typed gate head. Supervision adds `beta_pres * BCE(pi_t, 1[any true edge of type t > 0])` under
+the same closure-balanced row weights as `L_G`, with `beta_pres = 1`; `L_G` is computed on the rendered
+weights and is otherwise unchanged. Presence biases are initialised at `logit` of the corpus presence rate
+per type -- a Bernoulli mean, which is the right initialisation for a probability, unlike the v10 rule for
+a *weight* bias, where the density was wrong because it is not a magnitude. The point of the factorisation
+is that the two bits which carry the label and transfer across nodes are predicted by their own heads with
+an `O(1)` gradient, and an absent family can be rendered as *near-zero everywhere* rather than as a faint
+uniform template; the §8 family-scaling diagnostic already established that the reader distinguishes those
+two only if the scale is small enough, which the product now gives it. The presence head is read by pilot B
+unchanged plus one number, the held-out presence AUROC per type, before it enters a fold generator.
+
+#### 7.6.5 Lanes, order and reads
+
+| Step | Work | Container-hours (derived, not measured) | Read |
+|---|---|---|---|
+| 0 | §7.6.1 counterfactuals on V_val | ~2 GPU-h | Decides whether §7.6.2 and §7.6.4 are paid for |
+| 1a | Fold generators `G_A`, `G_B` with the current flat head; cache | two graph-only warm-ups on a quarter of the corpus each | pilot B per fold; fold-vs-deployed `L_G` on V_val |
+| 1b | Presence-head deployed `G` (`motif_prompt_stage2_v4_prefix`, eight-epoch warm-up) and its fold pair | one warm-up plus two quarter warm-ups | pilot B plus presence AUROC |
+| 2 | Lane 1 `motif_prompt_stage1_shift` (Revision 1 alone, flat `G`) | one Stage I run, 6.5–11 h | the primary read below |
+| 2 | Lane 2 `motif_prompt_stage1_shift_conf` (Revisions 1+2+3) | one Stage I run | ditto, plus `g_row` telemetry |
+| 2 | Lane 3 `motif_prompt_stage1_shift_control` (v16 `mean_blend` corruption, everything else as Lane 1: deployed `G` bundled, selection on predicted inputs) | one Stage I run | the matched comparator: separates *training on the predicted support* from merely selecting on it |
+| 3 | `hpc/run.sh test` on the lane that wins on V_val; §8 output-density control and the five interventions on it | scoring | the held-out row |
+
+Lanes 1–3 fit the three H20 containers after the dictionary lanes of the 2026-09-19 design release them;
+Step 1a and Step 0 need no result from those lanes. Step 1b is skipped, and Lane 2 with it, if Step 0's
+`presence_true` row does not clear its margin.
+
+*Primary read, pre-registered.* Per lane on V_val: `val_cls` AUPRC of the published checkpoint on the
+deployed `G` against its own `gates_off`; the five-number topology line at the protocol threshold and at
+the §8 matched density; the ceiling on true templates (expected to fall below Stage I's 0.887 -- a reader
+trained for the predicted support gives up some sharpness, and the amount is the price of the revision);
+`shuffle_graph` and `mean` as in §8. A lane whose `val_cls` gain over `gates_off` exceeds the wave-3
++0.004 and whose matched-density GS is not below `prefix_base`'s is provisionally adopted and replicated
+over seeds 1–2 before its test row is read; equal is the shift cleared as the binding constraint, and the
+information-path explanation stands; below `gates_off` sends the cache statistics, not the reader, back to
+the bench. No AUROC/AUPRC margin is claimed; ±0.01 GS and ±0.5 MMD ratio are the reporting thresholds.
+
+*Relation to the dictionary lanes.* The 2026-09-19 dictionary design (`2026-09-19-motif-dictionary-routing-design.md`)
+tests the other half of the same principle -- shrink the prompt task to 31 routing weights -- but reads the
+mixture through the interface trained on true templates. Under this section's argument, lane D is
+expected to lose part of the oracle gain to that mismatch and lane R more. If D retains most of the gain,
+the discrete subspace is usable and the natural follow-up is this section's recipe applied to it: Stage I
+trained on `q*`-mixture tokens at the router's realised entropy, with cross-fitted routers. If D loses most
+of the gain, the 31-entry compression is too lossy and Revisions 1–3 stand alone. Either way the two
+designs are not run against each other until both have a V_val row.
+
+*What v17 does not change.* The task contract (§1), the template (§2), the compiler (§3, except the
+corruption source), the reader (§5), the frozen trunk (§6, except the added field and gate), `L_slot`
+(§7.3), and every claim rule of §8. `L_topo` and the task gradient into `G` are gone from the deployable
+path, which the v15 read already showed to be null or harmful; the wave-1–3 configs keep them for
+reproduction.
+
 ## 8. Boundaries, comparisons and reading
 
 Validation selects models and thresholds and supplies no generator-training graph, prompt target,
@@ -791,6 +1020,9 @@ AUROC or AUPRC, whose single-seed differences are reported as such.
 | Freeze R/adapter for all 15 epochs vs the warm-up | trained | Does adaptation repair the teacher-student input shift? |
 | Closure-only and bridge-only, inactive family zeroed in both stages | trained | Does each family earn its place? |
 | `w_slot = 0`, and `L_topo = 0`, all else matched | trained | Which supervision contributes? |
+| **v17 shift-matched Stage I** (§7.6.2) against its `mean_blend` control (§7.6.5 Lane 3) | trained | Does a reader fitted to the cross-fitted predicted support use the generator's graph where the true-template reader could not? |
+| **v17 confidence field + row gate** (§7.6.3) against the shift-matched lane without them | trained | Does knowing the generator's presence confidence make the channel non-harmful on unseen nodes, and does it buy anything beyond that? |
+| **v17 Step 0 counterfactuals** `blur_true` / `presence_true` / `level_true` (§7.6.1) | scoring, oracle diagnostic | How much of the true-vs-predicted gap is support and sharpness, how much presence error, how much level? Decides whether the lanes above are run. |
 
 **Wave-2 arms (v10).** Three joint-phase arms continue from one graph-only prefix: **A** the fixed arm
 (`lambda_G` balanced, `lambda_T = 0.1`), **B** `lambda_T = 0` (does `L_topo`'s constant-token pull hurt once G
@@ -951,6 +1183,7 @@ cannot instantiate this interface.
 
 | Version | Date | Changes |
 |---|---|---|
+| v17 | 2026-09-19 | **Implemented; outcomes pending.** New **§7.6**: the reader and the generator do not share an intrinsic task subspace (L3-PPI's condition for freezing a reader and tuning a prompt) -- Stage I fits the reader to exact, sparse, presence-certain templates and Stage II hands it a hedged sigmoid graph whose error triples on unseen nodes (`L_G` 0.029 → 0.098, presence AUROC ~0.77, reconstruction ~0.6) -- and the frozen-reader order is inverted: `G` is trained once graph-only and frozen, the reader and interface are trained last on **cross-fitted** predictions from two node folds (`corruption.source: predicted`, §7.6.2), so the subspace condition holds by construction and the deployable checkpoint is published by that Stage I run with no Stage II phase. Adds a per-type presence-first generator head (`generator_head: presence_profile`, §7.6.4), a `topo_conf` prefix field and a row-wise gate initialised open (§7.6.3), and a scoring-only Step 0 (`blur_true` / `presence_true` / `level_true` counterfactuals on V_val, §7.6.1) that decomposes the 0.069 true-vs-predicted gap into support, presence and level before any lane is trained, with a pre-registered reading that can stop the plan at Step 0 as an information-path negative. Three Stage I lanes and their reads in §7.6.5; the relation to the 2026-09-19 dictionary lanes stated. §3, §4, §6 and §8 carry pointers; every key defaults to v16 behaviour. |
 | v16 | 2026-09-19 | Wave-3 adoption, no new key and no default change: the first generator setting to pass all three pre-registered pilot-B rules is adopted into the main Stage II arm. **§4** the three wave-3 keys pass only together -- `slot_read: residual_block`, `slot_read_value_norm: false` and `graph_row_weighting: closure_balanced` at `graph_row_positive_share: 0.5` -- each one alone leaving G on the empty-closure constant; the passing prefix is `motif_prompt_stage2_v3_novln_balanced_prefix` (held-out `L_G` 0.0510 vs the constant's 0.0595, `val_cls` 0.0934 vs 0.1081, reconstruction 0.562/0.648, transplant +93% on held-out train, downstream `s2_pred` 0.8175 vs `gates_off` 0.8136). **§7.5** `motif_prompt_stage2_v3` and `motif_prompt_stage2_v3_prefix` carry that setting at `interface_warmup_epochs: 8` with the prefix halted at `optim.stop_after_epoch: 8`, because the previous generator's eight-epoch warm-up peaked at epoch 6; every epoch checkpoint of the prefix is read by `src.experiments.motif_pilot_b`. The interface-open regime is left at `warmup_losses: graph_only` pending the v15 detached read. `motif_prompt_stage2_v3_{headgain,novln,novln_balanced}_prefix` stay as the attribution rows. |
 | v15 | 2026-09-19 | Wave-3 phase A' revision, one optional enum value, default unchanged: **§7.5** `motif_prompt.warmup_losses: graph_only_always` keeps the task/structural/`L_topo` gradients cut off from G for the whole run while the interface still opens on schedule, so "the interface adapts" is separated from "the task gradient reaches G". Measured cause: the joint continuation of the eight-epoch warm-up lost the prefix's generator within one epoch of the losses reaching G (V_val AUPRC 0.816 -> 0.800, closure gates re-saturated, task gradient into the closure head 1400x the graph gradient, selection back to warm-up epoch 6, test in the `prefix_base` band). `w_slot: balanced` is not measured under the new value and stays a pure scale on `L_G`. The resume comparison excludes `warmup_losses` in the one direction `graph_only -> graph_only_always` for a prefix halted inside its warm-up, and stops comparing `runtime.world_size` at all (the worker serializes `auto` unresolved while `src.e2_pipeline` resolves it before comparing, which rejected every cross-output_dir resume of an `auto` config; the real rank count is validated against `training_state.pt`). Arm: `motif_prompt_stage2_v3_initonly_warm8_detached`. |
 | v14 | 2026-09-18 | Wave-3 phase C revision, two optional generator keys, no default change: **§4** `motif_prompt.slot_read_value_norm` (`true` default) drops the `LN_h` from the residual block's value path, and `motif_prompt.slot_query_init_std` (`null` default) overrides the per-read query init rule. Measured cause: on the full corpus the residual read removed the within-row slot collapse but halved the transplant rise and the `V/proj` variance ratio, i.e. it bought slot distinction with pair dependence. Read by `src.experiments.motif_generator_fit --group {residual_novln,residual_q01,residual_q01_novln,residual_q03_novln}` at 600 steps against re-run `residual` and `baseline`; that harness's report gains the probe's attention entropy and `K/proj`, `V/proj` ratios and the held-out `L_G` at its best eval step. |
@@ -968,4 +1201,4 @@ cannot instantiate this interface.
 | v2 | 2026-09-16 | Nine amendments after an adversarial review returned "do not proceed as specified" and a feasibility audit returned "buildable with named changes". |
 | v1 | 2026-09-16 | First decision: motif template graph read by GRIT, three tokens, counts removed, corpus-wide compilation implied, teacher by true-template rank. |
 
-Wave 1 (v9) was implemented, trained and scored on 2026-09-17/18; wave 2 (v10) is implemented from the fix plan and not yet trained.
+Wave 1 (v9) was implemented, trained and scored on 2026-09-17/18; waves 2 and 3 (v10–v16) were trained and read on 2026-09-18/19 (`docs/results/motif_prompt_wave3/README.md`); v17 (§7.6) is implemented with outcomes pending.

@@ -68,6 +68,10 @@ from src.data.distributed_pairs import (
     identity_compact_batch,
 )
 from src.data.features import FeatureStore, build_f0_matrix
+from src.data.motif_crossfit import (
+    MotifCrossfitCache,
+    seeded_hash_node_folds,
+)
 from src.data.motif_dictionary import closure_nonempty_from_weights, load_dictionary
 from src.data.motif_template import (
     MotifTemplateStatistics,
@@ -154,8 +158,12 @@ from src.model.egostitch.classifier.motif_prompt import (
     EDGE_TYPE_NAMES,
     FIELD_ORDER,
     GENERATOR_GRAD_GROUPS,
+    PREDICTED_MASK_KEY,
+    PREDICTED_PRESENCE_KEY,
+    PREDICTED_WEIGHTS_KEY,
     TEMPLATE_KEY,
     TEMPLATE_MASK_KEY,
+    TRUE_DIAGNOSTIC_KEY,
     V3_1MotifPrompt,
 )
 from src.model.egostitch.classifier.motif_prompt import FAMILIES as MOTIF_FAMILIES
@@ -1560,7 +1568,10 @@ def _motif_generator_probe(
             output = cast(dict[str, torch.Tensor], model(dict(probe)))
             mask = probe[TEMPLATE_MASK_KEY].reshape(-1).to(output["loss"])
             denominator = mask.sum().clamp_min(1.0)
-            slot_rows = _motif_probe_slot_rows(model, probe, output["slot_loss_rows"], mask)
+            slot_rows = output["slot_loss_rows"] + model.cfg.beta_pres * output.get(
+                "presence_loss_rows", output["slot_loss_rows"].new_zeros(())
+            )
+            slot_rows = _motif_probe_slot_rows(model, probe, slot_rows, mask)
             terms = {
                 "task": output["loss"],
                 "slot": slot_rows.sum() / denominator,
@@ -2392,6 +2403,45 @@ def _load_motif_bundle(path: Path) -> tuple[Mapping[str, object], str]:
     return payload, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _load_deployed_motif_generator(model: V3_1MotifPrompt, path: Path) -> None:
+    """Load exactly the generator from a published motif checkpoint.
+
+    Shift-matched Stage I owns a fresh reader/interface, but carries the deployed
+    generator whose prediction distribution it is fitted to.  Accepting a
+    partial or differently shaped generator here would silently train the reader
+    against a hybrid random/source model, so the generator namespace is checked
+    exactly before any tensor is copied.
+    """
+    payload, _ = _load_motif_bundle(path)
+    source = cast(Mapping[str, Any], payload["model_state"])
+    expected = {key for key in model.state_dict() if key.startswith("generator.")}
+    supplied = {key for key in source if key.startswith("generator.")}
+    if not expected:
+        raise ValueError("deployed-generator Stage I model constructed no generator")
+    missing = sorted(expected - supplied)
+    unexpected = sorted(supplied - expected)
+    mismatched = sorted(
+        key
+        for key in expected & supplied
+        if tuple(model.state_dict()[key].shape) != tuple(cast(torch.Tensor, source[key]).shape)
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            f"{path}: deployed generator architecture mismatch: missing={missing[:5]}, "
+            f"unexpected={unexpected[:5]}, shape={mismatched[:5]}"
+        )
+    incompatible = model.load_state_dict(
+        {key: source[key] for key in supplied}, strict=False
+    )
+    if incompatible.unexpected_keys or any(
+        key.startswith("generator.") for key in incompatible.missing_keys
+    ):
+        raise RuntimeError(f"{path}: generator-only state load produced an invalid key set")
+    if model.generator is None:
+        raise RuntimeError("deployed generator disappeared after checkpoint load")
+    model.generator.requires_grad_(False).eval()
+
+
 def _resolve_motif_prompt_kwargs(model_cfg: ModelConfig) -> dict[str, object]:
     """Resolve the ``v3_1_motif_prompt`` constructor kwargs.
 
@@ -2613,6 +2663,9 @@ def build_model(cfg: Config) -> nn.Module:
                 )
             motif_model.load_state_dict(bundle_state, strict=False)
             motif_model.initialize_teacher()
+        deployed_generator = str(block.get("deployed_generator_checkpoint", "") or "")
+        if deployed_generator:
+            _load_deployed_motif_generator(motif_model, Path(deployed_generator))
         if motif_model.cfg.training_policy == "head_only":
             init_path = Path(motif_model.cfg.init_checkpoint)
             source, _ = _load_motif_bundle(init_path)
@@ -2754,7 +2807,7 @@ class AssembledData:
     operative_node_ids: list[str]
     operative_node_count: int
     exclude_nodes: frozenset[str]
-    _training_corpora: dict[tuple[int, int, int], TrainingCorpus] = field(
+    _training_corpora: dict[tuple[int, int, int, int | None, int], TrainingCorpus] = field(
         default_factory=dict, compare=False, repr=False
     )
 
@@ -3568,12 +3621,31 @@ def _shuffled_pairs_and_labels(
     return [pairs[i] for i in permutation], [labels[i] for i in permutation]
 
 
-def _build_negative_sampler(assembled: AssembledData) -> NegativeSampler:
+def _motif_crossfit_settings(cfg: Config) -> tuple[int | None, int]:
+    """Return the optional graph-only fold and its stable hash seed."""
+    if cfg.model.family != MOTIF_PROMPT_FAMILY:
+        return None, 42
+    block = cfg.model.config.get("motif_prompt")
+    if not isinstance(block, Mapping):
+        return None, 42
+    raw_fold = block.get("crossfit_fold")
+    fold = None if raw_fold is None else int(cast(int, raw_fold))
+    seed = int(cast(int, block.get("crossfit_seed", 42)))
+    if fold not in (None, 0, 1):
+        raise ValueError("motif_prompt.crossfit_fold must be null, 0 or 1")
+    return fold, seed
+
+
+def _build_negative_sampler(
+    assembled: AssembledData, *, allowed_nodes: frozenset[str] | None = None
+) -> NegativeSampler:
     """Build the degree-corrected negative sampler over featureful train nodes.
 
     The universe excludes V_val, so no sampled negative touches a held-out node.
     """
     train_universe = sorted(set(assembled.val_split.train_nodes) - assembled.exclude_nodes)
+    if allowed_nodes is not None:
+        train_universe = [node for node in train_universe if node in allowed_nodes]
     return NegativeSampler(
         train_universe,
         assembled.degrees,
@@ -3584,11 +3656,20 @@ def _build_negative_sampler(assembled: AssembledData) -> NegativeSampler:
 
 def _dynamic_training_corpus(cfg: Config, assembled: AssembledData) -> TrainingCorpus:
     """Same epoch rows for student loaders and the offline teacher-target dumper."""
-    key = (cfg.seed, cfg.optim.epochs, cfg.data.negative_ratio)
+    fold, fold_seed = _motif_crossfit_settings(cfg)
+    key = (cfg.seed, cfg.optim.epochs, cfg.data.negative_ratio, fold, fold_seed)
     if key not in assembled._training_corpora:
+        positives = assembled.training_positives
+        allowed_nodes: frozenset[str] | None = None
+        if fold is not None:
+            folds = seeded_hash_node_folds(assembled.val_split.train_nodes, seed=fold_seed)
+            allowed_nodes = frozenset(node for node, value in folds.items() if value == fold)
+            positives = [
+                pair for pair in positives if pair[0] in allowed_nodes and pair[1] in allowed_nodes
+            ]
         assembled._training_corpora[key] = build_training_corpus(
-            assembled.training_positives,
-            _build_negative_sampler(assembled),
+            positives,
+            _build_negative_sampler(assembled, allowed_nodes=allowed_nodes),
             negative_ratio=cfg.data.negative_ratio,
             seed=cfg.seed,
             epochs=cfg.optim.epochs,
@@ -4394,6 +4475,7 @@ def _evaluate_val_universe(
     reference: ValTopologyReference,
     row_coords: torch.Tensor | None = None,
     row_templates: torch.Tensor | None = None,
+    true_template_diagnostic: bool = False,
     logits_sink: Callable[[np.ndarray], None] | None = None,
 ) -> ValTopologyResult:
     """Score the exact ball-union rows and select sampled-only topology threshold.
@@ -4424,6 +4506,8 @@ def _evaluate_val_universe(
         row_templates: Optional ``(n_rows, 96)`` CPU compiled motif templates of
             the universe rows (motif-prompt Stage I, a labelled ceiling
             diagnostic), sliced per batch.
+        true_template_diagnostic: Mark attached templates as the explicit oracle
+            input for a deployed Stage I model.
         logits_sink: Optional recipient of gathered, ordered logits on every rank.
 
     Returns:
@@ -4460,6 +4544,10 @@ def _evaluate_val_universe(
                 batch[COORDS_KEY] = row_coords.index_select(0, rows).to(device)
             if row_templates is not None:
                 batch[TEMPLATE_KEY] = row_templates.index_select(0, rows).to(device)
+                if true_template_diagnostic:
+                    batch[TRUE_DIAGNOSTIC_KEY] = torch.ones(
+                        rows.numel(), device=device, dtype=torch.bool
+                    )
             output = model(batch)
             logits = output["logits"]
             if logits.dim() > 1 and logits.size(-1) == 1:
@@ -4562,6 +4650,30 @@ def _evaluate_two_pass(
         task_loss=cls_outcome.task_loss,
         diagnostics=cls_outcome.diagnostics,
     )
+
+
+def _evaluate_motif_shift(
+    model: nn.Module,
+    val_loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    cls_evaluate_fn: EvaluateFn,
+    topology_eval_fn: Callable[..., ValTopologyResult],
+    true_topology_eval_fn: Callable[..., ValTopologyResult],
+) -> ValidationOutcome:
+    """Select on deployed predictions and append the true-template ceiling."""
+    cls = cls_evaluate_fn(model, val_loader, accelerator)
+    topology = topology_eval_fn(model, accelerator)
+    true_topology = true_topology_eval_fn(model, accelerator)
+    diagnostics = dict(cls.diagnostics or {})
+    diagnostics.update(
+        {
+            f"diagnostic_true_topology_{key}": float(value)
+            for key, value in asdict(true_topology.metrics).items()
+        }
+    )
+    diagnostics["diagnostic_true_topology_threshold"] = true_topology.threshold
+    return ValidationOutcome(cls.metrics, topology, cls.task_loss, diagnostics)
 
 
 class PromptV2Validation:
@@ -5321,6 +5433,7 @@ class MotifTemplateRows:
         val_graph: nx.Graph | None = None,
         val_cls_pairs: Sequence[Pair] | None = None,
         universe_pairs: Sequence[Pair] | None = None,
+        predicted_cache: MotifCrossfitCache | None = None,
     ) -> None:
         """Compile every row once.
 
@@ -5334,6 +5447,7 @@ class MotifTemplateRows:
             val_cls_pairs: The V_val classification rows in row-id order; Stage I only.
             universe_pairs: The V_val topology ball-union rows in row-id order;
                 Stage I only.
+            predicted_cache: Optional cross-fitted generator outputs aligned by pair.
 
         Raises:
             ValueError: If a V_val graph is given without its row lists, or a
@@ -5350,11 +5464,16 @@ class MotifTemplateRows:
             self.train_table.weights(train_pairs, seed=seed, epoch=1, randomise=True)
         )
         self.train_mask = _motif_self_row_mask(train_pairs)
+        self.predicted_cache = predicted_cache
+        self.train_predictions = (
+            None if predicted_cache is None else predicted_cache.lookup(train_pairs)
+        )
         # One pass over epoch 1's rows: the mean adjacency the trunk's `mean`
         # intervention reads and the non-zero magnitudes the generator's gate
         # biases are initialised from come from exactly the same templates.
+        self.stats_row_ids = np.asarray(stats_rows, dtype=np.int64)
         self.stats: MotifTemplateStatistics = template_statistics(
-            self.train.numpy()[np.asarray(stats_rows, dtype=np.int64)]
+            self.train.numpy()[self.stats_row_ids]
         )
         self.mean = torch.from_numpy(self.stats.mean)
         self.stats_rows = int(np.asarray(stats_rows).size)
@@ -5387,6 +5506,15 @@ class MotifTemplateRows:
         if not isinstance(raw_model, V3_1MotifPrompt):
             raise TypeError("MotifTemplateRows.install needs a V3_1MotifPrompt")
         raw_model.install_mean_template(self.stats)
+        if (
+            raw_model.cfg.generator_head == "presence_profile"
+            and raw_model.generator is not None
+        ):
+            stats_index = torch.as_tensor(self.stats_row_ids, dtype=torch.int64)
+            presence = raw_model.generator.presence_from_weights(
+                self.train.index_select(0, stats_index).float()
+            ).mean(0)
+            raw_model.install_presence_rates(presence)
 
     def _attach(self, batch: Batch, table: torch.Tensor, mask: torch.Tensor) -> None:
         rows = batch["_row_id"].detach().to("cpu", torch.int64)
@@ -5398,6 +5526,18 @@ class MotifTemplateRows:
     def attach_train(self, batch: Batch) -> None:
         """Inject this training batch's compiled templates and self-row mask."""
         self._attach(batch, self.train, self.train_mask)
+        if self.train_predictions is not None:
+            rows = batch["_row_id"].detach().to("cpu", torch.int64)
+            batch[PREDICTED_WEIGHTS_KEY] = self.train_predictions.weights.index_select(
+                0, rows
+            ).to(self._device, non_blocking=True)
+            batch[PREDICTED_MASK_KEY] = self.train_predictions.mask.index_select(0, rows).to(
+                self._device, non_blocking=True
+            )
+            if self.train_predictions.presence is not None:
+                batch[PREDICTED_PRESENCE_KEY] = self.train_predictions.presence.index_select(
+                    0, rows
+                ).to(self._device, non_blocking=True)
 
     def attach_val(self, batch: Batch) -> None:
         """Inject this V_val classification batch's templates by ``_row_id``.
@@ -5412,6 +5552,22 @@ class MotifTemplateRows:
             )
         self._attach(batch, self.val_cls, self.val_cls_mask)
 
+    def attach_val_predicted(self, batch: Batch) -> None:
+        """Mark ordinary validation as deployable generator input.
+
+        The true table remains available only to :meth:`attach_val_diagnostic`.
+        """
+        batch[TRUE_DIAGNOSTIC_KEY] = torch.zeros(
+            batch["label"].reshape(-1).shape[0], device=self._device, dtype=torch.bool
+        )
+
+    def attach_val_diagnostic(self, batch: Batch) -> None:
+        """Attach labelled V_val truth for the separately named ceiling read."""
+        self.attach_val(batch)
+        batch[TRUE_DIAGNOSTIC_KEY] = torch.ones(
+            batch["label"].reshape(-1).shape[0], device=self._device, dtype=torch.bool
+        )
+
     def summary(self) -> dict[str, object]:
         """Provenance for logs and ``run_metadata.json``."""
         return {
@@ -5421,7 +5577,51 @@ class MotifTemplateRows:
             "universe_rows": 0 if self.universe is None else int(self.universe.shape[0]),
             "build_seconds": self.build_seconds,
             "compile_seconds_per_10k": self.compile_rate,
+            "predicted_cache_rows": (
+                0 if self.predicted_cache is None else len(self.predicted_cache.pairs)
+            ),
         }
+
+
+@torch.no_grad()
+def _motif_true_cls_diagnostics(
+    model: nn.Module,
+    loader: Iterable[Batch],
+    accelerator: Accelerator,
+    *,
+    rows: MotifTemplateRows,
+    expected_row_ids: np.ndarray,
+) -> dict[str, float]:
+    """Return the labelled true-template ceiling without affecting selection."""
+    gate_sum = torch.zeros(2, device=accelerator.device, dtype=torch.float64)
+    was_training = model.training
+    model.eval()
+    for batch in loader:
+        batch = _to_device(batch, accelerator.device)
+        rows.attach_val_predicted(batch)
+        output = cast(dict[str, torch.Tensor], model(batch))
+        if "row_gate" in output:
+            gate = output["row_gate"].reshape(-1).float()
+            gate_sum += torch.tensor(
+                [float(gate.sum().item()), float(gate.numel())],
+                device=accelerator.device,
+                dtype=torch.float64,
+            )
+    model.train(was_training)
+    gate_sum = accelerator.reduce(gate_sum, reduction="sum")
+    outcome = _evaluate_distributed(
+        model,
+        loader,
+        accelerator,
+        expected_row_ids=expected_row_ids,
+        attach=rows.attach_val_diagnostic,
+    )
+    values = asdict(outcome.metrics)
+    values["bce"] = float(cast(float, outcome.task_loss))
+    result = {f"diagnostic_true_cls_{key}": float(value) for key, value in values.items()}
+    if gate_sum[1] > 0:
+        result["val_row_gate_mean"] = float((gate_sum[0] / gate_sum[1]).item())
+    return result
 
 
 class DictionaryRouteRows:
@@ -5779,7 +5979,9 @@ def _motif_self_row_mask(pairs: Sequence[Pair]) -> torch.Tensor:
     return torch.tensor([0.0 if u == v else 1.0 for u, v in pairs], dtype=torch.float32)
 
 
-def _assert_motif_run_kind(*, stage: str, run_kind: str | None) -> None:
+def _assert_motif_run_kind(
+    *, stage: str, run_kind: str | None, deployed_generator_checkpoint: str = ""
+) -> None:
     """Fail closed on a motif-prompt stage / run-kind mismatch.
 
     Stage I compiles true V_val templates for validation, so it is a ceiling
@@ -5789,11 +5991,18 @@ def _assert_motif_run_kind(*, stage: str, run_kind: str | None) -> None:
     Args:
         stage: ``motif_prompt.stage``.
         run_kind: ``cfg.run_kind``.
+        deployed_generator_checkpoint: Published frozen generator carried by a
+            deployable shift-matched Stage I run, or empty for legacy Stage I.
 
     Raises:
         RuntimeError: On a Stage I formal run or a Stage II diagnostic run.
     """
-    if stage == "one" and run_kind != "diagnostic":
+    if stage == "one" and deployed_generator_checkpoint and run_kind != "formal":
+        raise RuntimeError(
+            "shift-matched Stage I scores ordinary validation through its frozen deployed "
+            "generator and requires a formal run"
+        )
+    if stage == "one" and not deployed_generator_checkpoint and run_kind != "diagnostic":
         raise RuntimeError(
             "v3_1_motif_prompt stage 'one' compiles V_val truth templates during validation; "
             "launch it with --run-kind diagnostic "
@@ -6091,6 +6300,7 @@ class StructStream:
         coordinates: TopoPromptRows | None = None,
         templates: MotifTemplateTable | None = None,
         val_templates: MotifTemplateTable | None = None,
+        predicted_cache: MotifCrossfitCache | None = None,
         autocast: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         if token_budget < 1:
@@ -6103,6 +6313,7 @@ class StructStream:
         self._coordinates = coordinates
         self._motif_table = templates
         self._val_motif_table = val_templates
+        self._motif_predicted_cache = predicted_cache
         # The teacher is called as a child module, outside the autocast wrapper
         # Accelerate installs on the prepared model's forward; the caller passes
         # `accelerator.autocast` so the pass sees the run's mixed precision.
@@ -6229,6 +6440,9 @@ class StructStream:
                 )
             buckets[boundary].append(row)
         raw_model = _unwrapped_model(model)
+        motif_beta_pres = (
+            float(raw_model.cfg.beta_pres) if _uses_legacy_motif_objective(raw_model) else 0.0
+        )
         parts: list[torch.Tensor] = []
         slot_parts: list[torch.Tensor] = []
         topo_parts: list[torch.Tensor] = []
@@ -6250,6 +6464,7 @@ class StructStream:
                 coord_table.coords_for_pairs(np.asarray(a), np.asarray(b))
             ).to(device)
         pair_templates: torch.Tensor | None = None
+        pair_predictions = None
         if _uses_legacy_motif_objective(raw_model):
             motif_table = self._motif_table_for(raw_model, sampler)
             if motif_table is not None:
@@ -6258,6 +6473,13 @@ class StructStream:
                 pair_templates = torch.from_numpy(
                     motif_table.weights_by_index(np.asarray(left), np.asarray(right))
                 ).to(device)
+            if sampler is self._sampler and self._motif_predicted_cache is not None:
+                struct_pairs = [(subgraph.nodes[i], subgraph.nodes[j]) for i, j in pairs]
+                fold_by_node = seeded_hash_node_folds(
+                    subgraph.nodes, seed=self._motif_predicted_cache.seed
+                )
+                self._motif_predicted_cache.require_pairs(struct_pairs, fold_by_node)
+                pair_predictions = self._motif_predicted_cache.lookup(struct_pairs)
 
         chunks = _stripe_struct_chunks(
             buckets,
@@ -6288,6 +6510,7 @@ class StructStream:
                 boundary: int,
                 coords: torch.Tensor | None,
                 templates: torch.Tensor | None,
+                row_indices: torch.Tensor | None = None,
             ) -> dict[str, torch.Tensor]:
                 # `boundary` is explicit: a closure over the loop variable
                 # would recompute every chunk at the last bucket.
@@ -6299,6 +6522,19 @@ class StructStream:
                     batch[COORDS_KEY] = coords
                 if templates is not None:
                     batch[TEMPLATE_KEY] = templates
+                    if pair_predictions is not None:
+                        assert row_indices is not None
+                        selected = row_indices.to("cpu", torch.int64)
+                        batch[PREDICTED_WEIGHTS_KEY] = pair_predictions.weights.index_select(
+                            0, selected
+                        ).to(device)
+                        batch[PREDICTED_MASK_KEY] = pair_predictions.mask.index_select(
+                            0, selected
+                        ).to(device)
+                        if pair_predictions.presence is not None:
+                            batch[PREDICTED_PRESENCE_KEY] = (
+                                pair_predictions.presence.index_select(0, selected).to(device)
+                            )
                 return batch
 
             def forward(
@@ -6319,6 +6555,7 @@ class StructStream:
                 partner: torch.Tensor,
                 boundary: int,
                 templates: torch.Tensor,
+                row_indices: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 """Score one chunk; motif rows also carry their L_slot/L_topo terms.
 
@@ -6328,7 +6565,7 @@ class StructStream:
                 Only this family takes this branch; every other arm keeps the
                 single-tensor ``forward`` above unchanged.
                 """
-                batch = chunk_batch(anchor, partner, boundary, None, templates)
+                batch = chunk_batch(anchor, partner, boundary, None, templates, row_indices)
                 output = cast(dict[str, torch.Tensor], raw_model(batch))
                 out = output["logits"]
                 if out.dim() > 1 and out.size(-1) == 1:
@@ -6338,13 +6575,18 @@ class StructStream:
                 # (or with ``w_topo == 0``) still contributes a differentiable
                 # zero and every rank stacks the same shapes.
                 zero = out.new_zeros(out.shape[0]) + out.sum() * 0.0
+                slot_rows = output.get("slot_loss_rows", zero).float()
+                slot_rows = slot_rows + motif_beta_pres * output.get(
+                    "presence_loss_rows", zero
+                ).float()
                 return (
                     out,
-                    output.get("slot_loss_rows", zero).float(),
+                    slot_rows,
                     output.get("topo_loss_rows", zero).float(),
                 )
 
             if templates is not None:
+                chunk_rows = torch.as_tensor(chunk, dtype=torch.int64, device=device)
                 motif_out = (
                     cast(
                         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -6354,11 +6596,12 @@ class StructStream:
                             partner,
                             boundary,
                             templates,
+                            chunk_rows,
                             use_reentrant=False,
                         ),
                     )
                     if recompute
-                    else motif_forward(anchor, partner, boundary, templates)
+                    else motif_forward(anchor, partner, boundary, templates, chunk_rows)
                 )
                 chunk_logits = motif_out[0]
                 slot_parts.append(motif_out[1])
@@ -7436,6 +7679,8 @@ def train_ddp_loop(
         epoch_motif_topo_sum = 0.0
         epoch_motif_nonempty_sum = 0.0
         epoch_motif_valid_sum = 0.0
+        epoch_motif_row_gate_sum = 0.0
+        epoch_motif_row_gate_count = 0
         epoch_motif_probe: dict[str, float] = {}
         epoch_online_sums: dict[str, float] = {}
         epoch_online_weight = 0.0
@@ -7591,6 +7836,10 @@ def train_ddp_loop(
                     accelerator.backward(struct_loss)
                 epoch_struct_seconds += time.monotonic() - struct_start
             output = model(batch)
+            if "row_gate" in output:
+                row_gate = output["row_gate"].detach().float()
+                epoch_motif_row_gate_sum += float(row_gate.sum().item())
+                epoch_motif_row_gate_count += row_gate.numel()
             if isinstance(raw_training_model, V3_1MotifDictionary):
                 loss, _route_counts = _route_step_loss(
                     output, batch, accelerator, world_size=world_size
@@ -7733,7 +7982,9 @@ def train_ddp_loop(
                 # backward, so the composite is added exactly once (spec 7.5).
                 task_term = (
                     {
-                        "slot": output.get("slot_loss_rows", loss.new_zeros(0)),
+                        "slot": output.get("slot_loss_rows", loss.new_zeros(0))
+                        + raw_training_model.cfg.beta_pres
+                        * output.get("presence_loss_rows", loss.new_zeros(0)),
                         "topo": output.get("topo_loss_rows", loss.new_zeros(0)),
                         "nonempty": _motif_task_nonempty(raw_training_model, batch, like=loss),
                     },
@@ -7965,6 +8216,18 @@ def train_ddp_loop(
                 nonempty_sum=float(motif_sums[2].item()) / float(world_size),
                 valid_sum=float(motif_sums[3].item()) / float(world_size),
             )
+            gate_sums = accelerator.reduce(
+                torch.tensor(
+                    [epoch_motif_row_gate_sum, float(epoch_motif_row_gate_count)],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                ),
+                reduction="sum",
+            )
+            if gate_sums[1] > 0:
+                epoch_motif_telemetry["train_row_gate_mean"] = float(
+                    (gate_sums[0] / gate_sums[1]).item()
+                )
         validation_start = time.monotonic()
         run_topology = _topology_due(
             epoch,
@@ -7973,6 +8236,13 @@ def train_ddp_loop(
             classification_only=cfg.eval.classification_only,
         )
         if isinstance(evaluate_fn, PromptV2Validation):
+            run_topology = True
+        raw_eval_model = _unwrapped_model(model)
+        if (
+            isinstance(raw_eval_model, V3_1MotifPrompt)
+            and raw_eval_model.cfg.stage == "one"
+            and raw_eval_model.cfg.deployed_generator_checkpoint
+        ):
             run_topology = True
         epoch_evaluate_fn = (
             evaluate_fn if run_topology or evaluate_cls_fn is None else evaluate_cls_fn
@@ -8981,13 +9251,22 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         # truth: spec section 8 gives true V_val template compilation exclusively
         # to labelled Stage I and oracle diagnostics.
         stage = model.cfg.stage
-        _assert_motif_run_kind(stage=stage, run_kind=cfg.run_kind)
+        deployed_checkpoint = model.cfg.deployed_generator_checkpoint
+        _assert_motif_run_kind(
+            stage=stage,
+            run_kind=cfg.run_kind,
+            deployed_generator_checkpoint=deployed_checkpoint,
+        )
         if cfg.distill is not None and cfg.distill.active:
             raise RuntimeError(
                 "v3_1_motif_prompt external distill sections are not supported for this family"
             )
         if cfg.eval.classification_only:
             raise RuntimeError("v3_1_motif_prompt requires the V_val topology pass")
+        if model.cfg.crossfit_fold is not None and cfg.struct is not None:
+            raise RuntimeError(
+                "motif crossfit fold generator requires the structural stream disabled"
+            )
         if _is_head_only_motif(model):
             # The complete wave-3 checkpoint already fixes the generator and
             # interface.  H trains only the output head on the real task and
@@ -8996,6 +9275,19 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             motif_rows = None
         elif stage == "one":
             corpus = _dynamic_training_corpus(cfg, assembled)
+            predicted_cache: MotifCrossfitCache | None = None
+            if model.cfg.corruption.source == "predicted":
+                cache_path = Path(model.cfg.corruption.predicted_cache_path)
+                predicted_cache = MotifCrossfitCache.load(cache_path)
+                if predicted_cache.seed != model.cfg.crossfit_seed:
+                    raise ValueError(
+                        f"{cache_path}: crossfit seed {predicted_cache.seed} does not match "
+                        f"configured seed {model.cfg.crossfit_seed}"
+                    )
+                fold_by_node = seeded_hash_node_folds(
+                    val_split.train_nodes, seed=model.cfg.crossfit_seed
+                )
+                predicted_cache.require_pairs(corpus.pairs, fold_by_node)
             reference = build_val_topology_reference(val_split)
             universe = val_ball_union_universe(val_split)
             universe_pairs = [
@@ -9011,6 +9303,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                 val_graph=val_split.build_g_val_simple(),
                 val_cls_pairs=val_cls_pairs,
                 universe_pairs=universe_pairs,
+                predicted_cache=predicted_cache,
             )
         else:
             corpus = _dynamic_training_corpus(cfg, assembled)
@@ -9040,12 +9333,37 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
         if route_rows is not None
         else None
     )
+    motif_true_fit_fn: DiagnosticsFn | None = (
+        functools.partial(
+            _motif_true_cls_diagnostics,
+            rows=motif_rows,
+            expected_row_ids=np.arange(num_val_rows, dtype=np.int64),
+        )
+        if motif_rows is not None
+        and motif_rows.val_cls is not None
+        and isinstance(model, V3_1MotifPrompt)
+        and model.cfg.deployed_generator_checkpoint
+        else None
+    )
     # Stage I alone carries V_val templates; the Stage II carrier compiled none,
     # so its validation batches and universe pass see no truth graph at all.
-    universe_templates = motif_rows.universe if motif_rows is not None else None
+    deployed_motif_stage_one = bool(
+        isinstance(model, V3_1MotifPrompt)
+        and model.cfg.stage == "one"
+        and model.cfg.deployed_generator_checkpoint
+    )
+    universe_templates = (
+        motif_rows.universe
+        if motif_rows is not None and not deployed_motif_stage_one
+        else None
+    )
     attach_val_fn: Callable[[Batch], None] | None = topo_rows.attach_val if topo_rows else None
     if motif_rows is not None and motif_rows.val_cls is not None:
-        attach_val_fn = motif_rows.attach_val
+        attach_val_fn = (
+            motif_rows.attach_val_predicted
+            if deployed_motif_stage_one
+            else motif_rows.attach_val
+        )
 
     if args.ddp_mode == "probe":
         _run_probe_mode(
@@ -9135,6 +9453,9 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             coordinates=topo_rows,
             templates=motif_rows.train_table if motif_rows is not None else None,
             val_templates=motif_rows.val_table if motif_rows is not None else None,
+            predicted_cache=(
+                motif_rows.predicted_cache if motif_rows is not None else None
+            ),
             autocast=accelerator.autocast,
         )
         if accelerator.is_main_process:
@@ -9174,7 +9495,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             label_smoothing=val_label_smoothing,
             validation_bank=validation_bank,
             attach=attach_val_fn,
-            diagnostics_fn=route_fit_fn or coord_fit_fn,
+            diagnostics_fn=route_fit_fn or coord_fit_fn or motif_true_fit_fn,
         ),
     )
     evaluate_cls_fn: EvaluateFn | None = None
@@ -9205,7 +9526,44 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
             row_coords=universe_coords,
             row_templates=universe_templates,
         )
-        if topo_rows is not None and cfg.model.family in {"v3_1_topo_prompt", "v3_1_coord_gen"}:
+        if deployed_motif_stage_one:
+            assert motif_rows is not None and motif_rows.universe is not None
+            if cfg.eval.eval_every != 1 or cfg.eval.topology_every != 1:
+                raise ValueError(
+                    "shift-matched Stage I selection requires eval_every=topology_every=1"
+                )
+            true_topology_evaluate_fn = functools.partial(
+                _evaluate_val_universe,
+                table=table,
+                node_a_all=torch.from_numpy(node_positions[universe.u_idx]).to(torch.int64),
+                node_b_all=torch.from_numpy(node_positions[universe.v_idx]).to(torch.int64),
+                boundary=universe_boundary,
+                batch_pairs=max(
+                    1,
+                    min(
+                        runtime.max_pairs_per_rank,
+                        runtime.token_budget // (2 * universe_boundary),
+                    ),
+                ),
+                u_idx=u_idx,
+                v_idx=v_idx,
+                reference=reference,
+                row_templates=motif_rows.universe,
+                true_template_diagnostic=True,
+            )
+            evaluate_fn = cast(
+                EvaluateFn,
+                functools.partial(
+                    _evaluate_motif_shift,
+                    cls_evaluate_fn=cls_evaluate_fn,
+                    topology_eval_fn=topology_evaluate_fn,
+                    true_topology_eval_fn=true_topology_evaluate_fn,
+                ),
+            )
+        elif topo_rows is not None and cfg.model.family in {
+            "v3_1_topo_prompt",
+            "v3_1_coord_gen",
+        }:
             if cfg.eval.eval_every != 1 or cfg.eval.topology_every != 1:
                 raise ValueError("two-stage prompt diagnostics require eval_every=topology_every=1")
             evaluate_fn = PromptV2Validation(
@@ -9228,7 +9586,7 @@ def _run_ddp_worker(cfg: Config, args: CliArgs) -> None:
                     label_smoothing=val_label_smoothing,
                     validation_bank=validation_bank,
                     attach=attach_val_fn,
-                    diagnostics_fn=route_fit_fn or coord_fit_fn,
+                    diagnostics_fn=route_fit_fn or coord_fit_fn or motif_true_fit_fn,
                 ),
             )
 

@@ -22,6 +22,8 @@ Usage:
   hpc/run.sh kd-targets <kd-targets args...>
   hpc/run.sh dictionary-build <dictionary builder args...>
   hpc/run.sh dictionary-diagnostic <dictionary oracle args...>
+  hpc/run.sh motif-shift-diagnostic <v17 Step 0 args...>
+  hpc/run.sh motif-crossfit <v17 cache preparation args...>
 
 The train command drives the full packed-feature DDP training pipeline
 (`python -m src.e2_pipeline`) across all visible NVIDIA H20 GPUs via an
@@ -254,6 +256,12 @@ print(cfg.output_dir, cfg.strategy, cfg.seed)
     ;;
   dictionary-diagnostic)
     exec "${PYTHON_BIN}" -m src.experiments.motif_dictionary_diagnostic "$@"
+    ;;
+  motif-shift-diagnostic)
+    exec "${PYTHON_BIN}" -m src.experiments.motif_shift_diagnostic "$@"
+    ;;
+  motif-crossfit)
+    exec "${PYTHON_BIN}" -m src.experiments.motif_crossfit "$@"
     ;;
   *)
     usage >&2

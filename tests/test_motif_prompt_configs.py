@@ -245,6 +245,7 @@ def test_only_the_pilots_and_the_wave_two_prefixes_stop_early(name: str) -> None
     eight = {
         "motif_prompt_stage2_v3_initonly_warm8_prefix.yaml",
         f"{_WAVE_THREE_MAIN}_prefix.yaml",
+        "motif_prompt_stage2_v4_prefix.yaml",
     }
     expected = 8 if name in eight else 2
     assert cfg.optim.stop_after_epoch == (expected if halted else None)
@@ -374,7 +375,12 @@ def test_every_other_motif_arm_keeps_the_streams_own_row_distribution() -> None:
     # The weighting is opt-in: wave 1 and wave 2 keep uniform rows, so the
     # phase-B prefixes and the wave-3 arm that adopted them are the only rows
     # that read differently.
-    balanced = {*_WAVE_THREE_BALANCED, _WAVE_THREE_MAIN, f"{_WAVE_THREE_MAIN}_prefix"}
+    balanced = {
+        *_WAVE_THREE_BALANCED,
+        _WAVE_THREE_MAIN,
+        f"{_WAVE_THREE_MAIN}_prefix",
+        "motif_prompt_stage2_v4_prefix",
+    }
     for name in ARMS:
         block = _block(name)
         expected = "closure_balanced" if Path(name).stem in balanced else "uniform"
@@ -513,6 +519,10 @@ def test_only_the_wave_three_arm_and_its_prefixes_use_the_residual_read() -> Non
         *_WAVE_THREE_ATTRIBUTION,
         *_WAVE_THREE_VALUE_NORM,
         "motif_prompt_stage2_v3_novln_balanced_prefix",
+        "motif_prompt_stage2_v4_prefix",
+        "motif_prompt_stage1_shift",
+        "motif_prompt_stage1_shift_conf",
+        "motif_prompt_stage1_shift_control",
     }
     # The value path is normalised everywhere but the two phase-C prefixes and
     # the wave-3 arm and prefix that adopted their read.
@@ -521,6 +531,10 @@ def test_only_the_wave_three_arm_and_its_prefixes_use_the_residual_read() -> Non
         "motif_prompt_stage2_v3_novln_balanced_prefix",
         _WAVE_THREE_MAIN,
         f"{_WAVE_THREE_MAIN}_prefix",
+        "motif_prompt_stage2_v4_prefix",
+        "motif_prompt_stage1_shift",
+        "motif_prompt_stage1_shift_conf",
+        "motif_prompt_stage1_shift_control",
     }
     for name in ARMS:
         block = _block(name)

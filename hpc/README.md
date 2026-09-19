@@ -157,6 +157,33 @@ training job. Use the diagnostic command above. Keep source checkpoints and the 
 fixed throughout the comparison; head-only `gates_off` uses the adapted head and is not the historical
 `prefix_base` result.
 
+## Motif v17 conditional campaign
+
+The v17 implementation follows §7.6 of the motif GRIT specification. Step 0
+scores V_val counterfactuals before buying fold training. Its measured
+one-third-gap rules determine whether the shift and confidence lanes run;
+if neither clears its rule the campaign records the information-path negative
+and stops. No held-out test result participates in this decision.
+
+```bash
+python -m src.experiments.motif_v17_queue --help
+hpc/run.sh motif-shift-diagnostic --help
+hpc/run.sh motif-crossfit --help
+```
+
+Run the one-shot queue in a separate Git checkout linked to the shared
+`.venv`, feature data and `outputs`. It waits for the specified predecessor
+process and for GPU processes on that container to exit before running any
+GPU stage. Keep `OMP_NUM_THREADS=16 MKL_NUM_THREADS=16`. A live waiting queue
+is evidence of an enqueued campaign, not of started or completed training.
+
+The shift Stage-I lanes are formal deployable runs: their checkpoints carry
+the frozen generator and select on its V_val predictions. True-template
+validation is a separate `diagnostic_*` read. Fold generators train only on
+pairs whose two endpoints belong to their own hash fold, including negatives;
+within-fold reader inputs come from the opposite generator. Cross-fold and
+self rows retain the original mean-blend training rule.
+
 ## EgoStitch E2E
 
 EgoStitch E2E trains on train-side positives that do not touch V_val and validates on the V_val

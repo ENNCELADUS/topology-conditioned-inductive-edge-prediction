@@ -150,10 +150,19 @@ PREFIX_INTERVENTIONS: tuple[str, ...] = (
     # `v3_1_motif_dictionary` only: transplant the route selected for another
     # row of the whole universe while retaining this row's endpoints.
     "shuffle_route",
+    # V17 section 7.6.1: precomputed whole-V_val counterfactual motif banks.
+    "blur_true",
+    "presence_true",
+    "level_true",
+    "content_true",
+    "s2_true",
 )
 #: The three motif-prompt interventions that substitute the *graph*, not a model mode.
 MOTIF_GRAPH_INTERVENTIONS: frozenset[str] = frozenset(
     {"shuffle_graph", "permute_closure", "rewire_bridge"}
+)
+MOTIF_SHIFT_INTERVENTIONS: frozenset[str] = frozenset(
+    {"blur_true", "presence_true", "level_true", "content_true", "s2_true"}
 )
 MOTIF_PROMPT_FAMILY = "v3_1_motif_prompt"
 MOTIF_DICTIONARY_FAMILY = "v3_1_motif_dictionary"
@@ -2196,6 +2205,29 @@ def _check_row_templates(row_templates: torch.Tensor | None, num_rows: int) -> N
         )
 
 
+def _load_motif_shift_bank(
+    path: Path, mode: str, pairs: Sequence[tuple[str, str]]
+) -> torch.Tensor:
+    """Load an exact-row Step-0 counterfactual bank and reject stale/misaligned input."""
+    with np.load(path, allow_pickle=False) as payload:
+        required = {"u", "v", mode}
+        missing = sorted(required - set(payload.files))
+        if missing:
+            raise ValueError(f"motif shift bank {path} is missing arrays {missing}")
+        u = payload["u"].astype(str).tolist()
+        v = payload["v"].astype(str).tolist()
+        bank_pairs = list(zip(u, v, strict=True))
+        if bank_pairs != list(pairs):
+            raise ValueError("motif shift bank pair rows do not exactly match the val_cls universe")
+        weights = np.asarray(payload[mode], dtype=np.float32)
+    if weights.shape != (len(pairs), N_MOTIF_EDGES) or not np.isfinite(weights).all():
+        raise ValueError(
+            f"motif shift bank {mode!r} must be finite shape "
+            f"({len(pairs)}, {N_MOTIF_EDGES}), got {weights.shape}"
+        )
+    return torch.from_numpy(weights)
+
+
 def _motif_source_weights(
     source_batches: Sequence[Sequence[int]],
     predict_batch: Callable[[Sequence[int]], torch.Tensor],
@@ -2516,25 +2548,28 @@ def _merge_degree_marginals(shards: Sequence[Mapping[str, object]]) -> dict[str,
     )
 
 
-def _assert_motif_scoring_contract(*, stage: str, allow_oracle_diagnostic: bool) -> None:
+def _assert_motif_scoring_contract(
+    *, stage: str, allow_oracle_diagnostic: bool, deployed_generator: bool = False
+) -> None:
     """Fail closed on a motif-prompt stage / diagnostic-flag mismatch.
 
     Args:
         stage: The checkpoint's ``motif_prompt.stage``.
+        deployed_generator: Whether Stage I carries the frozen endpoint-only generator.
         allow_oracle_diagnostic: Whether ``--allow-oracle-diagnostic`` was passed.
 
     Raises:
         ValueError: On Stage I without the acknowledgement, or Stage II with it.
     """
-    if stage == "one" and not allow_oracle_diagnostic:
+    if stage == "one" and not deployed_generator and not allow_oracle_diagnostic:
         raise ValueError(
             "checkpoint family v3_1_motif_prompt stage 'one' reads compiled true templates by "
             "construction; pass --allow-oracle-diagnostic to acknowledge this is a ceiling "
             "diagnostic, never a formal result"
         )
-    if stage == "two" and allow_oracle_diagnostic:
+    if (stage == "two" or deployed_generator) and allow_oracle_diagnostic:
         raise ValueError(
-            "v3_1_motif_prompt stage 'two' is deployable and scores from (x_u, x_v) alone; "
+            "this v3_1_motif_prompt checkpoint is deployable and scores from (x_u, x_v) alone; "
             "--allow-oracle-diagnostic does not apply"
         )
 
@@ -2587,11 +2622,12 @@ def _motif_read_graph(
     endpoints: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     *,
     motif_bank: torch.Tensor | None,
+    motif_presence_bank: torch.Tensor | None,
     row_templates: torch.Tensor | None,
     own_templates: torch.Tensor | None,
     transform: Callable[[torch.Tensor], torch.Tensor] | None,
     marginals: _MotifDegreeMarginals | None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return the fp32 graph the reader reads for one batch, recording the intervention.
 
     The row's *own* graph is the generator's prediction (Stage II) or its
@@ -2607,6 +2643,8 @@ def _motif_read_graph(
         rows: ``(B,)`` row positions of this batch.
         endpoints: ``(encoded_a, encoded_b, len_a, len_b)`` of the rows' own pairs.
         motif_bank: Row-aligned transplant bank, or ``None``.
+        motif_presence_bank: Presence probabilities aligned with a predicted
+            transplant bank, or ``None`` for flat generators.
         row_templates: Row-aligned compiled templates the reader reads, or ``None``.
         own_templates: The rows' own compiled templates when ``row_templates``
             are the transplant sources, else ``None``.
@@ -2619,28 +2657,37 @@ def _motif_read_graph(
     encoded_a, encoded_b, len_a, len_b = endpoints
     device = encoded_a.device
 
-    def predict() -> torch.Tensor:
-        return motif_model.predict_weights(encoded_a, encoded_b, len_a, len_b).float()
+    def predict() -> tuple[torch.Tensor, torch.Tensor | None]:
+        weights, presence = motif_model.predict_graph(encoded_a, encoded_b, len_a, len_b)
+        return weights.float(), presence
 
     own: torch.Tensor | None
     if motif_bank is not None:
         weights = motif_bank[rows].to(device=device, dtype=torch.float32)
-        own = predict() if marginals is not None else None
+        presence = (
+            None
+            if motif_presence_bank is None
+            else motif_presence_bank[rows].to(device=device, dtype=torch.float32)
+        )
+        own = predict()[0] if marginals is not None else None
     elif row_templates is not None:
+        from src.model.egostitch.classifier.motif_prompt import MotifGenerator
+
         weights = row_templates[rows].to(device=device, dtype=torch.float32)
+        presence = MotifGenerator.presence_from_weights(weights)
         own = (
             weights
             if own_templates is None
             else own_templates[rows].to(device=device, dtype=torch.float32)
         )
     else:
-        weights = predict()
+        weights, presence = predict()
         own = weights
     if transform is not None:
         weights = transform(weights)
     if marginals is not None and own is not None:
         marginals.record(own, weights)
-    return weights
+    return weights, presence
 
 
 def _score_v3_1(
@@ -2657,6 +2704,7 @@ def _score_v3_1(
     motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
     motif_own_templates: torch.Tensor | None = None,
     motif_marginals: _MotifDegreeMarginals | None = None,
+    motif_weight_output: torch.Tensor | None = None,
     row_routes: torch.Tensor | None = None,
 ) -> NDArray[np.float32]:
     """Score pairs with a `V3_1` model via the length-bucketed batching machinery.
@@ -2695,6 +2743,8 @@ def _score_v3_1(
             ``row_templates`` hold the transplant sources (`_motif_read_graph`).
         motif_marginals: Accumulator of the changed degree marginals under a
             graph intervention, or ``None``.
+        motif_weight_output: Optional CPU matrix populated with the exact graph
+            weights read by each row; used to prepare scoring diagnostics.
         row_routes: Explicit dictionary routes for each row, used only by an
             authorized oracle diagnostic.
 
@@ -2714,7 +2764,12 @@ def _score_v3_1(
     dictionary = _is_motif_dictionary(model)
     dictionary_model = cast("V3_1MotifDictionary", model) if dictionary else None
     motif_model = cast("V3_1MotifPrompt", model) if motif else None
-    if motif_model is not None and motif_model.cfg.stage == "one" and row_templates is None:
+    if (
+        motif_model is not None
+        and motif_model.cfg.stage == "one"
+        and motif_model.generator is None
+        and row_templates is None
+    ):
         raise ValueError(
             "v3_1_motif_prompt stage 'one' requires compiled row templates; it never scores "
             "a pair without one (spec section 7.2)"
@@ -2740,6 +2795,7 @@ def _score_v3_1(
     z_bank: torch.Tensor | None = None
     coord_bank: torch.Tensor | None = None
     motif_bank: torch.Tensor | None = None
+    motif_presence_bank: torch.Tensor | None = None
     route_bank: torch.Tensor | None = None
     if shuffle_sources is not None:
         from src.model.egostitch.classifier.coord_gen import V3_1CoordGen as _V3_1CoordGen
@@ -2781,16 +2837,25 @@ def _score_v3_1(
             )
         elif motif_model is not None:
             source_model = motif_model
+            presence_bank = torch.zeros((len(pairs), 3), dtype=torch.float32)
+            saw_presence = [False]
 
             def _graph(batch_indices: Sequence[int]) -> torch.Tensor:
                 """Pass 1: the generator's predicted graph for one batch of sources."""
                 encoded_a, encoded_b, len_a, len_b = _encode(source_dataset, batch_indices)
                 with torch.inference_mode(), _autocast_context(device, "off"):
-                    return source_model.predict_weights(
+                    weights, presence = source_model.predict_graph(
                         encoded_a.float(), encoded_b.float(), len_a, len_b
                     )
+                    if presence is not None:
+                        saw_presence[0] = True
+                        presence_bank[
+                            torch.as_tensor(batch_indices, dtype=torch.int64)
+                        ] = presence.detach().to(torch.float32).cpu()
+                    return weights
 
             motif_bank = _motif_source_weights(source_batches, _graph, num_rows=len(pairs))
+            motif_presence_bank = presence_bank if saw_presence[0] else None
         elif isinstance(model, _V3_1Prefix):
             prefix_model = model
 
@@ -2850,18 +2915,21 @@ def _score_v3_1(
             encoded_a, encoded_b = encoded_a.float(), encoded_b.float()
             rows = torch.as_tensor(batch_indices, dtype=torch.int64)
             with torch.inference_mode(), _autocast_context(device, "off"):
-                weights = _motif_read_graph(
+                weights, presence = _motif_read_graph(
                     motif_model,
                     rows,
                     (encoded_a, encoded_b, len_a, len_b),
                     motif_bank=motif_bank,
+                    motif_presence_bank=motif_presence_bank,
                     row_templates=row_templates,
                     own_templates=motif_own_templates,
                     transform=motif_weight_transform,
                     marginals=motif_marginals,
                 )
+                if motif_weight_output is not None:
+                    motif_weight_output[rows] = weights.detach().to(torch.float32).cpu()
                 logits = motif_model.logits_from_encoded(
-                    encoded_a, encoded_b, len_a, len_b, weights=weights
+                    encoded_a, encoded_b, len_a, len_b, weights=weights, presence=presence
                 )
         elif z_bank is None and coord_bank is None:
             batch = collate_token_pairs([dataset[i] for i in batch_indices])
@@ -2917,6 +2985,7 @@ def _score_v3_1_packed(
     motif_weight_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
     motif_own_templates: torch.Tensor | None = None,
     motif_marginals: _MotifDegreeMarginals | None = None,
+    motif_weight_output: torch.Tensor | None = None,
     row_routes: torch.Tensor | None = None,
 ) -> NDArray[np.float32]:
     """Score V3.1 pairs with packed features and cached per-node encodings.
@@ -2953,7 +3022,12 @@ def _score_v3_1_packed(
         raise ValueError("packed scoring of a v3_1_topo_prompt checkpoint needs row_coords")
     motif_model = cast("V3_1MotifPrompt", model) if motif else None
     dictionary_model = cast("V3_1MotifDictionary", model) if dictionary else None
-    if motif_model is not None and motif_model.cfg.stage == "one" and row_templates is None:
+    if (
+        motif_model is not None
+        and motif_model.cfg.stage == "one"
+        and motif_model.generator is None
+        and row_templates is None
+    ):
         raise ValueError(
             "v3_1_motif_prompt stage 'one' requires compiled row templates; it never scores "
             "a pair without one (spec section 7.2)"
@@ -3073,6 +3147,7 @@ def _score_v3_1_packed(
     z_bank: torch.Tensor | None = None
     coord_bank: torch.Tensor | None = None
     motif_bank: torch.Tensor | None = None
+    motif_presence_bank: torch.Tensor | None = None
     route_bank: torch.Tensor | None = None
     if shuffle_sources is not None:
         if not (motif or dictionary or isinstance(model, (V3_1Prefix, V3_1CoordGen))):
@@ -3101,15 +3176,24 @@ def _score_v3_1_packed(
             )
         elif motif_model is not None:
             source_motif = motif_model
+            presence_bank = torch.zeros((len(pairs), 3), dtype=torch.float32)
+            saw_presence = [False]
 
             def _graph(batch_indices: Sequence[int]) -> torch.Tensor:
                 """Pass 1: the generator's predicted graph for one batch of sources."""
                 with torch.inference_mode(), _autocast_context(device, "off"):
-                    return source_motif.predict_weights(
+                    weights, presence = source_motif.predict_graph(
                         *_gather(batch_indices, source_a, source_b, source_lengths)
                     )
+                    if presence is not None:
+                        saw_presence[0] = True
+                        presence_bank[
+                            torch.as_tensor(batch_indices, dtype=torch.int64)
+                        ] = presence.detach().to(torch.float32).cpu()
+                    return weights
 
             motif_bank = _motif_source_weights(source_batches, _graph, num_rows=len(pairs))
+            motif_presence_bank = presence_bank if saw_presence[0] else None
         elif isinstance(model, V3_1Prefix):
             prefix_model = model
 
@@ -3175,18 +3259,21 @@ def _score_v3_1_packed(
             # Autocast disabled for the pair pass: the reader's RRWP arithmetic
             # needs fp32 and the pinned contract of spec section 9 says so.
             with torch.inference_mode(), _autocast_context(device, "off"):
-                weights = _motif_read_graph(
+                weights, presence = _motif_read_graph(
                     motif_model,
                     rows,
                     (encoded_a, encoded_b, len_a, len_b),
                     motif_bank=motif_bank,
+                    motif_presence_bank=motif_presence_bank,
                     row_templates=row_templates,
                     own_templates=motif_own_templates,
                     transform=motif_weight_transform,
                     marginals=motif_marginals,
                 )
+                if motif_weight_output is not None:
+                    motif_weight_output[rows] = weights.detach().to(torch.float32).cpu()
                 motif_logits = motif_model.logits_from_encoded(
-                    encoded_a, encoded_b, len_a, len_b, weights=weights
+                    encoded_a, encoded_b, len_a, len_b, weights=weights, presence=presence
                 )
             out[np.asarray(batch_indices, dtype=np.int64)] = (
                 motif_logits.detach().to(torch.float32).cpu().numpy().reshape(-1)
@@ -4308,6 +4395,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     score.add_argument("--prefix-intervention-seed", type=int, default=0)
+    score.add_argument(
+        "--motif-shift-bank",
+        type=Path,
+        default=None,
+        help="whole-V_val .npz bank produced by motif_shift_diagnostic (v17 Step 0 only)",
+    )
     score.add_argument("--shard", type=int, default=None, help="shard index K (with --num-shards)")
     score.add_argument("--num-shards", type=int, default=None, help="total shard count N")
     score.add_argument(
@@ -4378,6 +4471,16 @@ def _validate_score_args(parser: argparse.ArgumentParser, args: argparse.Namespa
         parser.error("--rescore-reason must contain non-whitespace text")
     if args.scoring_run_id is not None and not args.scoring_run_id.strip():
         parser.error("--scoring-run-id must contain non-whitespace text")
+    shift = args.prefix_intervention in MOTIF_SHIFT_INTERVENTIONS
+    if shift != (args.motif_shift_bank is not None):
+        parser.error(
+            "--motif-shift-bank is required exactly for s2_true/blur_true/presence_true/"
+            "level_true/content_true"
+        )
+    if shift and args.pairs != "val_cls":
+        parser.error("motif shift interventions are V_val val_cls diagnostics only")
+    if args.motif_shift_bank is not None and not args.motif_shift_bank.is_file():
+        parser.error(f"motif shift bank not found: {args.motif_shift_bank}")
 
 
 def _resolve_cazi_context(args: argparse.Namespace) -> tuple[CAZIConfig, FeatureStats]:
@@ -4449,12 +4552,18 @@ def _run_score(args: argparse.Namespace) -> None:
                 "--prefix-intervention requires a v3_1_prefix, v3_1_topo_prompt, "
                 "v3_1_coord_gen, v3_1_motif_prompt or v3_1_motif_dictionary checkpoint"
             )
-        if args.prefix_intervention in MOTIF_GRAPH_INTERVENTIONS and not _is_motif_prompt(model):
+        if (
+            args.prefix_intervention
+            in (MOTIF_GRAPH_INTERVENTIONS | MOTIF_SHIFT_INTERVENTIONS)
+            and not _is_motif_prompt(model)
+        ):
             raise SystemExit(
                 f"--prefix-intervention {args.prefix_intervention} substitutes a motif graph "
                 "and requires a v3_1_motif_prompt checkpoint"
             )
-        if _is_motif_dictionary(model) and args.prefix_intervention in MOTIF_GRAPH_INTERVENTIONS:
+        if _is_motif_dictionary(model) and args.prefix_intervention in (
+            MOTIF_GRAPH_INTERVENTIONS | MOTIF_SHIFT_INTERVENTIONS
+        ):
             raise SystemExit(
                 f"--prefix-intervention {args.prefix_intervention} operates on motif graphs and "
                 "is invalid for cached dictionary tokens"
@@ -4492,7 +4601,7 @@ def _run_score(args: argparse.Namespace) -> None:
         # The three motif graph substitutions are universe-level for the same
         # reason `shuffle` is, so the model stays on `"none"` for them too.
         if args.prefix_intervention not in (
-            {"shuffle", "shuffle_route"} | MOTIF_GRAPH_INTERVENTIONS
+            {"shuffle", "shuffle_route"} | MOTIF_GRAPH_INTERVENTIONS | MOTIF_SHIFT_INTERVENTIONS
         ):
             model.intervention = args.prefix_intervention
 
@@ -4532,6 +4641,10 @@ def _run_score(args: argparse.Namespace) -> None:
     is_motif_prompt = model_family == MOTIF_PROMPT_FAMILY
     is_motif_dictionary = model_family == MOTIF_DICTIONARY_FAMILY
     motif_stage = cast("V3_1MotifPrompt", model).cfg.stage if is_motif_prompt else None
+    motif_deployed_generator = bool(
+        is_motif_prompt
+        and cast("V3_1MotifPrompt", model).cfg.deployed_generator_checkpoint
+    )
     dictionary_mode = (
         str(getattr(cast("V3_1MotifDictionary", model), "mode", ""))
         if is_motif_dictionary
@@ -4551,10 +4664,22 @@ def _run_score(args: argparse.Namespace) -> None:
         )
     oracle_truth_graph: nx.Graph | None = None
     if motif_stage is not None:
-        _assert_motif_scoring_contract(
-            stage=motif_stage, allow_oracle_diagnostic=args.allow_oracle_diagnostic
-        )
-        if motif_stage == "one":
+        if args.prefix_intervention in MOTIF_SHIFT_INTERVENTIONS:
+            if motif_stage != "two" or not args.allow_oracle_diagnostic:
+                raise ValueError(
+                    "motif shift interventions require the deployable stage-two checkpoint and "
+                    "--allow-oracle-diagnostic"
+                )
+        else:
+            _assert_motif_scoring_contract(
+                stage=motif_stage,
+                deployed_generator=motif_deployed_generator,
+                allow_oracle_diagnostic=args.allow_oracle_diagnostic,
+            )
+        if (
+            (motif_stage == "one" and not motif_deployed_generator)
+            or args.prefix_intervention in MOTIF_SHIFT_INTERVENTIONS
+        ):
             oracle_truth_graph = _oracle_truth_graph_for_scoring(
                 args.pairs, args.data_root, args.strategy
             )
@@ -4765,6 +4890,18 @@ def _run_score(args: argparse.Namespace) -> None:
                 shuffle_sources = None
         if is_motif_prompt:
             meta_extra["motif_stage"] = motif_stage
+            if args.prefix_intervention in MOTIF_SHIFT_INTERVENTIONS:
+                assert args.motif_shift_bank is not None
+                whole_bank = _load_motif_shift_bank(
+                    args.motif_shift_bank, args.prefix_intervention, pairs
+                )
+                row_templates = whole_bank[start:end]
+                meta_extra["oracle_diagnostic"] = {
+                    "name": "motif_shift_step0",
+                    "truth_source": "V_val",
+                    "diagnostic_only": True,
+                }
+                meta_extra["motif_shift_scope"] = "whole_val_cls"
             if args.prefix_intervention == "permute_closure":
                 motif_weight_transform = functools.partial(
                     _motif_permute_closure, seed=int(args.prefix_intervention_seed)
@@ -4773,7 +4910,7 @@ def _run_score(args: argparse.Namespace) -> None:
                 motif_weight_transform = functools.partial(
                     _motif_rewire_bridge, seed=int(args.prefix_intervention_seed)
                 )
-            if motif_stage == "one":
+            if motif_stage == "one" and not motif_deployed_generator:
                 from src.data.motif_template import MotifTemplateTable
 
                 assert oracle_truth_graph is not None  # gated above

@@ -49,6 +49,7 @@ from src.model.egostitch.encoder.grit_gmt import _grit_layer_cfg, _GritBatch, de
 from src.vendor.grit_official import GritTransformerLayer
 
 FIELD_ORDER = ("topo_self", "topo_partner", "topo_rel", "topo_cnt")
+ALL_FIELD_ORDER = (*FIELD_ORDER, "topo_conf")
 TEMPLATE_KEY = "motif_weights"
 TEMPLATE_MASK_KEY = "motif_mask"
 INTERVENTIONS = (
@@ -97,6 +98,12 @@ COUNT_FEATURES = ("all", "degree")
 GATE_MODES = ("learned", "per_type", "mean_graph")
 FAMILIES = ("closure", "bridge")
 LOSS_TERM_NAMES = ("task", "slot", "topo")
+GENERATOR_HEADS = ("flat", "presence_profile")
+CORRUPTION_SOURCES = ("mean_blend", "predicted")
+PREDICTED_WEIGHTS_KEY = "motif_predicted_weights"
+PREDICTED_PRESENCE_KEY = "motif_predicted_presence"
+PREDICTED_MASK_KEY = "motif_predicted_mask"
+TRUE_DIAGNOSTIC_KEY = "motif_use_true_template"
 _GRAPH_INTERVENTIONS = ("shuffle_graph", "permute_closure", "rewire_bridge")
 _READER_FIELDS = frozenset({"topo_self", "topo_partner", "topo_rel"})
 #: Reader and prefix parameters train at this fraction of the generator's LR
@@ -134,6 +141,9 @@ class CorruptionConfig:
     prob: float = 0.5
     lambda_min: float = 0.0
     lambda_max: float = 1.0
+    source: str = "mean_blend"
+    predicted_share: float = 1.0
+    predicted_cache_path: str = ""
 
     def __post_init__(self) -> None:
         """Validate the distribution.
@@ -145,6 +155,12 @@ class CorruptionConfig:
             raise ValueError("motif_prompt.corruption.prob must lie in [0, 1]")
         if not 0.0 <= self.lambda_min <= self.lambda_max <= 1.0:
             raise ValueError("motif_prompt.corruption lambda range must lie in [0, 1]")
+        if self.source not in CORRUPTION_SOURCES:
+            raise ValueError(
+                f"motif_prompt.corruption.source must be one of {list(CORRUPTION_SOURCES)}"
+            )
+        if not 0.0 <= self.predicted_share <= 1.0:
+            raise ValueError("motif_prompt.corruption.predicted_share must lie in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -187,6 +203,12 @@ class MotifPromptConfig:
     training_policy: str = "default"
     head_prompt_enabled: bool = True
     init_checkpoint: str = ""
+    deployed_generator_checkpoint: str = ""
+    generator_head: str = "flat"
+    beta_pres: float = 1.0
+    row_gate: bool = False
+    crossfit_fold: int | None = None
+    crossfit_seed: int = 42
 
     def __post_init__(self) -> None:
         """Validate the block.
@@ -205,8 +227,8 @@ class MotifPromptConfig:
             raise ValueError("motif_prompt.width and slots_per_field must be positive")
         if not self.fields or len(set(self.fields)) != len(self.fields):
             raise ValueError("motif_prompt.fields must be a non-empty set of field names")
-        if any(name not in FIELD_ORDER for name in self.fields):
-            raise ValueError(f"motif_prompt.fields must be drawn from {list(FIELD_ORDER)}")
+        if any(name not in ALL_FIELD_ORDER for name in self.fields):
+            raise ValueError(f"motif_prompt.fields must be drawn from {list(ALL_FIELD_ORDER)}")
         if not self.families or any(name not in FAMILIES for name in self.families):
             raise ValueError(
                 f"motif_prompt.families must be a non-empty subset of {list(FAMILIES)}"
@@ -259,6 +281,18 @@ class MotifPromptConfig:
             )
         if self.training_policy == "head_only" and not self.init_checkpoint:
             raise ValueError("head-only motif_prompt requires motif_prompt.init_checkpoint")
+        if self.generator_head not in GENERATOR_HEADS:
+            raise ValueError(f"motif_prompt.generator_head must be one of {list(GENERATOR_HEADS)}")
+        if self.beta_pres < 0.0:
+            raise ValueError("motif_prompt.beta_pres must be non-negative")
+        if (
+            "topo_conf" in self.fields or self.row_gate
+        ) and self.generator_head != "presence_profile":
+            raise ValueError("topo_conf and row_gate require generator_head='presence_profile'")
+        if self.row_gate and "topo_conf" not in self.fields:
+            raise ValueError("motif_prompt.row_gate requires fields to include 'topo_conf'")
+        if self.crossfit_fold is not None and self.crossfit_fold not in (0, 1):
+            raise ValueError("motif_prompt.crossfit_fold must be 0, 1, or null")
 
     @property
     def w_slot_is_balanced(self) -> bool:
@@ -284,7 +318,20 @@ class MotifPromptConfig:
             raise ValueError(f"unknown motif_prompt keys: {unknown}")
         values = dict(raw)
         reader = ReaderConfig(**cast(Mapping[str, int], values.pop("reader", {})))
-        corruption = CorruptionConfig(**cast(Mapping[str, float], values.pop("corruption", {})))
+        corruption_raw = cast(Mapping[str, object], values.pop("corruption", {}))
+        unknown_corruption = sorted(
+            set(corruption_raw) - set(CorruptionConfig.__dataclass_fields__)
+        )
+        if unknown_corruption:
+            raise ValueError(f"unknown motif_prompt.corruption keys: {unknown_corruption}")
+        corruption = CorruptionConfig(
+            prob=float(cast(float, corruption_raw.get("prob", 0.5))),
+            lambda_min=float(cast(float, corruption_raw.get("lambda_min", 0.0))),
+            lambda_max=float(cast(float, corruption_raw.get("lambda_max", 1.0))),
+            source=str(corruption_raw.get("source", "mean_blend")),
+            predicted_share=float(cast(float, corruption_raw.get("predicted_share", 1.0))),
+            predicted_cache_path=str(corruption_raw.get("predicted_cache_path", "")),
+        )
         fields_raw = values.pop("fields", FIELD_ORDER)
         families_raw = values.pop("families", FAMILIES)
         warmup = values.pop("interface_warmup_epochs", 2)
@@ -768,10 +815,28 @@ class MotifGenerator(nn.Module):
             )
             for _ in range(N_EDGE_TYPES)
         )
+        self.presence_heads = (
+            nn.ModuleList(
+                nn.Sequential(
+                    nn.LayerNorm(2 * _GATE_DIM),
+                    nn.Linear(2 * _GATE_DIM, _GATE_DIM),
+                    nn.GELU(),
+                    nn.Linear(_GATE_DIM, 1),
+                )
+                for _ in range(N_EDGE_TYPES)
+            )
+            if cfg.generator_head == "presence_profile"
+            else None
+        )
         for head in self.heads:
             output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
             nn.init.normal_(output.weight, std=float(cfg.head_output_init_std))
             nn.init.zeros_(output.bias)
+        if self.presence_heads is not None:
+            for head in self.presence_heads:
+                output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
+                nn.init.normal_(output.weight, std=float(cfg.head_output_init_std))
+                nn.init.zeros_(output.bias)
         self.register_buffer("fixed_weights", torch.zeros(N_EDGES))
         self.register_buffer("incidence", _candidate_incidence())
         #: What `init_biases` did, per edge type, for ``profile.json``.
@@ -858,6 +923,16 @@ class MotifGenerator(nn.Module):
                 "weight": weight,
                 "bias_logit": bias,
             }
+            if self.presence_heads is not None:
+                magnitude = float(stats.nonzero_mean_by_type[edge_type])
+                density = float(self.fixed_weights[_TYPE_MASKS[edge_type]].mean())
+                present = density / magnitude if magnitude > 0.0 else 0.0
+                present = min(max(present, low), high)
+                pres_bias = float(torch.logit(torch.tensor(present, dtype=torch.float32)))
+                pres_output = cast(
+                    nn.Linear, cast(nn.Sequential, self.presence_heads[edge_type])[-1]
+                )
+                pres_output.bias.fill_(pres_bias)
         self.bias_init_record = record
 
     def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
@@ -876,7 +951,11 @@ class MotifGenerator(nn.Module):
             TYPE_ATTACH: "head_attach",
             TYPE_INTERIOR: "head_interior",
         }
-        heads = {f"heads.{index}": head_groups[index] for index in range(N_EDGE_TYPES)}
+        heads = {
+            prefix: head_groups[index]
+            for index in range(N_EDGE_TYPES)
+            for prefix in (f"heads.{index}", f"presence_heads.{index}")
+        }
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
@@ -903,6 +982,21 @@ class MotifGenerator(nn.Module):
                         break
             named[group].append(param)
         return named
+
+    @torch.no_grad()
+    def init_presence_biases(self, rates: torch.Tensor | Sequence[float]) -> None:
+        """Initialise presence heads from measured corpus per-type presence rates."""
+        if self.presence_heads is None:
+            raise RuntimeError("generator_head='flat' has no presence heads")
+        value = torch.as_tensor(rates, dtype=torch.float32)
+        if tuple(value.shape) != (N_EDGE_TYPES,) or not torch.isfinite(value).all():
+            raise ValueError(f"presence rates must be a finite ({N_EDGE_TYPES},) vector")
+        if bool(((value < 0.0) | (value > 1.0)).any()):
+            raise ValueError("presence rates must lie in [0, 1]")
+        low, high = _BIAS_CLIP
+        for rate, head in zip(value.clamp(low, high), self.presence_heads, strict=True):
+            output = cast(nn.Linear, cast(nn.Sequential, head)[-1])
+            output.bias.fill_(torch.logit(rate))
 
     @staticmethod
     def gate_logit_statistics(weights: torch.Tensor) -> dict[str, float]:
@@ -982,13 +1076,13 @@ class MotifGenerator(nn.Module):
             [pooled_u.unsqueeze(1), pooled_v.unsqueeze(1), closure, left, right], dim=1
         )
 
-    def forward(
+    def forward_with_presence(
         self,
         encoded_u: torch.Tensor,
         encoded_v: torch.Tensor,
         lengths_u: torch.Tensor,
         lengths_v: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Predict the 96 edge weights of one batch of pairs.
 
         Args:
@@ -1002,7 +1096,11 @@ class MotifGenerator(nn.Module):
         """
         batch = encoded_u.size(0)
         if self.cfg.gate_mode == "mean_graph":
-            return self.fixed_weights.unsqueeze(0).expand(batch, -1)
+            weights = self.fixed_weights.unsqueeze(0).expand(batch, -1)
+            presence = (
+                self.presence_from_weights(weights) if self.presence_heads is not None else None
+            )
+            return weights, presence
         h = self._slot_states(encoded_u, encoded_v, lengths_u, lengths_v)
         for layer in self.message_layers:
             h = layer(h, self.incidence)
@@ -1030,7 +1128,37 @@ class MotifGenerator(nn.Module):
                     logits[:, mask] = head(block.mean(dim=1)).expand(-1, int(block.size(1)))
                 else:
                     logits[:, mask] = head(block).squeeze(-1)
-            return torch.sigmoid(logits)
+            profile = torch.sigmoid(logits)
+            if self.presence_heads is None:
+                return profile, None
+            presence_logits = []
+            for edge_type, head in enumerate(self.presence_heads):
+                block = features[:, _TYPE_MASKS[edge_type].to(h.device)]
+                presence_logits.append(head(block.mean(dim=1)).squeeze(-1))
+            presence = torch.sigmoid(torch.stack(presence_logits, dim=1))
+            rendered = profile * presence[:, torch.as_tensor(EDGE_TYPES, device=h.device)]
+            return rendered, presence
+
+    def forward(
+        self,
+        encoded_u: torch.Tensor,
+        encoded_v: torch.Tensor,
+        lengths_u: torch.Tensor,
+        lengths_v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return rendered edge weights; use ``forward_with_presence`` for confidence."""
+        return self.forward_with_presence(encoded_u, encoded_v, lengths_u, lengths_v)[0]
+
+    @staticmethod
+    def presence_from_weights(weights: torch.Tensor) -> torch.Tensor:
+        """Return exact per-type 0/1 presence for a compiled template."""
+        return torch.stack(
+            [
+                (weights[:, _TYPE_MASKS[t].to(weights.device)] > 0).any(dim=1)
+                for t in range(N_EDGE_TYPES)
+            ],
+            dim=1,
+        ).to(dtype=torch.float32)
 
 
 def pool_residues(states: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -1113,6 +1241,7 @@ _FIELD_TO_TOKEN = {
     "topo_partner": ("topo_v", "topo_u"),
     "topo_rel": ("topo_rel", "topo_rel"),
     "topo_cnt": ("topo_cnt", "topo_cnt"),
+    "topo_conf": ("topo_conf", "topo_conf"),
 }
 
 
@@ -1150,14 +1279,15 @@ class MotifPromptAdapter(nn.Module):
         self.cfg = cfg
         self.d_model = d_model
         self.n_layers = n_layers
-        self.slots = len(FIELD_ORDER) * cfg.slots_per_field
+        self.field_order = ALL_FIELD_ORDER if "topo_conf" in cfg.fields else FIELD_ORDER
+        self.slots = len(self.field_order) * cfg.slots_per_field
         self.active_rows: tuple[int, ...] = tuple(
             field_index * cfg.slots_per_field + offset
-            for field_index, name in enumerate(FIELD_ORDER)
+            for field_index, name in enumerate(self.field_order)
             if name in cfg.fields
             for offset in range(cfg.slots_per_field)
         )
-        self.role_embed = nn.Parameter(torch.randn(len(FIELD_ORDER), cfg.width) * 0.02)
+        self.role_embed = nn.Parameter(torch.randn(len(self.field_order), cfg.width) * 0.02)
         self.token_norm = nn.LayerNorm(cfg.width)
         self.layer_proj = nn.ModuleList(
             nn.Linear(cfg.width, cfg.slots_per_field * d_model) for _ in range(n_layers)
@@ -1180,7 +1310,7 @@ class MotifPromptAdapter(nn.Module):
             swap-invariant.
         """
         stacks: list[list[torch.Tensor]] = [[], []]
-        for index, name in enumerate(FIELD_ORDER):
+        for index, name in enumerate(self.field_order):
             first, second = _FIELD_TO_TOKEN[name]
             stacks[0].append(tokens[first] + self.role_embed[index])
             stacks[1].append(tokens[second] + self.role_embed[index])
@@ -1252,6 +1382,7 @@ class MotifPromptCrossAttentionLayer(nn.Module):
         key_padding_mask: torch.Tensor | None,
         prefix: torch.Tensor,
         gate_scale: float,
+        row_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one site's frozen attention and add the gated prefix branch."""
         layer = self.layer
@@ -1262,6 +1393,8 @@ class MotifPromptCrossAttentionLayer(nn.Module):
         branch = prefix_branch(
             layer.attn, query_norm, prefix, self.adapter.gate(self.layer_index, site), gate_scale
         )
+        if row_gate is not None:
+            branch = branch * row_gate.to(branch).reshape(-1, 1, 1)
         return query + cast(torch.Tensor, layer.drop_attn(attn_out)) + branch
 
     def forward(
@@ -1274,6 +1407,7 @@ class MotifPromptCrossAttentionLayer(nn.Module):
         prefix_a: torch.Tensor,
         prefix_b: torch.Tensor,
         gate_scale: float = 1.0,
+        row_gate: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One bidirectional block plus the gated prefix branch at all three sites.
 
@@ -1286,14 +1420,15 @@ class MotifPromptCrossAttentionLayer(nn.Module):
             prefix_a: This layer's prefix in the A stream's view.
             prefix_b: This layer's prefix in the B stream's view.
             gate_scale: ``0.0`` realises the gates-off intervention.
+            row_gate: Optional per-row confidence gate.
 
         Returns:
             Updated ``(h_a, h_b, cls_token)``.
         """
         layer = self.layer
-        h_a = self._attend(0, h_a, h_b, mask_b, prefix_a, gate_scale)
+        h_a = self._attend(0, h_a, h_b, mask_b, prefix_a, gate_scale, row_gate)
         h_a = layer._ffn(h_a)  # noqa: SLF001
-        h_b = self._attend(1, h_b, h_a, mask_a, prefix_b, gate_scale)
+        h_b = self._attend(1, h_b, h_a, mask_a, prefix_b, gate_scale, row_gate)
         h_b = layer._ffn(h_b)  # noqa: SLF001
 
         combined = torch.cat([h_a, h_b], dim=1)
@@ -1309,6 +1444,8 @@ class MotifPromptCrossAttentionLayer(nn.Module):
         branch = prefix_branch(
             layer.attn_cls, cls_norm, prefix_a, self.adapter.gate(self.layer_index, 2), gate_scale
         )
+        if row_gate is not None:
+            branch = branch * row_gate.to(branch).reshape(-1, 1, 1)
         cls_token = cls_token + layer.drop_cls_attn(attn_cls) + branch
         cls_token = cls_token + layer.drop_cls_ffn(layer.ff_cls(layer.norm_cls_ffn(cls_token)))
         return h_a, h_b, cls_token
@@ -1332,6 +1469,7 @@ class V3_1MotifPrompt(nn.Module):
 
     name: str = "v3_1_motif_prompt"
     mean_template: torch.Tensor
+    mean_presence: torch.Tensor
     family_mask: torch.Tensor
     w_slot_resolved: torch.Tensor
 
@@ -1372,7 +1510,32 @@ class V3_1MotifPrompt(nn.Module):
         self.adapter = MotifPromptAdapter(
             self.d_model, len(trunk.layers), int(base_model.n_heads), self.cfg
         )
-        self.generator = MotifGenerator(self.d_model, self.cfg) if self.cfg.stage == "two" else None
+        has_generator = self.cfg.stage == "two" or bool(self.cfg.deployed_generator_checkpoint)
+        self.generator = MotifGenerator(self.d_model, self.cfg) if has_generator else None
+        if self.cfg.stage == "one" and self.generator is not None:
+            self.generator.requires_grad_(False)
+            self.generator.eval()
+        self.conf_proj = (
+            nn.Sequential(
+                nn.Linear(N_EDGE_TYPES, self.cfg.width),
+                nn.GELU(),
+                nn.Linear(self.cfg.width, self.cfg.width),
+            )
+            if "topo_conf" in self.cfg.fields
+            else None
+        )
+        self.row_gate_head = (
+            nn.Sequential(
+                nn.Linear(self.cfg.width, self.cfg.width), nn.GELU(), nn.Linear(self.cfg.width, 1)
+            )
+            if self.cfg.row_gate
+            else None
+        )
+        if self.row_gate_head is not None:
+            output = cast(nn.Linear, self.row_gate_head[-1])
+            nn.init.zeros_(output.weight)
+            nn.init.zeros_(output.bias)
+        self.row_gate_bias = nn.Parameter(torch.tensor(4.0)) if self.cfg.row_gate else None
         self.base = base_model
         for param in self.base.parameters():
             param.requires_grad_(False)
@@ -1395,6 +1558,13 @@ class V3_1MotifPrompt(nn.Module):
             self.requires_grad_(False)
             self.base.output_head.requires_grad_(True)
         self.register_buffer("mean_template", torch.zeros(N_EDGES))
+        # Keep the v16 flat checkpoint key set byte-for-byte compatible. The
+        # confidence vector is checkpoint state only for the new presence head.
+        self.register_buffer(
+            "mean_presence",
+            torch.zeros(N_EDGE_TYPES),
+            persistent=self.cfg.generator_head == "presence_profile",
+        )
         # The balanced ``w_slot``, once measured; -1 means "not yet". It is a
         # buffer so it rides in ``model_state``: a resumed or scored run reads
         # the weight the run was actually trained under and never re-balances.
@@ -1520,6 +1690,8 @@ class V3_1MotifPrompt(nn.Module):
         self.base.eval()
         if self.teacher is not None:
             self.teacher.eval()
+        if self.cfg.stage == "one" and self.generator is not None:
+            self.generator.eval()
         if self.cfg.training_policy == "head_only":
             # Calling ``train()`` on the wrapper must not reactivate dropout in
             # any frozen feature producer.  The output head is the sole module
@@ -1584,7 +1756,8 @@ class V3_1MotifPrompt(nn.Module):
         reader_modules: list[nn.Module] = (
             [self.reader] if self.cfg.stage == "one" else self.reader.adaptable_modules()
         )
-        return [*reader_modules, self.count_head, self.adapter]
+        optional = [module for module in (self.conf_proj, self.row_gate_head) if module is not None]
+        return [*reader_modules, self.count_head, self.adapter, *optional]
 
     def optimizer_parameter_groups(
         self, generator_lr: float, interface_lr: float, weight_decay: float
@@ -1610,6 +1783,8 @@ class V3_1MotifPrompt(nn.Module):
             for param in module.parameters()
             if param.requires_grad
         ]
+        if self.row_gate_bias is not None and self.row_gate_bias.requires_grad:
+            interface.append(self.row_gate_bias)
         interface_ids = {id(param) for param in interface}
         generator = [
             param
@@ -1651,8 +1826,22 @@ class V3_1MotifPrompt(nn.Module):
         if tuple(mean.shape) != (N_EDGES,) or not torch.isfinite(mean).all():
             raise ValueError(f"mean template must be a finite ({N_EDGES},) vector")
         self.mean_template.copy_(mean.to(self.mean_template))
-        if self.generator is not None:
+        # A shift-matched Stage-I checkpoint carries a generator loaded from a
+        # deployed run. Installing Abar must not overwrite that frozen state.
+        if self.generator is not None and self.cfg.stage == "two":
             self.generator.init_biases(stats, closure_bias_init=self.cfg.closure_bias_init)
+
+    @torch.no_grad()
+    def install_presence_rates(self, rates: torch.Tensor | Sequence[float]) -> None:
+        """Persist corpus presence rates for mean inference and initialise a new G."""
+        value = torch.as_tensor(rates, dtype=torch.float32)
+        if tuple(value.shape) != (N_EDGE_TYPES,) or not torch.isfinite(value).all():
+            raise ValueError(f"presence rates must be a finite ({N_EDGE_TYPES},) vector")
+        if bool(((value < 0.0) | (value > 1.0)).any()):
+            raise ValueError("presence rates must lie in [0, 1]")
+        self.mean_presence.copy_(value.to(self.mean_presence))
+        if self.generator is not None and self.cfg.stage == "two":
+            self.generator.init_presence_biases(value)
 
     def initialize_teacher(self) -> None:
         """Snapshot the loaded Stage I bundle as the immutable teacher ``R_T``.
@@ -1729,6 +1918,7 @@ class V3_1MotifPrompt(nn.Module):
         encoded_v: torch.Tensor,
         lengths_u: torch.Tensor,
         lengths_v: torch.Tensor,
+        presence: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Read one graph through the student path or through the immutable teacher.
 
@@ -1757,6 +1947,10 @@ class V3_1MotifPrompt(nn.Module):
             if self.student_counts
             else weights.new_zeros(weights.size(0), self.cfg.width, dtype=torch.float32)
         )
+        if self.conf_proj is not None:
+            if presence is None:
+                raise ValueError("topo_conf requires explicit per-type presence probabilities")
+            tokens["topo_conf"] = self.conf_proj(presence.float())
         return tokens
 
     def tokens_from_weights(
@@ -1766,6 +1960,7 @@ class V3_1MotifPrompt(nn.Module):
         encoded_v: torch.Tensor,
         lengths_u: torch.Tensor,
         lengths_v: torch.Tensor,
+        presence: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return the four token fields for one batch of motif graphs.
 
@@ -1776,11 +1971,27 @@ class V3_1MotifPrompt(nn.Module):
             lengths_u: True residue lengths of ``u``, so the direct control pools
                 under the mask rather than over the batch's padding.
             lengths_v: True residue lengths of ``v``.
+            presence: Optional per-type presence probabilities.
 
         Returns:
             ``topo_u``, ``topo_v``, ``topo_rel`` and ``topo_cnt``.
         """
-        return self._tokens(None, weights, encoded_u, encoded_v, lengths_u, lengths_v)
+        return self._tokens(None, weights, encoded_u, encoded_v, lengths_u, lengths_v, presence)
+
+    def predict_graph(
+        self,
+        encoded_u: torch.Tensor,
+        encoded_v: torch.Tensor,
+        lengths_u: torch.Tensor,
+        lengths_v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Predict rendered weights and optional per-type presence probabilities."""
+        if self.generator is None:
+            raise RuntimeError("this motif prompt has no deployed generator")
+        weights, presence = self.generator.forward_with_presence(
+            encoded_u, encoded_v, lengths_u, lengths_v
+        )
+        return self._gate_families(weights), presence
 
     def predict_weights(
         self,
@@ -1803,9 +2014,7 @@ class V3_1MotifPrompt(nn.Module):
         Raises:
             RuntimeError: If called on a Stage I model, which has no generator.
         """
-        if self.generator is None:
-            raise RuntimeError("stage 'one' has no generator; supply batch['motif_weights']")
-        return self._gate_families(self.generator(encoded_u, encoded_v, lengths_u, lengths_v))
+        return self.predict_graph(encoded_u, encoded_v, lengths_u, lengths_v)[0]
 
     def _gate_families(self, weights: torch.Tensor) -> torch.Tensor:
         """Zero every edge of an inactive family, in both stages (spec section 8)."""
@@ -1867,6 +2076,7 @@ class V3_1MotifPrompt(nn.Module):
         prefixes_a: list[torch.Tensor],
         prefixes_b: list[torch.Tensor],
         gate_scale: float,
+        row_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Drive the frozen trunk once, in the A-as-self orientation."""
         trunk = self.base.cross_attention
@@ -1883,6 +2093,7 @@ class V3_1MotifPrompt(nn.Module):
                 prefixes_a[index],
                 prefixes_b[index],
                 gate_scale,
+                row_gate,
             )
         cls_vec = cls_token.squeeze(1)
         if trunk.pair_readout_mode == "pair_context_gated":
@@ -1903,6 +2114,7 @@ class V3_1MotifPrompt(nn.Module):
         *,
         weights: torch.Tensor,
         return_pair_repr: bool = False,
+        presence: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute logits from encoded token states and one batch of motif graphs.
 
@@ -1917,6 +2129,7 @@ class V3_1MotifPrompt(nn.Module):
             lengths_b: True sequence lengths for B.
             weights: ``(B, 96)`` motif graph of each pair, with A as endpoint ``u``.
             return_pair_repr: Return the representation before the output head.
+            presence: Optional per-type presence probabilities.
 
         Returns:
             The pair logits, or the pair representation.
@@ -1929,7 +2142,11 @@ class V3_1MotifPrompt(nn.Module):
         if self.intervention != "none" and self.training:
             raise ValueError("motif_prompt interventions are scoring-time only; call eval() first")
         weights, gate_scale = self._apply_intervention(weights)
-        tokens = self.tokens_from_weights(weights, encoded_a, encoded_b, lengths_a, lengths_b)
+        if self.intervention == "mean" and self.conf_proj is not None:
+            presence = self.mean_presence.to(weights).unsqueeze(0).expand(weights.size(0), -1)
+        tokens = self.tokens_from_weights(
+            weights, encoded_a, encoded_b, lengths_a, lengths_b, presence
+        )
         return self.logits_from_tokens(
             encoded_a,
             encoded_b,
@@ -1959,17 +2176,30 @@ class V3_1MotifPrompt(nn.Module):
         """
         if self.cfg.training_policy == "head_only" and not self.cfg.head_prompt_enabled:
             gate_scale = 0.0
+        row_gate = None
+        if self.row_gate_head is not None:
+            confidence = tokens["topo_conf"]
+            row_gate = torch.sigmoid(
+                cast(torch.Tensor, self.row_gate_bias) + self.row_gate_head(confidence).squeeze(-1)
+            )
         view_a, view_b = self.adapter.views(tokens)
         prefixes_a = [self.adapter.prefix(i, view_a) for i in range(len(self.prompt_layers))]
         prefixes_b = [self.adapter.prefix(i, view_b) for i in range(len(self.prompt_layers))]
         feature_ab = self._trunk(
-            encoded_a, encoded_b, lengths_a, lengths_b, prefixes_a, prefixes_b, gate_scale
+            encoded_a, encoded_b, lengths_a, lengths_b, prefixes_a, prefixes_b, gate_scale, row_gate
         )
         if self.base.order_aggregation == "single":
             pair_repr = feature_ab
         else:
             feature_ba = self._trunk(
-                encoded_b, encoded_a, lengths_b, lengths_a, prefixes_b, prefixes_a, gate_scale
+                encoded_b,
+                encoded_a,
+                lengths_b,
+                lengths_a,
+                prefixes_b,
+                prefixes_a,
+                gate_scale,
+                row_gate,
             )
             pair_repr = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
         if return_pair_repr:
@@ -2002,9 +2232,24 @@ class V3_1MotifPrompt(nn.Module):
         Raises:
             ValueError: If Stage I is called without ``batch['motif_weights']``.
         """
+        return self.resolve_graph(merged, encoded_a, encoded_b, lengths_a, lengths_b)[0]
+
+    def resolve_graph(
+        self,
+        merged: Mapping[str, torch.Tensor],
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Resolve the graph and the confidence source read by this row."""
         if self.cfg.stage == "two":
-            return self.predict_weights(encoded_a, encoded_b, lengths_a, lengths_b)
+            return self.predict_graph(encoded_a, encoded_b, lengths_a, lengths_b)
         target = merged.get(TEMPLATE_KEY)
+        use_true = merged.get(TRUE_DIAGNOSTIC_KEY)
+        explicit_true = bool(use_true is not None and bool(use_true.bool().all()))
+        if not self.training and self.generator is not None and not explicit_true:
+            return self.predict_graph(encoded_a, encoded_b, lengths_a, lengths_b)
         if target is None:
             raise ValueError(
                 "v3_1_motif_prompt stage 'one' requires batch['motif_weights']; this stage "
@@ -2017,7 +2262,41 @@ class V3_1MotifPrompt(nn.Module):
         # gate is applied last and holds in both stages (spec section 8).
         nonself = merged.get(TEMPLATE_MASK_KEY)
         template = target.to(device=encoded_a.device, dtype=torch.float32)
-        return self._gate_families(self._corrupt(template, nonself))
+        confidence = MotifGenerator.presence_from_weights(template)
+        if self.training and self.cfg.corruption.source == "predicted":
+            predicted = merged.get(PREDICTED_WEIGHTS_KEY)
+            if predicted is None:
+                raise ValueError("predicted corruption requires batch['motif_predicted_weights']")
+            predicted = predicted.to(device=template.device, dtype=torch.float32)
+            eligible = merged.get(PREDICTED_MASK_KEY)
+            choose = torch.ones(template.size(0), dtype=torch.bool, device=template.device)
+            if eligible is not None:
+                choose &= eligible.reshape(-1).to(device=template.device, dtype=torch.bool)
+            if nonself is not None:
+                choose &= nonself.reshape(-1).to(device=template.device, dtype=torch.bool)
+            if self.cfg.corruption.predicted_share < 1.0:
+                rng = torch.Generator(device=template.device).manual_seed(self.corruption_seed)
+                choose &= (
+                    torch.rand(template.size(0), device=template.device, generator=rng)
+                    < self.cfg.corruption.predicted_share
+                )
+            fallback = self._corrupt(template, nonself)
+            weights = torch.where(choose[:, None], predicted, fallback)
+            predicted_presence = merged.get(PREDICTED_PRESENCE_KEY)
+            if predicted_presence is None:
+                if self.conf_proj is not None:
+                    raise ValueError(
+                        "predicted corruption with topo_conf requires "
+                        "batch['motif_predicted_presence']"
+                    )
+                predicted_presence = MotifGenerator.presence_from_weights(predicted)
+            else:
+                predicted_presence = predicted_presence.to(
+                    device=template.device, dtype=torch.float32
+                )
+            confidence = torch.where(choose[:, None], predicted_presence, confidence)
+            return self._gate_families(weights), confidence
+        return self._gate_families(self._corrupt(template, nonself)), confidence
 
     def forward(
         self, batch: dict[str, torch.Tensor] | None = None, **kwargs: torch.Tensor
@@ -2052,21 +2331,62 @@ class V3_1MotifPrompt(nn.Module):
         with self._eval_pair_precision(encoded_a.device):
             if not self.training:
                 encoded_a, encoded_b = encoded_a.float(), encoded_b.float()
-            weights = self.resolve_weights(merged, encoded_a, encoded_b, lengths_a, lengths_b)
+            weights, presence = self.resolve_graph(
+                merged, encoded_a, encoded_b, lengths_a, lengths_b
+            )
             # The single point the graph-only warm-up acts at: everything that
             # reads the graph -- the token/trunk path of both streams and the
             # immutable teacher -- takes the detached weights, ``L_slot`` takes
             # the live ones. The values are identical, so every logged loss is
             # unchanged and only G's gradient path differs.
             read_weights = weights.detach() if self.graph_only_warmup else weights
+            read_presence = (
+                presence.detach() if self.graph_only_warmup and presence is not None else presence
+            )
+            if self.intervention == "mean" and self.conf_proj is not None:
+                read_presence = (
+                    self.mean_presence.to(read_weights)
+                    .unsqueeze(0)
+                    .expand(read_weights.size(0), -1)
+                )
+            logit_kwargs: dict[str, object] = {"weights": read_weights}
+            if self.conf_proj is not None:
+                logit_kwargs["presence"] = read_presence
             logits = self.logits_from_encoded(
-                encoded_a, encoded_b, lengths_a, lengths_b, weights=read_weights
+                encoded_a,
+                encoded_b,
+                lengths_a,
+                lengths_b,
+                **logit_kwargs,  # type: ignore[arg-type]
             )
             output: dict[str, torch.Tensor] = {"logits": logits}
-            if self.cfg.stage == "two":
+            if self.generator is not None and (self.cfg.stage == "two" or not self.training):
                 # `_apply_intervention` may have substituted the graph the trunk read;
                 # report what was actually read, not what the generator emitted.
                 output["predicted_weights"] = self._apply_intervention(read_weights)[0]
+            if read_presence is not None:
+                output["presence_probabilities"] = read_presence
+                if self.row_gate_head is not None and self.conf_proj is not None:
+                    conf = self.conf_proj(read_presence.float())
+                    output["row_gate"] = torch.sigmoid(
+                        cast(torch.Tensor, self.row_gate_bias)
+                        + self.row_gate_head(conf).squeeze(-1)
+                    )
+                if self.cfg.stage == "two" and TEMPLATE_KEY in merged and presence is not None:
+                    target_presence = MotifGenerator.presence_from_weights(
+                        self._gate_families(
+                            merged[TEMPLATE_KEY].to(device=presence.device, dtype=torch.float32)
+                        )
+                    )
+                    pres_rows = F.binary_cross_entropy(
+                        presence.float().clamp(1e-6, 1.0 - 1e-6),
+                        target_presence,
+                        reduction="none",
+                    ).mean(dim=1)
+                    mask = merged.get(TEMPLATE_MASK_KEY)
+                    if mask is not None:
+                        pres_rows = pres_rows * mask.reshape(-1).to(pres_rows)
+                    output["presence_loss_rows"] = pres_rows
             slot_row, topo_row = self._supervision_rows(
                 merged, weights, read_weights, encoded_a, encoded_b, lengths_a, lengths_b
             )
@@ -2238,12 +2558,15 @@ __all__ = [
     "BALANCED_W_SLOT",
     "CLOSURE_BIAS_INITS",
     "COUNT_FEATURES",
+    "CORRUPTION_SOURCES",
     "EDGE_TYPE_NAMES",
     "GENERATOR_GRAD_GROUPS",
     "WARMUP_LOSSES",
     "STAGE_TWO_INTERFACE_LR_SCALE",
     "FAMILIES",
     "FIELD_ORDER",
+    "ALL_FIELD_ORDER",
+    "GENERATOR_HEADS",
     "GATE_MODES",
     "GRAPH_ROW_WEIGHTINGS",
     "INTERVENTIONS",
@@ -2251,6 +2574,10 @@ __all__ = [
     "STAGES",
     "TEMPLATE_KEY",
     "TEMPLATE_MASK_KEY",
+    "PREDICTED_MASK_KEY",
+    "PREDICTED_PRESENCE_KEY",
+    "PREDICTED_WEIGHTS_KEY",
+    "TRUE_DIAGNOSTIC_KEY",
     "TOKEN_SOURCES",
     "TRAINING_POLICIES",
     "CorruptionConfig",

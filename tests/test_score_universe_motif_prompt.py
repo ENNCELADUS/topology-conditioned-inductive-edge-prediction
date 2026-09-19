@@ -55,6 +55,17 @@ def _motif_model(stage: str = "two", seed: int = 0) -> V3_1MotifPrompt:
     return model.eval()
 
 
+def _deployed_stage_one(seed: int = 0) -> V3_1MotifPrompt:
+    config = _model_config("one")
+    cast(dict[str, object], config["motif_prompt"])["deployed_generator_checkpoint"] = (
+        "deployed.pt"
+    )
+    torch.manual_seed(seed)
+    model = V3_1MotifPrompt(**config)  # type: ignore[arg-type]
+    model.install_mean_template(_statistics(torch.full((96,), 0.1)))
+    return model.eval()
+
+
 def _templates(rows: int, seed: int = 3) -> torch.Tensor:
     """A row-aligned bank of compiled-looking motif weights."""
     return torch.rand((rows, 96), generator=torch.Generator().manual_seed(seed))
@@ -286,6 +297,76 @@ def test_stage_one_scoring_reads_the_supplied_true_templates(
         )
 
 
+@pytest.mark.parametrize("intervention", ["none", "mean", "shuffle_graph"])
+def test_deployed_stage_one_scores_endpoint_only_raw_and_packed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intervention: str
+) -> None:
+    pack_root, pairs = _build_prefix_packed_fixture(tmp_path, monkeypatch, node_count=4)
+    store = FeatureStore(tmp_path / "features")
+    model = _deployed_stage_one()
+    if intervention == "mean":
+        model.intervention = "mean"
+    shuffle = list(reversed(pairs)) if intervention == "shuffle_graph" else None
+    raw = score_universe._score_v3_1(
+        model,
+        pairs,
+        store,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=512,
+        shuffle_sources=shuffle,
+    )
+    packed = score_universe._score_v3_1_packed(
+        model,
+        pairs,
+        pack_root,
+        device=torch.device("cpu"),
+        amp="off",
+        token_budget=512,
+        shuffle_sources=shuffle,
+    )
+    assert np.isfinite(raw).all() and np.isfinite(packed).all()
+    np.testing.assert_allclose(packed, raw, rtol=0, atol=5e-3)
+
+
+def test_run_score_classifies_deployed_stage_one_as_formal_without_truth_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _deployed_stage_one()
+    config = _model_config("one")
+    cast(dict[str, object], config["motif_prompt"])["deployed_generator_checkpoint"] = (
+        "deployed.pt"
+    )
+    checkpoint = tmp_path / "best.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "model_family": "v3_1_motif_prompt",
+            "model_config": config,
+        },
+        checkpoint,
+    )
+    args = score_universe.build_parser().parse_args(
+        [
+            "score", "--checkpoint", str(checkpoint), "--pairs", "val_cls",
+            "--output", str(tmp_path / "scores.npz"), "--device", "cpu",
+        ]
+    )
+
+    monkeypatch.setattr(
+        score_universe,
+        "_oracle_truth_graph_for_scoring",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("truth graph opened")),
+    )
+
+    def reached_pairs(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("formal pair resolution reached")
+
+    monkeypatch.setattr(score_universe, "_resolve_pairs", reached_pairs)
+    with pytest.raises(RuntimeError, match="formal pair resolution reached"):
+        score_universe._run_score(args)
+
+
 def test_stage_one_scoring_requires_the_oracle_diagnostic_acknowledgement() -> None:
     with pytest.raises(ValueError, match="allow-oracle-diagnostic"):
         score_universe._assert_motif_scoring_contract(stage="one", allow_oracle_diagnostic=False)
@@ -293,6 +374,13 @@ def test_stage_one_scoring_requires_the_oracle_diagnostic_acknowledgement() -> N
     with pytest.raises(ValueError, match="deployable"):
         score_universe._assert_motif_scoring_contract(stage="two", allow_oracle_diagnostic=True)
     score_universe._assert_motif_scoring_contract(stage="two", allow_oracle_diagnostic=False)
+    score_universe._assert_motif_scoring_contract(
+        stage="one", deployed_generator=True, allow_oracle_diagnostic=False
+    )
+    with pytest.raises(ValueError, match="deployable"):
+        score_universe._assert_motif_scoring_contract(
+            stage="one", deployed_generator=True, allow_oracle_diagnostic=True
+        )
 
 
 def test_scoring_is_batch_and_shard_independent(

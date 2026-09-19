@@ -98,6 +98,16 @@ selected method. Every piece of writing must explain how its context helps decid
   degree marginals; the output-density control is `python -m src.experiments.motif_density_control`.
   Edge weights, the count head and the RRWP stack are fp32 by construction; the family runs only
   through `hpc/run.sh train`, never the debug CLI.
+- Motif v17 (§7.6 of the same spec): `motif_prompt_stage1_shift`,
+  `motif_prompt_stage1_shift_conf` and `motif_prompt_stage1_shift_control` train
+  the reader last with a bundled frozen generator. These Stage-I checkpoints
+  are deployable and select on predicted V_val inputs; true-input validation
+  is separately labelled `diagnostic_*`. Predicted corruption uses opposite-fold
+  generator caches, excluding both row endpoints from the predictor's training
+  rows, positives and negatives alike. `presence_profile`, `topo_conf` and the
+  optional row gate form the confidence lane. The one-shot
+  `src.experiments.motif_v17_queue` waits behind existing GPU work and applies
+  the Step-0 stop/lane decisions before training; see `hpc/README.md`.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.
   Do not revive them or compare new results against them.
