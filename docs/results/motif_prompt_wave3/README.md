@@ -197,3 +197,101 @@ must never be reported as the arm's result. `s2_true` / `s1_true` in the pilot t
 diagnostic (true compiled templates on V_val) and appear in no deployable row. The output-density control
 of spec §8 was not trained for wave 3, so no matched-density comparison exists for these rows; the
 wave-1 diagnostic (`outputs/split_seed42/motif_rd1_diagnostic.json`) covers wave-1 Stage II only.
+
+## 7. Attribution
+
+Date 2026-09-19, same checkpoint (`outputs/split_seed42/motif_prompt_stage2_v3_prefix/best.pt`, epoch 2,
+checkpoint `d2bb4fc7a55a10d3`), same split, single seed. Two reads, run with the wave-1 recipe
+(`motif_prompt_verdict/interventions_and_counterfactuals.md` §1): the spec §8 output-density control, which
+asks whether the held-out MMD movement is shape or threshold placement, and the five scoring-time prefix
+interventions, which ask whether the V_val gain is attributable to the row's *own* predicted graph.
+Artifacts on the H20 shared checkout under `outputs/analysis/motif_wave3_attribution/`
+(`density_control.json`, `interventions_summary_vval.json`, `interventions/stage2_v3/<intervention>/<pairs>.npz`);
+drivers in `/2023533015/scratch_motif_wave3/`.
+
+### 7.1 Output-density control (spec §8, held-out test)
+
+One union of 943,685 scored `test_topology` pairs, self-pairs included and assembling as self-loops.
+The target is the arm's **own** realised edge count at its V_val-selected threshold — 29,992 union pairs at
+logit 2.8211 — and every row is re-thresholded to that count with `density_matched_threshold`, which admits
+tie groups atomically; all three rows land within 0.3% of the target, so none is marked approximate. Matching
+the union density does not equalise density inside each BFS subgraph, so RD here is a diagnostic of the
+residual spread, not a matched quantity. Reported **alongside** the protocol's V_val-selected threshold, never
+instead of it.
+
+| Row | logit threshold | realised edges | GS ↑ | RD →1 | degree / clustering / spectral MMD ↓ |
+|---|---|---|---|---|---|
+| **Wave-3 deployable, epoch 2** (its own protocol threshold) | 2.8211 | 29,992 | 0.404 | 0.529 | 8.38 / 7.31 / 13.31 |
+| `prefix_base`, density-matched | 2.3281 | 29,931 | **0.417** | 0.525 | **8.38 / 7.30 / 12.99** |
+| B0, density-matched | 1.7734 | 29,939 | **0.428** | 0.530 | 10.77 / 9.05 / 16.11 |
+| `prefix_base`, its own protocol threshold (published, for contrast) | — | — | 0.409 | 0.456 | 11.4 / 9.7 / 16.8 |
+| B0, its own protocol threshold (published, for contrast) | — | — | 0.429 | 0.550 | 9.9 / 8.4 / 15.0 |
+
+The arm's row reproduces its §3 test row exactly, as it must: the control re-thresholds it to the count it
+already realises.
+
+### 7.2 Scoring-time prefix interventions (V_val)
+
+`score_universe --prefix-intervention <mode> --prefix-intervention-seed 0` on the same checkpoint, scored
+through the repo's own four-GPU fan-out and read at the arm's ONE frozen protocol threshold
+(logit 2.8211100101470947) on `val_topology`. `gates_off` deletes the prompt channel; `mean` replaces the
+prediction with the corpus-mean template (the marginal-preserving null); `permute_closure` and
+`rewire_bridge` permute within a family of the row's own predicted graph; `shuffle_graph` gives every row
+another row's predicted graph under one seeded permutation of the whole universe. Every artifact passed
+`validate_artifact_precision` with the family's fp32 pair contract.
+
+| Intervention | val_cls AUROC | val_cls AUPRC | Δ AUPRC vs none | max abs Δ logit | GS ↑ | RD →1 | degree / clustering / spectral MMD ↓ |
+|---|---|---|---|---|---|---|---|
+| none (published) | 0.7984 | **0.8176** | – | – | 0.395 | 1.073 | 6.63 / 2.94 / 6.68 |
+| `gates_off` | 0.7925 | 0.8136 | −0.0040 | 6.89 | 0.399 | 1.040 | 10.94 / 5.08 / 9.57 |
+| `mean` | 0.7819 | 0.8017 | **−0.0159** | 6.74 | 0.228 | 0.192 | 80.12 / 40.09 / 54.45 |
+| `permute_closure` | 0.7976 | 0.8167 | −0.0009 | 1.19 | 0.389 | 0.969 | 7.06 / 3.42 / 7.40 |
+| `rewire_bridge` | 0.7983 | 0.8175 | −0.0001 | 1.17 | 0.395 | 1.082 | 6.63 / 2.94 / 6.51 |
+| `shuffle_graph` | 0.7922 | 0.8079 | **−0.0097** | 5.92 | 0.375 | 0.825 | 10.75 / 8.41 / 9.61 |
+| `prefix_base` (reference, replayed at the same threshold) | 0.7925 | 0.8130 | – | – | 0.400 | 1.040 | 10.95 / 5.10 / 9.56 |
+
+`gates_off` reproduces `prefix_base` to fp32 tolerance on both families of metrics, as in wave 1. On held-out
+test the two completed intervention rows read: `gates_off` AUROC 0.7205 / AUPRC 0.7446 and `mean`
+0.7132 / 0.7385, against the arm's own 0.7168 / 0.7418 and `prefix_base`'s 0.7205 / 0.7441.
+
+### 7.3 Reading
+
+**Edge, and the graph it comes from, together.** The +0.004 V_val `val_cls` AUPRC the arm holds over
+`gates_off` is attributable to the row's own predicted graph: transplanting another row's graph costs more
+than deleting the channel outright (0.8079 against `gates_off`'s 0.8136, −0.0097 from the unintervened
+0.8176), the marginal-preserving `mean` null removes the gain and a further 0.012 (0.8017), and the two
+within-family permutations — which move the output by at most ~1.2 logits, against wave 1's exactly-null
+0.001 — cost only −0.0009 and −0.0001; the V_val topology row says the same thing with its five numbers,
+the arm's GS 0.395 / RD 1.073 / MMD 6.63 / 2.94 / 6.68 falling to GS 0.375 / RD 0.825 / 10.75 / 8.41 / 9.61
+under `shuffle_graph` and collapsing under `mean` (GS 0.228, RD 0.192), while `gates_off` returns the frozen
+trunk's row (0.399 / 1.040 / 10.94 / 5.08 / 9.57 against `prefix_base`'s 0.400 / 1.040 / 10.95 / 5.10 / 9.56).
+**The held-out topology movement is threshold placement, not shape.** At the arm's own realised density —
+29,992 of 943,685 union pairs — `prefix_base` reaches degree / clustering / spectral MMD 8.38 / 7.30 / 12.99
+against the arm's 8.38 / 7.31 / 13.31 at an all-but-identical RD (0.525 vs 0.529) and a *better* GS
+(0.417 vs 0.404), and B0 at the same density is 10.77 / 9.05 / 16.11 at GS 0.428, so the 8.4 / 7.3 / 13.3
+against 11.4 / 9.7 / 16.8 of §3 is the arm's looser operating point rather than a better assembled shape.
+**Together these close the wave-3 evidence gap in opposite directions**: the generator's predicted graph is
+now genuinely row-conditioned and its condition is read by the interface — the mechanism wave 1 lacked — but
+that row conditioning buys +0.004 AUPRC on V_val, nothing on held-out test (the channel is net-harmful there,
+`gates_off` 0.7446 against the arm's 0.7418), and no shape gain at matched density, so the §4 verdict is
+unchanged and now rests on a density-matched control rather than on its absence.
+
+### 7.4 Limits of this read
+
+Single seed, single permutation, one `--prefix-intervention-seed 0`; the pre-registered margins are ±0.01 GS
+and ±0.5 MMD ratio and no margin is claimed for AUROC or AUPRC, so the −0.0097 `shuffle_graph` AUPRC cost and
+the +0.004 gain it attributes are single-seed differences reported as read. The V_val comparison between the
+arm and `gates_off` is **not** density-matched: their RDs differ (1.073 vs 1.040), and §7.1 shows how much a
+density difference alone can move MMD ratios on this family, so the V_val MMD contrast should not be read as a
+pure shape statement either. `mean` shifts every logit down by ~1.9 on test and ~1.5 more than `gates_off` on
+V_val, so its topology row is far off the frozen operating point and its RD 0.192 is a placement artefact, not
+a shape verdict. The test-universe interventions were run for completeness beyond the V_val question:
+`gates_off` and `mean` had completed when this was written and are quoted above; `permute_closure`,
+`rewire_bridge` and `shuffle_graph` on `test` / `test_topology` were still scoring, and land under
+`outputs/analysis/motif_wave3_attribution/interventions/stage2_v3/`. Finally, the shipped entry point
+`python -m src.experiments.motif_density_control` **cannot run against a current report**: it reads
+`graph.fixed_threshold.validation_selection.logit_threshold`, a flat key the `test_protocol_v8`
+`geometric_rd_five_rank_v1` schema does not write (the threshold is at `…validation_selection.selected.logit_threshold`),
+and raises `KeyError`. The control here was therefore run through that module's own
+`target_edge_count` / `density_matched_report` functions unchanged, with the threshold read from the key the
+schema does write; the module was not edited.
