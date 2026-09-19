@@ -85,88 +85,88 @@ must not run in head-only training. Source modules are loaded by name with actua
 
 ### Task 1: Dictionary construction and targets
 
-- [ ] Implement the artifact and pure tensor functions above. Encode target distance as
+- [x] Implement the artifact and pure tensor functions above. Encode target distance as
   `((target[:, None] - bank[None]) / scales[None, None, :, None]).square().mean((-1,-2))`;
   use `softmax(-distance / temperature)` and `einsum('bk,kfd->bfd', routes, tokens)` in FP32.
-- [ ] Add synthetic tests that assert `q(swapped_tokens) == q(tokens)[:, swap_index]`, a one-hot
+- [x] Add synthetic tests that assert `q(swapped_tokens) == q(tokens)[:, swap_index]`, a one-hot
   route exactly returns its token, and an attachment-only template belongs to neither empty nor bridge.
-- [ ] Implement deterministic category sampling and real medoid representatives exactly as spec §3;
+- [x] Implement deterministic category sampling and real medoid representatives exactly as spec §3;
   tied endpoint scales, temperature from training rows, swap-complete bank and training mean.
-- [ ] Add a production builder CLI using the existing split/corpus/compiler and Stage I checkpoint;
+- [x] Add a production builder CLI using the existing split/corpus/compiler and Stage I checkpoint;
   inputs `--config`, `--stage1-checkpoint`, `--output`, `--device`; compile only legal training rows.
   Cache row targets with explicit pair orientation when useful. Use bounded GPU encoding batches and
   progress logging; do not load feature packs or perform PPI forwards to build graph tokens.
-- [ ] Run new data/builder tests with `rtk proxy .venv/bin/python -m pytest <new-test-files> -n0`.
+- [x] Run new data/builder tests with `rtk proxy .venv/bin/python -m pytest <new-test-files> -n0`.
   Return artifact format, CLI example, tests and any consumer-interface changes to primary.
 
 ### Task 2: Dictionary model and head-only behavior
 
-- [ ] Factor `V3_1MotifPrompt.logits_from_tokens(...)` from its existing graph-to-logit method without
+- [x] Factor `V3_1MotifPrompt.logits_from_tokens(...)` from its existing graph-to-logit method without
   changing old graph behavior. Test old graph forward against the same tokens passed directly.
-- [ ] Implement the repaired slot encoder and shared MLP router. Compute
+- [x] Implement the repaired slot encoder and shared MLP router. Compute
   `logits = (h(S) + h(swap_slots(S))[:, swap_index]) / 2`, then FP32 softmax/mixing.
   Test endpoint exchange, output-logit symmetry and deterministic frozen producer eval mode.
-- [ ] Persist dictionary constants as buffers and reconstruct with config `dictionary_size` alone.
+- [x] Persist dictionary constants as buffers and reconstruct with config `dictionary_size` alone.
   Provide `install_dictionary`, `predict_routes`, `logits_from_routes`, model forward and explicit
   oracle target handling. Reject graph-only interventions and missing oracle targets.
-- [ ] Return per-row KL for training with an autograd-connected zero on self-only batches; do not
+- [x] Return per-row KL for training with an autograd-connected zero on self-only batches; do not
   return a task-gradient objective for R. Coordinate reduction with Task 3 before finalizing.
-- [ ] Add head-only policy: `requires_grad` only on output_head; preserve eval on every frozen
+- [x] Add head-only policy: `requires_grad` only on output_head; preserve eval on every frozen
   producer and training mode on the head. Content-only mode disables prefix contribution during
   both training and scoring. Test actual optimizer steps, including nonzero weight decay.
-- [ ] Run model tests and old motif regression tests. Return exact loading and scoring APIs.
+- [x] Run model tests and old motif regression tests. Return exact loading and scoring APIs.
 
 ### Task 3: Production training integration and configs
 
-- [ ] Register/resolve/build `v3_1_motif_dictionary` with embedded base, motif and dictionary config.
+- [x] Register/resolve/build `v3_1_motif_dictionary` with embedded base, motif and dictionary config.
   Load Stage I interface, wave3 slot modules and artifact only when initializing training.
   Load complete wave3 state for head-only mode; preserve published checkpoint reconstruction.
-- [ ] Build row-aligned training route targets from the legal template table, separately from V_val
+- [x] Build row-aligned training route targets from the legal template table, separately from V_val
   diagnostic targets. No validation target is attached to the deployable inference path.
-- [ ] Train R on globally reduced closure-balanced KL only, correctly compensating DDP averaging
+- [x] Train R on globally reduced closure-balanced KL only, correctly compensating DDP averaging
   and microbatch splits. Test unequal rank category counts and an all-self microbatch; run task BCE
   only as reporting/validation and skip the structural training stream for R.
-- [ ] Keep H task/structural objective and skip graph/teacher supervision and gradient probes that
+- [x] Keep H task/structural objective and skip graph/teacher supervision and gradient probes that
   would reopen frozen modules. Run the same production optimizer grouping for both H controls.
-- [ ] Extend per-epoch validation/publication/config metadata and needed pipeline family checks.
+- [x] Extend per-epoch validation/publication/config metadata and needed pipeline family checks.
   Add route KL, mean-predictor KL, token error, route entropy/mean/dispersion telemetry without
   quality gates or test data. Preserve existing checkpoint ranking and precision.
-- [ ] Create configs `motif_dict_router.yaml`, `motif_dict_oracle.yaml`, `motif_wave3_head.yaml`,
+- [x] Create configs `motif_dict_router.yaml`, `motif_dict_oracle.yaml`, `motif_wave3_head.yaml`,
   `motif_wave3_head_content.yaml` under `configs/split_seed42`; use approved budgets and source paths.
-- [ ] Run targeted training/config tests, including one tiny real optimizer step per trainable lane.
+- [x] Run targeted training/config tests, including one tiny real optimizer step per trainable lane.
   Return full launch commands and any outstanding scoring API needs.
 
 ### Task 4: Scoring, fan-out and oracle diagnostic
 
-- [ ] Extend checkpoint builders and scorer-family/precision handling for the dictionary family.
+- [x] Extend checkpoint builders and scorer-family/precision handling for the dictionary family.
   For sequence mode call `predict_routes` then `logits_from_routes`; oracle mode derives q* only
   after existing oracle diagnostic permission/run-kind checks. Keep encoder caching and FP32 pair pass.
-- [ ] Implement global `shuffle_route` using the existing whole-universe source permutation rather
+- [x] Implement global `shuffle_route` using the existing whole-universe source permutation rather
   than within-shard shuffling. Test contiguous shards against a serial reference. Support training
   `mean` and `gates_off`; reject `permute_closure` and `rewire_bridge` for dictionary models.
-- [ ] Verify checkpoint scoring with artifact/source paths absent and no training graph available.
+- [x] Verify checkpoint scoring with artifact/source paths absent and no training graph available.
   Update fan-out CLI forwarding and artifact precision validation consistently.
-- [ ] Add `src/experiments/motif_dictionary_diagnostic.py`: build an oracle dictionary checkpoint
+- [x] Add `src/experiments/motif_dictionary_diagnostic.py`: build an oracle dictionary checkpoint
   from shared artifact/source Stage I state, score V_val true/oracle-mixture/mean/gates_off using
   production fan-out, and analyze cached scores with existing threshold/topology functions.
   Do not run held-out test. Write per-case metrics and `complete.json`/`failure.json` for this driver.
-- [ ] Expose CLI `--artifact`, `--stage1-checkpoint`, `--output-dir`, `--pack-dir`, `--data-root`,
+- [x] Expose CLI `--artifact`, `--stage1-checkpoint`, `--output-dir`, `--pack-dir`, `--data-root`,
   `--strategy`; provide readable logs, non-self edge metrics and matched-density GS/MMD.
-- [ ] Run scorer/driver regression tests. Return the runnable three-lane diagnostic command.
+- [x] Run scorer/driver regression tests. Return the runnable three-lane diagnostic command.
 
 ### Task 5: Primary integration, review and launch
 
-- [ ] Review each task's diff and reported tests against the spec; fix concrete integration failures.
+- [x] Review each task's diff and reported tests against the spec; fix concrete integration failures.
   Inspect strict scoring boundaries, frozen parameter sets, row orientation and actual gradient flow.
-- [ ] Run relevant model/data/trainer/scorer tests together, changed-path Ruff and repo-required mypy;
+- [x] Run relevant model/data/trainer/scorer tests together, changed-path Ruff and repo-required mypy;
   distinguish pre-existing type failures with a baseline if needed. Check final diff and user dirt.
-- [ ] Read-only audit all three H20 endpoints: hostname, HEAD/status, GPU count/utilization/processes,
+- [x] Read-only audit all three H20 endpoints: hostname, HEAD/status, GPU count/utilization/processes,
   active outputs and source checkpoints. Use actual GPU counts, not stale allocation assumptions.
-- [ ] Commit only task changes; push the feature branch, pull through Git on the shared H20 checkout.
+- [x] Commit only task changes; push the feature branch, pull through Git on the shared H20 checkout.
   Build the shared dictionary and validate its finite values, swap map and training-only provenance.
-- [ ] Launch R on 30838, H then content-control on 30846, D on 30030, all disconnect-safe with
+- [x] Launch R on 30838, H then content-control on 30846, D on 30030, all disconnect-safe with
   separate logs and output directories. Training uses `hpc/run.sh train CONFIG --skip-test`.
-- [ ] Verify launcher/worker PIDs, logs and GPU activity from a fresh connection. Record run IDs,
+- [x] Verify launcher/worker PIDs, logs and GPU activity from a fresh connection. Record run IDs,
   output paths and real status in a launch note; no held-out test and no invented completion claim.
 
 ## Execution decisions and progress
@@ -194,3 +194,18 @@ must not run in head-only training. Source modules are loaded by name with actua
   baseline 103 errors in 17 files, with no new errors (normalized for line movement).
 - Initial H20 audit: all three endpoints idle, four H20s each, shared HEAD `63061a9`; Stage I epoch 11
   and final wave3 epoch 2 verified. Git synchronization, shared dictionary build and launch remain.
+- Execution update: code commit `9f46efb` pushed and pulled on shared H20 checkout through HTTPS
+  (container's configured GitHub SSH key is absent). Standard `hpc/run.sh check` passed. Builder
+  started on 30838 at 2026-09-19 16:56:40 UTC, PID 129168, log
+  `outputs/logs/motif_dictionary_build_20260919.log`. H chain started on 30846 at 16:56:44 UTC,
+  PID 187800, log `outputs/logs/motif_wave3_head_chain_20260919.log`; prompted-head attempt
+  `1128b8e71b724e179dd157507aada83f` has four DDP workers. R and D await completed dictionary.
+- Launch update: shared dictionary completed at 17:06:33 UTC (16 representatives, 31 entries),
+  builder exited and GPUs released. R started on 30838 at 17:08:03 UTC (pipeline 132178, attempt
+  `4c3bc71e8cfc4d299c40c37c5b3f954a`); D started on 30030 at 17:08:07 UTC (driver 81201) and wrote its
+  first merged V_val artifact at 17:09:00 UTC. H remains active and its content control is chained.
+  All implementation/review tasks complete. See `docs/tmp/2026-09-19-motif-dictionary-launch.md` for
+  launch evidence; experiment completion and scientific interpretation are not claimed.
+- Final launch verification: R target cache completed at 17:11:44 UTC and training reached step 201
+  with finite loss at 17:12:47 UTC. D wrote a merged V_val classification artifact and continues
+  topology scoring; H is active. All requested launch work is complete; full runs remain in progress.

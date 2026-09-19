@@ -1,8 +1,9 @@
 # Shared motif dictionary, sequence routing and task-head adaptation
 
 **Date:** 2026-09-19. **Version:** v1.
-**Status:** approved and implemented on 2026-09-19; local review/checks complete, three-container launch in progress.
+**Status:** approved, implemented and launched on three H20 containers on 2026-09-19; results pending.
 Implementation: [plan](../plans/2026-09-19-motif-dictionary-routing.md).
+Execution: [launch record](../../tmp/2026-09-19-motif-dictionary-launch.md).
 **Source checkout:** `63061a9`, branch `codex/motif-graph-grit-prompt`.
 
 This is the next architecture experiment after the three motif-prompt repair waves. It defines three
