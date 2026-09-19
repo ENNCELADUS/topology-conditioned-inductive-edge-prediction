@@ -111,8 +111,15 @@ selected method. Every piece of writing must explain how its context helps decid
   (held-out `L_G` 0.0510 vs the constant's 0.0595, `val_cls` 0.0934 vs 0.1081, transplant +93%,
   downstream `s2_pred` 0.8175 vs `gates_off` 0.8136), so `motif_prompt_stage2_v3{,_prefix}` carry that
   setting at an eight-epoch warm-up whose every epoch checkpoint is read by `motif_pilot_b`; the
-  `headgain`, `novln` and `novln_balanced` prefixes stay as the historical attribution rows. The
-  wave-1 configs keep their meaning: `beta_c`, `closure_bias_init`, `warmup_losses` and
+  `headgain`, `novln` and `novln_balanced` prefixes stay as the historical attribution rows.
+  Wave 3 phase A' (spec v15): `motif_prompt.warmup_losses: graph_only_always` keeps the task,
+  structural and `L_topo` gradients cut off from the generator for the whole run while the interface
+  still opens at `interface_warmup_epochs`, so `motif_prompt_stage2_v3_initonly_warm8_detached`
+  asks whether the reader gains downstream utility from a protected, graph-supervised G; it resumes
+  the same `..._warm8_prefix` attempt as the joint `..._warm8` arm, because the resume comparison
+  excludes `warmup_losses` in that one direction for a prefix halted inside its warm-up and no
+  longer compares `runtime.world_size` (which blocked every cross-output_dir resume of an `auto`
+  config). The wave-1 configs keep their meaning: `beta_c`, `closure_bias_init`, `warmup_losses` and
   `graph_row_weighting` default to wave-1 behaviour.
 - Retired, history only: the EgoStitch imagination arm (`egostitch_imagine`, G5 screens), the S-series
   (`docs/results/s_series.md`), `kd_struct`, `kd_white`, `kd_gen`, and the D1–D8 anchor-context arms.

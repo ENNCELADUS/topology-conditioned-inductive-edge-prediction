@@ -988,6 +988,78 @@ def test_the_exclusion_needs_graph_only_and_an_epoch_inside_the_warm_up() -> Non
     assert not _motif_prefix_keys_inert({"seed": 0}, 1)
 
 
+def test_a_resume_config_comparison_ignores_the_resolved_world_size() -> None:
+    # The worker serializes ``runtime.world_size`` unresolved (``0`` for
+    # ``auto``) while `src.e2_pipeline` resolves it to the visible GPU count
+    # before comparing, so keeping the key would reject every cross-output_dir
+    # resume of an ``auto`` config. The real rank count is validated against
+    # ``training_state.pt['world_size']`` instead.
+    from src.train_b0 import _resume_comparable_config
+
+    saved = {"seed": 0, "runtime": {"world_size": 0, "pack_workers": 16}}
+    live = {"seed": 0, "runtime": {"world_size": 4, "pack_workers": 16}}
+    assert _resume_comparable_config(saved) == _resume_comparable_config(live)
+    assert saved["runtime"] == {"world_size": 0, "pack_workers": 16}
+    other = {"seed": 0, "runtime": {"world_size": 4, "pack_workers": 8}}
+    assert _resume_comparable_config(saved) != _resume_comparable_config(other)
+
+
+def test_graph_only_may_become_graph_only_always_over_a_warm_up_prefix() -> None:
+    # The two values are the same function over the warm-up epochs, so the
+    # wave-3 detached arm continues the very prefix the joint arm continues.
+    from src.train_b0 import (
+        _motif_prefix_keys_inert,
+        _motif_warmup_losses_inert,
+        _resume_comparable_config,
+    )
+
+    saved = _prefix_config()
+    arm = _prefix_config(warmup_losses="graph_only_always")
+    arm["output_dir"] = "outputs/arm"
+    cast(dict[str, object], arm["optim"]).pop("stop_after_epoch")
+    assert _motif_prefix_keys_inert(saved, 2)
+    assert _motif_warmup_losses_inert(saved, arm)
+    assert _resume_comparable_config(
+        saved, drop_motif_joint_keys=True, drop_motif_warmup_losses=True
+    ) == _resume_comparable_config(arm, drop_motif_joint_keys=True, drop_motif_warmup_losses=True)
+    # Nothing else may change with it, and the saved mapping is untouched.
+    assert _resume_comparable_config(saved, drop_motif_joint_keys=True) != (
+        _resume_comparable_config(arm, drop_motif_joint_keys=True)
+    )
+    assert saved["model"] == _prefix_config()["model"]
+    # Only this one direction: joint, or a graph-only continuation of a joint
+    # prefix, differ over the prefix epochs themselves.
+    assert not _motif_warmup_losses_inert(saved, _prefix_config(warmup_losses="joint"))
+    assert not _motif_warmup_losses_inert(_prefix_config(warmup_losses="joint"), arm)
+    assert not _motif_warmup_losses_inert(arm, saved)
+    assert not _motif_warmup_losses_inert({"seed": 0}, arm)
+
+
+def test_the_detached_arm_resume_is_accepted_through_resume_config_matches() -> None:
+    from src.train_b0 import config_to_dict, load_config, resume_config_matches
+
+    prefix = Path("configs/split_seed42/motif_prompt_stage2_v3_initonly_warm8_prefix.yaml")
+    detached = Path("configs/split_seed42/motif_prompt_stage2_v3_initonly_warm8_detached.yaml")
+    joint = Path("configs/split_seed42/motif_prompt_stage2_v3_initonly_warm8.yaml")
+    saved = config_to_dict(load_config(prefix))
+    # The pipeline resolves ``runtime.world_size`` before comparing; the worker
+    # serialized it unresolved.
+    assert cast(dict[str, object], saved["runtime"])["world_size"] == 0
+    for path in (detached, joint):
+        cfg = load_config(path)
+        assert cfg.runtime is not None
+        resolved = replace(cfg, runtime=replace(cfg.runtime, world_size=4))
+        assert resume_config_matches(saved, resolved, completed_epoch=8)
+    # Only inside the warm-up: epoch 9 already trained under one of the two.
+    detached_cfg = load_config(detached)
+    assert detached_cfg.runtime is not None
+    assert not resume_config_matches(
+        saved,
+        replace(detached_cfg, runtime=replace(detached_cfg.runtime, world_size=4)),
+        completed_epoch=9,
+    )
+
+
 def test_schedule_total_steps_ignores_stop_after_epoch() -> None:
     # The pilot keeps optim.epochs at 15 so the first two epochs are a true
     # prefix of the full one-cycle: same trainability mask, same LRs, same order.
@@ -1573,6 +1645,39 @@ def test_the_graph_only_warm_up_probe_reports_a_zero_task_gradient() -> None:
     warm.interface_open = True
     opened = _motif_generator_probe(warm, batch, rows=4)
     assert opened.task_norm > 0.0
+
+
+def test_graph_only_always_reports_a_zero_task_gradient_after_the_open() -> None:
+    from src.train_b0 import _motif_generator_probe
+
+    always = _probe_model(warmup_losses="graph_only_always", beta_c=1.0)
+    always.interface_open = True
+    assert always.graph_only_warmup
+    measured = _motif_generator_probe(always, _probe_batch(), rows=4)
+    assert measured.task_norm == 0.0
+    assert measured.slot_norm > 0.0
+    assert all(
+        value == 0.0 for key, value in measured.telemetry.items() if key.startswith("grad_g_task_")
+    )
+    # The graph telemetry is still reported: the probe is the drift detector.
+    assert measured.telemetry["grad_g_slot_head_closure"] > 0.0
+
+
+def test_the_shared_probe_never_balances_w_slot_under_graph_only_always() -> None:
+    # The balance is a task/graph gradient ratio at G, and no task gradient ever
+    # reaches G here, so w_slot stays a pure scale on L_G at its default of 1.0.
+    from src.train_b0 import _share_motif_probe
+
+    accelerator = Accelerator(cpu=True)
+    model = _probe_model(warmup_losses="graph_only_always", w_slot="balanced", beta_c=1.0)
+    batch = _probe_batch()
+    profile: dict[str, object] = {}
+    model.interface_open = True
+    row = _share_motif_probe(model, batch, accelerator, epoch=3, world_size=1, profile=profile)
+    assert "balance" not in profile
+    assert "w_slot_resolved" not in row
+    assert model.w_slot_value == 1.0
+    assert float(model.w_slot_resolved) < 0.0
 
 
 def test_the_shared_probe_fixes_the_balanced_w_slot_once_and_records_it() -> None:

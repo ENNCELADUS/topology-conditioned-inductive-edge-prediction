@@ -61,7 +61,12 @@ INTERVENTIONS = (
 )
 STAGES = ("one", "two")
 CLOSURE_BIAS_INITS = ("density", "nonzero_mean")
-WARMUP_LOSSES = ("joint", "graph_only")
+#: Which losses reach the generator while the interface is held. ``joint`` is the
+#: wave-1 composite; ``graph_only`` cuts the task, structural and topo losses off
+#: from G for the warm-up epochs only; ``graph_only_always`` keeps that cut for
+#: the whole run, so the interface opens on schedule onto a generator that is
+#: only ever supervised by ``L_G`` (spec section 7.5).
+WARMUP_LOSSES = ("joint", "graph_only", "graph_only_always")
 #: How the rows of the graph loss are weighted. ``uniform`` is the row
 #: distribution of the stream itself; ``closure_balanced`` gives the rows whose
 #: closure family is non-empty a fixed share of L_G's mass (spec section 7.5).
@@ -1443,12 +1448,18 @@ class V3_1MotifPrompt(nn.Module):
         is the only term that reaches the generator. The task gradient into G
         outweighed the graph gradient 170-860x at wave-1 initialisation, which is
         what the warm start removes.
+
+        Wave-3: ``graph_only_always`` never lifts the cut. The eight-epoch warm-up
+        run showed the closure gates re-saturating within one epoch of the losses
+        reaching G (the task gradient into the closure head was 1400x the graph
+        gradient by then), so this variant opens the interface on the same
+        schedule while leaving G supervised by ``L_G`` alone for the whole run.
         """
-        return (
-            self.cfg.stage == "two"
-            and self.cfg.warmup_losses == "graph_only"
-            and not self.interface_open
-        )
+        if self.cfg.stage != "two":
+            return False
+        if self.cfg.warmup_losses == "graph_only_always":
+            return True
+        return self.cfg.warmup_losses == "graph_only" and not self.interface_open
 
     @property
     def w_slot_value(self) -> float:
@@ -1456,7 +1467,10 @@ class V3_1MotifPrompt(nn.Module):
 
         A balanced weight that has not been measured yet -- the warm-up epochs,
         which run before the first interface-open step -- is 1.0, the numeric
-        default, so the warm start is ``L_G`` at its own scale.
+        default, so the warm start is ``L_G`` at its own scale. Under
+        ``warmup_losses='graph_only_always'`` it is never measured (the balance is
+        a task/graph gradient ratio and no task gradient reaches G), so ``L_G``
+        keeps that scale for the whole run.
         """
         resolved = float(self.w_slot_resolved)
         if resolved >= 0.0:

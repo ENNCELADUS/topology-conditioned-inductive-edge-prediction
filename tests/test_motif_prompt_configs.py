@@ -555,3 +555,31 @@ def test_the_warm_eight_arm_is_the_joint_phase_of_its_own_eight_epoch_prefix() -
     header = (CONFIG_DIR / f"{stem}.yaml").read_text(encoding="utf-8")
     assert "--resume-attempt" in header
     assert f"outputs/split_seed42/{stem}_prefix/attempts/" in header
+
+
+def test_the_detached_warm_eight_arm_differs_from_the_joint_one_by_warmup_losses() -> None:
+    # Phase A': the same continuation of the same eight-epoch prefix, with G
+    # kept behind ``graph_only_always`` for the whole run while the interface
+    # still opens at epoch 9. It isolates "the interface adapts" from "the task
+    # gradient reaches G", which the joint continuation ran together.
+    stem = "motif_prompt_stage2_v3_initonly_warm8"
+    joint, detached = _raw(f"{stem}.yaml"), _raw(f"{stem}_detached.yaml")
+    assert detached["output_dir"] == f"outputs/split_seed42/{stem}_detached"
+    for section in ("data", "optim", "eval", "runtime", "struct", "seed", "mixed_precision"):
+        assert detached[section] == joint[section]
+    joint_block, detached_block = _block(f"{stem}.yaml"), _block(f"{stem}_detached.yaml")
+    assert {key for key in joint_block if joint_block[key] != detached_block[key]} == {
+        "warmup_losses"
+    }
+    assert set(detached_block) == set(joint_block)
+    assert joint_block["warmup_losses"] == "graph_only"
+    assert detached_block["warmup_losses"] == "graph_only_always"
+    # The prefix's own epochs are identical under both values, which is what the
+    # resume rule relies on.
+    prefix_block = _block(f"{stem}_prefix.yaml")
+    assert prefix_block["warmup_losses"] == "graph_only"
+    assert prefix_block["interface_warmup_epochs"] == detached_block["interface_warmup_epochs"] == 8
+    header = (CONFIG_DIR / f"{stem}_detached.yaml").read_text(encoding="utf-8")
+    assert "--resume-attempt" in header
+    assert f"outputs/split_seed42/{stem}_prefix/attempts/" in header
+    assert "protected" in header or "protect" in header

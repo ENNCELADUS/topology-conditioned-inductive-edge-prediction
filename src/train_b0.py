@@ -695,20 +695,58 @@ def _motif_prefix_keys_inert(config: Mapping[str, object], completed_epoch: int)
     return completed_epoch <= warmup
 
 
+def _motif_warmup_losses_inert(
+    saved_config: Mapping[str, object], live_config: Mapping[str, object]
+) -> bool:
+    """Whether ``warmup_losses`` may change between the prefix and its continuation.
+
+    ``graph_only`` and ``graph_only_always`` are the same function over the
+    warm-up epochs -- both cut the task, structural and topo losses off from the
+    generator there -- and differ only afterwards, so a prefix that stopped
+    inside the warm-up is a true prefix of both. Every other pair differs over
+    the prefix itself and stays strict.
+
+    Args:
+        saved_config: The serialized config stored with the prefix.
+        live_config: The serialized config of the continuation.
+
+    Returns:
+        ``True`` when the key may be excluded from the resume comparison.
+    """
+    saved_block = _motif_prompt_block(saved_config)
+    live_block = _motif_prompt_block(live_config)
+    if saved_block is None or live_block is None:
+        return False
+    return (
+        saved_block.get("warmup_losses") == "graph_only"
+        and live_block.get("warmup_losses") == "graph_only_always"
+    )
+
+
 def _resume_comparable_config(
-    config: Mapping[str, object], *, drop_motif_joint_keys: bool = False
+    config: Mapping[str, object],
+    *,
+    drop_motif_joint_keys: bool = False,
+    drop_motif_warmup_losses: bool = False,
 ) -> dict[str, object]:
     """Return the config a resume compares, with the excluded keys dropped.
 
     ``output_dir`` is an attempt path and ``optim.stop_after_epoch`` is a halt
     point; neither changes the training function, so neither may block a resume
-    (spec section 7.4). ``drop_motif_joint_keys`` additionally drops the three
-    motif weights `_motif_prefix_keys_inert` declares inert over the resumed
-    prefix. Everything else stays strict. The argument is never mutated.
+    (spec section 7.4). ``runtime.world_size`` is likewise excluded: the worker
+    serializes it unresolved (``0`` for ``auto``) while `src.e2_pipeline`
+    resolves it to the visible GPU count before comparing, so keeping it would
+    reject every cross-output-dir resume of an ``auto`` config -- and the real
+    rank count is separately validated against ``training_state.pt``.
+    ``drop_motif_joint_keys`` additionally drops the three motif weights
+    `_motif_prefix_keys_inert` declares inert over the resumed prefix, and
+    ``drop_motif_warmup_losses`` the key `_motif_warmup_losses_inert` clears.
+    Everything else stays strict. The argument is never mutated.
 
     Args:
         config: A serialized training config.
         drop_motif_joint_keys: Also drop `_MOTIF_PREFIX_INERT_KEYS`.
+        drop_motif_warmup_losses: Also drop ``motif_prompt.warmup_losses``.
 
     Returns:
         A deep copy without the excluded keys.
@@ -718,11 +756,16 @@ def _resume_comparable_config(
     optim_block = comparable.get("optim")
     if isinstance(optim_block, dict):
         optim_block.pop("stop_after_epoch", None)
-    if drop_motif_joint_keys:
-        block = _motif_prompt_block(comparable)
-        if isinstance(block, dict):
+    runtime_block = comparable.get("runtime")
+    if isinstance(runtime_block, dict):
+        runtime_block.pop("world_size", None)
+    block = _motif_prompt_block(comparable)
+    if isinstance(block, dict):
+        if drop_motif_joint_keys:
             for key in _MOTIF_PREFIX_INERT_KEYS:
                 block.pop(key, None)
+        if drop_motif_warmup_losses:
+            block.pop("warmup_losses", None)
     return comparable
 
 
@@ -743,9 +786,17 @@ def resume_config_matches(
     Returns:
         ``True`` when the two differ only in the excluded keys.
     """
+    live_config = config_to_dict(cfg)
     inert = _motif_prefix_keys_inert(saved_config, completed_epoch)
-    return _resume_comparable_config(saved_config, drop_motif_joint_keys=inert) == (
-        _resume_comparable_config(config_to_dict(cfg), drop_motif_joint_keys=inert)
+    drop_warmup_losses = inert and _motif_warmup_losses_inert(saved_config, live_config)
+    return _resume_comparable_config(
+        saved_config,
+        drop_motif_joint_keys=inert,
+        drop_motif_warmup_losses=drop_warmup_losses,
+    ) == _resume_comparable_config(
+        live_config,
+        drop_motif_joint_keys=inert,
+        drop_motif_warmup_losses=drop_warmup_losses,
     )
 
 
@@ -1466,6 +1517,12 @@ def _share_motif_probe(
     if (
         model.cfg.w_slot_is_balanced
         and model.interface_open
+        # The balance is the task/graph gradient ratio at G. Under
+        # ``warmup_losses='graph_only_always'`` no task gradient ever reaches G,
+        # so the ratio is zero by construction and would clamp ``w_slot`` to the
+        # floor for no reason; ``w_slot`` is then a pure scale on ``L_G`` and
+        # stays at the unmeasured default of 1.0 (`w_slot_value`).
+        and not model.graph_only_warmup
         and float(model.w_slot_resolved) < 0.0
         and values[-1] > 0.0
     ):

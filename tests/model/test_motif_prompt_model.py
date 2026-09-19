@@ -1183,6 +1183,57 @@ def test_the_graph_only_warm_up_cuts_the_generator_off_from_every_other_term() -
     )
 
 
+def test_graph_only_always_keeps_the_cut_after_the_interface_opens() -> None:
+    # Wave 3 phase A': the interface opens on the same schedule, but the task,
+    # structural and topo losses never reach G, so the generator is supervised
+    # by L_G alone for the whole run.
+    always = _model("two", warmup_losses="graph_only_always", beta_c=1.0)
+    _open_gates(always)
+    warm = _model("two", warmup_losses="graph_only", beta_c=1.0)
+    warm.load_state_dict(always.state_dict())
+    for model in (always, warm):
+        model.initialize_teacher()
+        model.train()
+
+    batch = _supervised_batch()
+    # Before the interface opens the two modes are the same function.
+    assert always.graph_only_warmup and warm.graph_only_warmup
+    torch.testing.assert_close(always(batch)["loss"], warm(batch)["loss"], rtol=0, atol=0)
+    torch.testing.assert_close(
+        _generator_grads(always, batch, "slot_loss_rows"),
+        _generator_grads(warm, batch, "slot_loss_rows"),
+    )
+
+    # The interface schedule is untouched: epoch 3 opens it under both values.
+    assert always.interface_open_at(2) is False and always.interface_open_at(3) is True
+    always.interface_open = True
+    warm.interface_open = True
+    assert always.graph_only_warmup and not warm.graph_only_warmup
+    for key in ("loss", "topo_loss_rows"):
+        assert float(_generator_grads(always, batch, key).abs().max()) == 0.0
+        assert float(_generator_grads(warm, batch, key).abs().max()) > 0.0
+    assert float(_generator_grads(always, batch, "slot_loss_rows").abs().max()) > 0.0
+    # The logged values are still the joint ones, exactly as during the warm-up.
+    torch.testing.assert_close(always(batch)["loss"], warm(batch)["loss"], rtol=0, atol=0)
+
+
+def test_graph_only_always_keeps_every_generator_parameter_on_the_task_graph() -> None:
+    # The DDP unused-parameter guard: ``loss + 0.0 * weights.sum()`` must still
+    # be added after the interface opens, or a global batch without a valid slot
+    # row would leave generator parameters unreduced.
+    model = _model("two", warmup_losses="graph_only_always", beta_c=1.0)
+    _open_gates(model)
+    model.initialize_teacher()
+    model.train()
+    model.interface_open = True
+    batch = _supervised_batch()
+    assert model.generator is not None
+    params = [param for param in model.generator.parameters() if param.requires_grad]
+    grads = torch.autograd.grad(model(batch)["loss"], params, allow_unused=True)
+    assert all(grad is not None for grad in grads)
+    assert all(float(grad.abs().max()) == 0.0 for grad in grads if grad is not None)
+
+
 def test_a_structural_style_forward_is_detached_in_the_warm_up_too() -> None:
     # The structural stream drives the same forward without a label, so the one
     # detach point covers both streams.
@@ -1236,6 +1287,7 @@ def test_the_wave_two_config_keys_default_to_the_wave_one_behaviour() -> None:
     assert parsed.to_dict()["w_slot"] == "balanced"
     for key, value, message in (
         ("warmup_losses", "later", "warmup_losses"),
+        ("warmup_losses", "graph_only_never", "warmup_losses"),
         ("closure_bias_init", "mass", "closure_bias_init"),
         ("w_slot", "auto", "w_slot"),
         ("w_slot_multiplier", 0.0, "w_slot_multiplier"),

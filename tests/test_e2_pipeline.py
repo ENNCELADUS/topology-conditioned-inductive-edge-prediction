@@ -1100,6 +1100,37 @@ class TestRunPipelineSuccess:
         # The source attempt is read-only: its status is exactly what it was.
         assert json.loads((prior / "status.json").read_text()) == before
 
+    def test_a_cross_output_dir_resume_accepts_an_unresolved_world_size(
+        self, tmp_path: Path
+    ) -> None:
+        """``runtime.world_size: auto`` is resolved here but not in the prefix.
+
+        The worker serializes the config it loaded, so an ``auto`` prefix stores
+        ``world_size: 0`` while this function resolves the live config to the
+        visible GPU count before comparing. Comparing the key would reject every
+        cross-output_dir resume of an ``auto`` config -- every motif arm -- and
+        the real rank count is checked against ``training_state.pt`` regardless.
+        """
+        args, output_dir = TestRunPipelineFailures()._base_args_and_config(tmp_path)
+        prior = self._cross_dir_source(tmp_path, args.config)
+        saved = torch.load(prior / "training_state.pt", weights_only=False)
+        cast(dict[str, object], saved["config"]["runtime"])["world_size"] = 0
+        torch.save(saved, prior / "training_state.pt")
+        resumed_args = PipelineArgs(**{**vars(args), "resume_attempt": prior})
+
+        assert run_pipeline(resumed_args, training_command_runner=_make_fake_runner()) == 0
+
+        complete = json.loads((output_dir / "complete.json").read_text())
+        new_status = json.loads(
+            (output_dir / "attempts" / complete["attempt_id"] / "status.json").read_text()
+        )
+        assert new_status["resume_source_attempt"] == str(prior)
+        # The live config really was resolved away from the saved 0.
+        from src.train_b0 import load_config
+
+        live = load_config(args.config)
+        assert live.runtime is not None and live.runtime.world_size == 4
+
     def test_a_cross_output_dir_resume_is_refused_when_any_other_key_differs(
         self, tmp_path: Path
     ) -> None:
